@@ -195,6 +195,16 @@ DELETED (old engine files removed):
 | Benchmark batch-128 throughput | 15K states/s |
 | Benchmark single inference | 306 inf/s (3.3 ms/call) |
 
-### Multi-GPU testing (TODO — needs remote Linux machine)
+### Linux 2× RTX 5070 Ti (OpenCL backend — multi-gpu branch)
 
-To be tested on 2× RTX 5070 Ti with `test_multi_gpu.sh`.
+All 9 tests pass (`test_multi_gpu.sh`).
+
+| Test | Result |
+|---|---|
+| Selfplay, 1 server, GPU 0 | 4 games pass (1.47 s/game) |
+| Selfplay, 2 servers, GPU 0,0 | 4 games pass (1.07 s/game, 1.4× baseline) |
+| Selfplay, 2 servers, GPU 0,1 | 4 games pass (0.56 s/game, **2.6× baseline**) |
+| Selfplay, 4 servers, GPU 0,0,1,1 | 8 games pass (0.36 s/game, **4.1× baseline**) |
+| Benchmark batch-128 throughput | 52K states/s |
+| Large model (128 filters, 10 blocks), 2 GPUs | 4 games pass (2.35 s/game) |
+| Stability (10 sequential runs, 2 GPUs) | 10/10 pass |
