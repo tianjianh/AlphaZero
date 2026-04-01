@@ -1,13 +1,15 @@
 #include "config.h"
 #include "game.h"
 #include "mcts.h"
-#include "inference_engine.h"
+#include "loaded_model.h"
+#include "compute_context.h"
 #include "nn_evaluator.h"
 #include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <mutex>
@@ -31,6 +33,15 @@ static void write_records(const std::string& path,
     }
 }
 
+static std::vector<int> parse_device_ids(const std::string& str) {
+    std::vector<int> ids;
+    std::istringstream ss(str);
+    std::string token;
+    while (std::getline(ss, token, ','))
+        ids.push_back(std::stoi(token));
+    return ids;
+}
+
 int main(int argc, char* argv[]) {
     Config config;
     std::string model_path  = "model.onnx";
@@ -38,45 +49,59 @@ int main(int argc, char* argv[]) {
     int  num_games          = 100;
     int  num_threads        = 1;
     int  search_threads     = 16;
+    int  nn_server_threads  = 1;
+    std::string nn_device_ids_str = "0";
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if      (arg == "--model"          && i+1<argc) model_path                   = argv[++i];
-        else if (arg == "--games"          && i+1<argc) num_games                    = std::stoi(argv[++i]);
-        else if (arg == "--threads"        && i+1<argc) num_threads                  = std::stoi(argv[++i]);
-        else if (arg == "--search-threads" && i+1<argc) search_threads               = std::stoi(argv[++i]);
-        else if (arg == "--max-batch"      && i+1<argc) config.max_batch_size        = std::stoi(argv[++i]);
-        else if (arg == "--output"         && i+1<argc) output_dir                   = argv[++i];
-        else if (arg == "--sims"           && i+1<argc) config.num_simulations       = std::stoi(argv[++i]);
+        if      (arg == "--model"             && i+1<argc) model_path         = argv[++i];
+        else if (arg == "--games"             && i+1<argc) num_games          = std::stoi(argv[++i]);
+        else if (arg == "--threads"           && i+1<argc) num_threads        = std::stoi(argv[++i]);
+        else if (arg == "--search-threads"    && i+1<argc) search_threads     = std::stoi(argv[++i]);
+        else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
+        else if (arg == "--output"            && i+1<argc) output_dir         = argv[++i];
+        else if (arg == "--sims"              && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
+        else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads  = std::stoi(argv[++i]);
+        else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str  = argv[++i];
         else if (arg == "--help") {
             std::cout
                 << "Usage: selfplay [options]\n"
-                << "  --model PATH          Model file (default: model.onnx)\n"
-                << "  --games N             Number of games (default: 100)\n"
-                << "  --threads N           Parallel self-play workers (default: 1)\n"
-                << "  --search-threads N    MCTS search threads per move (default: 16)\n"
-                << "  --max-batch N         Max GPU batch size (default: 256)\n"
-                << "  --output DIR          Output directory (default: selfplay_data)\n"
-                << "  --sims N              MCTS simulations per move (default: 800)\n";
+                << "  --model PATH            Model file (default: model.onnx)\n"
+                << "  --games N               Number of games (default: 100)\n"
+                << "  --threads N             Parallel self-play workers (default: 1)\n"
+                << "  --search-threads N      MCTS search threads per move (default: 16)\n"
+                << "  --max-batch N           Max GPU batch size (default: 256)\n"
+                << "  --output DIR            Output directory (default: selfplay_data)\n"
+                << "  --sims N                MCTS simulations per move (default: 800)\n"
+                << "  --nn-server-threads N   NN server threads (default: 1)\n"
+                << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
         }
     }
 
     system(("mkdir -p " + output_dir).c_str());
 
-    // Create engine (backend selected at compile time)
-    auto engine = std::shared_ptr<InferenceEngine>(create_engine(model_path));
+    // Parse device IDs
+    std::vector<int> device_ids = parse_device_ids(nn_device_ids_str);
+    while ((int)device_ids.size() < nn_server_threads)
+        device_ids.push_back(0);
 
-    config.board_size       = engine->board_size;
-    config.input_channels   = engine->input_channels;
-    config.num_filters      = engine->num_filters;
-    config.num_res_blocks   = engine->num_res_blocks;
+    // Load model once (shared CPU weights — KataGo pattern)
+    auto model = LoadedModel::load(model_path);
+
+    config.board_size         = model->board_size;
+    config.input_channels     = model->input_channels;
+    config.num_filters        = model->num_filters;
+    config.num_res_blocks     = model->num_res_blocks;
     config.max_moves_per_game = config.board_size * config.board_size * 2;
     config.num_search_threads = search_threads;
 
-    // All backends use NNEvaluator (unified architecture)
+    // Create compute context (device init — shared across server threads)
+    auto context = std::shared_ptr<ComputeContext>(create_compute_context(device_ids));
+
+    // Create NNEvaluator with N server threads
     auto nn_evaluator = std::make_shared<NNEvaluator>(
-        engine.get(), config.max_batch_size);
+        model, context, device_ids, config.max_batch_size);
 
     std::cout << "MiniGo C++ Self-Play\n"
               << "  Board:            " << config.board_size << "x" << config.board_size << "\n"
@@ -86,7 +111,8 @@ int main(int argc, char* argv[]) {
               << "  Search threads:   " << config.num_search_threads << "\n"
               << "  Games:            " << num_games << "\n"
               << "  Threads:          " << num_threads << "\n"
-              << "  Backend:          " << engine->backend_name() << "\n"
+              << "  Backend:          " << context->backend_name() << "\n"
+              << "  NN servers:       " << nn_server_threads << "\n"
               << "  Model:            " << model_path << "\n"
               << "  Output:           " << output_dir << "\n\n";
 

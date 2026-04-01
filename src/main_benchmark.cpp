@@ -1,17 +1,28 @@
 #include "config.h"
 #include "game.h"
 #include "mcts.h"
-#include "inference_engine.h"
+#include "loaded_model.h"
+#include "compute_context.h"
 #include "nn_evaluator.h"
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <mutex>
 
 using namespace minigo;
+
+static std::vector<int> parse_device_ids(const std::string& str) {
+    std::vector<int> ids;
+    std::istringstream ss(str);
+    std::string token;
+    while (std::getline(ss, token, ','))
+        ids.push_back(std::stoi(token));
+    return ids;
+}
 
 int main(int argc, char* argv[]) {
     Config config;
@@ -21,41 +32,54 @@ int main(int argc, char* argv[]) {
     int  board_override     = -1;
     int  num_threads        = 1;
     int  search_threads     = 16;
+    int  nn_server_threads  = 1;
+    std::string nn_device_ids_str = "0";
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if      (arg == "--model"          && i+1<argc) model_path      = argv[++i];
-        else if (arg == "--board"          && i+1<argc) board_override  = std::stoi(argv[++i]);
-        else if (arg == "--sims"           && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
-        else if (arg == "--nn-iters"       && i+1<argc) nn_iters        = std::stoi(argv[++i]);
-        else if (arg == "--games"          && i+1<argc) num_games       = std::stoi(argv[++i]);
-        else if (arg == "--threads"        && i+1<argc) num_threads     = std::stoi(argv[++i]);
-        else if (arg == "--search-threads" && i+1<argc) search_threads  = std::stoi(argv[++i]);
-        else if (arg == "--max-batch"      && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
+        if      (arg == "--model"             && i+1<argc) model_path      = argv[++i];
+        else if (arg == "--board"             && i+1<argc) board_override  = std::stoi(argv[++i]);
+        else if (arg == "--sims"              && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
+        else if (arg == "--nn-iters"          && i+1<argc) nn_iters        = std::stoi(argv[++i]);
+        else if (arg == "--games"             && i+1<argc) num_games       = std::stoi(argv[++i]);
+        else if (arg == "--threads"           && i+1<argc) num_threads     = std::stoi(argv[++i]);
+        else if (arg == "--search-threads"    && i+1<argc) search_threads  = std::stoi(argv[++i]);
+        else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
+        else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
+        else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--help") {
             std::cout << "Usage: benchmark [options]\n"
-                      << "  --model PATH          Model file (default: model.onnx)\n"
-                      << "  --board N             Board size override\n"
-                      << "  --sims N              MCTS simulations\n"
-                      << "  --nn-iters N          NN inference iterations (default: 1000)\n"
-                      << "  --games N             Self-play games (default: 5)\n"
-                      << "  --threads N           Self-play worker threads (default: 1)\n"
-                      << "  --search-threads N    MCTS search threads per move (default: 16)\n"
-                      << "  --max-batch N         Max GPU batch size (default: 256)\n";
+                      << "  --model PATH            Model file (default: model.onnx)\n"
+                      << "  --board N               Board size override\n"
+                      << "  --sims N                MCTS simulations\n"
+                      << "  --nn-iters N            NN inference iterations (default: 1000)\n"
+                      << "  --games N               Self-play games (default: 5)\n"
+                      << "  --threads N             Self-play worker threads (default: 1)\n"
+                      << "  --search-threads N      MCTS search threads per move (default: 16)\n"
+                      << "  --max-batch N           Max GPU batch size (default: 256)\n"
+                      << "  --nn-server-threads N   NN server threads (default: 1)\n"
+                      << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
         }
     }
 
-    // Load model (backend selected at compile time)
-    std::shared_ptr<InferenceEngine> engine;
+    // Parse device IDs
+    std::vector<int> device_ids = parse_device_ids(nn_device_ids_str);
+    while ((int)device_ids.size() < nn_server_threads)
+        device_ids.push_back(0);
+
+    // Load model
+    std::shared_ptr<LoadedModel> model;
+    std::shared_ptr<ComputeContext> context;
     bool has_model = false;
     try {
-        engine = std::shared_ptr<InferenceEngine>(create_engine(model_path));
+        model = LoadedModel::load(model_path);
+        context = std::shared_ptr<ComputeContext>(create_compute_context(device_ids));
         has_model = true;
-        config.board_size      = engine->board_size;
-        config.input_channels  = engine->input_channels;
-        config.num_filters     = engine->num_filters;
-        config.num_res_blocks  = engine->num_res_blocks;
+        config.board_size      = model->board_size;
+        config.input_channels  = model->input_channels;
+        config.num_filters     = model->num_filters;
+        config.num_res_blocks  = model->num_res_blocks;
     } catch (...) {
         std::cout << "No model loaded — NN/MCTS benchmarks will be skipped.\n";
     }
@@ -66,7 +90,7 @@ int main(int argc, char* argv[]) {
     std::cout << "MiniGo C++ Benchmark\n"
               << "  Board: " << config.board_size << "x" << config.board_size;
     if (has_model)
-        std::cout << "  Backend: " << engine->backend_name();
+        std::cout << "  Backend: " << context->backend_name();
     std::cout << "\n\n";
 
     // ── 1. Game engine speed ──────────────────────────────────────
@@ -103,19 +127,23 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    // Create a single-server evaluator for tests 2-4 (direct inference)
+    auto eval_single = std::make_shared<NNEvaluator>(
+        model, context, std::vector<int>{device_ids[0]}, config.max_batch_size);
+
     // ── 2. Single-thread NN inference ────────────────────────────
     {
-        std::cout << "2. NN inference, single-thread (" << engine->backend_name() << ")...\n";
+        std::cout << "2. NN inference, single-thread (" << context->backend_name() << ")...\n";
 
         GoGame game(config.board_size, config.komi);
         std::vector<float> state;
         game.encode(state);
 
         // Warmup
-        for (int i = 0; i < 10; i++) engine->predict(state);
+        for (int i = 0; i < 10; i++) eval_single->evaluate_single(state);
 
         auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < nn_iters; i++) engine->predict(state);
+        for (int i = 0; i < nn_iters; i++) eval_single->evaluate_single(state);
         double secs = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
 
@@ -138,11 +166,11 @@ int main(int argc, char* argv[]) {
             std::vector<std::vector<float>> batch_states(batch, state);
 
             // Warmup
-            for (int i = 0; i < 5; i++) engine->predict_batch(batch_states);
+            for (int i = 0; i < 5; i++) eval_single->evaluate(batch_states);
 
             int iters = std::max(10, 500 / batch);
             auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < iters; i++) engine->predict_batch(batch_states);
+            for (int i = 0; i < iters; i++) eval_single->evaluate(batch_states);
             double secs = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
 
@@ -156,13 +184,12 @@ int main(int argc, char* argv[]) {
         std::cout << "\n";
     }
 
-    // ── 4. MCTS single-threaded (via NNEvaluator, 1 search thread) ──
+    // ── 4. MCTS (1 search thread, via NNEvaluator) ──────────────
     {
         std::cout << "4. MCTS (" << config.num_simulations << " sims, 1 thread)...\n";
 
         config.num_search_threads = 1;
-        NNEvaluator eval_single(engine.get(), config.max_batch_size);
-        MCTS mcts(&eval_single, config);
+        MCTS mcts(eval_single.get(), config);
         GoGame game(config.board_size, config.komi);
 
         auto t0 = std::chrono::steady_clock::now();
@@ -176,15 +203,19 @@ int main(int argc, char* argv[]) {
                   << "s  (" << (int)(config.num_simulations / secs) << " sims/s)\n\n";
     }
 
+    // Destroy single-server evaluator before creating multi-server one
+    eval_single.reset();
+
     // ── 5. Multi-threaded self-play ───────────────────────────────
     {
         std::cout << "5. Self-play (" << num_games << " games, "
-                  << num_threads << " threads)...\n";
+                  << num_threads << " threads, "
+                  << nn_server_threads << " server(s))...\n";
 
         config.num_search_threads = search_threads;
 
         auto nn_evaluator = std::make_shared<NNEvaluator>(
-            engine.get(), config.max_batch_size);
+            model, context, device_ids, config.max_batch_size);
 
         std::atomic<int> games_done{0};
         std::atomic<int> total_records{0};

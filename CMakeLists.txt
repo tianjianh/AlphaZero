@@ -123,18 +123,19 @@ endif()
 set(CORE_SOURCES
     src/game.cpp
     src/onnx_loader.cpp
-    src/eigen_engine.cpp
-    src/inference_engine.cpp
+    src/loaded_model.cpp
+    src/compute_context.cpp
+    src/eigen_compute.cpp
     src/nn_evaluator.cpp
     src/mcts.cpp
 )
 
 if(HAS_OPENCL)
-  list(APPEND CORE_SOURCES src/opencl_engine.cpp)
+  list(APPEND CORE_SOURCES src/opencl_compute.cpp)
 endif()
 
 if(HAS_METAL)
-  list(APPEND CORE_SOURCES src/metal_engine.mm)
+  list(APPEND CORE_SOURCES src/metal_compute.mm)
 endif()
 
 add_library(minigo_core STATIC ${CORE_SOURCES})

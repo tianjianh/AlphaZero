@@ -1,10 +1,12 @@
 #include "config.h"
 #include "game.h"
 #include "mcts.h"
-#include "inference_engine.h"
+#include "loaded_model.h"
+#include "compute_context.h"
 #include "nn_evaluator.h"
 #include <algorithm>
 #include <iostream>
+#include <sstream>
 #include <random>
 #include <string>
 
@@ -20,48 +22,72 @@ static int random_legal_move(GoGame& game) {
     return actions[rng() % actions.size()];
 }
 
+static std::vector<int> parse_device_ids(const std::string& str) {
+    std::vector<int> ids;
+    std::istringstream ss(str);
+    std::string token;
+    while (std::getline(ss, token, ','))
+        ids.push_back(std::stoi(token));
+    return ids;
+}
+
 int main(int argc, char* argv[]) {
     Config config;
     std::string model_path  = "model.onnx";
     bool use_random         = false;
     int  board_override     = -1;
     int  search_threads     = 16;
+    int  nn_server_threads  = 1;
+    std::string nn_device_ids_str = "0";
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
-        if      (arg == "--model"          && i+1<argc) model_path    = argv[++i];
-        else if (arg == "--board"          && i+1<argc) board_override = std::stoi(argv[++i]);
-        else if (arg == "--sims"           && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
-        else if (arg == "--search-threads" && i+1<argc) search_threads = std::stoi(argv[++i]);
-        else if (arg == "--komi"           && i+1<argc) config.komi   = std::stof(argv[++i]);
+        if      (arg == "--model"             && i+1<argc) model_path      = argv[++i];
+        else if (arg == "--board"             && i+1<argc) board_override  = std::stoi(argv[++i]);
+        else if (arg == "--sims"              && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
+        else if (arg == "--search-threads"    && i+1<argc) search_threads  = std::stoi(argv[++i]);
+        else if (arg == "--komi"              && i+1<argc) config.komi     = std::stof(argv[++i]);
+        else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
+        else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--random") use_random = true;
         else if (arg == "--help") {
             std::cout << "Usage: play [options]\n"
-                      << "  --model PATH          Model file (default: model.onnx)\n"
-                      << "  --board N             Board size (for --random mode)\n"
-                      << "  --sims N              MCTS simulations (default: 800)\n"
-                      << "  --search-threads N    MCTS search threads (default: 16)\n"
-                      << "  --komi F              Komi value (default: 7.5)\n"
-                      << "  --random              Use random bot (no model needed)\n";
+                      << "  --model PATH            Model file (default: model.onnx)\n"
+                      << "  --board N               Board size (for --random mode)\n"
+                      << "  --sims N                MCTS simulations (default: 800)\n"
+                      << "  --search-threads N      MCTS search threads (default: 16)\n"
+                      << "  --komi F                Komi value (default: 7.5)\n"
+                      << "  --nn-server-threads N   NN server threads (default: 1)\n"
+                      << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n"
+                      << "  --random                Use random bot (no model needed)\n";
             return 0;
         }
     }
 
-    std::shared_ptr<InferenceEngine> engine;
+    std::vector<int> device_ids = parse_device_ids(nn_device_ids_str);
+    while ((int)device_ids.size() < nn_server_threads)
+        device_ids.push_back(0);
+
+    std::shared_ptr<LoadedModel> model;
+    std::shared_ptr<ComputeContext> context;
     std::shared_ptr<NNEvaluator> evaluator;
     std::unique_ptr<MCTS> mcts;
 
     if (!use_random) {
         try {
-            engine = std::shared_ptr<InferenceEngine>(create_engine(model_path));
-            config.board_size      = engine->board_size;
-            config.input_channels  = engine->input_channels;
-            config.num_filters     = engine->num_filters;
-            config.num_res_blocks  = engine->num_res_blocks;
+            model   = LoadedModel::load(model_path);
+            context = std::shared_ptr<ComputeContext>(create_compute_context(device_ids));
+
+            config.board_size         = model->board_size;
+            config.input_channels     = model->input_channels;
+            config.num_filters        = model->num_filters;
+            config.num_res_blocks     = model->num_res_blocks;
             config.max_moves_per_game = config.board_size * config.board_size * 2;
             config.num_search_threads = search_threads;
-            evaluator = std::make_shared<NNEvaluator>(engine.get(), config.max_batch_size);
-            mcts      = std::make_unique<MCTS>(evaluator.get(), config);
+
+            evaluator = std::make_shared<NNEvaluator>(
+                model, context, device_ids, config.max_batch_size);
+            mcts = std::make_unique<MCTS>(evaluator.get(), config);
         } catch (const std::exception& e) {
             std::cerr << "Error: " << e.what() << "\n";
             std::cout << "Use --random for random bot, or train first.\n";
@@ -93,7 +119,7 @@ int main(int argc, char* argv[]) {
                   << "\nBoard: " << config.board_size << "x" << config.board_size
                   << "  Komi: " << config.komi
                   << "  Sims: " << config.num_simulations;
-        if (engine) std::cout << "  Backend: " << engine->backend_name();
+        if (context) std::cout << "  Backend: " << context->backend_name();
         std::cout << "\nMoves: A1-"
                   << (char)('A' + (config.board_size > 8 ? config.board_size
                                                          : config.board_size - 1))
