@@ -65,8 +65,12 @@ int main(int argc, char* argv[]) {
 
     // Parse device IDs
     std::vector<int> device_ids = parse_device_ids(nn_device_ids_str);
-    while ((int)device_ids.size() < nn_server_threads)
-        device_ids.push_back(0);
+    if ((int)device_ids.size() != nn_server_threads) {
+        std::cerr << "ERROR: --nn-device-ids has " << device_ids.size()
+                  << " entries but --nn-server-threads is " << nn_server_threads
+                  << ". Must match exactly.\n";
+        return 1;
+    }
 
     // Load model
     std::shared_ptr<LoadedModel> model;
