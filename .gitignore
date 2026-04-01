@@ -1,0 +1,12 @@
+build/
+selfplay_data/
+checkpoints/
+model.onnx
+model_large.onnx
+model_xlarge.onnx
+*.bin
+*.pt
+.DS_Store
+__pycache__/
+*.pyc
+third_party/

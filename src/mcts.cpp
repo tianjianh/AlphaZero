@@ -1,0 +1,528 @@
+#include "mcts.h"
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <numeric>
+#include <thread>
+#include <pthread.h>
+
+namespace minigo {
+
+MCTSNode* MCTSNode::select_child(float c_puct) {
+    MCTSNode* best = nullptr;
+    float best_score = -1e9f;
+    for (auto& child : children) {
+        if (!child) continue;
+        float score = child->ucb_score(c_puct);
+        if (score > best_score) {
+            best_score = score;
+            best = child.get();
+        }
+    }
+    return best;
+}
+
+MCTS::MCTS(BatchEvaluator* evaluator, const Config& config)
+    : evaluator_(evaluator), config_(config),
+      rng_(std::random_device{}()) {}
+
+std::vector<float> MCTS::dirichlet(int n, float alpha) {
+    std::gamma_distribution<float> gamma(alpha, 1.0f);
+    std::vector<float> samples(n);
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) {
+        samples[i] = gamma(rng_);
+        sum += samples[i];
+    }
+    if (sum > 0.0f)
+        for (auto& s : samples) s /= sum;
+    return samples;
+}
+
+void MCTS::expand(MCTSNode* node, const std::vector<float>& policy,
+                  const std::vector<float>& legal) {
+    int action_size = (int)policy.size();
+    node->children.resize(action_size);
+    for (int a = 0; a < action_size; a++) {
+        if (legal[a] > 0.0f) {
+            auto child = std::make_unique<MCTSNode>();
+            child->parent = node;
+            child->action = a;
+            child->prior  = policy[a];
+            node->children[a] = std::move(child);
+        }
+    }
+}
+
+void MCTS::mask_policy(std::vector<float>& policy,
+                       const std::vector<float>& legal, int action_size) {
+    float policy_sum = 0.0f;
+    for (int a = 0; a < action_size; a++) {
+        policy[a] *= legal[a];
+        policy_sum += policy[a];
+    }
+    if (policy_sum > 0.0f) {
+        for (auto& p : policy) p /= policy_sum;
+    } else {
+        float ls = std::accumulate(legal.begin(), legal.end(), 0.0f);
+        for (int a = 0; a < action_size; a++)
+            policy[a] = legal[a] / ls;
+    }
+}
+
+void MCTS::add_dirichlet_noise(MCTSNode* node, int action_size) {
+    auto noise = dirichlet(action_size, config_.dirichlet_alpha);
+    float eps  = config_.dirichlet_epsilon;
+    for (int a = 0; a < (int)node->children.size(); a++) {
+        if (node->children[a])
+            node->children[a]->prior = (1.0f - eps) * node->children[a]->prior
+                                     + eps * noise[a];
+    }
+}
+
+// ================================================================
+// Backpropagation — two variants (matching KataGo)
+// ================================================================
+
+// Full backprop: undo virtual loss + add real visit + update value.
+// Called after a successful NN evaluation.
+void MCTS::backprop(const std::vector<MCTSNode*>& path, float value) {
+    float v = value;
+    for (int i = (int)path.size() - 1; i >= 0; i--) {
+        MCTSNode* node = path[i];
+        node->virtual_loss_count.fetch_sub(1, std::memory_order_relaxed);
+        node->visit_count.fetch_add(1, std::memory_order_relaxed);
+        node->add_value(v);
+        v = -v;
+    }
+}
+
+// Revert virtual losses ONLY — no visit count, no value update.
+// Called on collision (abandoned playout).  Matches KataGo's
+// revertVirtualLosses: cleans up the vloss applied during descent
+// so the abandoned playout leaves no trace except the yield.
+void MCTS::revert_virtual_losses(const std::vector<MCTSNode*>& path) {
+    for (auto* node : path)
+        node->virtual_loss_count.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// ================================================================
+// Multi-threaded search: KataGo's exact pattern
+//
+// Each thread does ONE playout at a time:
+//   descend (with vloss) → evaluate_single (block) → expand → backprop
+//
+// On collision (node in EXPANDING state):
+//   revert virtual losses, yield, retry from root.
+//   The playout does NOT count.  This matches KataGo's
+//   shouldCountPlayout=false + revertVirtualLosses.
+//
+// Batch size = however many threads submit leaves during one GPU call.
+// With N search threads across all games, steady-state batch ≈ N.
+// Speed scales linearly with search threads (more threads → bigger batch).
+// ================================================================
+
+void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
+                               int action_size,
+                               std::atomic<int>& sims_done,
+                               int num_simulations) {
+    // Pre-allocate ONE NNResultBuf for this thread's entire lifetime.
+    // Reused for every evaluation call — the mutex + condvar are created
+    // once here, not per eval.  Matches KataGo: one buf per SearchThread.
+    NNResultBuf result_buf;
+
+    while (true) {
+        // Check termination BEFORE doing work (KataGo pattern)
+        if (sims_done.load(std::memory_order_relaxed) >= num_simulations)
+            break;
+
+        // ── Descend with virtual loss ────────────────────────────
+        MCTSNode* node = root;
+        GoGame game_copy = game.copy();
+        std::vector<MCTSNode*> path;
+        path.push_back(node);
+        node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
+
+        bool collision = false;
+
+        while (true) {
+            int st = node->state.load(std::memory_order_acquire);
+
+            if (st == NODE_EXPANDED) {
+                MCTSNode* child = node->select_child(config_.c_puct);
+                if (!child) break;
+                child->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
+                path.push_back(child);
+                int action = child->action;
+                if (action == action_size - 1)
+                    game_copy.play(PASS_MOVE);
+                else
+                    game_copy.play(action);
+                node = child;
+
+            } else if (st == NODE_EXPANDING) {
+                // ── Collision: another thread is evaluating this node ──
+                // Revert virtual losses, yield, retry.  Don't count playout.
+                // (KataGo: shouldCountPlayout=false, revertVirtualLosses)
+                collision = true;
+                break;
+
+            } else {
+                // NODE_UNEVALUATED — reached a leaf
+                break;
+            }
+        }
+
+        if (collision) {
+            revert_virtual_losses(path);
+            std::this_thread::yield();
+            continue;  // retry from root — playout doesn't count
+        }
+
+        // ── Terminal node ────────────────────────────────────────
+        if (game_copy.game_over) {
+            float leaf_value;
+            if      (game_copy.winner == EMPTY)                     leaf_value =  0.0f;
+            else if (game_copy.winner == game_copy.current_player)  leaf_value =  1.0f;
+            else                                                     leaf_value = -1.0f;
+            backprop(path, leaf_value);
+            sims_done.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
+        // ── CAS to claim expansion ──────────────────────────────
+        int expected = NODE_UNEVALUATED;
+        if (!node->state.compare_exchange_strong(expected, NODE_EXPANDING,
+                std::memory_order_acq_rel)) {
+            // Extremely rare: another thread claimed between our state check and CAS
+            revert_virtual_losses(path);
+            std::this_thread::yield();
+            continue;  // retry, don't count
+        }
+
+        // ── Evaluate (blocks until server processes batch) ──────
+        std::vector<float> state;
+        game_copy.encode(state);
+
+        auto [policy, value] = evaluator_->evaluate_with_buf(result_buf, state);
+
+        // ── Expand + backprop ────────────────────────────────────
+        std::vector<float> legal;
+        game_copy.get_legal_moves(legal);
+        mask_policy(policy, legal, action_size);
+        expand(node, policy, legal);
+        node->state.store(NODE_EXPANDED, std::memory_order_release);
+
+        backprop(path, value);
+        sims_done.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// ================================================================
+// Single-threaded VLP search (for DirectEvaluator / Eigen)
+//
+// Uses VLP batching: collect vloss_parallel leaves, batch evaluate,
+// expand, backprop.  Kept for the Eigen backend where there's no
+// server thread and batch submission is direct.
+// ================================================================
+
+void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
+                                   int action_size, int num_simulations) {
+    int sims_done      = 0;
+    int vloss_parallel = config_.virtual_loss_parallel;
+
+    while (sims_done < num_simulations) {
+        int batch_count = std::min(vloss_parallel, num_simulations - sims_done);
+
+        struct PendingLeaf {
+            std::vector<MCTSNode*> path;
+            MCTSNode*              leaf;
+            std::vector<float>     state;
+            std::vector<float>     legal;
+        };
+
+        std::vector<PendingLeaf> pending;
+        pending.reserve(batch_count);
+
+        for (int i = 0; i < batch_count; i++) {
+            PendingLeaf leaf;
+
+            MCTSNode* node = root;
+            GoGame game_copy = game.copy();
+            leaf.path.push_back(node);
+            node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
+
+            while (!node->children.empty()) {
+                node = node->select_child(config_.c_puct);
+                if (!node) break;
+                node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
+                leaf.path.push_back(node);
+                int action = node->action;
+                if (action == action_size - 1)
+                    game_copy.play(PASS_MOVE);
+                else
+                    game_copy.play(action);
+            }
+
+            if (!node) {
+                for (auto* n : leaf.path)
+                    n->virtual_loss_count.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            leaf.leaf = node;
+
+            if (game_copy.game_over) {
+                float v;
+                if      (game_copy.winner == EMPTY)                     v =  0.0f;
+                else if (game_copy.winner == game_copy.current_player)  v =  1.0f;
+                else                                                     v = -1.0f;
+                backprop(leaf.path, v);
+                sims_done++;
+                continue;
+            }
+
+            game_copy.encode(leaf.state);
+            game_copy.get_legal_moves(leaf.legal);
+            pending.push_back(std::move(leaf));
+        }
+
+        if (pending.empty()) continue;
+
+        std::vector<std::vector<float>> states;
+        states.reserve(pending.size());
+        for (auto& p : pending)
+            states.push_back(std::move(p.state));
+
+        auto results = evaluator_->evaluate(states);
+
+        for (size_t i = 0; i < pending.size(); i++) {
+            auto& [res_policy, res_value] = results[i];
+            auto& leaf = pending[i];
+
+            mask_policy(res_policy, leaf.legal, action_size);
+            if (leaf.leaf->children.empty())
+                expand(leaf.leaf, res_policy, leaf.legal);
+            leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
+
+            backprop(leaf.path, res_value);
+            sims_done++;
+        }
+    }
+}
+
+// ================================================================
+// search() — dispatch
+// ================================================================
+
+void MCTS::search(GoGame& game, std::vector<float>& visits,
+                  int num_simulations, bool add_noise) {
+    if (num_simulations < 0) num_simulations = config_.num_simulations;
+
+    int action_size = config_.action_size();
+    auto root = std::make_unique<MCTSNode>();
+
+    // ── Evaluate root ────────────────────────────────────────────
+    std::vector<float> state_enc;
+    game.encode(state_enc);
+    auto root_results = evaluator_->evaluate({ state_enc });
+    auto& [policy, value] = root_results[0];
+
+    std::vector<float> legal;
+    game.get_legal_moves(legal);
+    mask_policy(policy, legal, action_size);
+    expand(root.get(), policy, legal);
+    root->state.store(NODE_EXPANDED, std::memory_order_release);
+    root->visit_count.store(1, std::memory_order_relaxed);
+    root->add_value(value);
+    if (add_noise) add_dirichlet_noise(root.get(), action_size);
+
+    // ── Run search (KataGo pattern: N threads, each VLP=1) ─────
+    int nthreads = std::max(1, config_.num_search_threads);
+    std::atomic<int> sims_done{0};
+
+    // Spawn search threads with explicit 2MB stack (GoGame is 4KB per frame;
+    // default 512KB can be tight with deep call stacks on some platforms)
+    struct ThreadArg {
+        MCTS* self;
+        MCTSNode* root;
+        const GoGame* game;
+        int action_size;
+        std::atomic<int>* sims_done;
+        int num_simulations;
+    };
+    auto thread_fn = [](void* arg) -> void* {
+        auto* a = static_cast<ThreadArg*>(arg);
+        a->self->search_thread_loop(a->root, *a->game, a->action_size,
+                                     *a->sims_done, a->num_simulations);
+        return nullptr;
+    };
+
+    std::vector<ThreadArg> args(nthreads - 1);
+    std::vector<pthread_t> pthreads(nthreads - 1);
+    for (int t = 0; t < nthreads - 1; t++) {
+        args[t] = { this, root.get(), &game, action_size, &sims_done, num_simulations };
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);  // 8MB stack (match main thread)
+        pthread_create(&pthreads[t], &attr, thread_fn, &args[t]);
+        pthread_attr_destroy(&attr);
+    }
+
+    search_thread_loop(root.get(), game, action_size, sims_done, num_simulations);
+
+    for (int t = 0; t < nthreads - 1; t++)
+        pthread_join(pthreads[t], nullptr);
+
+    // ── Extract visit counts ─────────────────────────────────────
+    visits.assign(action_size, 0.0f);
+    for (int a = 0; a < (int)root->children.size(); a++)
+        if (root->children[a])
+            visits[a] = (float)root->children[a]->visit_count.load(std::memory_order_relaxed);
+}
+
+int MCTS::get_action(GoGame& game, std::vector<float>& policy,
+                     float temperature, int num_simulations, bool add_noise) {
+    int action_size = config_.action_size();
+
+    std::vector<float> visits;
+    search(game, visits, num_simulations, add_noise);
+
+    if (temperature == 0.0f) {
+        int best = (int)(std::max_element(visits.begin(), visits.end())
+                         - visits.begin());
+        policy.assign(action_size, 0.0f);
+        policy[best] = 1.0f;
+        return best;
+    }
+
+    policy.resize(action_size);
+    float sum = 0.0f;
+    for (int a = 0; a < action_size; a++) {
+        policy[a] = std::pow(visits[a], 1.0f / temperature);
+        sum += policy[a];
+    }
+    if (sum > 0.0f) {
+        for (auto& p : policy) p /= sum;
+    } else {
+        std::vector<float> legal;
+        game.get_legal_moves(legal);
+        float ls = std::accumulate(legal.begin(), legal.end(), 0.0f);
+        for (int a = 0; a < action_size; a++) policy[a] = legal[a] / ls;
+    }
+
+    std::discrete_distribution<int> dist(policy.begin(), policy.end());
+    return dist(rng_);
+}
+
+// ================================================================
+// Dihedral augmentation (8-fold symmetry)
+// ================================================================
+static void augment_sample(const std::vector<float>& state,
+                           const std::vector<float>& policy,
+                           float value, int board_size, int input_channels,
+                           std::vector<TrainingRecord>& out) {
+    int n  = board_size;
+    int hw = n * n;
+    int action_size = hw + 1;
+    float pass_prob = policy[hw];
+
+    for (int rot = 0; rot < 4; rot++) {
+        for (int flip = 0; flip < 2; flip++) {
+            TrainingRecord rec;
+            rec.state.resize((size_t)input_channels * hw);
+            rec.policy.resize(action_size);
+            rec.value = value;
+
+            auto transform = [&](int r, int c) -> std::pair<int,int> {
+                int tr = r, tc = c;
+                for (int k = 0; k < rot; k++) {
+                    int tmp = tr; tr = tc; tc = n - 1 - tmp;
+                }
+                if (flip) tc = n - 1 - tc;
+                return {tr, tc};
+            };
+
+            for (int ch = 0; ch < input_channels; ch++) {
+                for (int r = 0; r < n; r++) {
+                    for (int c = 0; c < n; c++) {
+                        auto [tr, tc] = transform(r, c);
+                        rec.state[ch * hw + tr * n + tc] =
+                            state[ch * hw + r * n + c];
+                    }
+                }
+            }
+            for (int r = 0; r < n; r++) {
+                for (int c = 0; c < n; c++) {
+                    auto [tr, tc] = transform(r, c);
+                    rec.policy[tr * n + tc] = policy[r * n + c];
+                }
+            }
+            rec.policy[hw] = pass_prob;
+            out.push_back(std::move(rec));
+        }
+    }
+}
+
+// ================================================================
+// Self-play game
+// ================================================================
+static std::vector<TrainingRecord> self_play_game_impl(
+        MCTS& mcts, const Config& config) {
+    GoGame game(config.board_size, config.komi);
+
+    struct Step {
+        std::vector<float> state;
+        std::vector<float> policy;
+        Stone player;
+    };
+    std::vector<Step> trajectory;
+
+    int action_size = config.action_size();
+
+    while (!game.game_over && game.move_count < config.max_moves_per_game) {
+        float temp = (game.move_count < config.temperature_threshold)
+                     ? 1.0f : 0.0f;
+
+        std::vector<float> pi;
+        int action = mcts.get_action(game, pi, temp, -1, true);
+
+        Step step;
+        game.encode(step.state);
+        step.policy = pi;
+        step.player = game.current_player;
+        trajectory.push_back(std::move(step));
+
+        if (action == action_size - 1)
+            game.play(PASS_MOVE);
+        else
+            game.play(action);
+    }
+
+    while (!game.game_over) game.play(PASS_MOVE);
+
+    std::vector<TrainingRecord> records;
+    records.reserve(trajectory.size() * 8);
+
+    for (auto& step : trajectory) {
+        float value;
+        if      (game.winner == EMPTY)        value =  0.0f;
+        else if (game.winner == step.player)  value =  1.0f;
+        else                                  value = -1.0f;
+
+        augment_sample(step.state, step.policy, value,
+                       config.board_size, config.input_channels, records);
+    }
+
+    return records;
+}
+
+std::vector<TrainingRecord> self_play_game(
+        BatchEvaluator* evaluator, const Config& config) {
+    MCTS mcts(evaluator, config);
+    return self_play_game_impl(mcts, config);
+}
+
+}  // namespace minigo
