@@ -49,7 +49,7 @@ multi-gpu     — active development branch (KataGo-style multi-server architect
 - **Removed --backend flag**: backend is compile-time only
 - **Fixed GPU buffer overflows**: buf_pol_out_ and buf_val_h1_ sizes were swapped
 
-### Session 7 (current): Multi-GPU Refactor
+### Session 7: Multi-GPU Refactor (Part 1)
 - **LoadedModel**: extracted ONNX parsing + BN pre-fusion into shared CPU-side class
 - **ComputeContext / ComputeHandle**: base classes matching KataGo's architecture
 - **EigenComputeContext/Handle**: working, tested with 2 server threads
@@ -58,72 +58,21 @@ multi-gpu     — active development branch (KataGo-style multi-server architect
 - **ComputeHandle created ON server thread**: matches KataGo pattern exactly
 - **New CLI**: `--nn-server-threads N`, `--nn-device-ids 0,1`
 
+### Session 8 (current): OpenCL Refactor + Cleanup
+- **OpenCLComputeContext**: per-GPU device state (cl_context + cl_queue + cl_program), device selection by index
+- **OpenCLComputeHandle**: uploads weights from LoadedModel CPU data, per-thread kernel handles + workspace
+- **Kernel handles per-thread**: each ComputeHandle creates its own cl_kernel objects from the shared cl_program
+- **Old engine files deleted**: inference_engine.h/.cpp, opencl_engine.h/.cpp, metal_engine.h/.mm, eigen_engine.h/.cpp
+- **run_loop.sh updated**: `--nn-server-threads N`, `--nn-device-ids 0,1` flags forwarded to selfplay
+- **Both Metal and OpenCL builds verified**: compile clean on macOS
+
 ## What Remains (multi-gpu branch)
 
-### Priority 1: OpenCL ComputeContext/Handle Refactor
+### ~~Priority 1: OpenCL ComputeContext/Handle Refactor~~ ✓ DONE
 
-The 866-line `src/opencl_engine.cpp` needs to be refactored into `src/opencl_compute.cpp`:
+### ~~Priority 2: Clean Up Old Files~~ ✓ DONE
 
-**OpenCLComputeContext** (created on main thread, shared):
-- `init_opencl(device_id)`: select platform + device by index
-- `compile_kernels()`: build program from embedded kernel source string
-- One cl_context + cl_command_queue + cl_program per unique GPU device
-- KataGo pattern: separate contexts per GPU to avoid NVIDIA serialization
-- The `OPENCL_KERNELS` string and all 6 kernel definitions stay verbatim
-
-**OpenCLComputeHandle** (created ON server thread):
-- Upload weights from `LoadedModel` CPU data → `cl_mem` buffers via `clCreateBuffer(CL_MEM_COPY_HOST_PTR)`
-- Allocate workspace buffers (buf_main_, buf_temp_, buf_skip_, etc.)
-- `predict_batch()`: same forward pass logic as current opencl_engine.cpp
-- References shared cl_context/cl_command_queue from OpenCLComputeContext
-
-**Key code to extract from opencl_engine.cpp:**
-- Lines 18-307: `OPENCL_KERNELS` string → stays in opencl_compute.cpp (static const)
-- Lines 305-318: `CL_CHECK` macro, `new_buf`, `release_buf` → utility helpers
-- Lines 327-393: `init_opencl()` → moves to `OpenCLComputeContext` constructor
-- Lines 398-427: `compile_kernels()` → moves to `OpenCLComputeContext` constructor
-- Lines 432-478: `allocate_workspace()`, `free_workspace()` → `OpenCLComputeHandle`
-- Lines 483-621: `load_model()` → REPLACED by `LoadedModel::load()` + weight upload in `OpenCLComputeHandle` constructor
-- Lines 626-866: `predict_batch()` + helper methods → `OpenCLComputeHandle::predict_batch()`
-
-**The weight upload change:**
-```cpp
-// OLD (opencl_engine.cpp): parsed ONNX, uploaded directly
-auto& wt = get("input_conv.weight");
-g.weight = upload(wt.get_floats());
-
-// NEW (opencl_compute.cpp): upload from LoadedModel CPU data
-g.weight = upload(model->input_conv.weight);
-```
-
-### Priority 2: Clean Up Old Files
-
-After OpenCL refactor is complete, remove:
-- `include/opencl_engine.h` → replaced by `include/opencl_compute.h`
-- `src/opencl_engine.cpp` → replaced by `src/opencl_compute.cpp`
-- `include/metal_engine.h` → replaced by `include/metal_compute.h`
-- `src/metal_engine.mm` → replaced by `src/metal_compute.mm`
-- `include/eigen_engine.h` → replaced by `include/eigen_compute.h`
-- `src/eigen_engine.cpp` → replaced by `src/eigen_compute.cpp`
-- `include/inference_engine.h` → replaced by `include/compute_context.h` + `include/loaded_model.h`
-- `src/inference_engine.cpp` → replaced by `src/compute_context.cpp`
-
-### Priority 3: run_loop.sh Updates
-
-Add new flags:
-```bash
-NN_SERVER_THREADS=1
-NN_DEVICE_IDS="0"
-
---nn-server-threads) NN_SERVER_THREADS=$2; shift 2;;
---nn-device-ids)     NN_DEVICE_IDS=$2; shift 2;;
-
-# Pass to selfplay
-"${BUILD_DIR}/selfplay" \
-    --nn-server-threads ${NN_SERVER_THREADS} \
-    --nn-device-ids ${NN_DEVICE_IDS} \
-    ...
-```
+### ~~Priority 3: run_loop.sh Updates~~ ✓ DONE
 
 ### Priority 4: test_multi_gpu.sh
 
@@ -204,7 +153,7 @@ src/
   loaded_model.cpp        NEW — ONNX parsing + BN pre-fusion
   compute_context.cpp     NEW — factory for backend-specific context
   eigen_compute.cpp       NEW — Eigen context + handle
-  opencl_compute.cpp      WIP — needs full refactor from opencl_engine.cpp
+  opencl_compute.cpp      NEW — OpenCL context + handle (refactored from opencl_engine.cpp)
   metal_compute.mm        NEW — Metal/MPSGraph context + handle
   nn_evaluator.cpp        MODIFIED — N server threads, ComputeHandle per thread
   game.cpp                UNCHANGED
@@ -214,15 +163,9 @@ src/
   main_benchmark.cpp      MODIFIED — same
   main_play.cpp           MODIFIED — same
 
-TO DELETE (after OpenCL refactor):
-  include/inference_engine.h
-  include/opencl_engine.h
-  include/metal_engine.h
-  include/eigen_engine.h
-  src/inference_engine.cpp
-  src/opencl_engine.cpp
-  src/metal_engine.mm
-  src/eigen_engine.cpp
+DELETED (old engine files removed):
+  include/inference_engine.h, include/opencl_engine.h, include/metal_engine.h, include/eigen_engine.h
+  src/inference_engine.cpp, src/opencl_engine.cpp, src/metal_engine.mm, src/eigen_engine.cpp
 ```
 
 ## Test Results
@@ -243,6 +186,15 @@ TO DELETE (after OpenCL refactor):
 | Selfplay, 64 games, 8 threads, 32 search | 2.17 s/game |
 | Batch-128 throughput | 55K states/s |
 
-### Multi-GPU testing (TODO — needs OpenCL refactor first)
+### macOS M1 Max (OpenCL backend — multi-gpu branch)
+
+| Test | Result |
+|---|---|
+| Selfplay, 1 server thread, GPU 0 | 2 games pass (2.86 s/game) |
+| Selfplay, 2 server threads, GPU 0,0 | 4 games pass (4.12 s/game) |
+| Benchmark batch-128 throughput | 15K states/s |
+| Benchmark single inference | 306 inf/s (3.3 ms/call) |
+
+### Multi-GPU testing (TODO — needs remote Linux machine)
 
 To be tested on 2× RTX 5070 Ti with `test_multi_gpu.sh`.

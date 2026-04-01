@@ -56,6 +56,8 @@ FILTERS=64
 BLOCKS=5
 SEARCH_THREADS=16
 SELFPLAY_INSTANCES=1
+NN_SERVER_THREADS=1
+NN_DEVICE_IDS="0"
 
 # ── Parse args ──────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -69,6 +71,8 @@ while [[ $# -gt 0 ]]; do
         --threads) THREADS=$2; shift 2;;
         --search-threads) SEARCH_THREADS=$2; shift 2;;
         --selfplay-instances) SELFPLAY_INSTANCES=$2; shift 2;;
+        --nn-server-threads) NN_SERVER_THREADS=$2; shift 2;;
+        --nn-device-ids) NN_DEVICE_IDS=$2; shift 2;;
         --quick)
             ITERATIONS=3; GAMES_PER_ITER=10; SIMS=100; BOARD=5
             EPOCHS=5; BATCH_SIZE=64; THREADS=$(num_cores); FILTERS=32; BLOCKS=3
@@ -78,7 +82,8 @@ while [[ $# -gt 0 ]]; do
             echo "Unknown option: $1"
             echo "Usage: $0 [--iterations N] [--games N] [--sims N] [--board N]"
             echo "          [--epochs N] [--batch N] [--threads N]"
-            echo "          [--search-threads N] [--selfplay-instances N] [--quick]"
+            echo "          [--search-threads N] [--selfplay-instances N]"
+            echo "          [--nn-server-threads N] [--nn-device-ids 0,1] [--quick]"
             exit 1;;
     esac
 done
@@ -100,6 +105,8 @@ echo "  MCTS sims:          ${SIMS}"
 echo "  Search threads:     ${SEARCH_THREADS}"
 echo "  Worker threads:     ${THREADS}"
 echo "  Selfplay instances: ${SELFPLAY_INSTANCES}"
+echo "  NN server threads: ${NN_SERVER_THREADS}"
+echo "  NN device IDs:     ${NN_DEVICE_IDS}"
 echo "  Epochs:             ${EPOCHS}"
 echo "============================================"
 echo
@@ -151,6 +158,8 @@ for iter in $(seq 1 ${ITERATIONS}); do
             --games ${GAMES_PER_ITER} \
             --threads ${THREADS} \
             --search-threads ${SEARCH_THREADS} \
+            --nn-server-threads ${NN_SERVER_THREADS} \
+            --nn-device-ids ${NN_DEVICE_IDS} \
             --output "${ITER_DATA}" \
             --sims ${SIMS}
     else
@@ -167,6 +176,8 @@ for iter in $(seq 1 ${ITERATIONS}); do
                 --games ${GAMES_PER_INSTANCE} \
                 --threads ${THREADS_PER_INSTANCE} \
                 --search-threads ${SEARCH_THREADS} \
+                --nn-server-threads ${NN_SERVER_THREADS} \
+                --nn-device-ids ${NN_DEVICE_IDS} \
                 --output "${ITER_DATA}" \
                 --sims ${SIMS} &
             pids+=($!)

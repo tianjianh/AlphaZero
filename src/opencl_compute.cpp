@@ -7,7 +7,6 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 #include <algorithm>
 
 namespace minigo {
@@ -38,7 +37,7 @@ __kernel void transpose_nchw_to_cnhw(
 // ================================================================
 // Implicit GEMM for 3×3 convolution + fused BN + optional ReLU
 //
-// Replaces the separate im2col + sgemm_bn two-kernel sequence with a
+// Replaces the separate im2col + SGEMM two-kernel sequence with a
 // single kernel that computes im2col indices on-the-fly during B-tile
 // loading, so the 24 MB col buffer is never written to global memory.
 // The 2.7 MB input tensor (C_in=64, NHW=10368 for batch=128, 9×9 board)
@@ -90,8 +89,6 @@ void conv3x3_sgemm_bn(
     if (gm_base >= C_out || gn_base >= NHW) return;
 
     // ── Precompute nhw decompositions for this thread's B columns ──
-    // Each thread is responsible for WPT_N columns of B (fixed for all K-tiles).
-    // Decomposing nhw → (n, oh, ow) once avoids repeated integer division in the tile loop.
     const int HW = H * W;
     int b_nhw[WPT_N], b_n[WPT_N], b_oh[WPT_N], b_ow[WPT_N];
     for (int wn = 0; wn < WPT_N; wn++) {
@@ -125,8 +122,6 @@ void conv3x3_sgemm_bn(
         }
 
         // Load B tile [TS, TSN]: implicit im2col from input[C_in, NHW]
-        // Thread (lm, ln) loads k_row = k_off + lm,  for WPT_N column groups.
-        // k → (c_in, kh, kw) computed once per tile step (outside wn loop).
         {
             int k_row = k_off + lm;
             int c_in_k = -1, kh_k = -1, kw_k = -1;
@@ -149,7 +144,7 @@ void conv3x3_sgemm_bn(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Compute: WPT_M × WPT_N register blocking (same as old sgemm_bn)
+        // Compute: WPT_M × WPT_N register blocking
         for (int ki = 0; ki < TS; ki++) {
             float a[WPT_M], b[WPT_N];
             for (int wm = 0; wm < WPT_M; wm++) a[wm] = As[lm + wm * TS][ki];
@@ -183,11 +178,6 @@ void conv3x3_sgemm_bn(
 //
 // input [C_in, N*HW]  channel-major
 // output[C_out*HW, N] FC-ready layout (reshaped)
-//
-// Each work-item handles one (n, hw) position and computes all C_out outputs.
-// Writes directly in the reshaped [C_out*HW, N] layout.
-// For policy head: C_out=2, C_in=64 → 128 MADs per work-item
-// For value  head: C_out=1, C_in=64 → 64 MADs per work-item
 // ================================================================
 __kernel void conv1x1_bn_relu_reshape(
     __global const float* input,
@@ -209,19 +199,16 @@ __kernel void conv1x1_bn_relu_reshape(
         for (int ci = 0; ci < C_in; ci++) {
             acc += weight[co * C_in + ci] * input[ci * NHW + n * HW + hw];
         }
-        // Fused BN + ReLU
         float v = bn_scale[co] * acc + bn_bias[co];
         if (v < 0.0f) v = 0.0f;
-        // Write in reshaped [C_out*HW, N] layout
         output[(co * HW + hw) * N + n] = v;
     }
 }
 
 // ================================================================
-// Fused FC + bias + optional ReLU   (replaces sgemm + add_bias_relu)
+// Fused FC + bias + optional ReLU
 //
 // output[M, N] = weight[M, K] × input[K, N] + bias[M]
-// Each work-item computes one output element.
 // ================================================================
 __kernel void fc_bias_relu(
     __global const float* weight,
@@ -245,9 +232,6 @@ __kernel void fc_bias_relu(
 
 // ================================================================
 // Fused FC + bias + softmax   (for policy head final stage)
-//
-// Computes: output[m, n] = softmax_m( weight[m,k]*input[k,n] + bias[m] )
-// Each work-item handles one sample (column n) and loops over all M outputs.
 // ================================================================
 __kernel void fc_bias_softmax(
     __global const float* weight,
@@ -259,7 +243,6 @@ __kernel void fc_bias_softmax(
     const int n = get_global_id(0);
     if (n >= N) return;
 
-    // Pass 1: compute all logits and find max
     float mx = -1e30f;
     for (int m = 0; m < M; m++) {
         float acc = bias[m];
@@ -269,7 +252,6 @@ __kernel void fc_bias_softmax(
         mx = fmax(mx, acc);
     }
 
-    // Pass 2: exp and sum
     float sum = 0.0f;
     for (int m = 0; m < M; m++) {
         float e = exp(output[m * N + n] - mx);
@@ -277,7 +259,6 @@ __kernel void fc_bias_softmax(
         sum += e;
     }
 
-    // Pass 3: normalize
     float inv_sum = 1.0f / sum;
     for (int m = 0; m < M; m++)
         output[m * N + n] *= inv_sum;
@@ -285,9 +266,6 @@ __kernel void fc_bias_softmax(
 
 // ================================================================
 // Fused FC + bias + tanh  (for value head final stage: M=1)
-//
-// output[n] = tanh( dot(weight[K], input[K,n]) + bias )
-// Each work-item handles one sample.
 // ================================================================
 __kernel void fc_bias_tanh(
     __global const float* weight,
@@ -325,36 +303,20 @@ static cl_mem new_buf(cl_context ctx, size_t bytes, cl_int* err) {
     return clCreateBuffer(ctx, CL_MEM_READ_WRITE, bytes, nullptr, err);
 }
 
-void OpenCLEngine::release_buf(cl_mem& buf) {
+static void release_buf(cl_mem& buf) {
     if (buf) { clReleaseMemObject(buf); buf = nullptr; }
 }
 
-// ================================================================
-// Constructor / Destructor
-// ================================================================
-OpenCLEngine::OpenCLEngine() {
-    init_opencl();
-    compile_kernels();
-}
-
-OpenCLEngine::~OpenCLEngine() {
-    free_workspace();
-    free_weights();
-    if (k_transpose_nchw_)          clReleaseKernel(k_transpose_nchw_);
-    if (k_conv3x3_sgemm_bn_)        clReleaseKernel(k_conv3x3_sgemm_bn_);
-    if (k_conv1x1_bn_relu_reshape_) clReleaseKernel(k_conv1x1_bn_relu_reshape_);
-    if (k_fc_bias_relu_)            clReleaseKernel(k_fc_bias_relu_);
-    if (k_fc_bias_softmax_)         clReleaseKernel(k_fc_bias_softmax_);
-    if (k_fc_bias_tanh_)            clReleaseKernel(k_fc_bias_tanh_);
-    if (program_)  clReleaseProgram(program_);
-    if (queue_)    clReleaseCommandQueue(queue_);
-    if (context_)  clReleaseContext(context_);
+static size_t round_up(size_t n, size_t tile) {
+    return ((n + tile - 1) / tile) * tile;
 }
 
 // ================================================================
-// OpenCL initialisation: find first GPU (or CPU fallback)
+// OpenCLComputeContext — one cl_context + cl_queue + cl_program per
+// unique GPU device (KataGo pattern: avoids NVIDIA serialization)
 // ================================================================
-void OpenCLEngine::init_opencl() {
+
+static void init_device(OpenCLDeviceState& ds, int device_id) {
     cl_uint num_platforms = 0;
     CL_CHECK(clGetPlatformIDs(0, nullptr, &num_platforms));
     if (num_platforms == 0)
@@ -363,64 +325,128 @@ void OpenCLEngine::init_opencl() {
     std::vector<cl_platform_id> platforms(num_platforms);
     CL_CHECK(clGetPlatformIDs(num_platforms, platforms.data(), nullptr));
 
-    // Prefer GPU; fall back to any device
-    cl_device_type pref[] = { CL_DEVICE_TYPE_GPU, CL_DEVICE_TYPE_ALL };
-    for (cl_device_type dtype : pref) {
+    // Collect all GPU devices across all platforms
+    std::vector<std::pair<cl_platform_id, cl_device_id>> all_gpus;
+    for (auto plat : platforms) {
+        cl_uint nd = 0;
+        if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &nd) != CL_SUCCESS || nd == 0)
+            continue;
+        std::vector<cl_device_id> devs(nd);
+        if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, nd, devs.data(), nullptr) != CL_SUCCESS)
+            continue;
+        for (auto d : devs)
+            all_gpus.push_back({plat, d});
+    }
+
+    // Fall back to any device if no GPUs found
+    if (all_gpus.empty()) {
         for (auto plat : platforms) {
             cl_uint nd = 0;
-            if (clGetDeviceIDs(plat, dtype, 0, nullptr, &nd) != CL_SUCCESS || nd == 0)
+            if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_ALL, 0, nullptr, &nd) != CL_SUCCESS || nd == 0)
                 continue;
             std::vector<cl_device_id> devs(nd);
-            if (clGetDeviceIDs(plat, dtype, nd, devs.data(), nullptr) != CL_SUCCESS)
+            if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_ALL, nd, devs.data(), nullptr) != CL_SUCCESS)
                 continue;
-            platform_ = plat;
-            device_   = devs[0];
-            goto found;
+            for (auto d : devs)
+                all_gpus.push_back({plat, d});
         }
     }
-    throw std::runtime_error("No OpenCL device found");
-found:;
 
-    // Print device name
+    if (all_gpus.empty())
+        throw std::runtime_error("No OpenCL devices found");
+
+    if (device_id < 0 || device_id >= (int)all_gpus.size())
+        throw std::runtime_error("OpenCL device_id " + std::to_string(device_id) +
+                                 " out of range [0, " + std::to_string(all_gpus.size()) + ")");
+
+    ds.platform = all_gpus[device_id].first;
+    ds.device   = all_gpus[device_id].second;
+
     char name[256] = {};
-    clGetDeviceInfo(device_, CL_DEVICE_NAME, sizeof(name), name, nullptr);
-    std::cout << "OpenCL device: " << name << "\n";
+    clGetDeviceInfo(ds.device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+    std::cout << "OpenCL device " << device_id << ": " << name << "\n";
 
     cl_int err;
-    context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, &err);
+    ds.context = clCreateContext(nullptr, 1, &ds.device, nullptr, nullptr, &err);
     CL_CHECK(err);
 
 #ifdef CL_VERSION_2_0
     cl_queue_properties props[] = { 0 };
-    queue_ = clCreateCommandQueueWithProperties(context_, device_, props, &err);
+    ds.queue = clCreateCommandQueueWithProperties(ds.context, ds.device, props, &err);
 #else
-    queue_ = clCreateCommandQueue(context_, device_, 0, &err);
+    ds.queue = clCreateCommandQueue(ds.context, ds.device, 0, &err);
 #endif
     CL_CHECK(err);
 }
 
-// ================================================================
-// Kernel compilation
-// ================================================================
-void OpenCLEngine::compile_kernels() {
+static void compile_kernels(OpenCLDeviceState& ds) {
     cl_int err;
-    program_ = clCreateProgramWithSource(context_, 1, &OPENCL_KERNELS,
-                                         nullptr, &err);
+    ds.program = clCreateProgramWithSource(ds.context, 1, &OPENCL_KERNELS,
+                                           nullptr, &err);
     CL_CHECK(err);
 
-    err = clBuildProgram(program_, 1, &device_, "-cl-mad-enable", nullptr, nullptr);
+    err = clBuildProgram(ds.program, 1, &ds.device, "-cl-mad-enable", nullptr, nullptr);
     if (err != CL_SUCCESS) {
         size_t log_size = 0;
-        clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG,
+        clGetProgramBuildInfo(ds.program, ds.device, CL_PROGRAM_BUILD_LOG,
                               0, nullptr, &log_size);
         std::string log(log_size, ' ');
-        clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG,
+        clGetProgramBuildInfo(ds.program, ds.device, CL_PROGRAM_BUILD_LOG,
                               log_size, &log[0], nullptr);
         throw std::runtime_error("OpenCL build error:\n" + log);
     }
+}
 
+OpenCLComputeContext::OpenCLComputeContext(const std::vector<int>& device_ids) {
+    for (int id : device_ids) {
+        if (devices_.count(id)) continue;  // already initialized this GPU
+        auto& ds = devices_[id];
+        init_device(ds, id);
+        compile_kernels(ds);
+    }
+}
+
+OpenCLComputeContext::~OpenCLComputeContext() {
+    for (auto& [id, ds] : devices_) {
+        if (ds.program) clReleaseProgram(ds.program);
+        if (ds.queue)   clReleaseCommandQueue(ds.queue);
+        if (ds.context) clReleaseContext(ds.context);
+    }
+}
+
+OpenCLDeviceState& OpenCLComputeContext::device_state(int gpu_id) {
+    auto it = devices_.find(gpu_id);
+    if (it == devices_.end())
+        throw std::runtime_error("OpenCL device " + std::to_string(gpu_id) + " not initialized");
+    return it->second;
+}
+
+std::unique_ptr<ComputeHandle>
+OpenCLComputeContext::create_handle(const LoadedModel* model, int gpu_id, int max_batch_size) {
+    return std::make_unique<OpenCLComputeHandle>(device_state(gpu_id), model, max_batch_size);
+}
+
+// ================================================================
+// OpenCLComputeHandle — per-server-thread GPU state
+//
+// Created ON the server thread.  Uploads weights from LoadedModel
+// CPU data → cl_mem buffers.  Owns workspace buffers.
+// ================================================================
+
+OpenCLComputeHandle::OpenCLComputeHandle(OpenCLDeviceState& dev,
+                                         const LoadedModel* model,
+                                         int max_batch_size)
+    : dev_(dev)
+{
+    board_size     = model->board_size;
+    input_channels = model->input_channels;
+    num_filters    = model->num_filters;
+    num_res_blocks = model->num_res_blocks;
+
+    // Create kernel handles from the shared compiled program
+    cl_int err;
     auto mk = [&](const char* name) -> cl_kernel {
-        cl_kernel k = clCreateKernel(program_, name, &err);
+        cl_kernel k = clCreateKernel(dev_.program, name, &err);
         CL_CHECK(err);
         return k;
     };
@@ -430,12 +456,103 @@ void OpenCLEngine::compile_kernels() {
     k_fc_bias_relu_            = mk("fc_bias_relu");
     k_fc_bias_softmax_         = mk("fc_bias_softmax");
     k_fc_bias_tanh_            = mk("fc_bias_tanh");
+
+    // Upload weights from LoadedModel CPU data → GPU buffers
+    auto upload_conv = [&](ConvBNGPU& g, const ConvBNWeights& src) {
+        g.c_out = src.c_out;
+        g.c_in  = src.c_in;
+        g.k     = src.k;
+        g.weight   = upload(src.weight);
+        g.bn_scale = upload(src.bn_scale);
+        g.bn_bias  = upload(src.bn_bias);
+    };
+
+    auto upload_fc = [&](FCGPU& g, const FCWeights& src) {
+        g.out_features = src.out_features;
+        g.in_features  = src.in_features;
+        g.weight = upload(src.weight);
+        g.bias   = upload(src.bias);
+    };
+
+    upload_conv(input_conv_gpu_, model->input_conv);
+
+    res_conv1_gpu_.resize(num_res_blocks);
+    res_conv2_gpu_.resize(num_res_blocks);
+    for (int i = 0; i < num_res_blocks; i++) {
+        upload_conv(res_conv1_gpu_[i], model->res_conv1[i]);
+        upload_conv(res_conv2_gpu_[i], model->res_conv2[i]);
+    }
+
+    upload_conv(policy_conv_gpu_, model->policy_conv);
+    upload_conv(value_conv_gpu_,  model->value_conv);
+    upload_fc(policy_fc_gpu_, model->policy_fc);
+    upload_fc(value_fc1_gpu_, model->value_fc1);
+    upload_fc(value_fc2_gpu_, model->value_fc2);
+
+    // Pre-allocate workspace
+    allocate_workspace(max_batch_size > 0 ? max_batch_size : 32);
+
+    std::cout << "OpenCL handle ready: board=" << board_size
+              << " filters=" << num_filters
+              << " blocks="  << num_res_blocks << "\n";
+}
+
+OpenCLComputeHandle::~OpenCLComputeHandle() {
+    free_workspace();
+    free_weights();
+    if (k_transpose_nchw_)          clReleaseKernel(k_transpose_nchw_);
+    if (k_conv3x3_sgemm_bn_)        clReleaseKernel(k_conv3x3_sgemm_bn_);
+    if (k_conv1x1_bn_relu_reshape_) clReleaseKernel(k_conv1x1_bn_relu_reshape_);
+    if (k_fc_bias_relu_)            clReleaseKernel(k_fc_bias_relu_);
+    if (k_fc_bias_softmax_)         clReleaseKernel(k_fc_bias_softmax_);
+    if (k_fc_bias_tanh_)            clReleaseKernel(k_fc_bias_tanh_);
+}
+
+// ================================================================
+// Weight upload / free helpers
+// ================================================================
+
+cl_mem OpenCLComputeHandle::upload(const std::vector<float>& data) {
+    cl_int err;
+    cl_mem buf = clCreateBuffer(dev_.context,
+                                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                data.size() * sizeof(float),
+                                (void*)data.data(), &err);
+    CL_CHECK(err);
+    return buf;
+}
+
+void OpenCLComputeHandle::release_buf(cl_mem& buf) {
+    if (buf) { clReleaseMemObject(buf); buf = nullptr; }
+}
+
+void OpenCLComputeHandle::free_weights() {
+    auto free_conv = [this](ConvBNGPU& c) {
+        release_buf(c.weight);
+        release_buf(c.bn_scale);
+        release_buf(c.bn_bias);
+    };
+    auto free_fc = [this](FCGPU& f) {
+        release_buf(f.weight);
+        release_buf(f.bias);
+    };
+    free_conv(input_conv_gpu_);
+    for (auto& c : res_conv1_gpu_) free_conv(c);
+    for (auto& c : res_conv2_gpu_) free_conv(c);
+    free_conv(policy_conv_gpu_);
+    free_conv(value_conv_gpu_);
+    free_fc(policy_fc_gpu_);
+    free_fc(value_fc1_gpu_);
+    free_fc(value_fc2_gpu_);
+    res_conv1_gpu_.clear();
+    res_conv2_gpu_.clear();
 }
 
 // ================================================================
 // Workspace allocation
 // ================================================================
-void OpenCLEngine::allocate_workspace(int batch) {
+
+void OpenCLComputeHandle::allocate_workspace(int batch) {
     if (batch <= alloc_batch_) return;
     free_workspace();
 
@@ -447,28 +564,27 @@ void OpenCLEngine::allocate_workspace(int batch) {
 
     cl_int err;
     auto alloc = [&](size_t floats) -> cl_mem {
-        cl_mem b = new_buf(context_, floats * sizeof(float), &err);
+        cl_mem b = new_buf(dev_.context, floats * sizeof(float), &err);
         CL_CHECK(err);
         return b;
     };
 
-    buf_flat_in_  = alloc((size_t)inch * NHW);  // staging for NCHW upload
-    buf_input_    = alloc((size_t)inch * NHW);  // channel-major after transpose
+    buf_flat_in_  = alloc((size_t)inch * NHW);
+    buf_input_    = alloc((size_t)inch * NHW);
     buf_main_     = alloc((size_t)filt * NHW);
     buf_temp_     = alloc((size_t)filt * NHW);
     buf_skip_     = alloc((size_t)filt * NHW);
-    // buf_col_ removed: implicit GEMM eliminates 24 MB im2col scratch buffer
 
-    buf_pol_out_  = alloc((size_t)2 * H * W * batch);  // conv1x1 output [2*HW, N]
-    buf_pol_feat_ = alloc((size_t)as * batch);          // FC softmax output [action_size, N]
-    buf_val_h1_   = alloc((size_t)H * W * batch);   // conv1x1 output [HW, N]
-    buf_val_feat_ = alloc((size_t)filt * batch);    // FC1 output [num_filters, N]
+    buf_pol_out_  = alloc((size_t)2 * H * W * batch);
+    buf_pol_feat_ = alloc((size_t)as * batch);
+    buf_val_h1_   = alloc((size_t)H * W * batch);
+    buf_val_feat_ = alloc((size_t)filt * batch);
     buf_val_out_  = alloc((size_t)batch);
 
     alloc_batch_ = batch;
 }
 
-void OpenCLEngine::free_workspace() {
+void OpenCLComputeHandle::free_workspace() {
     release_buf(buf_flat_in_);
     release_buf(buf_input_);
     release_buf(buf_main_);
@@ -483,176 +599,21 @@ void OpenCLEngine::free_workspace() {
 }
 
 // ================================================================
-// Weight helpers
-// ================================================================
-cl_mem OpenCLEngine::upload(const std::vector<float>& data) {
-    cl_int err;
-    cl_mem buf = clCreateBuffer(context_,
-                                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                data.size() * sizeof(float),
-                                (void*)data.data(), &err);
-    CL_CHECK(err);
-    return buf;
-}
-
-void OpenCLEngine::free_weights() {
-    auto free_conv = [](ConvBNGPU& c) {
-        release_buf(c.weight);
-        release_buf(c.bn_scale);
-        release_buf(c.bn_bias);
-    };
-    auto free_fc = [](FCGPU& f) {
-        release_buf(f.weight);
-        release_buf(f.bias);
-    };
-    free_conv(input_conv_gpu_);
-    for (auto& c : res_conv1_gpu_) free_conv(const_cast<ConvBNGPU&>(c));
-    for (auto& c : res_conv2_gpu_) free_conv(const_cast<ConvBNGPU&>(c));
-    free_conv(policy_conv_gpu_);
-    free_conv(value_conv_gpu_);
-    free_fc(policy_fc_gpu_);
-    free_fc(value_fc1_gpu_);
-    free_fc(value_fc2_gpu_);
-    res_conv1_gpu_.clear();
-    res_conv2_gpu_.clear();
-}
-
-// ================================================================
-// load_model: parse ONNX and upload weights to GPU
-// ================================================================
-void OpenCLEngine::load_model(const std::string& path) {
-    using namespace onnx_parser;
-
-    auto tensors = parse_onnx_file(path);
-    std::unordered_map<std::string, OnnxTensor*> tm;
-    for (auto& t : tensors) tm[t.name] = &t;
-
-    auto get = [&](const std::string& name) -> OnnxTensor& {
-        auto it = tm.find(name);
-        if (it == tm.end())
-            throw std::runtime_error("Missing tensor: " + name);
-        return *it->second;
-    };
-
-    // ── Infer architecture ───────────────────────────────────────
-    auto& iw = get("input_conv.weight");
-    input_channels = (int)iw.dims[1];
-    num_filters    = (int)iw.dims[0];
-    board_size     = 0;
-
-    num_res_blocks = 0;
-    while (tm.count("res_blocks." + std::to_string(num_res_blocks) + ".conv1.weight"))
-        num_res_blocks++;
-
-    auto& pfw = get("policy_fc.weight");
-    int action_size = (int)pfw.dims[0];
-    board_size = (int)std::round(std::sqrt((double)(action_size - 1)));
-
-    std::cout << "OpenCL model: board=" << board_size
-              << " filters=" << num_filters
-              << " blocks="  << num_res_blocks
-              << " channels=" << input_channels << "\n";
-
-    const float eps = 1e-5f;
-
-    // Helper: load conv weight [C_out, C_in, kH, kW] → flat [C_out, C_in*k*k]
-    auto load_conv = [&](ConvBNGPU& g, const std::string& wname) {
-        auto& wt = get(wname);
-        int c_out = (int)wt.dims[0];
-        int c_in  = (int)wt.dims[1];
-        int kh    = (int)wt.dims[2];
-        int kw    = (int)wt.dims[3];
-        g.c_out = c_out; g.c_in = c_in; g.k = kh;  // square kernels assumed
-        // ONNX stores row-major [C_out, C_in*kH*kW], which is what we want
-        std::vector<float> w = wt.get_floats();
-        g.weight = upload(w);
-    };
-
-    // Helper: pre-fuse BN into (scale, bias)
-    auto load_bn = [&](ConvBNGPU& g, const std::string& prefix) {
-        auto gamma = get(prefix + ".weight").get_floats();
-        auto beta  = get(prefix + ".bias").get_floats();
-        auto mean  = get(prefix + ".running_mean").get_floats();
-        auto var   = get(prefix + ".running_var").get_floats();
-        int  ch    = (int)gamma.size();
-        std::vector<float> sc(ch), bi(ch);
-        for (int i = 0; i < ch; i++) {
-            float inv_std = 1.0f / std::sqrt(var[i] + eps);
-            sc[i] = gamma[i] * inv_std;
-            bi[i] = beta[i]  - gamma[i] * mean[i] * inv_std;
-        }
-        g.bn_scale = upload(sc);
-        g.bn_bias  = upload(bi);
-    };
-
-    // Helper: load FC weight+bias
-    auto load_fc = [&](FCGPU& g, const std::string& prefix) {
-        auto& wt = get(prefix + ".weight");
-        g.out_features = (int)wt.dims[0];
-        g.in_features  = (int)wt.dims[1];
-        g.weight = upload(wt.get_floats());
-        g.bias   = upload(get(prefix + ".bias").get_floats());
-    };
-
-    // ── Upload all weights ───────────────────────────────────────
-    free_weights();
-
-    load_conv(input_conv_gpu_, "input_conv.weight");
-    load_bn  (input_conv_gpu_, "input_bn");
-
-    res_conv1_gpu_.resize(num_res_blocks);
-    res_conv2_gpu_.resize(num_res_blocks);
-    for (int i = 0; i < num_res_blocks; i++) {
-        std::string pfx = "res_blocks." + std::to_string(i);
-        load_conv(res_conv1_gpu_[i], pfx + ".conv1.weight");
-        load_bn  (res_conv1_gpu_[i], pfx + ".bn1");
-        load_conv(res_conv2_gpu_[i], pfx + ".conv2.weight");
-        load_bn  (res_conv2_gpu_[i], pfx + ".bn2");
-    }
-
-    load_conv(policy_conv_gpu_, "policy_conv.weight");
-    load_bn  (policy_conv_gpu_, "policy_bn");
-    load_conv(value_conv_gpu_,  "value_conv.weight");
-    load_bn  (value_conv_gpu_,  "value_bn");
-
-    load_fc(policy_fc_gpu_, "policy_fc");
-    load_fc(value_fc1_gpu_, "value_fc1");
-    load_fc(value_fc2_gpu_, "value_fc2");
-
-    // Pre-allocate workspace for a moderate default batch
-    allocate_workspace(32);
-
-    std::cout << "OpenCL weights uploaded\n";
-}
-
-// ================================================================
 // Kernel launch helpers
 // ================================================================
 
-// Round up to multiple of tile
-static size_t round_up(size_t n, size_t tile) {
-    return ((n + tile - 1) / tile) * tile;
-}
-
-// Implicit GEMM: single kernel for 3×3 conv + BN + optional ReLU.
-// Replaces the old im2col → sgemm_bn two-kernel sequence.
-// Eliminates the 24 MB col buffer; input fits in L2 → L2 hits vs GDDR7 reads.
-// mode: 1 = BN + optional ReLU,  2 = BN + residual-add + ReLU
-void OpenCLEngine::run_conv3x3(cl_mem input_buf, cl_mem output_buf,
-                                const ConvBNGPU& conv, cl_mem residual_buf,
-                                int N, int H, int W, int mode, bool relu) {
+void OpenCLComputeHandle::run_conv3x3(cl_mem input_buf, cl_mem output_buf,
+                                       const ConvBNGPU& conv, cl_mem residual_buf,
+                                       int N, int H, int W, int mode, bool relu) {
     int NHW   = N * H * W;
     int C_in  = conv.c_in, C_out = conv.c_out;
-    int K     = C_in * 9;     // virtual K dimension of implicit GEMM
+    int K     = C_in * 9;
     int do_relu_i = relu ? 1 : 0;
 
-    // When mode != 2, residual arg is unused; pass output_buf as a safe dummy.
     cl_mem res_arg = (mode == 2 && residual_buf) ? residual_buf : output_buf;
 
-    // Global size: { ceil(C_out/TSM)*TS,  ceil(NHW/TSN)*TS }
-    // TSM=32 (TS*WPT_M), TSN=64 (TS*WPT_N), TS=16
-    size_t gsX = ((size_t)(C_out + 31) / 32) * 16;  // ceil(C_out/32) * 16
-    size_t gsY = ((size_t)(NHW   + 63) / 64) * 16;  // ceil(NHW/64)   * 16
+    size_t gsX = ((size_t)(C_out + 31) / 32) * 16;
+    size_t gsY = ((size_t)(NHW   + 63) / 64) * 16;
     size_t gs2[2] = { gsX, gsY };
     size_t ls2[2] = { 16, 16 };
 
@@ -669,13 +630,13 @@ void OpenCLEngine::run_conv3x3(cl_mem input_buf, cl_mem output_buf,
     CL_CHECK(clSetKernelArg(k_conv3x3_sgemm_bn_, 10, sizeof(int),    &W));
     CL_CHECK(clSetKernelArg(k_conv3x3_sgemm_bn_, 11, sizeof(int),    &mode));
     CL_CHECK(clSetKernelArg(k_conv3x3_sgemm_bn_, 12, sizeof(int),    &do_relu_i));
-    CL_CHECK(clEnqueueNDRangeKernel(queue_, k_conv3x3_sgemm_bn_, 2,
+    CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_conv3x3_sgemm_bn_, 2,
                                     nullptr, gs2, ls2, 0, nullptr, nullptr));
 }
 
-void OpenCLEngine::run_conv1x1_bn_relu_reshape(cl_mem input_buf, cl_mem output_buf,
-                                                const ConvBNGPU& conv,
-                                                int N, int HW) {
+void OpenCLComputeHandle::run_conv1x1_bn_relu_reshape(cl_mem input_buf, cl_mem output_buf,
+                                                       const ConvBNGPU& conv,
+                                                       int N, int HW) {
     int C_in  = conv.c_in;
     int C_out = conv.c_out;
 
@@ -691,12 +652,12 @@ void OpenCLEngine::run_conv1x1_bn_relu_reshape(cl_mem input_buf, cl_mem output_b
 
     size_t gs[2] = { round_up((size_t)N,  16),
                      round_up((size_t)HW, 16) };
-    CL_CHECK(clEnqueueNDRangeKernel(queue_, k_conv1x1_bn_relu_reshape_, 2,
+    CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_conv1x1_bn_relu_reshape_, 2,
                                     nullptr, gs, nullptr, 0, nullptr, nullptr));
 }
 
-void OpenCLEngine::run_fc_bias_relu(cl_mem input_buf, cl_mem output_buf,
-                                    const FCGPU& fc, int N, bool relu) {
+void OpenCLComputeHandle::run_fc_bias_relu(cl_mem input_buf, cl_mem output_buf,
+                                            const FCGPU& fc, int N, bool relu) {
     int M  = fc.out_features;
     int K  = fc.in_features;
     int do_relu_i = relu ? 1 : 0;
@@ -712,15 +673,16 @@ void OpenCLEngine::run_fc_bias_relu(cl_mem input_buf, cl_mem output_buf,
 
     size_t gs[2] = { round_up((size_t)M, 16),
                      round_up((size_t)N, 16) };
-    CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_relu_, 2,
+    CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_relu_, 2,
                                     nullptr, gs, nullptr, 0, nullptr, nullptr));
 }
 
 // ================================================================
-// Forward pass (batched) — optimised with fused kernels
+// Forward pass (batched)
 // ================================================================
+
 std::vector<std::pair<std::vector<float>, float>>
-OpenCLEngine::predict_batch(const std::vector<std::vector<float>>& states) {
+OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) {
     if (states.empty()) return {};
 
     int N = (int)states.size();
@@ -738,8 +700,7 @@ OpenCLEngine::predict_batch(const std::vector<std::vector<float>>& states) {
     for (auto& s : states)
         flat_input.insert(flat_input.end(), s.begin(), s.end());
 
-    // Upload NCHW-ordered data to staging buffer
-    CL_CHECK(clEnqueueWriteBuffer(queue_, buf_flat_in_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueWriteBuffer(dev_.queue, buf_flat_in_, CL_FALSE, 0,
         input_floats * sizeof(float), flat_input.data(),
         0, nullptr, nullptr));
 
@@ -753,45 +714,35 @@ OpenCLEngine::predict_batch(const std::vector<std::vector<float>>& states) {
         CL_CHECK(clSetKernelArg(k_transpose_nchw_, 2, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_transpose_nchw_, 3, sizeof(int), &C));
         CL_CHECK(clSetKernelArg(k_transpose_nchw_, 4, sizeof(int), &HW));
-        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_transpose_nchw_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_transpose_nchw_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
     // ── Input conv: in_channels → num_filters, 3×3 + BN + ReLU ──
-    // 2 launches: im2col + sgemm_bn(mode=1, relu=true)
     run_conv3x3(buf_input_, buf_main_,
                 input_conv_gpu_, nullptr,
                 N, H, W, /*mode=*/1, /*relu=*/true);
 
     // ── Residual blocks ──────────────────────────────────────────
-    // 4 launches per block: im2col+sgemm_bn (conv1) + im2col+sgemm_bn_add_relu (conv2)
     for (int i = 0; i < num_res_blocks; i++) {
-        // conv1 + BN + ReLU:  buf_main → buf_temp
         run_conv3x3(buf_main_, buf_temp_,
                     res_conv1_gpu_[i], nullptr,
                     N, H, W, /*mode=*/1, /*relu=*/true);
 
-        // conv2 + BN + residual(buf_main) + ReLU → buf_skip
-        // mode=2: fuses residual add into SGEMM epilogue — no extra kernel
         run_conv3x3(buf_temp_, buf_skip_,
                     res_conv2_gpu_[i], buf_main_,
                     N, H, W, /*mode=*/2, /*relu=*/true);
 
-        // Swap: buf_skip becomes the new buf_main for next block
         std::swap(buf_main_, buf_skip_);
     }
 
     // ── Policy head ──────────────────────────────────────────────
-    // Fused 1×1 conv + BN + ReLU + reshape: buf_main[64, NHW] → buf_pol_out_[2*HW, N]
-    // 1 kernel launch (was 3: sgemm + bn_relu + reshape_for_fc)
     run_conv1x1_bn_relu_reshape(buf_main_, buf_pol_out_,
                                 policy_conv_gpu_, N, HW);
 
-    // Fused FC + bias + softmax: buf_pol_out_[2*HW, N] → buf_pol_feat_[action_size, N]
-    // 1 kernel launch (was 3: sgemm + add_bias_relu + softmax_cols)
     {
-        int M = policy_fc_gpu_.out_features;  // action_size
-        int K = policy_fc_gpu_.in_features;   // 2*HW
+        int M = policy_fc_gpu_.out_features;
+        int K = policy_fc_gpu_.in_features;
         size_t gs = round_up((size_t)N, 64);
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 0, sizeof(cl_mem), &policy_fc_gpu_.weight));
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 1, sizeof(cl_mem), &buf_pol_out_));
@@ -800,25 +751,19 @@ OpenCLEngine::predict_batch(const std::vector<std::vector<float>>& states) {
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 4, sizeof(int), &M));
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 5, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 6, sizeof(int), &K));
-        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_softmax_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_softmax_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
     // ── Value head ───────────────────────────────────────────────
-    // Fused 1×1 conv + BN + ReLU + reshape: buf_main[64, NHW] → buf_val_h1_[HW, N]
-    // 1 kernel launch (was 3)
     run_conv1x1_bn_relu_reshape(buf_main_, buf_val_h1_,
                                 value_conv_gpu_, N, HW);
 
-    // FC1 + bias + ReLU: buf_val_h1_[HW, N] → buf_val_feat_[num_filters, N]
-    // 1 kernel launch (was 2: sgemm + add_bias_relu)
     run_fc_bias_relu(buf_val_h1_, buf_val_feat_,
                      value_fc1_gpu_, N, /*relu=*/true);
 
-    // Fused FC2 + bias + tanh: buf_val_feat_[num_filters, N] → buf_val_out_[N]
-    // 1 kernel launch (was 3: sgemm + add_bias_relu + apply_tanh)
     {
-        int K = value_fc2_gpu_.in_features;  // num_filters
+        int K = value_fc2_gpu_.in_features;
         size_t gs = round_up((size_t)N, 64);
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 0, sizeof(cl_mem), &value_fc2_gpu_.weight));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 1, sizeof(cl_mem), &buf_val_feat_));
@@ -826,26 +771,22 @@ OpenCLEngine::predict_batch(const std::vector<std::vector<float>>& states) {
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 3, sizeof(cl_mem), &value_fc2_gpu_.bias));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 4, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 5, sizeof(int), &K));
-        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_tanh_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_tanh_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
     // ── Read back results ────────────────────────────────────────
-    // Policy: buf_pol_feat_ = [action_size, N]
     std::vector<float> pol_flat((size_t)action_size * N);
-    CL_CHECK(clEnqueueReadBuffer(queue_, buf_pol_feat_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_pol_feat_, CL_FALSE, 0,
         pol_flat.size() * sizeof(float), pol_flat.data(), 0, nullptr, nullptr));
 
-    // Value: buf_val_out_ = [N]
     std::vector<float> val_flat((size_t)N);
-    CL_CHECK(clEnqueueReadBuffer(queue_, buf_val_out_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_val_out_, CL_FALSE, 0,
         val_flat.size() * sizeof(float), val_flat.data(), 0, nullptr, nullptr));
 
-    // Wait for all GPU work to complete
-    CL_CHECK(clFinish(queue_));
+    CL_CHECK(clFinish(dev_.queue));
 
     // ── Pack results ─────────────────────────────────────────────
-    // Policy layout: pol_flat[action * N + n]
     std::vector<std::pair<std::vector<float>, float>> results(N);
     for (int n = 0; n < N; n++) {
         std::vector<float> pol(action_size);
@@ -854,12 +795,6 @@ OpenCLEngine::predict_batch(const std::vector<std::vector<float>>& states) {
         results[n] = { std::move(pol), val_flat[n] };
     }
     return results;
-}
-
-std::pair<std::vector<float>, float>
-OpenCLEngine::predict(const std::vector<float>& state) {
-    auto results = predict_batch({ state });
-    return results[0];
 }
 
 }  // namespace minigo

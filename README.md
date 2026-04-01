@@ -5,12 +5,15 @@ multi-threaded MCTS with per-leaf blocking evaluation + a KataGo-style
 `NNEvaluator` server that batches leaf evaluations into one GPU call.
 Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple Silicon).
 
-**Inference backends** (compile-time selectable, runtime switchable):
+**Inference backends** (compile-time selectable):
 - **Metal** (default on macOS Apple Silicon) — GPU inference via MPSGraph with FP16 compute; 2-3× faster than OpenCL on the same hardware
 - **OpenCL** (default on Linux) — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
-- **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS; one engine per thread
+- **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS
 
-All GPU backends use the same `NNEvaluator` server thread for batching across MCTS threads.
+**Multi-GPU support**: KataGo-style architecture with N server threads, each owning
+a `ComputeHandle` on its assigned GPU.  All threads drain from a single shared queue
+— whichever GPU finishes first picks up the next batch (self-balancing).
+
 Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching KataGo's pattern.
 
 **Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency)
@@ -98,6 +101,12 @@ chmod +x run_loop.sh
 # Full training (9x9 board, 16 search threads per move)
 ./run_loop.sh --iterations 30 --games 200 --sims 800
 
+# Multi-GPU: 2 server threads across 2 GPUs
+./run_loop.sh --iterations 30 --games 200 --nn-server-threads 2 --nn-device-ids 0,1
+
+# 4 server threads on 2 GPUs (2 threads per GPU)
+./run_loop.sh --iterations 30 --games 200 --nn-server-threads 4 --nn-device-ids 0,0,1,1
+
 # Maximize GPU utilization with 2 parallel selfplay instances
 ./run_loop.sh --iterations 30 --games 200 --selfplay-instances 2
 
@@ -120,7 +129,8 @@ cd ..
 
 # 2. Generate self-play data (GPU)
 ./build/selfplay --model model.onnx \
-    --games 100 --threads 8 --search-threads 16 --sims 400
+    --games 100 --threads 8 --search-threads 16 --sims 400 \
+    --nn-server-threads 1 --nn-device-ids 0
 
 # 3. Train in Python (auto-exports updated model.onnx)
 cd scripts
@@ -158,48 +168,48 @@ cd ..
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Self-Play (C++)                                │
-│                                                                  │
-│  Worker 1 (game 1) ─┐  Each worker plays one game at a time.    │
-│  Worker 2 (game 2) ─┤  Per move, MCTS::search() spawns N        │
-│  Worker 3 (game 3) ─┤  search threads (KataGo pattern):         │
-│         ...         ─┤                                           │
-│  Worker T (game T) ─┘  Each search thread owns one NNResultBuf  │
-│                        (pre-allocated, reused for all evals):   │
-│                        descend → evaluate_with_buf(BLOCK) →     │
-│                        expand → backprop → repeat               │
-│                                     │                            │
-│         ┌───────────────────────────▼──────────────────┐         │
-│         │          NNEvaluator (server thread)          │         │
-│         │  Shared queue of NNResultBuf* pointers.       │         │
-│         │  Pops up to max_batch_size, fires one         │         │
-│         │  predict_batch() GPU call, signals each       │         │
-│         │  client's condvar. No timeout, no threshold.  │         │
-│         └───────────────────────────┬──────────────────┘         │
-│                                     │                            │
-│                    ┌────────────────▼────────────┐               │
-│                    │     InferenceEngine          │               │
-│                    │  ┌────────┬────────┬───────┐ │               │
-│                    │  │ Eigen  │ OpenCL │ Metal │ │               │
-│                    │  │ (CPU)  │ (GPU)  │ (GPU) │ │               │
-│                    │  └────────┴────────┴───────┘ │               │
-│                    └─────────────────────────────┘               │
-│                                     │                            │
-│                        Self-Play Data (.bin)                      │
-└─────────────────────────────────────┬────────────────────────────┘
-                                      │
-                                      ▼
-                          ┌─── Python ───────────┐
-                          │  train.py (PyTorch)  │
-                          │  export_onnx.py      │──▶ model.onnx
-                          └──────────────────────┘
+            LoadedModel (1, shared, main thread)
+                │ CPU weights (ONNX parsed once)
+                ▼
+          ComputeContext (1, shared, main thread)
+          ┌─────┴──────────────────┐
+          │                        │
+     DeviceState[GPU 0]      DeviceState[GPU 1]
+          │                        │
+     ┌────┼────┐              ┌────┼────┐
+     │         │              │         │
+  Handle_0  Handle_1       Handle_2  Handle_3
+  (server0) (server1)      (server2) (server3)
+  own bufs  own bufs        own bufs  own bufs
+     │         │              │         │
+     └─────────┴──────────────┴─────────┘
+                      │
+              NNEvaluator (1 instance)
+     ┌────────────────────────────────────┐
+     │  Shared Queue (NNResultBuf*)       │ ← search threads push
+     │  Competing consumers               │ → N server threads pop
+     └────────────────────────────────────┘
+                      │
+              MCTS Search Threads
+     ┌────────────────────────────────────┐
+     │  Worker 1 (game 1) ─┐             │
+     │  Worker 2 (game 2) ─┤  search()   │
+     │  Worker T (game T) ─┘  spawns N   │
+     │    threads per move               │
+     └────────────────────────────────────┘
+                      │
+              Self-Play Data (.bin)
+                      ▼
+          ┌─── Python ───────────┐
+          │  train.py (PyTorch)  │
+          │  export_onnx.py      │──▶ model.onnx
+          └──────────────────────┘
 ```
 
 **All backends use the same NNEvaluator architecture** — even Eigen (CPU).
-The NNEvaluator server thread serializes all `predict_batch()` calls, so
-the engine doesn't need to be thread-safe.  The backend is selected at
-compile time via `cmake -DMINIGO_BACKEND=...`.
+Each server thread creates its own `ComputeHandle` on its assigned GPU
+(KataGo pattern).  The backend is selected at compile time via
+`cmake -DMINIGO_BACKEND=...`.
 
 ### Multi-Threaded MCTS (KataGo pattern)
 
@@ -245,8 +255,8 @@ in the hot path.
 
 ### OpenCL GPU Backend
 
-`OpenCLEngine` (`src/opencl_engine.cpp`) implements the full AlphaZero forward
-pass using hand-written OpenCL kernels:
+`OpenCLComputeHandle` (`src/opencl_compute.cpp`) implements the full AlphaZero
+forward pass using hand-written OpenCL kernels:
 
 | Kernel | Purpose |
 |---|---|
@@ -264,10 +274,10 @@ with shared-memory tiling.
 
 ### Metal GPU Backend (macOS)
 
-`MetalEngine` (`src/metal_engine.mm`) uses **MPSGraph** (Metal Performance
-Shaders Graph) to build the entire forward pass as a computation graph at
-`load_model()` time.  Each `predict_batch()` call feeds inputs through the
-pre-compiled graph via `graph.run()`.
+`MetalComputeHandle` (`src/metal_compute.mm`) uses **MPSGraph** (Metal
+Performance Shaders Graph) to build the entire forward pass as a computation
+graph.  Each `predict_batch()` call feeds inputs through the pre-compiled
+graph via `graph.run()`.
 
 - **FP16 compute**: weights and activations in half-precision with FP32
   accumulation.  Softmax and tanh run in FP32 for numerical stability.
@@ -276,21 +286,25 @@ pre-compiled graph via `graph.run()`.
   Metal backend pattern for correct ObjC object lifecycle on server threads
 - **Unified memory**: CPU and GPU share the same memory (no explicit copies)
 
-### Modular Backend Design
+### Modular Backend Design (KataGo pattern)
 
-The `InferenceEngine` interface (`include/inference_engine.h`) defines:
-- `load_model(path)` — load a `.onnx` model
-- `predict(state)` — single inference
-- `predict_batch(states)` — batch inference
+The architecture has three layers:
 
-Adding a new backend (e.g., CUDA): implement `InferenceEngine`, add to the
-factory in `inference_engine.cpp`, add CMake detection.  The NNEvaluator,
-MCTS, game engine, and training pipeline are completely backend-agnostic.
+1. **`LoadedModel`** (`include/loaded_model.h`) — parses ONNX once, holds
+   pre-fused BN weights in CPU memory.  Shared (const) across all threads.
 
-`BatchEvaluator` (`include/batch_evaluator.h`) is what MCTS sees.
-All backends use `NNEvaluator` — the KataGo-style server that batches
-across threads.  There is no `DirectEvaluator`; the architecture is
-fully unified.
+2. **`ComputeContext`** (`include/compute_context.h`) — per-device GPU state.
+   For OpenCL: one `cl_context` + `cl_queue` + `cl_program` per unique GPU
+   (avoids NVIDIA serialization).  Created on the main thread.
+
+3. **`ComputeHandle`** — per-server-thread GPU state.  Created ON the server
+   thread.  Uploads weights from `LoadedModel` and owns workspace buffers.
+   Implements `predict_batch()`.
+
+Adding a new backend (e.g., CUDA): implement `ComputeContext` + `ComputeHandle`,
+add to the factory in `compute_context.cpp`, add CMake detection.  The
+NNEvaluator, MCTS, game engine, and training pipeline are completely
+backend-agnostic.
 
 ## Performance
 
@@ -336,9 +350,8 @@ All backends use **ONNX** (`.onnx`) as the universal model format.
 The project includes a built-in minimal protobuf parser (`onnx_loader.cpp`)
 — **no external protobuf library required**.
 
-- The OpenCL backend parses ONNX protobuf to extract weights → uploads to GPU
-- The Metal backend parses the same way → builds MPSGraph with FP16 weights
-- The Eigen backend uses the same parser → stores weights as Eigen matrices
+- `LoadedModel::load()` parses the ONNX protobuf once and pre-fuses BN parameters
+- Each `ComputeHandle` uploads these CPU weights to its own GPU buffers
 
 The model has dynamic batch dimensions, so the same `.onnx` file works for
 batch sizes 1 through N.  GPU workspace buffers auto-grow to fit the batch.
@@ -356,26 +369,29 @@ python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../mo
 ```
 minigo-cpp/
 ├── CMakeLists.txt              # Build (Eigen required, OpenCL/Metal optional)
-├── run_loop.sh                 # Automated training loop (multi-instance selfplay)
+├── run_loop.sh                 # Automated training loop (multi-GPU selfplay)
+├── test_multi_gpu.sh           # Multi-GPU test suite
 ├── include/
 │   ├── config.h                # Hyperparameters
 │   ├── game.h                  # Go engine (ring buffer history, fast is_legal)
-│   ├── inference_engine.h      # Abstract inference interface + factory
+│   ├── loaded_model.h          # Shared CPU weights (ONNX parsed once)
+│   ├── compute_context.h       # ComputeContext + ComputeHandle base classes
 │   ├── batch_evaluator.h       # BatchEvaluator interface + NNResultBuf
-│   ├── nn_evaluator.h          # KataGo-style batching server
-│   ├── eigen_engine.h          # Eigen CPU inference
-│   ├── opencl_engine.h         # OpenCL GPU inference
-│   ├── metal_engine.h          # Metal/MPSGraph GPU inference (macOS)
+│   ├── nn_evaluator.h          # KataGo-style batching server (N server threads)
+│   ├── eigen_compute.h         # Eigen CPU backend (context + handle)
+│   ├── opencl_compute.h        # OpenCL GPU backend (context + handle)
+│   ├── metal_compute.h         # Metal/MPSGraph GPU backend (macOS)
 │   ├── onnx_loader.h           # Built-in minimal ONNX protobuf parser
 │   └── mcts.h                  # Multi-threaded MCTS (atomic MCTSNode)
 ├── src/
 │   ├── game.cpp                # Full Go rules (captures, ko, scoring)
 │   ├── onnx_loader.cpp         # ONNX weight parser (no external dependency)
-│   ├── eigen_engine.cpp        # Eigen inference
-│   ├── opencl_engine.cpp       # OpenCL inference + embedded kernels
-│   ├── metal_engine.mm         # Metal/MPSGraph inference (Obj-C++)
-│   ├── inference_engine.cpp    # Backend factory
-│   ├── nn_evaluator.cpp        # NNEvaluator server thread (KataGo pattern)
+│   ├── loaded_model.cpp        # ONNX parsing + BN pre-fusion
+│   ├── compute_context.cpp     # Backend factory
+│   ├── eigen_compute.cpp       # Eigen context + handle
+│   ├── opencl_compute.cpp      # OpenCL context + handle + embedded kernels
+│   ├── metal_compute.mm        # Metal/MPSGraph context + handle (Obj-C++)
+│   ├── nn_evaluator.cpp        # NNEvaluator N server threads (KataGo pattern)
 │   ├── mcts.cpp                # Multi-threaded MCTS + data augmentation
 │   ├── main_play.cpp           # Human vs AI
 │   ├── main_selfplay.cpp       # Multi-threaded data generation
@@ -401,6 +417,8 @@ minigo-cpp/
   --threads N            Total selfplay worker threads (default: all cores)
   --search-threads N     MCTS search threads per move (default: 16)
   --selfplay-instances N Parallel selfplay processes (default: 1)
+  --nn-server-threads N  NN server threads (default: 1)
+  --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
   --quick                Fast test mode (5x5 board, small net)
 ```
 
@@ -415,6 +433,8 @@ minigo-cpp/
   --max-batch N          Max GPU batch size (default: 256)
   --output DIR           Output directory (default: selfplay_data)
   --sims N               MCTS simulations per move (default: 800)
+  --nn-server-threads N  NN server threads (default: 1)
+  --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
 
 ### play
@@ -440,11 +460,13 @@ minigo-cpp/
   --threads N            Self-play worker threads (default: 1)
   --search-threads N     MCTS search threads per move (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
+  --nn-server-threads N  NN server threads (default: 1)
+  --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
 
 ## Platform Notes
 
-### macOS (Apple Silicon) — recommended: `--backend metal`
+### macOS (Apple Silicon) — recommended: Metal
 
 - **Metal** (default): uses MPSGraph for GPU inference with FP16 compute.
   The computation graph is compiled once at model load time (~200ms).
@@ -458,7 +480,7 @@ minigo-cpp/
 - OpenCL 1.2 available via Intel HD/Iris GPU.
 - Accelerate provides vecLib BLAS for Eigen.
 
-### Linux — recommended: `--backend opencl`
+### Linux — recommended: OpenCL
 
 - **OpenCL** (default): hand-written implicit GEMM kernels optimized for
   NVIDIA GPUs.  Available on NVIDIA (CUDA toolkit), AMD (ROCm/Mesa), Intel (NEO).
@@ -475,12 +497,13 @@ on macOS OpenCL ships with Xcode Command Line Tools.
 **Metal not found**: Requires macOS with Apple Silicon.  Check that
 Xcode Command Line Tools are installed (`xcode-select --install`).
 
-**Build without GPU**: `cmake .. -DENABLE_OPENCL=OFF -DENABLE_METAL=OFF` (Eigen-only)
+**Build without GPU**: `cmake .. -DMINIGO_BACKEND=eigen` (CPU-only)
 
 **OpenCL kernel compile error**: shown in the exception message; usually means
 the GPU doesn't support the feature used.  File a bug with the error text.
 
 **Training interrupted**: Just restart `./run_loop.sh` — it resumes automatically.
 
-**Slow on macOS with OpenCL**: Use `--backend metal` instead.  Metal with
-MPSGraph FP16 is 2-3× faster than OpenCL on Apple Silicon.
+**Slow on macOS with OpenCL**: Rebuild with Metal backend:
+`cmake .. -DMINIGO_BACKEND=metal && make -j$(sysctl -n hw.ncpu)`.
+Metal with MPSGraph FP16 is 2-3× faster than OpenCL on Apple Silicon.
