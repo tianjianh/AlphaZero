@@ -6,8 +6,9 @@ multi-threaded MCTS with per-leaf blocking evaluation + a KataGo-style
 Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple Silicon).
 
 **Inference backends** (compile-time selectable):
+- **CUDA** (default on Linux with NVIDIA GPU) — FP16 Tensor Core inference via WMMA; hand-written implicit GEMM kernels. Supports Turing, Ampere, Ada, Hopper, Blackwell
 - **Metal** (default on macOS Apple Silicon) — GPU inference via MPSGraph with FP16 compute; 2-3× faster than OpenCL on the same hardware
-- **OpenCL** (default on Linux) — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
+- **OpenCL** — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
 - **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS
 
 **Multi-GPU support**: KataGo-style architecture with N server threads, each owning
@@ -43,7 +44,11 @@ Metal is not available on Intel Macs; OpenCL or Eigen is used.
 ```bash
 sudo apt install cmake g++ libeigen3-dev
 
-# For NVIDIA GPU (OpenCL):
+# For NVIDIA GPU (CUDA — recommended):
+# Install CUDA toolkit (provides nvcc compiler + runtime)
+# https://developer.nvidia.com/cuda-downloads
+
+# For NVIDIA GPU (OpenCL — alternative):
 sudo apt install ocl-icd-opencl-dev
 # + CUDA toolkit (provides the NVIDIA OpenCL ICD)
 
@@ -75,15 +80,24 @@ cd ..
 CMake auto-detects the best backend for your platform:
 ```
 -- Backend:    metal      (macOS Apple Silicon)
--- Backend:    opencl     (Linux with GPU)
+-- Backend:    cuda       (Linux with NVIDIA GPU + CUDA toolkit)
+-- Backend:    opencl     (Linux with GPU, no CUDA)
 -- Backend:    eigen      (no GPU available)
 ```
 
 Force a specific backend:
 ```bash
+cmake .. -DMINIGO_BACKEND=cuda     # CUDA FP16 Tensor Cores (NVIDIA)
 cmake .. -DMINIGO_BACKEND=metal    # Metal/MPSGraph (macOS Apple Silicon)
 cmake .. -DMINIGO_BACKEND=opencl   # OpenCL (Linux, macOS)
 cmake .. -DMINIGO_BACKEND=eigen    # CPU only (no GPU)
+```
+
+For CUDA, multi-arch is built by default (Turing/Ampere/Ada SASS + Hopper PTX
+for Blackwell forward-compat). For faster local builds targeting one GPU:
+```bash
+cmake .. -DMINIGO_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=75   # Turing (RTX 2080 Ti)
+cmake .. -DMINIGO_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89   # Ada (RTX 4090)
 ```
 
 The backend is selected at **compile time** — no `--backend` flag at runtime.
@@ -253,6 +267,26 @@ Each search thread's `NNResultBuf` is pre-allocated at the start of the
 thread and reused across all evaluations — zero mutex/condvar creation
 in the hot path.
 
+### CUDA GPU Backend (NVIDIA)
+
+`CUDAComputeHandle` (`src/cuda_compute.cu`) implements the forward pass using
+FP16 Tensor Cores (WMMA) for maximum throughput on NVIDIA GPUs:
+
+| Kernel | Purpose |
+|---|---|
+| `transpose_nchw_fp32_to_fp16` | Fused transpose + FP32→FP16 conversion |
+| `conv3x3_wmma_bn` | **WMMA Tensor Core** implicit GEMM: fused im2col + 16×16×16 MMA + BN/residual/ReLU |
+| `conv1x1_bn_relu_reshape_fp16` | FP16 1×1 conv + BN + ReLU + layout reshape |
+| `fc_bias_relu_fp16` | FP16 FC + bias + ReLU |
+| `fc_bias_softmax_fp16_to_fp32` | FP16→FP32 FC + softmax (policy head) |
+| `fc_bias_tanh_fp16_to_fp32` | FP16→FP32 FC + tanh (value head) |
+
+- **FP16 weights & activations**: halves memory bandwidth for all buffers
+- **FP32 BN scale/bias and FC bias**: small per-channel params stored natively as float (avoids conversion overhead)
+- **FP32 accumulator**: WMMA accumulates in FP32 for numerical stability, converts to FP16 on write-back
+- **Softmax/tanh in FP32**: final outputs computed in full precision
+- Multi-arch: SASS for SM 75 (Turing), 80/86 (Ampere), 89 (Ada) + compute_90 PTX (Hopper/Blackwell)
+
 ### OpenCL GPU Backend
 
 `OpenCLComputeHandle` (`src/opencl_compute.cpp`) implements the full AlphaZero
@@ -294,6 +328,7 @@ The architecture has three layers:
    pre-fused BN weights in CPU memory.  Shared (const) across all threads.
 
 2. **`ComputeContext`** (`include/compute_context.h`) — per-device GPU state.
+   For CUDA: one `cudaStream` per unique GPU.
    For OpenCL: one `cl_context` + `cl_queue` + `cl_program` per unique GPU
    (avoids NVIDIA serialization).  Created on the main thread.
 
@@ -301,24 +336,36 @@ The architecture has three layers:
    thread.  Uploads weights from `LoadedModel` and owns workspace buffers.
    Implements `predict_batch()`.
 
-Adding a new backend (e.g., CUDA): implement `ComputeContext` + `ComputeHandle`,
+Adding a new backend: implement `ComputeContext` + `ComputeHandle`,
 add to the factory in `compute_context.cpp`, add CMake detection.  The
 NNEvaluator, MCTS, game engine, and training pipeline are completely
 backend-agnostic.
 
 ## Performance
 
-### Batch NN inference throughput (9×9, 64 filters, 5 blocks)
+### Batch NN inference throughput (9×9, states/s)
 
-| Batch | Metal FP16 (M1 Max) | OpenCL (M1 Max) | OpenCL (RTX 5070 Ti) |
-|---|---|---|---|
-| 1 | **750/s** | 303/s | 1,100/s |
-| 8 | **7,500/s** | 2,400/s | 8,700/s |
-| 32 | **26,000/s** | 7,700/s | 28,300/s |
-| 64 | **28,000/s** | 10,800/s | 41,300/s |
-| 128 | **44,000/s** | 15,800/s | 55,200/s |
+**Small model** (64 filters, 5 blocks):
 
-Metal FP16 is **2.8× faster** than OpenCL on the same Apple Silicon chip.
+| Batch | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) | Metal FP16 (M1 Max) |
+|------:|-----------------------------:|---------------------------:|--------------------:|
+| 1     | 1,013                        | 934                        | 750                 |
+| 8     | 7,908                        | 7,336                      | 7,500               |
+| 32    | **27,060**                   | 19,886                     | 26,000              |
+| 64    | **45,247**                   | 27,383                     | 28,000              |
+| 128   | **56,452**                   | 34,005                     | 44,000              |
+
+**Large model** (128 filters, 10 blocks):
+
+| Batch | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) |
+|------:|-----------------------------:|---------------------------:|
+| 1     | 330                          | 324                        |
+| 32    | **7,766**                    | 4,723                      |
+| 64    | **9,160**                    | 5,712                      |
+| 128   | **11,007**                   | 6,012                      |
+
+CUDA FP16+WMMA is **1.66×** faster than OpenCL FP32 at batch-128 (small model)
+and **1.83×** faster for the large model, where tensor core utilization is higher.
 
 ### Self-play throughput (800 sims/move)
 
@@ -380,6 +427,7 @@ minigo-cpp/
 │   ├── nn_evaluator.h          # KataGo-style batching server (N server threads)
 │   ├── eigen_compute.h         # Eigen CPU backend (context + handle)
 │   ├── opencl_compute.h        # OpenCL GPU backend (context + handle)
+│   ├── cuda_compute.h          # CUDA GPU backend (context + handle)
 │   ├── metal_compute.h         # Metal/MPSGraph GPU backend (macOS)
 │   ├── onnx_loader.h           # Built-in minimal ONNX protobuf parser
 │   └── mcts.h                  # Multi-threaded MCTS (atomic MCTSNode)
@@ -390,6 +438,7 @@ minigo-cpp/
 │   ├── compute_context.cpp     # Backend factory
 │   ├── eigen_compute.cpp       # Eigen context + handle
 │   ├── opencl_compute.cpp      # OpenCL context + handle + embedded kernels
+│   ├── cuda_compute.cu         # CUDA context + handle + FP16 WMMA kernels
 │   ├── metal_compute.mm        # Metal/MPSGraph context + handle (Obj-C++)
 │   ├── nn_evaluator.cpp        # NNEvaluator N server threads (KataGo pattern)
 │   ├── mcts.cpp                # Multi-threaded MCTS + data augmentation
@@ -480,10 +529,13 @@ minigo-cpp/
 - OpenCL 1.2 available via Intel HD/Iris GPU.
 - Accelerate provides vecLib BLAS for Eigen.
 
-### Linux — recommended: OpenCL
+### Linux — recommended: CUDA (NVIDIA) or OpenCL
 
-- **OpenCL** (default): hand-written implicit GEMM kernels optimized for
-  NVIDIA GPUs.  Available on NVIDIA (CUDA toolkit), AMD (ROCm/Mesa), Intel (NEO).
+- **CUDA** (default on NVIDIA): FP16 Tensor Core inference via WMMA. Requires
+  CUDA toolkit (nvcc). Auto-detected when `nvcc` is on PATH. 1.7-1.8× faster
+  than OpenCL on the same GPU.
+- **OpenCL** (fallback): hand-written implicit GEMM kernels.  Available on
+  NVIDIA (CUDA toolkit), AMD (ROCm/Mesa), Intel (NEO).
 - Metal not available on Linux.
 - For faster Eigen: `sudo apt install libopenblas-dev`
 

@@ -58,13 +58,25 @@ multi-gpu     — active development branch (KataGo-style multi-server architect
 - **ComputeHandle created ON server thread**: matches KataGo pattern exactly
 - **New CLI**: `--nn-server-threads N`, `--nn-device-ids 0,1`
 
-### Session 8 (current): OpenCL Refactor + Cleanup
+### Session 8: OpenCL Refactor + Cleanup
 - **OpenCLComputeContext**: per-GPU device state (cl_context + cl_queue + cl_program), device selection by index
 - **OpenCLComputeHandle**: uploads weights from LoadedModel CPU data, per-thread kernel handles + workspace
 - **Kernel handles per-thread**: each ComputeHandle creates its own cl_kernel objects from the shared cl_program
 - **Old engine files deleted**: inference_engine.h/.cpp, opencl_engine.h/.cpp, metal_engine.h/.mm, eigen_engine.h/.cpp
 - **run_loop.sh updated**: `--nn-server-threads N`, `--nn-device-ids 0,1` flags forwarded to selfplay
 - **Both Metal and OpenCL builds verified**: compile clean on macOS
+
+### Session 9: CUDA Backend with FP16 Tensor Cores
+- **CUDAComputeContext / CUDAComputeHandle**: same architecture as OpenCL/Metal — context per unique GPU, handle per server thread
+- **Opaque Impl pattern**: header (`cuda_compute.h`) has no CUDA includes — all CUDA types live in the `.cu` file, so `compute_context.cpp` compiles as plain C++
+- **FP16 weights & activations**: all intermediate buffers in half precision, halving memory bandwidth
+- **WMMA Tensor Core GEMM** (`conv3x3_wmma_bn`): 16×16×16 `nvcuda::wmma` fragments with FP32 accumulator, implicit im2col on-the-fly. Block: 256 threads = 8 warps (2×4 layout), tile: 32×64 output
+- **FP32 BN scale/bias and FC bias**: small per-channel params stored as float (direct upload, no GPU conversion), eliminates `__half2float` in every kernel's hot path
+- **Fused transpose + FP32→FP16**: single kernel converts host input and transposes to channel-major FP16 layout
+- **FP32 softmax/tanh output**: final head outputs computed in full precision for numerical stability
+- **Multi-architecture CMake**: default builds SASS for SM 75 (Turing), 80/86 (Ampere), 89 (Ada) + compute_90 PTX (forward-compat with Hopper/Blackwell). Override with `-DCMAKE_CUDA_ARCHITECTURES=75`
+- **Auto-detection**: `cmake -DMINIGO_BACKEND=auto` tries CUDA first on Linux (checks for nvcc), falls back to OpenCL
+- **Performance**: 1.66× faster than OpenCL FP32 at batch-128 (small model), 1.83× for large model on RTX 2080 Ti
 
 ## What Remains (multi-gpu branch)
 
@@ -101,9 +113,9 @@ Create a test script for the remote Linux machine with 2× RTX 5070 Ti:
               ┌─────┴──────────────────┐
               │                        │
          DeviceState[GPU 0]      DeviceState[GPU 1]
-         cl_context_0             cl_context_1
-         cl_queue_0               cl_queue_1
-         cl_program_0             cl_program_1
+         (CUDA: cudaStream)       (CUDA: cudaStream)
+         (OpenCL: cl_context+     (OpenCL: cl_context+
+          cl_queue+cl_program)     cl_queue+cl_program)
               │                        │
      ┌────────┼────────┐      ┌────────┼────────┐
      │        │        │      │        │        │
@@ -141,6 +153,7 @@ include/
   compute_context.h       NEW — ComputeContext + ComputeHandle base classes
   eigen_compute.h         NEW — Eigen backend (context + handle)
   opencl_compute.h        NEW — OpenCL backend (context + handle)
+  cuda_compute.h          NEW — CUDA backend (context + handle, opaque Impl)
   metal_compute.h         NEW — Metal backend (context + handle)
   batch_evaluator.h       UNCHANGED — NNResultBuf + BatchEvaluator
   nn_evaluator.h          MODIFIED — takes LoadedModel + ComputeContext + gpu_ids
@@ -154,6 +167,7 @@ src/
   compute_context.cpp     NEW — factory for backend-specific context
   eigen_compute.cpp       NEW — Eigen context + handle
   opencl_compute.cpp      NEW — OpenCL context + handle (refactored from opencl_engine.cpp)
+  cuda_compute.cu         NEW — CUDA context + handle + FP16 WMMA kernels
   metal_compute.mm        NEW — Metal/MPSGraph context + handle
   nn_evaluator.cpp        MODIFIED — N server threads, ComputeHandle per thread
   game.cpp                UNCHANGED
@@ -208,3 +222,27 @@ All 9 tests pass (`test_multi_gpu.sh`).
 | Benchmark batch-128 throughput | 52K states/s |
 | Large model (128 filters, 10 blocks), 2 GPUs | 4 games pass (2.35 s/game) |
 | Stability (10 sequential runs, 2 GPUs) | 10/10 pass |
+
+### Linux 2× RTX 2080 Ti (CUDA FP16+WMMA backend)
+
+Batch NN inference throughput (states/s):
+
+| Batch | CUDA FP16+WMMA | OpenCL FP32 | Speedup |
+|------:|---------------:|------------:|--------:|
+| **Small model (64f, 5b)** | | | |
+| 1     | 1,013          | 934         | 1.08× |
+| 32    | 27,060         | 19,886      | 1.36× |
+| 64    | 45,247         | 27,383      | **1.65×** |
+| 128   | 56,452         | 34,005      | **1.66×** |
+| **Large model (128f, 10b)** | | | |
+| 1     | 330            | 324         | 1.02× |
+| 32    | 7,766          | 4,723       | 1.64× |
+| 64    | 9,160          | 5,712       | 1.60× |
+| 128   | 11,007         | 6,012       | **1.83×** |
+
+Multi-GPU self-play (CUDA, small model, 800 sims):
+
+| Config | Wall time |
+|---|---|
+| 1 server, GPU 0 | 39.2s (5 games) |
+| 2 servers, GPU 0,1 | 15.9s (5 games, **2.5× speedup**) |

@@ -34,6 +34,7 @@ public:
 //
 // For OpenCL: one cl_context + cl_command_queue + cl_program per
 //             unique GPU device (avoids NVIDIA serialization).
+// For CUDA:   one cudaStream per unique GPU device.
 // For Metal:  one MTLDevice + compiled MPSGraph.
 // For Eigen:  trivial (no GPU resources).
 // ================================================================

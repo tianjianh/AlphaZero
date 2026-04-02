@@ -42,17 +42,19 @@ endif()
 # MINIGO_BACKEND controls which GPU backend is compiled:
 #   auto   — auto-detect best available (default)
 #   metal  — Metal/MPSGraph (macOS Apple Silicon only)
+#   cuda   — CUDA (NVIDIA GPUs)
 #   opencl — OpenCL 1.2+ (Linux NVIDIA/AMD/Intel, macOS)
 #   eigen  — CPU only (no GPU)
 #
 # Usage:
 #   cmake .. -DMINIGO_BACKEND=auto     # (default)
 #   cmake .. -DMINIGO_BACKEND=metal
+#   cmake .. -DMINIGO_BACKEND=cuda
 #   cmake .. -DMINIGO_BACKEND=opencl
 #   cmake .. -DMINIGO_BACKEND=eigen
 #
-set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, opencl, eigen")
-set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "opencl" "eigen")
+set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, cuda, opencl, eigen")
+set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "cuda" "opencl" "eigen")
 
 # ── Auto-detect best backend ────────────────────────────────
 if(MINIGO_BACKEND STREQUAL "auto")
@@ -81,12 +83,18 @@ if(MINIGO_BACKEND STREQUAL "auto")
       set(MINIGO_BACKEND "eigen")
     endif()
   else()
-    # Linux: try OpenCL
-    find_package(OpenCL QUIET)
-    if(OpenCL_FOUND)
-      set(MINIGO_BACKEND "opencl")
+    # Linux: try CUDA first, then OpenCL
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+      set(MINIGO_BACKEND "cuda")
     else()
-      set(MINIGO_BACKEND "eigen")
+      find_package(OpenCL QUIET)
+      if(OpenCL_FOUND)
+        set(MINIGO_BACKEND "opencl")
+      else()
+        set(MINIGO_BACKEND "eigen")
+      endif()
     endif()
   endif()
 endif()
@@ -94,6 +102,7 @@ endif()
 # ── Validate and configure selected backend ─────────────────
 set(HAS_OPENCL FALSE)
 set(HAS_METAL FALSE)
+set(HAS_CUDA FALSE)
 
 if(MINIGO_BACKEND STREQUAL "metal")
   if(NOT APPLE)
@@ -108,6 +117,18 @@ if(MINIGO_BACKEND STREQUAL "metal")
   endif()
   set(HAS_METAL TRUE)
 
+elseif(MINIGO_BACKEND STREQUAL "cuda")
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  # Default architectures: Turing(75) Ampere(80,86) Ada(89) SASS + Hopper(90) PTX
+  # The 90-virtual PTX JIT-compiles on Hopper, Blackwell, and future GPUs.
+  # Override with: cmake .. -DCMAKE_CUDA_ARCHITECTURES=75  (for faster local builds)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-virtual")
+  endif()
+  set(HAS_CUDA TRUE)
+
 elseif(MINIGO_BACKEND STREQUAL "opencl")
   find_package(OpenCL REQUIRED)
   set(HAS_OPENCL TRUE)
@@ -116,7 +137,7 @@ elseif(MINIGO_BACKEND STREQUAL "eigen")
   # Nothing extra needed — Eigen is always available
 
 else()
-  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, opencl, eigen")
+  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, cuda, opencl, eigen")
 endif()
 
 # ── Library: minigo core ────────────────────────────────────
@@ -132,6 +153,10 @@ set(CORE_SOURCES
 
 if(HAS_OPENCL)
   list(APPEND CORE_SOURCES src/opencl_compute.cpp)
+endif()
+
+if(HAS_CUDA)
+  list(APPEND CORE_SOURCES src/cuda_compute.cu)
 endif()
 
 if(HAS_METAL)
@@ -150,6 +175,11 @@ endif()
 if(HAS_OPENCL)
   target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_OPENCL=1)
   target_link_libraries(minigo_core PUBLIC OpenCL::OpenCL)
+endif()
+
+if(HAS_CUDA)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_CUDA=1)
+  set_target_properties(minigo_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()
 
 if(HAS_METAL)
