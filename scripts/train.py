@@ -2,8 +2,8 @@
 """
 MiniGo AlphaZero — Training Script
 
-Reads binary self-play data from C++ and trains the PyTorch model.
-Supports gzip-compressed .bin.gz files (streamed, ~100x smaller on disk).
+Reads zstd-compressed self-play data (.bin.zst) and trains the PyTorch model.
+Streams data from disk — one file decompressed at a time, no memory limit.
 Multi-GPU via DistributedDataParallel (launched with torchrun).
 
 Single GPU:   python train.py --data ../training/selfplay --epochs 15
@@ -11,10 +11,7 @@ Multi GPU:    torchrun --nproc_per_node=2 train.py --data ../training/selfplay -
 """
 
 import argparse
-import bisect
 import glob
-import gzip
-import mmap
 import os
 import random
 import struct
@@ -27,132 +24,103 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, IterableDataset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, IterableDataset
+import zstandard as zstd
 
 sys.path.insert(0, os.path.dirname(__file__))
 from model import AlphaZeroNet
 
 
 # ═══════════════════════════════════════════════════════════
-# Dataset — supports both .bin (mmap) and .bin.gz (streaming)
+# Streaming dataset — decompresses one file at a time
 # ═══════════════════════════════════════════════════════════
 
 def _find_data_files(data_dirs):
-    """Find all .bin and .bin.gz files across data directories."""
+    """Find all selfplay data files (.bin.zst, .bin.gz, .bin)."""
     files = []
     for d in data_dirs:
         if not os.path.isdir(d):
             continue
-        files.extend(sorted(glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)))
-        files.extend(sorted(glob.glob(os.path.join(d, "**", "*.bin.gz"), recursive=True)))
+        for ext in ("*.bin.zst", "*.bin.gz", "*.bin"):
+            files.extend(sorted(glob.glob(os.path.join(d, "**", ext), recursive=True)))
     return files
 
 
+def _decompress(filepath):
+    """Read and decompress a data file. Supports .bin.zst, .bin.gz, .bin."""
+    if filepath.endswith(".zst"):
+        dctx = zstd.ZstdDecompressor()
+        with open(filepath, "rb") as f:
+            return dctx.decompress(f.read())
+    elif filepath.endswith(".gz"):
+        import gzip
+        with gzip.open(filepath, "rb") as f:
+            return f.read()
+    else:
+        with open(filepath, "rb") as f:
+            return f.read()
+
+
 def _read_header(filepath):
-    """Read the 4-byte record count header from a .bin or .bin.gz file."""
+    """Read the 4-byte record count from a data file header."""
     try:
-        if filepath.endswith(".gz"):
-            with gzip.open(filepath, "rb") as f:
-                return struct.unpack("i", f.read(4))[0]
-        else:
-            with open(filepath, "rb") as f:
-                return struct.unpack("i", f.read(4))[0]
-    except (OSError, struct.error):
+        data = _decompress(filepath)
+        return struct.unpack_from("i", data, 0)[0]
+    except (OSError, struct.error, zstd.ZstdError):
         return 0
 
 
-def _parse_records(data, board_size, input_channels=17):
-    """Parse all records from raw bytes (after decompression)."""
+def _parse_file(data, board_size, input_channels=17):
+    """Parse all records from raw (decompressed) bytes into tensors."""
     state_floats = input_channels * board_size * board_size
     policy_floats = board_size * board_size + 1
     record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4
 
     n = struct.unpack_from("i", data, 0)[0]
-    records = []
+    if n == 0:
+        return []
+
+    # Bulk parse into numpy arrays, then convert to tensors once
+    states = np.empty((n, input_channels, board_size, board_size), dtype=np.float32)
+    policies = np.empty((n, policy_floats), dtype=np.float32)
+    values = np.empty(n, dtype=np.float32)
+
     for i in range(n):
-        off = 4 + i * record_bytes
-        pos = off + 4  # skip state_size
-        state = np.frombuffer(data, np.float32, state_floats, pos).copy()
-        pos += state_floats * 4 + 4  # skip policy_size
-        policy = np.frombuffer(data, np.float32, policy_floats, pos).copy()
-        pos += policy_floats * 4
-        value = struct.unpack_from("f", data, pos)[0]
-        records.append((state.reshape(input_channels, board_size, board_size),
-                        policy, value))
-    return records
+        off = 4 + i * record_bytes + 4  # skip file header + record state_size
+        states[i] = np.frombuffer(data, np.float32, state_floats, off).reshape(
+            input_channels, board_size, board_size)
+        off += state_floats * 4 + 4  # skip policy_size
+        policies[i] = np.frombuffer(data, np.float32, policy_floats, off)
+        off += policy_floats * 4
+        values[i] = struct.unpack_from("f", data, off)[0]
+
+    return list(zip(
+        torch.from_numpy(states),
+        torch.from_numpy(policies),
+        torch.from_numpy(values),
+    ))
 
 
-class MmapDataset(Dataset):
-    """Map-style dataset for uncompressed .bin files via memory-mapped I/O.
-    Supports random access — used with DistributedSampler for DDP."""
+class SelfPlayDataset(IterableDataset):
+    """Streams from compressed selfplay files, decompressing one at a time.
 
-    def __init__(self, files, board_size=9, input_channels=17):
+    Memory per worker = one decompressed file (~10MB).
+    File-level + within-file shuffling for good data mixing.
+    For DDP, files are partitioned across ranks.
+    """
+
+    def __init__(self, files, board_size=9, rank=0, world_size=1):
         self.board_size = board_size
-        self.input_channels = input_channels
-        state_floats = input_channels * board_size * board_size
-        policy_floats = board_size * board_size + 1
-        self.record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4
-        self.state_floats = state_floats
-        self.policy_floats = policy_floats
-
-        self.files = []
-        self.cumulative = [0]
-        for f in files:
-            n = _read_header(f)
-            if n > 0:
-                self.files.append(os.path.abspath(f))
-                self.cumulative.append(self.cumulative[-1] + n)
-        self.total = self.cumulative[-1]
-        self._mmaps = {}
-
-    def __len__(self):
-        return self.total
-
-    def _get_mmap(self, filepath):
-        if filepath not in self._mmaps:
-            fh = open(filepath, "rb")
-            self._mmaps[filepath] = (fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ))
-        return self._mmaps[filepath][1]
-
-    def __getitem__(self, idx):
-        file_idx = bisect.bisect_right(self.cumulative, idx) - 1
-        local_idx = idx - self.cumulative[file_idx]
-        mm = self._get_mmap(self.files[file_idx])
-        off = 4 + local_idx * self.record_bytes
-
-        pos = off + 4
-        state = np.frombuffer(mm, np.float32, self.state_floats, pos).copy()
-        pos += self.state_floats * 4 + 4
-        policy = np.frombuffer(mm, np.float32, self.policy_floats, pos).copy()
-        pos += self.policy_floats * 4
-        value = struct.unpack_from("f", mm, pos)[0]
-
-        return (torch.from_numpy(state.reshape(self.input_channels, self.board_size, self.board_size)),
-                torch.from_numpy(policy),
-                torch.tensor(value, dtype=torch.float32))
-
-
-class StreamingDataset(IterableDataset):
-    """Iterable dataset for .bin.gz files — decompresses one file at a time.
-    Memory = 1 decompressed file per worker (~10MB). File-level + within-file
-    shuffling. For DDP, files are partitioned across ranks."""
-
-    def __init__(self, files, board_size=9, input_channels=17,
-                 rank=0, world_size=1, epoch=0):
-        self.board_size = board_size
-        self.input_channels = input_channels
-        self.rank = rank
-        self.world_size = world_size
-        self.epoch = epoch
+        self.epoch = 0
 
         # Partition files across DDP ranks
         self.all_files = list(files)
         self.files = self.all_files[rank::world_size]
 
-        # Count total records (read 4-byte headers only)
+        # Count records (decompress headers only — fast for zstd)
         self.total = sum(_read_header(f) for f in self.all_files)
         self.rank_total = sum(_read_header(f) for f in self.files)
+        self.rank = rank
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -161,7 +129,6 @@ class StreamingDataset(IterableDataset):
         return self.rank_total
 
     def __iter__(self):
-        # Deterministic shuffle (same seed = same file order for reproducibility)
         rng = random.Random(self.epoch * 1000 + self.rank)
         files = list(self.files)
         rng.shuffle(files)
@@ -172,41 +139,11 @@ class StreamingDataset(IterableDataset):
             files = files[worker_info.id::worker_info.num_workers]
 
         for filepath in files:
-            # Decompress one file at a time (~100KB → ~10MB in memory)
-            if filepath.endswith(".gz"):
-                with gzip.open(filepath, "rb") as f:
-                    data = f.read()
-            else:
-                with open(filepath, "rb") as f:
-                    data = f.read()
-
-            records = _parse_records(data, self.board_size, self.input_channels)
+            data = _decompress(filepath)
+            records = _parse_file(data, self.board_size)
+            del data  # free compressed bytes immediately
             rng.shuffle(records)
-
-            for state, policy, value in records:
-                yield (torch.from_numpy(state),
-                       torch.from_numpy(policy),
-                       torch.tensor(value, dtype=torch.float32))
-
-
-def create_dataset(data_dirs, board_size, rank=0, world_size=1):
-    """Auto-select dataset type based on file format.
-    .bin files → MmapDataset (random access, supports DistributedSampler)
-    .bin.gz files → StreamingDataset (streaming, memory-efficient)
-    """
-    files = _find_data_files(data_dirs)
-    if not files:
-        return None, 0
-
-    has_gz = any(f.endswith(".gz") for f in files)
-    total = sum(_read_header(f) for f in files)
-
-    if has_gz:
-        ds = StreamingDataset(files, board_size, rank=rank, world_size=world_size)
-    else:
-        ds = MmapDataset(files, board_size)
-
-    return ds, total
+            yield from records
 
 
 # ═══════════════════════════════════════════════════════════
@@ -225,7 +162,8 @@ def main():
     parser.add_argument("--board", type=int, default=9)
     parser.add_argument("--filters", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=5)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8,
+                        help="DataLoader workers for prefetching (default: 8)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
     parser.add_argument("--log-file", default=None,
                         help="Append structured metrics to this file")
@@ -305,11 +243,9 @@ def main():
     # ── Dataset + DataLoader ───────────────────────────────
     data_dirs = [d.strip() for d in args.data.split(",")]
     t_index = time.time()
-    dataset, total_samples = create_dataset(
-        data_dirs, args.board, rank=rank, world_size=world_size)
-    index_time = time.time() - t_index
+    files = _find_data_files(data_dirs)
 
-    if dataset is None or total_samples == 0:
+    if not files:
         mprint("No training data found.")
         tlog("    ERROR: no training data found")
         if log_file:
@@ -318,52 +254,32 @@ def main():
             dist.destroy_process_group()
         return
 
-    is_streaming = isinstance(dataset, StreamingDataset)
+    dataset = SelfPlayDataset(files, args.board, rank=rank, world_size=world_size)
+    index_time = time.time() - t_index
 
-    if is_streaming:
-        # StreamingDataset handles DDP partitioning internally
-        sampler = None
-        shuffle = False
-    else:
-        # MmapDataset uses DistributedSampler for DDP
-        if use_ddp:
-            sampler = DistributedSampler(dataset, num_replicas=world_size,
-                                         rank=rank, shuffle=True)
-            shuffle = False
-        else:
-            sampler = None
-            shuffle = True
-
-    # drop_last=False for streaming DDP: max_batches cap handles sync.
-    # drop_last=True for mmap: DistributedSampler guarantees equal counts.
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=(not is_streaming),
-        persistent_workers=(args.num_workers > 0 and not is_streaming),
+        drop_last=False,  # max_batches cap handles DDP sync
     )
 
-    n_files = len(dataset.files) if hasattr(dataset, "files") else 0
-    fmt = "streaming (.bin.gz)" if is_streaming else "mmap (.bin)"
-    mprint(f"Dataset: {total_samples} samples, {n_files} files, {fmt} ({index_time:.1f}s)")
-    tlog(f"    Samples:       {total_samples} from {n_files} files ({fmt})")
+    mprint(f"Dataset: {dataset.total} samples, {len(files)} files ({index_time:.1f}s)")
+    mprint(f"DataLoader: batch={args.batch_size}, {args.num_workers} workers"
+           + (f", {world_size} GPUs" if world_size > 1 else ""))
+    tlog(f"    Samples:       {dataset.total} from {len(files)} files")
+    tlog(f"    Workers:       {args.num_workers}")
     tlog(f"    Index time:    {index_time:.1f}s")
 
-    # For streaming DDP: sync batch count across ranks to prevent hangs.
-    # Each rank may have slightly different record counts from file partitioning.
-    # All ranks must run the same number of batches (all-reduce requires it).
+    # DDP batch sync: all ranks agree on batch count to prevent NCCL hangs
     max_batches = None
-    if is_streaming and use_ddp:
-        rank_records = dataset.rank_total
-        rank_batches = rank_records // args.batch_size
+    if use_ddp:
+        rank_batches = dataset.rank_total // args.batch_size
         t = torch.tensor([rank_batches], dtype=torch.long, device=device)
         dist.all_reduce(t, op=dist.ReduceOp.MIN)
         max_batches = t.item()
-        mprint(f"DDP batch sync: {max_batches} batches/epoch (min across ranks)")
+        mprint(f"DDP sync: {max_batches} batches/epoch")
 
     # ── Train ──────────────────────────────────────────────
     mprint(f"\nTraining: {args.epochs} epochs, batch={args.batch_size}, lr={args.lr}")
@@ -371,11 +287,7 @@ def main():
 
     t_train_start = time.time()
     for epoch in range(1, args.epochs + 1):
-        if sampler:
-            sampler.set_epoch(epoch)
-        if is_streaming:
-            dataset.set_epoch(epoch)
-
+        dataset.set_epoch(epoch)
         model.train()
         total_loss = total_pl = total_vl = 0.0
         n = 0
