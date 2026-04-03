@@ -182,9 +182,10 @@ The plan is a plain text file — edit it to customize the schedule.
 
 #### Model version management
 
-Every iteration produces a versioned model snapshot:
-- `models/v0001.onnx` ... `models/v0060.onnx` — all candidates
-- `models/best.onnx` — current best (used for self-play)
+All models live in `models/` with a simple versioning scheme:
+- `models/v0000.onnx` — initial random model (created by `init`)
+- `models/v0001.onnx` ... `models/v0060.onnx` — candidates from each iteration
+- `models/best.onnx` — copy of the current best (used for self-play)
 - `training/checkpoints/v0001.pt` ... — training checkpoints with optimizer state
 
 Only models that pass evaluation gating are promoted to `best.onnx`.
@@ -223,32 +224,15 @@ Each model gets its own NNEvaluator with separate compute contexts.
 Games alternate which model plays Black.  Temperature is 0 (deterministic)
 with no Dirichlet noise for clean evaluation.
 
-### Train (manual steps)
-
-```bash
-# 1. Export initial (random) ONNX model
-cd scripts
-python3 export_onnx.py --init --board 9 --output ../model.onnx
-cd ..
-
-# 2. Generate self-play data (GPU)
-./build/selfplay --model model.onnx \
-    --games 100 --threads 8 --search-threads 16 --sims 400 \
-    --nn-server-threads 1 --nn-device-ids 0
-
-# 3. Train in Python (auto-exports updated model.onnx)
-cd scripts
-python3 train.py --data ../selfplay_data --epochs 20 --board 9
-cd ..
-
-# Repeat from step 2 with the updated model
-```
-
 ### Play
 
 ```bash
 # Against trained model (backend selected at compile time)
-./build/play --model model.onnx --sims 800
+./build/play --model models/best.onnx --sims 800
+
+# Multi-GPU with larger batch
+./build/play --model models/best.onnx --sims 800 \
+    --max-batch 512 --nn-server-threads 2 --nn-device-ids 0,0
 
 # Against random bot (no model needed)
 ./build/play --random --board 9
@@ -257,15 +241,15 @@ cd ..
 ### Benchmark
 
 ```bash
-# Benchmark (backend selected at compile time)
-./build/benchmark --model model.onnx \
-    --games 10 --threads 10 --search-threads 8
+# Benchmark the current best model
+./build/benchmark --model models/best.onnx \
+    --games 10 --threads 10 --search-threads 16 --max-batch 512
 
-# Generate larger models for GPU benchmarking
+# Generate a standalone model for benchmarking
 cd scripts
-python3 export_onnx.py --init --filters 128 --blocks 10 --output ../model_large.onnx
+python3 export_onnx.py --init --filters 128 --blocks 10 --output ../models/bench_large.onnx
 cd ..
-./build/benchmark --model model_large.onnx \
+./build/benchmark --model models/bench_large.onnx \
     --games 10 --threads 10 --search-threads 16
 ```
 
@@ -519,12 +503,12 @@ The project includes a built-in minimal protobuf parser (`onnx_loader.cpp`)
 The model has dynamic batch dimensions, so the same `.onnx` file works for
 batch sizes 1 through N.  GPU workspace buffers auto-grow to fit the batch.
 
-Generate models of different sizes:
+Generate standalone models of different sizes (for benchmarking):
 ```bash
 cd scripts
-python3 export_onnx.py --init --board 9 --filters 64  --blocks 5  --output ../model.onnx        # small (default)
-python3 export_onnx.py --init --board 9 --filters 128 --blocks 10 --output ../model_large.onnx   # large
-python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../model_xlarge.onnx  # extra-large
+python3 export_onnx.py --init --board 9 --filters 64  --blocks 5  --output ../models/small.onnx
+python3 export_onnx.py --init --board 9 --filters 128 --blocks 10 --output ../models/large.onnx
+python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../models/xlarge.onnx
 ```
 
 ## Files

@@ -373,7 +373,7 @@ EOF
 }
 
 cmd_init() {
-    local board=9 filters=64 blocks=5 preset=""
+    local board=9 filters=64 blocks=5 preset="" yes_flag=0
 
     case "${1:-}" in
         quick) preset=quick; board=5; filters=32; blocks=3; shift;;
@@ -386,6 +386,7 @@ cmd_init() {
             --board)   board=$2; shift 2;;
             --filters) filters=$2; shift 2;;
             --blocks)  blocks=$2; shift 2;;
+            -y|--yes)  yes_flag=1; shift;;
             *) echo "Unknown init option: $1"; exit 1;;
         esac
     done
@@ -400,25 +401,42 @@ cmd_init() {
     echo "  Network:    ${filters}f x ${blocks}b"
     echo
 
-    # Clean previous state
-    echo "Clearing previous training state..."
-    rm -rf "${MODELS_DIR}" "${PROJECT_DIR}/training"
-    rm -f "${PROJECT_DIR}/pipeline_config"
+    # Confirm before clearing
+    echo "This will DELETE all existing training data:"
+    echo "  models/              (ONNX model files)"
+    echo "  training/            (selfplay data, checkpoints, logs)"
+    echo "  trt_cache/           (TensorRT engine cache)"
+    echo "  training_plan        (training schedule)"
+    echo
+
+    if [ $yes_flag -eq 0 ]; then
+        read -p "Continue? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+    fi
+
+    echo "Clearing..."
+    rm -rf "${MODELS_DIR}" "${PROJECT_DIR}/training" "${PROJECT_DIR}/trt_cache"
+    rm -f "${PLAN_FILE}" "${PROJECT_DIR}/pipeline_config"
+
+    # Create fresh directories
     mkdir -p "${MODELS_DIR}" "${DATA_DIR}" "${LOGS_DIR}" "${CHECKPOINT_DIR}"
 
     # Generate training plan
     echo "Generating training plan..."
     generate_plan "$board" "$filters" "$blocks" "$preset"
 
-    # Create initial random model
-    echo "Creating initial random model (v0000)..."
+    # Create initial random model (v0000) and set as best
+    echo "Creating initial model (v0000)..."
     cd "${PROJECT_DIR}/scripts"
     $PYTHON export_onnx.py \
-        --output "$(best_onnx)" \
+        --output "$(version_onnx 0)" \
         --board ${board} --filters ${filters} --blocks ${blocks} \
         --init
     cd "${PROJECT_DIR}"
-    cp "$(best_onnx)" "$(version_onnx 0)"
+    cp "$(version_onnx 0)" "$(best_onnx)"
 
     # Initialize state
     PIPELINE_ITER=0; BEST_VERSION=0; TOTAL_GAMES=0; TOTAL_PROMOTIONS=0

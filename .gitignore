@@ -1,12 +1,19 @@
 build/
 build-*/
-selfplay_data/
-checkpoints/
-model.onnx
-model_large.onnx
-model_xlarge.onnx
+
+# Training pipeline runtime artifacts
+models/
+training/
+trt_cache/
+training_plan
+pipeline_config
+
+# Data files
 *.bin
 *.pt
+*.engine
+*.onnx.data
+
 .DS_Store
 __pycache__/
 *.pyc
