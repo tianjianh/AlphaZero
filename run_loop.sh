@@ -399,7 +399,7 @@ cmd_init() {
     # Confirm before clearing
     echo "This will DELETE all existing training data:"
     echo "  models/              (ONNX model files)"
-    echo "  training/            (selfplay data, checkpoints, logs)"
+    echo "  training/            (selfplay data, eval games, checkpoints, logs)"
     echo "  trt_cache/           (TensorRT engine cache)"
     echo "  training_plan        (training schedule)"
     echo
@@ -772,6 +772,9 @@ EOF
             eval_tmp=$(mktemp)
 
             set +e
+            local EVAL_DIR="${PROJECT_DIR}/training/eval/iter_$(printf '%04d' ${iter})"
+            mkdir -p "${EVAL_DIR}"
+
             "${BUILD_DIR}/evaluate" \
                 --model1 "${CANDIDATE_ONNX}" \
                 --model2 "$(version_onnx $BEST_VERSION)" \
@@ -783,6 +786,7 @@ EOF
                 --nn-device-ids ${NN_DEVICE_IDS} \
                 --sims ${STAGE_SIMS} \
                 --threshold ${PLAN_EVAL_THRESHOLD} \
+                --output "${EVAL_DIR}" \
                 2>&1 | tee "$eval_tmp"
             local eval_result=$?
             set -e

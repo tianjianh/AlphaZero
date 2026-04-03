@@ -74,7 +74,7 @@ sudo apt install libopenblas-dev
 ### Python (both platforms — only needed for training)
 
 ```bash
-pip install torch numpy onnx onnxscript
+pip install torch numpy onnx onnxscript zstandard
 ```
 
 Python is NOT required for inference — only for training (`train.py`)
@@ -215,18 +215,39 @@ Override with explicit flags if needed.
 #### Evaluation binary
 
 The `evaluate` binary plays match games between two models to determine
-which is stronger:
+which is stronger.  Games are saved as SGF files for review:
 
 ```bash
 ./build/evaluate --model1 candidate.onnx --model2 baseline.onnx \
-    --games 100 --sims 400 --threshold 0.55
+    --games 100 --sims 400 --threshold 0.55 --output eval_games/
 # Exit code 0 = model1 wins (above threshold)
 # Exit code 1 = model1 fails
+# SGF game records saved to eval_games/game_*.sgf
 ```
 
 Each model gets its own NNEvaluator with separate compute contexts.
 Games alternate which model plays Black.  Temperature is 0 (deterministic)
-with no Dirichlet noise for clean evaluation.
+with no Dirichlet noise for clean evaluation.  During training, evaluation
+games are saved to `training/eval/iter_NNNN/`.
+
+#### Visualizing games
+
+Review selfplay or evaluation games with the visualizer:
+
+```bash
+# Selfplay game (binary format, supports .bin / .bin.zst / .bin.gz)
+python scripts/visualize.py training/selfplay/iter_0001/game_0.bin.zst
+
+# Evaluation game (SGF format)
+python scripts/visualize.py training/eval/iter_0006/game_0.sgf
+
+# All games in a directory
+python scripts/visualize.py training/eval/iter_0006/
+```
+
+The visualizer shows the board after each move with narration
+(e.g. "Black X plays D4").  Controls:
+Enter = next, `b` = back, `s` = skip to end, number = jump to move, `q` = quit.
 
 ### Play
 
@@ -494,9 +515,11 @@ The pipeline is fully resumable at every phase boundary.  Run
 Training uses a **sliding window** — only data from the last N iterations
 is loaded (configurable via `PLAN_WINDOW_SIZE` in the training plan),
 keeping training focused on recent, stronger games.  This is the standard
-approach used by AlphaGo Zero and KataGo.  Data is streamed from disk via
-memory-mapped I/O with a multi-worker DataLoader, so there is no memory
-limit — the OS page cache handles hot/cold data automatically.
+approach used by AlphaGo Zero and KataGo.
+
+Selfplay data is compressed with **zstd** after generation (~10x smaller on
+disk).  The training DataLoader streams and decompresses one file at a time
+with 8 prefetch workers, keeping GPU utilization high with minimal memory.
 
 ## Model Format
 
@@ -531,6 +554,7 @@ minigo-cpp/
 ├── trt_cache/                  # TensorRT compiled engine cache
 ├── training/                   # All training artifacts
 │   ├── selfplay/               #   Game data (iter_0001/, iter_0002/, ...)
+│   ├── eval/                   #   Evaluation match SGFs (iter_0006/, iter_0007/, ...)
 │   ├── checkpoints/            #   PyTorch checkpoints (training.pt, v0001.pt, ...)
 │   ├── logs/                   #   train.log (structured), pipeline.log
 │   └── state                   #   Pipeline resume state
@@ -568,7 +592,8 @@ minigo-cpp/
 └── scripts/
     ├── model.py                # PyTorch model definition
     ├── export_onnx.py          # PyTorch → ONNX export
-    └── train.py                # Train on self-play data (DDP, resumable)
+    ├── train.py                # Train on self-play data (DDP, streaming)
+    └── visualize.py            # Selfplay/eval game viewer (.bin/.zst/.sgf)
 ```
 
 ## CLI Reference
@@ -634,11 +659,13 @@ minigo-cpp/
   --sims N               MCTS simulations per move (default: 800)
   --max-batch N          Max GPU batch size (default: 256)
   --threshold FLOAT      Win rate to pass (default: 0.55)
+  --output DIR           Save game records as SGF files
   --nn-server-threads N  NN server threads per model (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
 ```
 
 Exit code 0 = model1 wins (above threshold), 1 = model1 fails.
+SGF files can be reviewed with `python scripts/visualize.py`.
 
 ### benchmark
 

@@ -6,6 +6,7 @@
 #include "nn_evaluator.h"
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -24,14 +25,28 @@ static std::vector<int> parse_device_ids(const std::string& str) {
     return ids;
 }
 
+// Game record: sequence of moves + result
+struct GameRecord {
+    int board_size;
+    float komi;
+    bool model1_is_black;
+    std::vector<int> moves;   // action indices (-1 = pass)
+    int result;               // +1 = model1 wins, -1 = model2 wins, 0 = draw
+};
+
 // Play one game between two evaluators.
 // Returns: +1 if eval1 wins, -1 if eval2 wins, 0 if draw.
-static int play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
-                          const Config& config, bool eval1_is_black) {
+static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
+                                const Config& config, bool eval1_is_black) {
     GoGame game(config.board_size, config.komi);
     MCTS mcts1(eval1, config);
     MCTS mcts2(eval2, config);
     int action_size = config.action_size();
+
+    GameRecord rec;
+    rec.board_size = config.board_size;
+    rec.komi = config.komi;
+    rec.model1_is_black = eval1_is_black;
 
     while (!game.game_over && game.move_count < config.max_moves_per_game) {
         bool current_is_black = (game.current_player == BLACK);
@@ -41,6 +56,8 @@ static int play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
         std::vector<float> policy;
         int action = mcts.get_action(game, policy, 0.0f, -1, false);
 
+        rec.moves.push_back(action == action_size - 1 ? PASS_MOVE : action);
+
         if (action == action_size - 1)
             game.play(PASS_MOVE);
         else
@@ -49,13 +66,53 @@ static int play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
 
     while (!game.game_over) game.play(PASS_MOVE);
 
-    if (game.winner == EMPTY) return 0;
-    Stone eval1_color = eval1_is_black ? BLACK : WHITE;
-    return (game.winner == eval1_color) ? 1 : -1;
+    if (game.winner == EMPTY) rec.result = 0;
+    else {
+        Stone eval1_color = eval1_is_black ? BLACK : WHITE;
+        rec.result = (game.winner == eval1_color) ? 1 : -1;
+    }
+    return rec;
+}
+
+// Write a game record as SGF
+static void write_sgf(const std::string& path, const GameRecord& rec,
+                      int game_id, const std::string& m1_name,
+                      const std::string& m2_name) {
+    std::ofstream out(path);
+    int n = rec.board_size;
+    std::string black_name = rec.model1_is_black ? m1_name : m2_name;
+    std::string white_name = rec.model1_is_black ? m2_name : m1_name;
+    std::string result_str;
+    if (rec.result == 0) result_str = "0";
+    else {
+        bool m1_won = rec.result > 0;
+        bool black_won = (m1_won == rec.model1_is_black);
+        result_str = black_won ? "B+R" : "W+R";
+    }
+
+    out << "(;GM[1]FF[4]SZ[" << n << "]KM[" << rec.komi << "]"
+        << "PB[" << black_name << "]PW[" << white_name << "]"
+        << "RE[" << result_str << "]"
+        << "GN[eval_game_" << game_id << "]\n";
+
+    for (int i = 0; i < (int)rec.moves.size(); i++) {
+        const char* color = (i % 2 == 0) ? "B" : "W";
+        if (rec.moves[i] == PASS_MOVE) {
+            out << ";" << color << "[]";
+        } else {
+            int r = rec.moves[i] / n;
+            int c = rec.moves[i] % n;
+            char col = 'a' + c;
+            char row = 'a' + r;
+            out << ";" << color << "[" << col << row << "]";
+        }
+    }
+    out << ")\n";
 }
 
 int main(int argc, char* argv[]) {
     std::string model1_path, model2_path;
+    std::string output_dir;  // empty = don't save games
     int num_games          = 100;
     int num_threads        = 1;
     int search_threads     = 16;
@@ -77,6 +134,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--threshold"         && i+1<argc) threshold         = std::stof(argv[++i]);
         else if (arg == "--max-batch"         && i+1<argc) max_batch_size    = std::stoi(argv[++i]);
+        else if (arg == "--output"            && i+1<argc) output_dir        = argv[++i];
         else if (arg == "--help") {
             std::cout
                 << "Usage: evaluate [options]\n"
@@ -94,6 +152,7 @@ int main(int argc, char* argv[]) {
                 << "  --sims N                MCTS simulations per move (default: 800)\n"
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
                 << "  --threshold FLOAT       Win rate to pass (default: 0.55)\n"
+                << "  --output DIR            Save game records as SGF files\n"
                 << "  --nn-server-threads N   NN server threads per model (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated GPU indices (default: \"0\")\n";
             return 0;
@@ -161,6 +220,10 @@ int main(int argc, char* argv[]) {
               << (threshold * 100.0f) << "%\n"
               << "  Backend:    " << ctx1->backend_name() << "\n\n";
 
+    // Create output dir for SGF if requested
+    if (!output_dir.empty())
+        system(("mkdir -p " + output_dir).c_str());
+
     std::mutex print_mutex;
     std::atomic<int> games_done{0};
     std::atomic<int> m1_wins{0}, m2_wins{0}, draws{0};
@@ -173,14 +236,22 @@ int main(int argc, char* argv[]) {
 
             bool m1_black = (gid % 2 == 0);   // alternate colors
             auto t0 = std::chrono::steady_clock::now();
-            int result = play_one_game(
+            auto rec = play_one_game(
                 eval1.get(), eval2.get(), config, m1_black);
             auto t1 = std::chrono::steady_clock::now();
             double secs = std::chrono::duration<double>(t1 - t0).count();
 
+            int result = rec.result;
             if      (result > 0) m1_wins.fetch_add(1);
             else if (result < 0) m2_wins.fetch_add(1);
             else                 draws.fetch_add(1);
+
+            // Save SGF
+            if (!output_dir.empty()) {
+                std::string sgf_path = output_dir + "/game_" +
+                                       std::to_string(gid) + ".sgf";
+                write_sgf(sgf_path, rec, gid, model1_path, model2_path);
+            }
 
             {
                 std::lock_guard<std::mutex> lock(print_mutex);
