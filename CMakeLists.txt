@@ -233,10 +233,12 @@ endif()
 add_executable(play      src/main_play.cpp)
 add_executable(selfplay  src/main_selfplay.cpp)
 add_executable(benchmark src/main_benchmark.cpp)
+add_executable(evaluate  src/main_evaluate.cpp)
 
 target_link_libraries(play      PRIVATE minigo_core)
 target_link_libraries(selfplay  PRIVATE minigo_core)
 target_link_libraries(benchmark PRIVATE minigo_core)
+target_link_libraries(evaluate  PRIVATE minigo_core)
 
 # ── Summary ─────────────────────────────────────────────────
 message(STATUS "System:     ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")

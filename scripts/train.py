@@ -66,7 +66,6 @@ def load_all_data(data_dir, exclude_files=None):
     # Search recursively for .bin files
     files = sorted(glob.glob(os.path.join(data_dir, "**", "*.bin"), recursive=True))
     if not files:
-        print(f"No data files found in {data_dir}")
         return [], set()
 
     all_records = []
@@ -78,10 +77,7 @@ def load_all_data(data_dir, exclude_files=None):
         records = read_selfplay_data(f)
         all_records.extend(records)
         loaded_files.add(abs_f)
-        print(f"  Loaded {f}: {len(records)} records")
 
-    print(f"Total: {len(all_records)} training samples from {len(loaded_files)} files"
-          f" ({len(exclude_files)} files skipped)")
     return all_records, loaded_files
 
 
@@ -137,7 +133,7 @@ def train_epoch(model, data, batch_size, optimizer, device):
 def main():
     parser = argparse.ArgumentParser(description="Train model on C++ self-play data")
     parser.add_argument("--data", default="selfplay_data",
-                        help="Directory containing .bin data files (searched recursively)")
+                        help="Data directories (comma-separated for multiple, searched recursively)")
     parser.add_argument("--checkpoint", default="checkpoints/best_model.pt",
                         help="Model checkpoint to load/save")
     parser.add_argument("--epochs", type=int, default=20)
@@ -151,7 +147,21 @@ def main():
                         help="Max training samples to keep (most recent)")
     parser.add_argument("--output-onnx", default="model.onnx",
                         help="Output ONNX model path")
+    parser.add_argument("--retrain", action="store_true",
+                        help="Retrain on all data (ignore previously trained file history)")
+    parser.add_argument("--log-file", default=None,
+                        help="Append structured training metrics to this file (for pipeline)")
     args = parser.parse_args()
+
+    # Structured log helper — writes to log file in real time
+    log_file = None
+    if args.log_file:
+        log_file = open(args.log_file, "a")
+
+    def tlog(msg):
+        if log_file:
+            log_file.write(msg + "\n")
+            log_file.flush()
 
     # Device
     if torch.cuda.is_available():
@@ -160,7 +170,10 @@ def main():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    print(f"Device: {device}")
+
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    print(f"Device: {device}  GPUs: {num_gpus}")
+    tlog(f"    Device: {device}, {num_gpus} GPU(s)")
 
     # Load model
     model = AlphaZeroNet(
@@ -170,7 +183,7 @@ def main():
         num_res_blocks=args.blocks,
     ).to(device)
 
-    # Optimizer
+    # Optimizer (created before DataParallel so param groups match)
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
 
@@ -182,51 +195,92 @@ def main():
     if os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            # Full checkpoint with optimizer state
             model.load_state_dict(ckpt["model_state_dict"])
             if "optimizer_state_dict" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             trained_files = set(ckpt.get("trained_files", []))
             start_iteration = ckpt.get("iteration", 0)
-            print(f"Resumed from checkpoint: {args.checkpoint}")
-            print(f"  Iteration: {start_iteration}")
-            print(f"  Previously trained on {len(trained_files)} files")
+            print(f"Resumed from iteration {start_iteration}")
         else:
-            # Legacy checkpoint (state_dict only)
             model.load_state_dict(ckpt)
-            print(f"Loaded legacy checkpoint: {args.checkpoint}")
+            print(f"Loaded legacy checkpoint")
     else:
         print("Starting from scratch")
 
-    # Load training data (skip already-trained files for incremental training)
-    print(f"\nLoading self-play data from {args.data}...")
-    data, new_files = load_all_data(args.data, exclude_files=trained_files)
+    # Multi-GPU DataParallel (wrap after checkpoint load, before training)
+    if num_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f"DataParallel: training on {num_gpus} GPUs")
+
+    # With --retrain, ignore trained file history (load everything fresh)
+    if args.retrain:
+        trained_files = set()
+
+    # Load training data from one or more directories
+    data_dirs = [d.strip() for d in args.data.split(",")]
+    print(f"Loading data from {len(data_dirs)} dir(s)...")
+    t_load = time.time()
+    data = []
+    new_files = set()
+    n_files = 0
+    for d in data_dirs:
+        if os.path.isdir(d):
+            records, files = load_all_data(d, exclude_files=trained_files)
+            data.extend(records)
+            new_files |= files
+            n_files += len(files)
+    load_time = time.time() - t_load
+
     if not data:
         print("No new data to train on.")
+        tlog("    ERROR: no training data found")
+        if log_file:
+            log_file.close()
         return
 
+    print(f"Loaded {len(data)} samples from {n_files} files ({load_time:.1f}s)")
+
     # Trim to buffer size (keep most recent)
+    trimmed = False
     if len(data) > args.buffer_size:
         data = data[-args.buffer_size:]
+        trimmed = True
         print(f"Trimmed to {len(data)} most recent samples")
 
-    # Train
-    print(f"\nTraining for {args.epochs} epochs, batch_size={args.batch_size}")
-    print("-" * 50)
+    n_batches = len(data) // args.batch_size
+    tlog(f"    Samples:       {len(data)} from {n_files} files" +
+         (f" (trimmed to buffer {args.buffer_size})" if trimmed else ""))
+    tlog(f"    Batches/epoch: {n_batches}")
+    tlog(f"    Load time:     {load_time:.1f}s")
 
+    # Train
+    print(f"\nTraining: {args.epochs} epochs, batch={args.batch_size}, "
+          f"lr={args.lr}, {n_batches} batches/epoch")
+    print("-" * 60)
+
+    t_train_start = time.time()
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         loss, pl, vl = train_epoch(model, data, args.batch_size, optimizer, device)
         dt = time.time() - t0
-        print(f"  Epoch {epoch:3d}  loss={loss:.4f}  "
+        print(f"  Epoch {epoch:3d}/{args.epochs}  loss={loss:.4f}  "
               f"policy={pl:.4f}  value={vl:.4f}  ({dt:.1f}s)")
+        tlog(f"    Epoch {epoch:3d}/{args.epochs}  "
+             f"loss={loss:.4f}  policy={pl:.4f}  value={vl:.4f}  {dt:.1f}s")
+
+    train_time = time.time() - t_train_start
+    print(f"Training complete ({train_time:.1f}s)")
+    tlog(f"    Training time: {train_time:.1f}s")
 
     # Update trained files set
     all_trained_files = trained_files | new_files
 
+    # Unwrap DataParallel for saving and export
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+
     # Save full checkpoint (model + optimizer + metadata)
     checkpoint = {
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": base_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "iteration": start_iteration + 1,
         "trained_files": list(all_trained_files),
@@ -235,14 +289,17 @@ def main():
         "num_res_blocks": args.blocks,
     }
     torch.save(checkpoint, args.checkpoint)
-    print(f"\nSaved checkpoint: {args.checkpoint}")
-    print(f"  Total trained files: {len(all_trained_files)}")
+    print(f"Saved checkpoint: {args.checkpoint}")
 
     # Export ONNX model for C++
-    print("\nExporting ONNX model for C++...")
+    print("Exporting ONNX model...")
     from export_onnx import export_to_onnx
-    model_cpu = model.cpu()
+    model_cpu = base_model.cpu()
     export_to_onnx(model_cpu, args.output_onnx, board_size=args.board)
+    tlog(f"    Exported: {args.output_onnx}")
+
+    if log_file:
+        log_file.close()
 
 
 if __name__ == "__main__":

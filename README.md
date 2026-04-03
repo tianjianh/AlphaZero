@@ -122,33 +122,106 @@ All binaries automatically use whichever backend was compiled.
 
 ## Quick Start
 
-### Train (automated loop)
+### Train (automated pipeline)
+
+The training pipeline uses two commands: `init` (choose network, generate
+training plan) and `train` (run or resume training).
 
 ```bash
-# Quick test (~5 min, 5x5 board, small net)
-chmod +x run_loop.sh
-./run_loop.sh --quick
+# 1. Initialize — pick a preset or custom architecture
+./run_loop.sh init small       # 9x9, 64f/5b,  60 iters (~2-4 hours)
+./run_loop.sh init large       # 9x9, 128f/10b, 200 iters (~12-24 hours)
+./run_loop.sh init quick       # 5x5, 32f/3b,  5 iters (pipeline test)
+./run_loop.sh init --board 9 --filters 96 --blocks 8   # custom arch
 
-# Full training (9x9 board, 16 search threads per move)
-./run_loop.sh --iterations 30 --games 200 --sims 800
+# 2. Train — GPUs are auto-detected, just run:
+./run_loop.sh train
 
-# Multi-GPU: 2 server threads across 2 GPUs
-./run_loop.sh --iterations 30 --games 200 --nn-server-threads 2 --nn-device-ids 0,1
+# Or with explicit hardware settings:
+./run_loop.sh train --threads 64 --nn-device-ids 0,0,1,1
 
-# 4 server threads on 2 GPUs (2 threads per GPU)
-./run_loop.sh --iterations 30 --games 200 --nn-server-threads 4 --nn-device-ids 0,0,1,1
+# Run a limited number of iterations then pause:
+./run_loop.sh train --iterations 20
 
-# Maximize GPU utilization with 2 parallel selfplay instances
-./run_loop.sh --iterations 30 --games 200 --selfplay-instances 2
-
-# CPU-only: rebuild with Eigen backend first
-# cmake .. -DMINIGO_BACKEND=eigen && make -j$(nproc)
-./run_loop.sh --iterations 30 --games 200
+# 3. Check progress:
+./run_loop.sh status
 ```
 
-Training is **resumable** — stop at any time (Ctrl+C) and restart
-`./run_loop.sh` to continue from the last checkpoint.  Self-play data
-accumulates across iterations; the optimizer state is preserved.
+**Resumable** — stop at any time (Ctrl+C) and re-run `./run_loop.sh train`
+to continue from where it left off.  Pipeline state, selfplay data,
+checkpoints, and training logs are all preserved.
+
+#### Training pipeline
+
+Each iteration runs three phases:
+
+1. **Self-play**: generate games with the current best model (C++, multi-GPU)
+2. **Train**: train on a sliding window of recent data (Python/PyTorch, multi-GPU DataParallel)
+3. **Evaluate & gate**: play games between candidate and best model; promote
+   if candidate wins ≥ 55% (configurable)
+
+The pipeline is controlled by a **training plan** (`training_plan` file)
+generated during `init`.  The plan defines staged training with escalating
+parameters:
+
+```
+  Stage             Iters   Games   Sims  Epoch      LR   Gate
+  ────────────────────────────────────────────────────────────
+  Warm up           1-5     200    400     15    2e-3    off
+  Explore           6-15    400    600     15    1e-3    50g
+  Strengthen       16-35    400    600     20    5e-4   100g
+  Polish           36-60    500    800     20    1e-4   100g
+```
+
+Each stage defines: selfplay games per iteration, MCTS simulations per move,
+training epochs, learning rate, and evaluation games for gating.  Early stages
+use fewer sims and no gating for fast exploration; later stages increase data
+quality and enable gating to ensure only stronger models are promoted.
+
+The plan is a plain text file — edit it to customize the schedule.
+
+#### Model version management
+
+Every iteration produces a versioned model snapshot:
+- `models/v0001.onnx` ... `models/v0060.onnx` — all candidates
+- `models/best.onnx` — current best (used for self-play)
+- `checkpoints/v0001.pt` ... — training checkpoints with optimizer state
+
+Only models that pass evaluation gating are promoted to `best.onnx`.
+The `pipeline_state` file tracks progress for resume.
+
+#### Logging
+
+All training metrics are written to `logs/train.log` in real-time:
+per-iteration parameters, per-epoch losses, selfplay timing, evaluation
+win rates, and promotion decisions.  This single file captures the full
+training history for debugging and tuning.
+
+#### GPU auto-detection
+
+The `train` command auto-detects NVIDIA GPUs and configures pipelining
+(2 NN server threads per GPU):
+- 1 GPU → `--nn-server-threads 2 --nn-device-ids 0,0`
+- 2 GPUs → `--nn-server-threads 4 --nn-device-ids 0,0,1,1`
+
+Override with explicit flags if needed.  PyTorch training also uses
+`DataParallel` automatically when multiple GPUs are available.
+
+#### Evaluation binary
+
+The `evaluate` binary plays match games between two models to determine
+which is stronger:
+
+```bash
+./build/evaluate --model1 candidate.onnx --model2 baseline.onnx \
+    --games 100 --sims 400 --threshold 0.55
+# Exit code 0 = model1 wins (above threshold)
+# Exit code 1 = model1 fails
+```
+
+Each model gets its own NNEvaluator with separate compute contexts.
+Games alternate which model plays Black.  Temperature is 0 (deterministic)
+with no Dirichlet noise for clean evaluation.
 
 ### Train (manual steps)
 
@@ -418,16 +491,21 @@ threads: `total = min(games, threads) × search_threads`.
 
 ## Resumable Training
 
-Training state is fully saved in checkpoints:
-- Model weights + optimizer state (Adam momentum buffers)
-- List of already-trained data files
-- Iteration counter
+The pipeline is fully resumable at every phase boundary.  Run
+`./run_loop.sh train` after any interruption to continue:
 
-On resume, `train.py` skips previously-trained data files and restores
-the optimizer state, so training continues smoothly from where it left off.
+- **Pipeline state** (`pipeline_state`): tracks current iteration, best model
+  version, total games played, and promotion count
+- **Selfplay resume**: skips iterations that already have enough game files
+- **Training resume**: skips iterations whose versioned ONNX + checkpoint exist
+- **Checkpoints** (`checkpoints/training.pt`): model weights + Adam optimizer
+  state (momentum buffers) for smooth continuation
+- **Selfplay data**: accumulates in per-iteration directories
+  (`selfplay_data/iter_0001/`, etc.) and is never deleted
 
-Self-play data accumulates in per-iteration subdirectories
-(`selfplay_data/iter_0001/`, etc.) and is not deleted between iterations.
+Training uses a **sliding window** — only data from the last N iterations
+is loaded (configurable via `PLAN_WINDOW_SIZE` in the training plan),
+keeping training focused on recent, stronger games and bounding memory usage.
 
 ## Model Format
 
@@ -454,7 +532,8 @@ python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../mo
 ```
 minigo-cpp/
 ├── CMakeLists.txt              # Build (Eigen required, OpenCL/Metal optional)
-├── run_loop.sh                 # Automated training loop (multi-GPU selfplay)
+├── run_loop.sh                 # Training pipeline (init/train/status)
+├── training_plan               # Generated training schedule (editable)
 ├── test_multi_gpu.sh           # Multi-GPU test suite
 ├── include/
 │   ├── config.h                # Hyperparameters
@@ -484,6 +563,7 @@ minigo-cpp/
 │   ├── mcts.cpp                # Multi-threaded MCTS + data augmentation
 │   ├── main_play.cpp           # Human vs AI
 │   ├── main_selfplay.cpp       # Multi-threaded data generation
+│   ├── main_evaluate.cpp       # Model vs model evaluation matches
 │   └── main_benchmark.cpp      # Performance tests
 └── scripts/
     ├── model.py                # PyTorch model definition
@@ -496,19 +576,19 @@ minigo-cpp/
 ### run_loop.sh
 
 ```
-./run_loop.sh [options]
-  --iterations N         Training iterations (default: 30)
-  --games N              Games per iteration (default: 100)
-  --sims N               MCTS simulations per move (default: 400)
-  --board N              Board size (default: 9)
-  --epochs N             Training epochs per iteration (default: 15)
-  --batch N              Training batch size (default: 256)
-  --threads N            Total selfplay worker threads (default: all cores)
-  --search-threads N     MCTS search threads per move (default: 16)
-  --selfplay-instances N Parallel selfplay processes (default: 1)
-  --nn-server-threads N  NN server threads (default: 1)
-  --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
-  --quick                Fast test mode (5x5 board, small net)
+./run_loop.sh init <preset>      Initialize training (clears previous state)
+  Presets: quick, small, large
+  Custom:  init --board 9 --filters 96 --blocks 8
+
+./run_loop.sh train [options]    Start or resume training
+  --threads N             Worker threads (default: all cores)
+  --search-threads N      MCTS search threads per move (default: 16)
+  --selfplay-instances N  Parallel selfplay processes (default: 1)
+  --nn-server-threads N   NN server threads (default: auto-detect)
+  --nn-device-ids IDS     GPU indices, comma-sep (default: auto-detect)
+  --iterations N          Max iterations this session (default: all)
+
+./run_loop.sh status             Show training progress
 ```
 
 ### selfplay
@@ -537,6 +617,24 @@ minigo-cpp/
   --random               Use random bot (no model needed)
   --board N              Board size (for --random mode)
 ```
+
+### evaluate
+
+```
+./build/evaluate [options]
+  --model1 PATH          Candidate model (required)
+  --model2 PATH          Baseline model (required)
+  --games N              Games to play (default: 100)
+  --threads N            Parallel game workers (default: 1)
+  --search-threads N     MCTS threads per move (default: 16)
+  --sims N               MCTS simulations per move (default: 800)
+  --max-batch N          Max GPU batch size (default: 256)
+  --threshold FLOAT      Win rate to pass (default: 0.55)
+  --nn-server-threads N  NN server threads per model (default: 1)
+  --nn-device-ids IDS    GPU indices (default: "0")
+```
+
+Exit code 0 = model1 wins (above threshold), 1 = model1 fails.
 
 ### benchmark
 
@@ -607,7 +705,8 @@ Delete `*.trt_*.engine` files to force a rebuild after upgrading TensorRT or swi
 **OpenCL kernel compile error**: shown in the exception message; usually means
 the GPU doesn't support the feature used.  File a bug with the error text.
 
-**Training interrupted**: Just restart `./run_loop.sh` — it resumes automatically.
+**Training interrupted**: Just re-run `./run_loop.sh train` — it resumes automatically
+from the last completed iteration.  Check `./run_loop.sh status` to see progress.
 
 **Slow on macOS with OpenCL**: Rebuild with Metal backend:
 `cmake .. -DMINIGO_BACKEND=metal && make -j$(sysctl -n hw.ncpu)`.
