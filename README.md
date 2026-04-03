@@ -138,7 +138,7 @@ training plan) and `train` (run or resume training).
 ./run_loop.sh train
 
 # Or with explicit hardware settings:
-./run_loop.sh train --threads 64 --nn-device-ids 0,0,1,1
+./run_loop.sh train --threads 64 --nn-device-ids 0,0,1,1 --max-batch 512
 
 # Run a limited number of iterations then pause:
 ./run_loop.sh train --iterations 20
@@ -185,14 +185,14 @@ The plan is a plain text file — edit it to customize the schedule.
 Every iteration produces a versioned model snapshot:
 - `models/v0001.onnx` ... `models/v0060.onnx` — all candidates
 - `models/best.onnx` — current best (used for self-play)
-- `checkpoints/v0001.pt` ... — training checkpoints with optimizer state
+- `training/checkpoints/v0001.pt` ... — training checkpoints with optimizer state
 
 Only models that pass evaluation gating are promoted to `best.onnx`.
-The `pipeline_state` file tracks progress for resume.
+The `training/state` file tracks progress for resume.
 
 #### Logging
 
-All training metrics are written to `logs/train.log` in real-time:
+All training metrics are written to `training/logs/train.log` in real-time:
 per-iteration parameters, per-epoch losses, selfplay timing, evaluation
 win rates, and promotion decisions.  This single file captures the full
 training history for debugging and tuning.
@@ -534,6 +534,15 @@ minigo-cpp/
 ├── CMakeLists.txt              # Build (Eigen required, OpenCL/Metal optional)
 ├── run_loop.sh                 # Training pipeline (init/train/status)
 ├── training_plan               # Generated training schedule (editable)
+├── models/                     # ONNX model files
+│   ├── best.onnx               #   Current best (used for selfplay)
+│   └── v0001.onnx ...          #   Version snapshots
+├── trt_cache/                  # TensorRT compiled engine cache
+├── training/                   # All training artifacts
+│   ├── selfplay/               #   Game data (iter_0001/, iter_0002/, ...)
+│   ├── checkpoints/            #   PyTorch checkpoints (training.pt, v0001.pt, ...)
+│   ├── logs/                   #   train.log (structured), pipeline.log
+│   └── state                   #   Pipeline resume state
 ├── test_multi_gpu.sh           # Multi-GPU test suite
 ├── include/
 │   ├── config.h                # Hyperparameters
@@ -586,6 +595,7 @@ minigo-cpp/
   --selfplay-instances N  Parallel selfplay processes (default: 1)
   --nn-server-threads N   NN server threads (default: auto-detect)
   --nn-device-ids IDS     GPU indices, comma-sep (default: auto-detect)
+  --max-batch N           Max GPU batch size for NN server (default: 256)
   --iterations N          Max iterations this session (default: all)
 
 ./run_loop.sh status             Show training progress
@@ -613,7 +623,10 @@ minigo-cpp/
   --model PATH           Model file (default: model.onnx)
   --sims N               MCTS simulations per move (default: 800)
   --search-threads N     MCTS search threads (default: 16)
+  --max-batch N          Max GPU batch size (default: 256)
   --komi F               Komi value (default: 7.5)
+  --nn-server-threads N  NN server threads (default: 1)
+  --nn-device-ids IDS    GPU indices (default: "0")
   --random               Use random bot (no model needed)
   --board N              Board size (for --random mode)
 ```

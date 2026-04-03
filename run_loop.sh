@@ -55,12 +55,12 @@ timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
 MODELS_DIR="${PROJECT_DIR}/models"
-DATA_DIR="${PROJECT_DIR}/selfplay_data"
-LOGS_DIR="${PROJECT_DIR}/logs"
-CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints"
-STATE_FILE="${PROJECT_DIR}/pipeline_state"
+DATA_DIR="${PROJECT_DIR}/training/selfplay"
+LOGS_DIR="${PROJECT_DIR}/training/logs"
+CHECKPOINT_DIR="${PROJECT_DIR}/training/checkpoints"
+STATE_FILE="${PROJECT_DIR}/training/state"
 PLAN_FILE="${PROJECT_DIR}/training_plan"
-TRAIN_LOG="${PROJECT_DIR}/logs/train.log"
+TRAIN_LOG="${PROJECT_DIR}/training/logs/train.log"
 
 # ── Logging ────────────────────────────────────────────────
 log() {
@@ -157,7 +157,7 @@ build_data_window() {
 clear_trt_cache() {
     local base
     base=$(basename "$1")
-    rm -f "${PROJECT_DIR}/trt_cache/${base}.trt_"*.engine 2>/dev/null || true
+    rm -f "trt_cache/${base}.trt_"*.engine 2>/dev/null || true
 }
 
 # ── Hardware auto-detection ────────────────────────────────
@@ -199,6 +199,7 @@ run_selfplay() {
             --games ${games_needed} \
             --threads ${THREADS} \
             --search-threads ${SEARCH_THREADS} \
+            --max-batch ${MAX_BATCH} \
             --nn-server-threads ${NN_SERVER_THREADS} \
             --nn-device-ids ${NN_DEVICE_IDS} \
             --output "${iter_data}" \
@@ -215,6 +216,7 @@ run_selfplay() {
                 --games ${gpii} \
                 --threads ${tpii} \
                 --search-threads ${SEARCH_THREADS} \
+                --max-batch ${MAX_BATCH} \
                 --nn-server-threads ${NN_SERVER_THREADS} \
                 --nn-device-ids ${NN_DEVICE_IDS} \
                 --output "${iter_data}" \
@@ -400,8 +402,8 @@ cmd_init() {
 
     # Clean previous state
     echo "Clearing previous training state..."
-    rm -rf "${MODELS_DIR}" "${DATA_DIR}" "${LOGS_DIR}" "${CHECKPOINT_DIR}"
-    rm -f "${STATE_FILE}" "${PROJECT_DIR}/pipeline_config"
+    rm -rf "${MODELS_DIR}" "${PROJECT_DIR}/training"
+    rm -f "${PROJECT_DIR}/pipeline_config"
     mkdir -p "${MODELS_DIR}" "${DATA_DIR}" "${LOGS_DIR}" "${CHECKPOINT_DIR}"
 
     # Generate training plan
@@ -550,6 +552,7 @@ cmd_status() {
 cmd_train() {
     # Auto-detect hardware defaults
     detect_hardware
+    MAX_BATCH=256
     local max_iters=0  # 0 = run until plan ends
 
     while [[ $# -gt 0 ]]; do
@@ -559,6 +562,7 @@ cmd_train() {
             --selfplay-instances)  SELFPLAY_INSTANCES=$2; shift 2;;
             --nn-server-threads)   NN_SERVER_THREADS=$2; shift 2;;
             --nn-device-ids)       NN_DEVICE_IDS=$2; shift 2;;
+            --max-batch)           MAX_BATCH=$2; shift 2;;
             --iterations)          max_iters=$2; shift 2;;
             --help|-h)
                 cat << 'EOF'
@@ -570,6 +574,7 @@ Hardware options (only affects speed, not training quality):
   --selfplay-instances N  Parallel selfplay processes (default: 1)
   --nn-server-threads N   NN server threads (default: auto-detect)
   --nn-device-ids IDS     GPU indices, comma-sep (default: auto-detect)
+  --max-batch N           Max GPU batch size for NN server (default: 256)
   --iterations N          Max iterations to run this session (default: all)
 
 GPU auto-detection: 2 server threads per GPU with pipelining.
@@ -612,7 +617,8 @@ EOF
     echo "  Selfplay inst:    ${SELFPLAY_INSTANCES}"
     echo "  NN servers:       ${NN_SERVER_THREADS}"
     echo "  NN devices:       ${NN_DEVICE_IDS}"
-    echo "  Batch size:       ${PLAN_BATCH_SIZE}"
+    echo "  Max batch (NN):   ${MAX_BATCH}"
+    echo "  Batch size (SGD): ${PLAN_BATCH_SIZE}"
     echo "============================================"
     echo
 
@@ -629,6 +635,7 @@ EOF
     tlog "    Selfplay inst:    ${SELFPLAY_INSTANCES}"
     tlog "    NN servers:       ${NN_SERVER_THREADS}"
     tlog "    NN devices:       ${NN_DEVICE_IDS}"
+    tlog "    Max batch (NN):   ${MAX_BATCH}"
     tlog "  State:"
     tlog "    Best model:       v$(printf '%04d' $BEST_VERSION)"
     tlog "    Total games:      ${TOTAL_GAMES}"
@@ -742,6 +749,7 @@ EOF
                 --games ${STAGE_EVAL_GAMES} \
                 --threads ${THREADS} \
                 --search-threads ${SEARCH_THREADS} \
+                --max-batch ${MAX_BATCH} \
                 --nn-server-threads ${NN_SERVER_THREADS} \
                 --nn-device-ids ${NN_DEVICE_IDS} \
                 --sims ${STAGE_SIMS} \
