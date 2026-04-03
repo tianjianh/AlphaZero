@@ -130,8 +130,8 @@ training plan) and `train` (run or resume training).
 
 ```bash
 # 1. Initialize — pick a preset or custom architecture
-./run_loop.sh init small       # 9x9, 64f/5b,  60 iters (~2-4 hours)
-./run_loop.sh init large       # 9x9, 128f/10b, 200 iters (~12-24 hours)
+./run_loop.sh init small       # 9x9, 64f/5b,  100 iters, ~240K games
+./run_loop.sh init large       # 9x9, 128f/10b, 200 iters, ~800K games
 ./run_loop.sh init quick       # 5x5, 32f/3b,  5 iters (pipeline test)
 ./run_loop.sh init --board 9 --filters 96 --blocks 8   # custom arch
 
@@ -168,10 +168,10 @@ parameters:
 ```
   Stage             Iters   Games   Sims  Epoch      LR   Gate
   ────────────────────────────────────────────────────────────
-  Warm up           1-5     200    400     15    2e-3    off
-  Explore           6-15    400    600     15    1e-3    50g
-  Strengthen       16-35    400    600     20    5e-4   100g
-  Polish           36-60    500    800     20    1e-4   100g
+  Warm up           1-5     500    400     10    2e-3    off
+  Explore           6-25   1500    600     15    1e-3   100g
+  Strengthen       26-60   2500    600     15    5e-4   100g
+  Polish           61-100  3000    800     20    1e-4   100g
 ```
 
 Each stage defines: selfplay games per iteration, MCTS simulations per move,
@@ -493,7 +493,10 @@ The pipeline is fully resumable at every phase boundary.  Run
 
 Training uses a **sliding window** — only data from the last N iterations
 is loaded (configurable via `PLAN_WINDOW_SIZE` in the training plan),
-keeping training focused on recent, stronger games and bounding memory usage.
+keeping training focused on recent, stronger games.  This is the standard
+approach used by AlphaGo Zero and KataGo.  Data is streamed from disk via
+memory-mapped I/O with a multi-worker DataLoader, so there is no memory
+limit — the OS page cache handles hot/cold data automatically.
 
 ## Model Format
 

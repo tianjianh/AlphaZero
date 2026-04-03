@@ -254,26 +254,26 @@ EOF
             cat << 'EOF'
 PLAN_NUM_STAGES=4
 PLAN_STAGE_NAME_1="Warm up"
-PLAN_STAGE_1="1 5 200 400 15 2e-3 0"
+PLAN_STAGE_1="1 5 500 400 10 2e-3 0"
 PLAN_STAGE_NAME_2="Explore"
-PLAN_STAGE_2="6 15 400 600 15 1e-3 50"
+PLAN_STAGE_2="6 25 1500 600 15 1e-3 100"
 PLAN_STAGE_NAME_3="Strengthen"
-PLAN_STAGE_3="16 35 400 600 20 5e-4 100"
+PLAN_STAGE_3="26 60 2500 600 15 5e-4 100"
 PLAN_STAGE_NAME_4="Polish"
-PLAN_STAGE_4="36 60 500 800 20 1e-4 100"
+PLAN_STAGE_4="61 100 3000 800 20 1e-4 100"
 EOF
             ;;
         large)
             cat << 'EOF'
 PLAN_NUM_STAGES=4
 PLAN_STAGE_NAME_1="Warm up"
-PLAN_STAGE_1="1 10 400 600 15 2e-3 0"
+PLAN_STAGE_1="1 10 1000 600 10 2e-3 0"
 PLAN_STAGE_NAME_2="Explore"
-PLAN_STAGE_2="11 50 800 800 20 1e-3 100"
+PLAN_STAGE_2="11 50 3000 800 15 1e-3 200"
 PLAN_STAGE_NAME_3="Strengthen"
-PLAN_STAGE_3="51 120 800 1000 20 5e-4 200"
+PLAN_STAGE_3="51 130 4000 1000 20 5e-4 200"
 PLAN_STAGE_NAME_4="Master"
-PLAN_STAGE_4="121 200 1000 1200 20 1e-4 200"
+PLAN_STAGE_4="131 200 5000 1200 20 1e-4 200"
 EOF
             ;;
         custom)
@@ -291,19 +291,20 @@ EOF
             local s3_start=$(( s2_end + 1 ))
             local s4_start=$(( s3_end + 1 ))
 
-            local bg=$(( 200 * board * board / 81 ))
-            [ $bg -lt 20 ] && bg=20
+            # Base games scale with board complexity
+            local bg=$(( 500 * board * board / 81 ))
+            [ $bg -lt 50 ] && bg=50
 
             cat << EOF
 PLAN_NUM_STAGES=4
 PLAN_STAGE_NAME_1="Warm up"
-PLAN_STAGE_1="1 ${s1_end} $((bg * 2)) 400 15 2e-3 0"
+PLAN_STAGE_1="1 ${s1_end} ${bg} 400 10 2e-3 0"
 PLAN_STAGE_NAME_2="Explore"
-PLAN_STAGE_2="${s2_start} ${s2_end} $((bg * 4)) 600 15 1e-3 50"
+PLAN_STAGE_2="${s2_start} ${s2_end} $((bg * 3)) 600 15 1e-3 100"
 PLAN_STAGE_NAME_3="Strengthen"
-PLAN_STAGE_3="${s3_start} ${s3_end} $((bg * 4)) 600 20 5e-4 100"
+PLAN_STAGE_3="${s3_start} ${s3_end} $((bg * 5)) 600 15 5e-4 100"
 PLAN_STAGE_NAME_4="Polish"
-PLAN_STAGE_4="${s4_start} ${s4_end} $((bg * 5)) 800 20 1e-4 100"
+PLAN_STAGE_4="${s4_start} ${s4_end} $((bg * 6)) 800 20 1e-4 100"
 EOF
             ;;
     esac
@@ -312,11 +313,11 @@ EOF
 generate_plan() {
     local board=$1 filters=$2 blocks=$3 preset=$4
 
-    local batch_size=1024 eval_threshold="0.55" buffer_size=500000 window=20
+    local batch_size=1024 eval_threshold="0.55" window=20
 
     case "$preset" in
-        quick) batch_size=64; buffer_size=50000; window=5; eval_threshold="0.5";;
-        large) buffer_size=1000000; window=30;;
+        quick) batch_size=64; window=5; eval_threshold="0.5";;
+        large) window=30;;
     esac
 
     cat > "$PLAN_FILE" << EOF
@@ -339,12 +340,12 @@ PLAN_BATCH_SIZE=${batch_size}
 # Candidate model must win >= this fraction of evaluation games
 # to be promoted over the current best model.
 PLAN_EVAL_THRESHOLD=${eval_threshold}
-# Maximum training samples kept in memory. When total samples exceed
-# this, only the most recent are kept. Prevents OOM on long runs.
-PLAN_BUFFER_SIZE=${buffer_size}
-# Number of recent selfplay iterations whose data is loaded for training.
-# E.g. window=20 means only data from the last 20 iterations is used,
-# keeping training focused on recent (stronger) games.
+# Sliding window: number of recent selfplay iterations whose data is
+# loaded for training. Keeps training focused on games from models of
+# similar strength while retaining enough history for diversity.
+# This is the standard AlphaZero approach (AlphaGo Zero used the last
+# 500K games; KataGo uses a similar sliding window).
+# Data is streamed from disk via memory-mapped I/O — no memory limit.
 PLAN_WINDOW_SIZE=${window}
 
 # ── Training Stages ──────────────────────────────────────
@@ -449,8 +450,7 @@ Initialized:  $(timestamp)
 Preset:       ${preset}
 Architecture: ${board}x${board} board, ${filters} filters, ${blocks} blocks
 Batch size:   ${PLAN_BATCH_SIZE}
-Buffer size:  ${PLAN_BUFFER_SIZE} samples
-Window size:  ${PLAN_WINDOW_SIZE} iterations
+Window size:  ${PLAN_WINDOW_SIZE} iterations (data streamed via mmap, no memory limit)
 Eval gate:    ${PLAN_EVAL_THRESHOLD} win rate threshold
 
 Training Plan:
@@ -638,7 +638,6 @@ EOF
     tlog_section "TRAINING SESSION  iter ${start_iter}..${end_iter}"
     tlog "  Architecture:     ${PLAN_BOARD}x${PLAN_BOARD}, ${PLAN_FILTERS}f x ${PLAN_BLOCKS}b"
     tlog "  Batch size:       ${PLAN_BATCH_SIZE}"
-    tlog "  Buffer size:      ${PLAN_BUFFER_SIZE} samples"
     tlog "  Data window:      last ${PLAN_WINDOW_SIZE} iterations"
     tlog "  Eval threshold:   ${PLAN_EVAL_THRESHOLD}"
     tlog "  Hardware:"
@@ -716,7 +715,7 @@ EOF
 
             log "Phase 2 — Training: ${STAGE_EPOCHS} epochs, lr=${STAGE_LR}, batch=${PLAN_BATCH_SIZE}..."
             tlog "  Phase 2 training: ${STAGE_EPOCHS} epochs, lr=${STAGE_LR}, batch=${PLAN_BATCH_SIZE}"
-            tlog "    window=${n_window_dirs} dirs  buffer=${PLAN_BUFFER_SIZE}"
+            tlog "    window=${n_window_dirs} dirs"
 
             local t_start=$SECONDS
 
@@ -744,9 +743,7 @@ EOF
                 --board ${PLAN_BOARD} \
                 --filters ${PLAN_FILTERS} \
                 --blocks ${PLAN_BLOCKS} \
-                --buffer-size ${PLAN_BUFFER_SIZE} \
                 --output-onnx "${CANDIDATE_ONNX}" \
-                --retrain \
                 --log-file "${TRAIN_LOG}"
             cd "${PROJECT_DIR}"
 
@@ -856,8 +853,8 @@ Commands:
 
 Presets for init:
   quick           5x5, 32f/3b, 5 iterations (pipeline test)
-  small           9x9, 64f/5b, 60 iterations (~2-4 hours)
-  large           9x9, 128f/10b, 200 iterations (~12-24 hours)
+  small           9x9, 64f/5b, 100 iterations, ~240K games
+  large           9x9, 128f/10b, 200 iterations, ~800K games
 
 Custom init:
   init --board 9 --filters 96 --blocks 8
