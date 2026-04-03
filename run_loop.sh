@@ -671,7 +671,7 @@ EOF
         ITER_DATA="${DATA_DIR}/iter_$(printf '%04d' ${iter})"
         mkdir -p "${ITER_DATA}"
 
-        existing_games=$(find "${ITER_DATA}" -maxdepth 1 -name "*.bin" 2>/dev/null | wc -l)
+        existing_games=$(find "${ITER_DATA}" -maxdepth 1 \( -name "*.bin" -o -name "*.bin.gz" \) 2>/dev/null | wc -l)
         if [ "$existing_games" -ge "$STAGE_GAMES" ]; then
             log "Phase 1 — Selfplay: SKIP (${existing_games} games exist)"
             tlog "  Phase 1 selfplay: SKIP (${existing_games} games exist)"
@@ -689,6 +689,9 @@ EOF
             run_selfplay "${ITER_DATA}" "${SELFPLAY_MODEL}" "${games_needed}" "${STAGE_SIMS}"
             local sp_time=$((SECONDS - t_start))
             TOTAL_GAMES=$((TOTAL_GAMES + games_needed))
+
+            # Compress .bin → .bin.gz to save disk (~100x smaller)
+            gzip "${ITER_DATA}"/game_*.bin 2>/dev/null || true
 
             tlog "    done: ${sp_time}s ($(echo "scale=2; $sp_time / $games_needed" | bc 2>/dev/null || echo "?")s/game)  total_games=${TOTAL_GAMES}"
             log "Phase 1 — Selfplay done (${sp_time}s). Total games: ${TOTAL_GAMES}"
