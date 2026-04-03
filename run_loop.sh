@@ -153,12 +153,6 @@ build_data_window() {
     echo "$dirs"
 }
 
-# Delete stale TensorRT cached engines for a model
-clear_trt_cache() {
-    local base
-    base=$(basename "$1")
-    rm -f "trt_cache/${base}.trt_"*.engine 2>/dev/null || true
-}
 
 # ── Hardware auto-detection ────────────────────────────────
 detect_hardware() {
@@ -684,13 +678,16 @@ EOF
             tlog "  Phase 1 selfplay: SKIP (${existing_games} games exist)"
         else
             local games_needed=$(( STAGE_GAMES - existing_games ))
+            # Use versioned model file directly (TRT cache persists per version)
+            local SELFPLAY_MODEL
+            SELFPLAY_MODEL="$(version_onnx $BEST_VERSION)"
             log "Phase 1 — Selfplay: ${games_needed} games, ${STAGE_SIMS} sims, model v$(printf '%04d' $BEST_VERSION)..."
             tlog "  Phase 1 selfplay: ${games_needed} games, ${STAGE_SIMS} sims/move"
-            tlog "    model=$(best_onnx)  threads=${THREADS}  search_threads=${SEARCH_THREADS}"
+            tlog "    model=${SELFPLAY_MODEL}  threads=${THREADS}  search_threads=${SEARCH_THREADS}"
             tlog "    nn_servers=${NN_SERVER_THREADS}  devices=${NN_DEVICE_IDS}  instances=${SELFPLAY_INSTANCES}"
 
             local t_start=$SECONDS
-            run_selfplay "${ITER_DATA}" "$(best_onnx)" "${games_needed}" "${STAGE_SIMS}"
+            run_selfplay "${ITER_DATA}" "${SELFPLAY_MODEL}" "${games_needed}" "${STAGE_SIMS}"
             local sp_time=$((SECONDS - t_start))
             TOTAL_GAMES=$((TOTAL_GAMES + games_needed))
 
@@ -723,8 +720,22 @@ EOF
 
             local t_start=$SECONDS
 
+            # Detect GPUs for DDP training
+            local train_gpus=1
+            if command -v nvidia-smi &>/dev/null; then
+                train_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+            fi
+
+            local train_cmd="$PYTHON"
+            local train_args=""
+            if [ "$train_gpus" -gt 1 ]; then
+                local port=$((29500 + RANDOM % 1000))
+                train_cmd="torchrun --nproc_per_node=${train_gpus} --master_port=${port}"
+                train_args=""  # torchrun replaces $PYTHON
+            fi
+
             cd "${PROJECT_DIR}/scripts"
-            $PYTHON train.py \
+            $train_cmd train.py \
                 --data "${WINDOW_DIRS}" \
                 --checkpoint "${TRAIN_CKPT}" \
                 --epochs ${STAGE_EPOCHS} \
@@ -763,7 +774,7 @@ EOF
             set +e
             "${BUILD_DIR}/evaluate" \
                 --model1 "${CANDIDATE_ONNX}" \
-                --model2 "$(best_onnx)" \
+                --model2 "$(version_onnx $BEST_VERSION)" \
                 --games ${STAGE_EVAL_GAMES} \
                 --threads ${THREADS} \
                 --search-threads ${SEARCH_THREADS} \
@@ -792,7 +803,6 @@ EOF
             if [ $eval_result -eq 0 ]; then
                 log "Phase 3 — PROMOTED v$(printf '%04d' $iter) ${wr} (beats v$(printf '%04d' $BEST_VERSION)) [${ev_time}s]"
                 cp "${CANDIDATE_ONNX}" "$(best_onnx)"
-                clear_trt_cache "$(best_onnx)"
                 BEST_VERSION=$iter
                 TOTAL_PROMOTIONS=$((TOTAL_PROMOTIONS + 1))
             else
@@ -804,7 +814,6 @@ EOF
                 || log "Phase 3 — Auto-promote v$(printf '%04d' $iter) (no gate this stage)"
             tlog "  Phase 3: auto-promote v$(printf '%04d' $iter)"
             cp "${CANDIDATE_ONNX}" "$(best_onnx)"
-            clear_trt_cache "$(best_onnx)"
             BEST_VERSION=$iter
             TOTAL_PROMOTIONS=$((TOTAL_PROMOTIONS + 1))
         fi

@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-MiniGo AlphaZero — Hybrid Training Pipeline
+MiniGo AlphaZero — Training Script
 
-Workflow:
-  1. Export current model to ONNX:       python export_onnx.py
-  2. Generate self-play data in C++:     ./selfplay --model model.onnx --games 200
-  3. Train the model in Python:          python train.py --data selfplay_data/
-  4. Export updated ONNX model and repeat
+Reads binary self-play data from C++ and trains the PyTorch model.
+Supports multi-GPU via DistributedDataParallel (launched with torchrun).
 
-This script handles step 3: reading binary self-play data and training
-the PyTorch model. Training is resumable — optimizer state, epoch, and
-trained file history are saved in the checkpoint.
+Single GPU:   python train.py --data selfplay/ --epochs 15
+Multi GPU:    torchrun --nproc_per_node=2 train.py --data selfplay/ --epochs 15
 """
 
 import argparse
@@ -25,6 +21,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.insert(0, os.path.dirname(__file__))
 from model import AlphaZeroNet
@@ -56,14 +54,8 @@ def read_selfplay_data(path):
 
 
 def load_all_data(data_dir, exclude_files=None):
-    """Load all self-play data files from a directory (recursively).
-
-    Returns (records, loaded_files) where loaded_files is the set of
-    file paths that were loaded (for tracking in checkpoint).
-    """
+    """Load all .bin files from a directory recursively."""
     exclude_files = exclude_files or set()
-
-    # Search recursively for .bin files
     files = sorted(glob.glob(os.path.join(data_dir, "**", "*.bin"), recursive=True))
     if not files:
         return [], set()
@@ -99,14 +91,11 @@ def train_epoch(model, data, batch_size, optimizer, device):
         policy_t = torch.tensor(np.array(policies), dtype=torch.float32).to(device)
         value_t = torch.tensor(values, dtype=torch.float32).unsqueeze(1).to(device)
 
-        # Reshape state: (batch, C*H*W) -> (batch, C, H, W)
         board_size = int(np.sqrt(state_t.shape[1] // 17))
         state_t = state_t.view(-1, 17, board_size, board_size)
 
-        # Forward
         logits, pred_value = model(state_t)
 
-        # Losses
         policy_loss = -torch.sum(
             policy_t * torch.log_softmax(logits, dim=1)
         ) / state_t.size(0)
@@ -133,7 +122,7 @@ def train_epoch(model, data, batch_size, optimizer, device):
 def main():
     parser = argparse.ArgumentParser(description="Train model on C++ self-play data")
     parser.add_argument("--data", default="selfplay_data",
-                        help="Data directories (comma-separated for multiple, searched recursively)")
+                        help="Data directories (comma-separated for multiple)")
     parser.add_argument("--checkpoint", default="checkpoints/best_model.pt",
                         help="Model checkpoint to load/save")
     parser.add_argument("--epochs", type=int, default=20)
@@ -148,14 +137,38 @@ def main():
     parser.add_argument("--output-onnx", default="model.onnx",
                         help="Output ONNX model path")
     parser.add_argument("--retrain", action="store_true",
-                        help="Retrain on all data (ignore previously trained file history)")
+                        help="Retrain on all data (ignore trained file history)")
     parser.add_argument("--log-file", default=None,
-                        help="Append structured training metrics to this file (for pipeline)")
+                        help="Append structured metrics to this file")
     args = parser.parse_args()
 
-    # Structured log helper — writes to log file in real time
+    # ── DDP setup ──────────────────────────────────────────
+    # Detect if launched via torchrun (sets LOCAL_RANK env var)
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    use_ddp = local_rank >= 0 and torch.cuda.is_available()
+
+    if use_ddp:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank = 0
+        world_size = 1
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+
+    is_main = (rank == 0)
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+
+    # Structured log — only main process writes
     log_file = None
-    if args.log_file:
+    if args.log_file and is_main:
         log_file = open(args.log_file, "a")
 
     def tlog(msg):
@@ -163,19 +176,18 @@ def main():
             log_file.write(msg + "\n")
             log_file.flush()
 
-    # Device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
+    def mprint(*a, **kw):
+        if is_main:
+            print(*a, **kw)
+
+    if use_ddp:
+        mprint(f"DDP: {world_size} GPUs (rank {rank}, device cuda:{local_rank})")
+        tlog(f"    DDP: {world_size} GPUs")
     else:
-        device = torch.device("cpu")
+        mprint(f"Device: {device}  GPUs: {num_gpus}")
+        tlog(f"    Device: {device}, {num_gpus} GPU(s)")
 
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print(f"Device: {device}  GPUs: {num_gpus}")
-    tlog(f"    Device: {device}, {num_gpus} GPU(s)")
-
-    # Load model
+    # ── Model + optimizer ──────────────────────────────────
     model = AlphaZeroNet(
         board_size=args.board,
         input_channels=17,
@@ -183,15 +195,15 @@ def main():
         num_res_blocks=args.blocks,
     ).to(device)
 
-    # Optimizer (created before DataParallel so param groups match)
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
                            weight_decay=args.weight_decay)
 
-    # Resume from checkpoint if it exists
+    # Resume from checkpoint
     trained_files = set()
     start_iteration = 0
 
-    os.makedirs(os.path.dirname(args.checkpoint) or "checkpoints", exist_ok=True)
+    if is_main:
+        os.makedirs(os.path.dirname(args.checkpoint) or "checkpoints", exist_ok=True)
     if os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
@@ -200,25 +212,23 @@ def main():
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             trained_files = set(ckpt.get("trained_files", []))
             start_iteration = ckpt.get("iteration", 0)
-            print(f"Resumed from iteration {start_iteration}")
+            mprint(f"Resumed from iteration {start_iteration}")
         else:
             model.load_state_dict(ckpt)
-            print(f"Loaded legacy checkpoint")
+            mprint("Loaded legacy checkpoint")
     else:
-        print("Starting from scratch")
+        mprint("Starting from scratch")
 
-    # Multi-GPU DataParallel (wrap after checkpoint load, before training)
-    if num_gpus > 1:
-        model = nn.DataParallel(model)
-        print(f"DataParallel: training on {num_gpus} GPUs")
+    # Wrap with DDP (after checkpoint load)
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank])
 
-    # With --retrain, ignore trained file history (load everything fresh)
     if args.retrain:
         trained_files = set()
 
-    # Load training data from one or more directories
+    # ── Load data ──────────────────────────────────────────
     data_dirs = [d.strip() for d in args.data.split(",")]
-    print(f"Loading data from {len(data_dirs)} dir(s)...")
+    mprint(f"Loading data from {len(data_dirs)} dir(s)...")
     t_load = time.time()
     data = []
     new_files = set()
@@ -232,74 +242,81 @@ def main():
     load_time = time.time() - t_load
 
     if not data:
-        print("No new data to train on.")
+        mprint("No new data to train on.")
         tlog("    ERROR: no training data found")
         if log_file:
             log_file.close()
+        if use_ddp:
+            dist.destroy_process_group()
         return
 
-    print(f"Loaded {len(data)} samples from {n_files} files ({load_time:.1f}s)")
-
-    # Trim to buffer size (keep most recent)
+    # Trim to buffer size
     trimmed = False
     if len(data) > args.buffer_size:
         data = data[-args.buffer_size:]
         trimmed = True
-        print(f"Trimmed to {len(data)} most recent samples")
 
-    n_batches = len(data) // args.batch_size
+    mprint(f"Loaded {len(data)} samples from {n_files} files ({load_time:.1f}s)")
     tlog(f"    Samples:       {len(data)} from {n_files} files" +
          (f" (trimmed to buffer {args.buffer_size})" if trimmed else ""))
-    tlog(f"    Batches/epoch: {n_batches}")
+
+    # Split data across DDP ranks (interleaved for even distribution)
+    if world_size > 1:
+        data = data[rank::world_size]
+        mprint(f"DDP: {len(data)} samples per GPU (effective batch={args.batch_size * world_size})")
+
+    n_batches = len(data) // args.batch_size
+    tlog(f"    Batches/epoch: {n_batches}" +
+         (f" x {world_size} GPUs" if world_size > 1 else ""))
     tlog(f"    Load time:     {load_time:.1f}s")
 
-    # Train
-    print(f"\nTraining: {args.epochs} epochs, batch={args.batch_size}, "
-          f"lr={args.lr}, {n_batches} batches/epoch")
-    print("-" * 60)
+    # ── Train ──────────────────────────────────────────────
+    mprint(f"\nTraining: {args.epochs} epochs, batch={args.batch_size}, "
+           f"lr={args.lr}, {n_batches} batches/epoch"
+           + (f" x {world_size} GPUs" if world_size > 1 else ""))
+    mprint("-" * 60)
 
     t_train_start = time.time()
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         loss, pl, vl = train_epoch(model, data, args.batch_size, optimizer, device)
         dt = time.time() - t0
-        print(f"  Epoch {epoch:3d}/{args.epochs}  loss={loss:.4f}  "
-              f"policy={pl:.4f}  value={vl:.4f}  ({dt:.1f}s)")
+        mprint(f"  Epoch {epoch:3d}/{args.epochs}  loss={loss:.4f}  "
+               f"policy={pl:.4f}  value={vl:.4f}  ({dt:.1f}s)")
         tlog(f"    Epoch {epoch:3d}/{args.epochs}  "
              f"loss={loss:.4f}  policy={pl:.4f}  value={vl:.4f}  {dt:.1f}s")
 
     train_time = time.time() - t_train_start
-    print(f"Training complete ({train_time:.1f}s)")
+    mprint(f"Training complete ({train_time:.1f}s)")
     tlog(f"    Training time: {train_time:.1f}s")
 
-    # Update trained files set
-    all_trained_files = trained_files | new_files
+    # ── Save & export (main process only) ──────────────────
+    if is_main:
+        all_trained_files = trained_files | new_files
+        base_model = model.module if use_ddp else model
 
-    # Unwrap DataParallel for saving and export
-    base_model = model.module if isinstance(model, nn.DataParallel) else model
+        checkpoint = {
+            "model_state_dict": base_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "iteration": start_iteration + 1,
+            "trained_files": list(all_trained_files),
+            "board_size": args.board,
+            "num_filters": args.filters,
+            "num_res_blocks": args.blocks,
+        }
+        torch.save(checkpoint, args.checkpoint)
+        print(f"Saved checkpoint: {args.checkpoint}")
 
-    # Save full checkpoint (model + optimizer + metadata)
-    checkpoint = {
-        "model_state_dict": base_model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "iteration": start_iteration + 1,
-        "trained_files": list(all_trained_files),
-        "board_size": args.board,
-        "num_filters": args.filters,
-        "num_res_blocks": args.blocks,
-    }
-    torch.save(checkpoint, args.checkpoint)
-    print(f"Saved checkpoint: {args.checkpoint}")
-
-    # Export ONNX model for C++
-    print("Exporting ONNX model...")
-    from export_onnx import export_to_onnx
-    model_cpu = base_model.cpu()
-    export_to_onnx(model_cpu, args.output_onnx, board_size=args.board)
-    tlog(f"    Exported: {args.output_onnx}")
+        print("Exporting ONNX model...")
+        from export_onnx import export_to_onnx
+        model_cpu = base_model.cpu()
+        export_to_onnx(model_cpu, args.output_onnx, board_size=args.board)
+        tlog(f"    Exported: {args.output_onnx}")
 
     if log_file:
         log_file.close()
+    if use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
