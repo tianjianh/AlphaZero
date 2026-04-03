@@ -89,7 +89,17 @@ static std::string make_cache_path(const std::string& model_path,
         else if (c == ' ')
             safe_name += '_';
     }
-    return model_path + ".trt_" + safe_name + "_b" +
+
+    // Extract model filename; cache in a fixed trt_cache/ directory
+    std::string base = model_path;
+    auto slash = model_path.find_last_of('/');
+    if (slash != std::string::npos)
+        base = model_path.substr(slash + 1);
+
+    std::string cache_dir = "trt_cache";
+    system(("mkdir -p " + cache_dir).c_str());
+
+    return cache_dir + "/" + base + ".trt_" + safe_name + "_b" +
            std::to_string(max_batch_size) + ".engine";
 }
 

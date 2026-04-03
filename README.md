@@ -697,8 +697,9 @@ Requires NVIDIA's CUDA apt repository. Verify with `dpkg -l | grep libnvinfer-de
 Check `nvidia-smi` (driver CUDA version) vs `dpkg -l libnvinfer10` (TensorRT CUDA version).
 If mismatched, install the TensorRT package built for your driver's CUDA version.
 
-**TensorRT engine rebuild**: The cached `.engine` file is GPU-specific and TensorRT-version-specific.
-Delete `*.trt_*.engine` files to force a rebuild after upgrading TensorRT or switching GPUs.
+**TensorRT engine rebuild**: Cached engines are stored in `trt_cache/` beside the model directory
+and are GPU-specific and TensorRT-version-specific.
+Delete the `trt_cache/` directory to force a rebuild after upgrading TensorRT or switching GPUs.
 
 **Build without GPU**: `cmake .. -DMINIGO_BACKEND=eigen` (CPU-only)
 

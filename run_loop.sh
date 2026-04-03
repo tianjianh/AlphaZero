@@ -153,7 +153,12 @@ build_data_window() {
     echo "$dirs"
 }
 
-clear_trt_cache() { rm -f "${1}.trt_"*.engine 2>/dev/null || true; }
+# Delete stale TensorRT cached engines for a model
+clear_trt_cache() {
+    local base
+    base=$(basename "$1")
+    rm -f "${PROJECT_DIR}/trt_cache/${base}.trt_"*.engine 2>/dev/null || true
+}
 
 # ── Hardware auto-detection ────────────────────────────────
 detect_hardware() {
