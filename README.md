@@ -74,11 +74,12 @@ sudo apt install libopenblas-dev
 ### Python (both platforms — only needed for training)
 
 ```bash
-pip install torch numpy onnx
+pip install torch numpy onnx onnxscript
 ```
 
 Python is NOT required for inference — only for training (`train.py`)
-and model export (`export_onnx.py`).
+and model export (`export_onnx.py`).  Multi-GPU training uses PyTorch
+DistributedDataParallel via `torchrun` (included with PyTorch).
 
 ## Build
 
@@ -156,7 +157,7 @@ checkpoints, and training logs are all preserved.
 Each iteration runs three phases:
 
 1. **Self-play**: generate games with the current best model (C++, multi-GPU)
-2. **Train**: train on a sliding window of recent data (Python/PyTorch, multi-GPU DataParallel)
+2. **Train**: train on a sliding window of recent data (Python/PyTorch, multi-GPU DDP)
 3. **Evaluate & gate**: play games between candidate and best model; promote
    if candidate wins ≥ 55% (configurable)
 
@@ -200,13 +201,16 @@ training history for debugging and tuning.
 
 #### GPU auto-detection
 
-The `train` command auto-detects NVIDIA GPUs and configures pipelining
-(2 NN server threads per GPU):
-- 1 GPU → `--nn-server-threads 2 --nn-device-ids 0,0`
-- 2 GPUs → `--nn-server-threads 4 --nn-device-ids 0,0,1,1`
+The `train` command auto-detects NVIDIA GPUs and configures:
+- **C++ selfplay/evaluate**: 2 NN server threads per GPU with pipelining
+  - 1 GPU → `--nn-server-threads 2 --nn-device-ids 0,0`
+  - 2 GPUs → `--nn-server-threads 4 --nn-device-ids 0,0,1,1`
+- **Python training**: auto-launches via `torchrun` with DDP (DistributedDataParallel)
+  when multiple GPUs are detected.  Each GPU runs its own process with NCCL
+  gradient synchronization.  Data is split across GPUs; effective batch size
+  scales with GPU count.
 
-Override with explicit flags if needed.  PyTorch training also uses
-`DataParallel` automatically when multiple GPUs are available.
+Override with explicit flags if needed.
 
 #### Evaluation binary
 
@@ -290,7 +294,7 @@ cd ..
                       ▼
           ┌─── Python ───────────┐
           │  train.py (PyTorch)  │
-          │  export_onnx.py      │──▶ model.onnx
+          │  export_onnx.py      │──▶ models/*.onnx
           └──────────────────────┘
 ```
 
@@ -478,14 +482,14 @@ threads: `total = min(games, threads) × search_threads`.
 The pipeline is fully resumable at every phase boundary.  Run
 `./run_loop.sh train` after any interruption to continue:
 
-- **Pipeline state** (`pipeline_state`): tracks current iteration, best model
+- **Pipeline state** (`training/state`): tracks current iteration, best model
   version, total games played, and promotion count
 - **Selfplay resume**: skips iterations that already have enough game files
 - **Training resume**: skips iterations whose versioned ONNX + checkpoint exist
-- **Checkpoints** (`checkpoints/training.pt`): model weights + Adam optimizer
+- **Checkpoints** (`training/checkpoints/training.pt`): model weights + Adam optimizer
   state (momentum buffers) for smooth continuation
 - **Selfplay data**: accumulates in per-iteration directories
-  (`selfplay_data/iter_0001/`, etc.) and is never deleted
+  (`training/selfplay/iter_0001/`, etc.) and is never deleted
 
 Training uses a **sliding window** — only data from the last N iterations
 is loaded (configurable via `PLAN_WINDOW_SIZE` in the training plan),
@@ -561,7 +565,7 @@ minigo-cpp/
 └── scripts/
     ├── model.py                # PyTorch model definition
     ├── export_onnx.py          # PyTorch → ONNX export
-    └── train.py                # Train on self-play data (resumable)
+    └── train.py                # Train on self-play data (DDP, resumable)
 ```
 
 ## CLI Reference
@@ -589,12 +593,12 @@ minigo-cpp/
 
 ```
 ./build/selfplay [options]
-  --model PATH           Model file (default: model.onnx)
+  --model PATH           Model file (default: models/best.onnx)
   --games N              Number of games (default: 100)
   --threads N            Parallel workers (default: 1)
   --search-threads N     MCTS search threads per move (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
-  --output DIR           Output directory (default: selfplay_data)
+  --output DIR           Output directory (default: training/selfplay)
   --sims N               MCTS simulations per move (default: 800)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
@@ -604,7 +608,7 @@ minigo-cpp/
 
 ```
 ./build/play [options]
-  --model PATH           Model file (default: model.onnx)
+  --model PATH           Model file (default: models/best.onnx)
   --sims N               MCTS simulations per move (default: 800)
   --search-threads N     MCTS search threads (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
@@ -637,7 +641,7 @@ Exit code 0 = model1 wins (above threshold), 1 = model1 fails.
 
 ```
 ./build/benchmark [options]
-  --model PATH           Model file (default: model.onnx)
+  --model PATH           Model file (default: models/best.onnx)
   --sims N               MCTS simulations
   --nn-iters N           NN inference iterations (default: 1000)
   --games N              Self-play games (default: 5)

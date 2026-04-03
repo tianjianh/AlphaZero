@@ -6,8 +6,8 @@ The ONNX model is the universal format used by all C++ inference backends.
 Both the ONNX Runtime backend and the Eigen backend load .onnx files.
 
 Usage:
-  python export_onnx.py --checkpoint checkpoints/best_model.pt --output model.onnx
-  python export_onnx.py --init --board 9 --output model.onnx  # random weights
+  python export_onnx.py --checkpoint ../training/checkpoints/training.pt --output ../models/model.onnx
+  python export_onnx.py --init --board 9 --output ../models/model.onnx  # random weights
 """
 
 import argparse
@@ -90,18 +90,15 @@ def main():
         description="Export PyTorch model to ONNX",
         epilog="""Examples:
   # Default small model (64 filters, 5 blocks)
-  python3 export_onnx.py --init --output model.onnx
+  python3 export_onnx.py --init --output ../models/model.onnx
 
   # Large model for GPU benchmarking (128 filters, 10 blocks)
-  python3 export_onnx.py --init --filters 128 --blocks 10 --output model_large.onnx
-
-  # Extra-large model
-  python3 export_onnx.py --init --filters 256 --blocks 20 --output model_xlarge.onnx
+  python3 export_onnx.py --init --filters 128 --blocks 10 --output ../models/large.onnx
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", default="checkpoints/best_model.pt",
+    parser.add_argument("--checkpoint", default="../training/checkpoints/training.pt",
                         help="PyTorch checkpoint path")
-    parser.add_argument("--output", default="model.onnx",
+    parser.add_argument("--output", default="../models/model.onnx",
                         help="Output ONNX file")
     parser.add_argument("--board", type=int, default=9,
                         help="Board size (default: 9)")

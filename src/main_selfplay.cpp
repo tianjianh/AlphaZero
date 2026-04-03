@@ -44,8 +44,8 @@ static std::vector<int> parse_device_ids(const std::string& str) {
 
 int main(int argc, char* argv[]) {
     Config config;
-    std::string model_path  = "model.onnx";
-    std::string output_dir  = "selfplay_data";
+    std::string model_path  = "models/best.onnx";
+    std::string output_dir  = "training/selfplay";
     int  num_games          = 100;
     int  num_threads        = 1;
     int  search_threads     = 16;
@@ -66,12 +66,12 @@ int main(int argc, char* argv[]) {
         else if (arg == "--help") {
             std::cout
                 << "Usage: selfplay [options]\n"
-                << "  --model PATH            Model file (default: model.onnx)\n"
+                << "  --model PATH            Model file (default: models/best.onnx)\n"
                 << "  --games N               Number of games (default: 100)\n"
                 << "  --threads N             Parallel self-play workers (default: 1)\n"
                 << "  --search-threads N      MCTS search threads per move (default: 16)\n"
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
-                << "  --output DIR            Output directory (default: selfplay_data)\n"
+                << "  --output DIR            Output directory (default: training/selfplay)\n"
                 << "  --sims N                MCTS simulations per move (default: 800)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";

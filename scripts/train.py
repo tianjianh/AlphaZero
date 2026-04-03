@@ -5,8 +5,8 @@ MiniGo AlphaZero — Training Script
 Reads binary self-play data from C++ and trains the PyTorch model.
 Supports multi-GPU via DistributedDataParallel (launched with torchrun).
 
-Single GPU:   python train.py --data selfplay/ --epochs 15
-Multi GPU:    torchrun --nproc_per_node=2 train.py --data selfplay/ --epochs 15
+Single GPU:   python train.py --data ../training/selfplay --epochs 15
+Multi GPU:    torchrun --nproc_per_node=2 train.py --data ../training/selfplay --epochs 15
 """
 
 import argparse
@@ -121,9 +121,9 @@ def train_epoch(model, data, batch_size, optimizer, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train model on C++ self-play data")
-    parser.add_argument("--data", default="selfplay_data",
+    parser.add_argument("--data", default="training/selfplay",
                         help="Data directories (comma-separated for multiple)")
-    parser.add_argument("--checkpoint", default="checkpoints/best_model.pt",
+    parser.add_argument("--checkpoint", default="training/checkpoints/training.pt",
                         help="Model checkpoint to load/save")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -134,7 +134,7 @@ def main():
     parser.add_argument("--blocks", type=int, default=5)
     parser.add_argument("--buffer-size", type=int, default=200_000,
                         help="Max training samples to keep (most recent)")
-    parser.add_argument("--output-onnx", default="model.onnx",
+    parser.add_argument("--output-onnx", default="models/model.onnx",
                         help="Output ONNX model path")
     parser.add_argument("--retrain", action="store_true",
                         help="Retrain on all data (ignore trained file history)")

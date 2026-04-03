@@ -33,7 +33,7 @@ static std::vector<int> parse_device_ids(const std::string& str) {
 
 int main(int argc, char* argv[]) {
     Config config;
-    std::string model_path  = "model.onnx";
+    std::string model_path  = "models/best.onnx";
     bool use_random         = false;
     int  board_override     = -1;
     int  search_threads     = 16;
@@ -53,7 +53,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--random") use_random = true;
         else if (arg == "--help") {
             std::cout << "Usage: play [options]\n"
-                      << "  --model PATH            Model file (default: model.onnx)\n"
+                      << "  --model PATH            Model file (default: models/best.onnx)\n"
                       << "  --board N               Board size (for --random mode)\n"
                       << "  --sims N                MCTS simulations (default: 800)\n"
                       << "  --search-threads N      MCTS search threads (default: 16)\n"

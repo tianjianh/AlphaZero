@@ -26,7 +26,7 @@ static std::vector<int> parse_device_ids(const std::string& str) {
 
 int main(int argc, char* argv[]) {
     Config config;
-    std::string model_path  = "model.onnx";
+    std::string model_path  = "models/best.onnx";
     int  num_games          = 5;
     int  nn_iters           = 1000;
     int  board_override     = -1;
@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--help") {
             std::cout << "Usage: benchmark [options]\n"
-                      << "  --model PATH            Model file (default: model.onnx)\n"
+                      << "  --model PATH            Model file (default: models/best.onnx)\n"
                       << "  --board N               Board size override\n"
                       << "  --sims N                MCTS simulations\n"
                       << "  --nn-iters N            NN inference iterations (default: 1000)\n"
