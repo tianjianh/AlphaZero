@@ -32,11 +32,13 @@ public:
 // Created once on the main thread.  Holds device contexts, compiled
 // kernels, and any immutable state shared across server threads.
 //
-// For OpenCL: one cl_context + cl_command_queue + cl_program per
-//             unique GPU device (avoids NVIDIA serialization).
-// For CUDA:   one cudaStream per unique GPU device.
-// For Metal:  one MTLDevice + compiled MPSGraph.
-// For Eigen:  trivial (no GPU resources).
+// For TensorRT: one ICudaEngine + cudaStream per unique GPU device
+//               (engine built lazily, cached to disk).
+// For OpenCL:   one cl_context + cl_command_queue + cl_program per
+//               unique GPU device (avoids NVIDIA serialization).
+// For CUDA:     one cudaStream per unique GPU device.
+// For Metal:    one MTLDevice + compiled MPSGraph.
+// For Eigen:    trivial (no GPU resources).
 // ================================================================
 class ComputeContext {
 public:

@@ -49,12 +49,13 @@ endif()
 # Usage:
 #   cmake .. -DMINIGO_BACKEND=auto     # (default)
 #   cmake .. -DMINIGO_BACKEND=metal
+#   cmake .. -DMINIGO_BACKEND=tensorrt
 #   cmake .. -DMINIGO_BACKEND=cuda
 #   cmake .. -DMINIGO_BACKEND=opencl
 #   cmake .. -DMINIGO_BACKEND=eigen
 #
-set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, cuda, opencl, eigen")
-set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "cuda" "opencl" "eigen")
+set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, eigen")
+set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "eigen")
 
 # ── Auto-detect best backend ────────────────────────────────
 if(MINIGO_BACKEND STREQUAL "auto")
@@ -83,11 +84,20 @@ if(MINIGO_BACKEND STREQUAL "auto")
       set(MINIGO_BACKEND "eigen")
     endif()
   else()
-    # Linux: try CUDA first, then OpenCL
+    # Linux: try TensorRT > CUDA > OpenCL
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
-      set(MINIGO_BACKEND "cuda")
+      # Check for TensorRT (preferred over raw CUDA)
+      find_library(NVINFER_LIB nvinfer)
+      find_path(NVINFER_INCLUDE_DIR NvInfer.h
+        PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include)
+      find_library(NVONNXPARSER_LIB nvonnxparser)
+      if(NVINFER_LIB AND NVINFER_INCLUDE_DIR AND NVONNXPARSER_LIB)
+        set(MINIGO_BACKEND "tensorrt")
+      else()
+        set(MINIGO_BACKEND "cuda")
+      endif()
     else()
       find_package(OpenCL QUIET)
       if(OpenCL_FOUND)
@@ -99,10 +109,20 @@ if(MINIGO_BACKEND STREQUAL "auto")
   endif()
 endif()
 
+# ── Default CUDA architectures (shared by cuda and tensorrt backends) ──
+# Turing(75) Ampere(80,86) Ada(89) SASS + Hopper(90) PTX.
+# The 90-virtual PTX JIT-compiles on Hopper, Blackwell, and future GPUs.
+# Override with: cmake .. -DCMAKE_CUDA_ARCHITECTURES=89  (for faster local builds)
+# Note: only affects .cu files (CUDA backend); TensorRT has no .cu files.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+  set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-virtual")
+endif()
+
 # ── Validate and configure selected backend ─────────────────
 set(HAS_OPENCL FALSE)
 set(HAS_METAL FALSE)
 set(HAS_CUDA FALSE)
+set(HAS_TENSORRT FALSE)
 
 if(MINIGO_BACKEND STREQUAL "metal")
   if(NOT APPLE)
@@ -117,16 +137,21 @@ if(MINIGO_BACKEND STREQUAL "metal")
   endif()
   set(HAS_METAL TRUE)
 
+elseif(MINIGO_BACKEND STREQUAL "tensorrt")
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  find_library(NVINFER_LIB nvinfer REQUIRED)
+  find_path(NVINFER_INCLUDE_DIR NvInfer.h
+    PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+    REQUIRED)
+  find_library(NVONNXPARSER_LIB nvonnxparser REQUIRED)
+  set(HAS_TENSORRT TRUE)
+
 elseif(MINIGO_BACKEND STREQUAL "cuda")
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  # Default architectures: Turing(75) Ampere(80,86) Ada(89) SASS + Hopper(90) PTX
-  # The 90-virtual PTX JIT-compiles on Hopper, Blackwell, and future GPUs.
-  # Override with: cmake .. -DCMAKE_CUDA_ARCHITECTURES=75  (for faster local builds)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;86-real;89-real;90-virtual")
-  endif()
   set(HAS_CUDA TRUE)
 
 elseif(MINIGO_BACKEND STREQUAL "opencl")
@@ -137,7 +162,7 @@ elseif(MINIGO_BACKEND STREQUAL "eigen")
   # Nothing extra needed — Eigen is always available
 
 else()
-  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, cuda, opencl, eigen")
+  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, eigen")
 endif()
 
 # ── Library: minigo core ────────────────────────────────────
@@ -157,6 +182,10 @@ endif()
 
 if(HAS_CUDA)
   list(APPEND CORE_SOURCES src/cuda_compute.cu)
+endif()
+
+if(HAS_TENSORRT)
+  list(APPEND CORE_SOURCES src/tensorrt_compute.cpp)
 endif()
 
 if(HAS_METAL)
@@ -180,6 +209,17 @@ endif()
 if(HAS_CUDA)
   target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_CUDA=1)
   set_target_properties(minigo_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
+if(HAS_TENSORRT)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_TENSORRT=1)
+  target_include_directories(minigo_core PUBLIC
+    ${NVINFER_INCLUDE_DIR}
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  find_library(CUDART_LIB cudart
+    PATHS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES}
+    REQUIRED)
+  target_link_libraries(minigo_core PUBLIC ${NVINFER_LIB} ${NVONNXPARSER_LIB} ${CUDART_LIB})
 endif()
 
 if(HAS_METAL)

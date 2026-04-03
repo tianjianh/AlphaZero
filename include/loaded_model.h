@@ -38,6 +38,9 @@ public:
     // Load and parse an ONNX model file.  Pre-fuses BN parameters.
     static std::shared_ptr<LoadedModel> load(const std::string& model_path);
 
+    // Original ONNX file path (needed by TensorRT backend)
+    std::string model_path;
+
     // Model architecture metadata
     int board_size = 9;
     int input_channels = 17;

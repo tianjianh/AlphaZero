@@ -6,7 +6,8 @@ multi-threaded MCTS with per-leaf blocking evaluation + a KataGo-style
 Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple Silicon).
 
 **Inference backends** (compile-time selectable):
-- **CUDA** (default on Linux with NVIDIA GPU) — FP16 Tensor Core inference via WMMA; hand-written implicit GEMM kernels. Supports Turing, Ampere, Ada, Hopper, Blackwell
+- **TensorRT** (default on Linux with NVIDIA GPU + TensorRT installed) — optimized inference via NVIDIA TensorRT; automatic FP16, layer fusion, and kernel auto-tuning. Engine cached to disk after first build
+- **CUDA** (default on Linux with NVIDIA GPU, no TensorRT) — FP16 Tensor Core inference via WMMA; hand-written implicit GEMM kernels. Supports Turing, Ampere, Ada, Hopper, Blackwell
 - **Metal** (default on macOS Apple Silicon) — GPU inference via MPSGraph with FP16 compute; 2-3× faster than OpenCL on the same hardware
 - **OpenCL** — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
 - **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS
@@ -44,11 +45,22 @@ Metal is not available on Intel Macs; OpenCL or Eigen is used.
 ```bash
 sudo apt install cmake g++ libeigen3-dev
 
-# For NVIDIA GPU (CUDA — recommended):
-# Install CUDA toolkit (provides nvcc compiler + runtime)
-# https://developer.nvidia.com/cuda-downloads
+# For NVIDIA GPU (TensorRT — recommended, fastest):
+# 1. Install CUDA toolkit: https://developer.nvidia.com/cuda-downloads
+# 2. Install TensorRT (from the same NVIDIA apt repo):
+sudo apt install libnvinfer-dev libnvonnxparsers-dev
+# IMPORTANT: TensorRT must match your CUDA version. Check with:
+#   nvidia-smi              # shows driver CUDA version (e.g. 12.8)
+#   dpkg -l libnvinfer10    # shows TensorRT CUDA version
+# To install a specific version matching your CUDA:
+#   apt-cache madison libnvinfer-dev | grep cuda12.8
+#   sudo apt install libnvinfer-dev=<version>+cuda12.8 ...
+# Verify: dpkg -l | grep libnvinfer-dev
 
-# For NVIDIA GPU (OpenCL — alternative):
+# For NVIDIA GPU (CUDA — alternative, no TensorRT dependency):
+# Install CUDA toolkit only (provides nvcc compiler + runtime)
+
+# For NVIDIA GPU (OpenCL — portable alternative):
 sudo apt install ocl-icd-opencl-dev
 # + CUDA toolkit (provides the NVIDIA OpenCL ICD)
 
@@ -80,24 +92,29 @@ cd ..
 CMake auto-detects the best backend for your platform:
 ```
 -- Backend:    metal      (macOS Apple Silicon)
--- Backend:    cuda       (Linux with NVIDIA GPU + CUDA toolkit)
+-- Backend:    tensorrt   (Linux with NVIDIA GPU + CUDA + TensorRT)
+-- Backend:    cuda       (Linux with NVIDIA GPU + CUDA, no TensorRT)
 -- Backend:    opencl     (Linux with GPU, no CUDA)
 -- Backend:    eigen      (no GPU available)
 ```
 
 Force a specific backend:
 ```bash
+cmake .. -DMINIGO_BACKEND=tensorrt # TensorRT (NVIDIA, fastest — requires libnvinfer-dev)
 cmake .. -DMINIGO_BACKEND=cuda     # CUDA FP16 Tensor Cores (NVIDIA)
 cmake .. -DMINIGO_BACKEND=metal    # Metal/MPSGraph (macOS Apple Silicon)
 cmake .. -DMINIGO_BACKEND=opencl   # OpenCL (Linux, macOS)
 cmake .. -DMINIGO_BACKEND=eigen    # CPU only (no GPU)
 ```
 
-For CUDA, multi-arch is built by default (Turing/Ampere/Ada SASS + Hopper PTX
-for Blackwell forward-compat). For faster local builds targeting one GPU:
+CUDA and TensorRT share the same `CMAKE_CUDA_ARCHITECTURES` default:
+Turing/Ampere/Ada SASS + Hopper PTX (forward-compat with Blackwell and beyond).
+Note: this flag only affects `.cu` files (CUDA backend); TensorRT has no `.cu`
+files — it JIT-compiles its own kernels at engine build time on the target GPU.
+For faster local builds targeting one GPU:
 ```bash
-cmake .. -DMINIGO_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=75   # Turing (RTX 2080 Ti)
-cmake .. -DMINIGO_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89   # Ada (RTX 4090)
+cmake .. -DMINIGO_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=75      # Turing (RTX 2080 Ti)
+cmake .. -DMINIGO_BACKEND=cuda -DCMAKE_CUDA_ARCHITECTURES=89      # Ada (RTX 4090)
 ```
 
 The backend is selected at **compile time** — no `--backend` flag at runtime.
@@ -287,6 +304,25 @@ FP16 Tensor Cores (WMMA) for maximum throughput on NVIDIA GPUs:
 - **Softmax/tanh in FP32**: final outputs computed in full precision
 - Multi-arch: SASS for SM 75 (Turing), 80/86 (Ampere), 89 (Ada) + compute_90 PTX (Hopper/Blackwell)
 
+### TensorRT GPU Backend (NVIDIA)
+
+`TensorRTComputeHandle` (`src/tensorrt_compute.cpp`) uses NVIDIA TensorRT for
+optimized inference.  TensorRT parses the ONNX model directly using its own
+ONNX parser and applies automatic optimizations:
+
+- **FP16 precision**: enabled automatically when the GPU supports it
+- **Layer fusion**: TensorRT fuses conv+BN+ReLU, eliminating intermediate buffers
+- **Kernel auto-tuning**: TensorRT benchmarks multiple kernel implementations
+  at engine build time and selects the fastest for each layer on the target GPU
+- **Engine caching**: the compiled engine is serialized to disk
+  (`<model>.trt_<gpu_name>_b<N>.engine`) and reloaded on subsequent runs,
+  skipping the build step (which can take 10-60s)
+- **Dynamic batching**: optimization profile covers batch sizes 1 to `max_batch`
+
+The design follows the same Context/Handle pattern:
+- **`TRTDeviceState`** (per GPU): `ICudaEngine*` + `cudaStream_t` + `IRuntime*`
+- **`TensorRTComputeHandle`** (per server thread): `IExecutionContext*` + I/O buffers
+
 ### OpenCL GPU Backend
 
 `OpenCLComputeHandle` (`src/opencl_compute.cpp`) implements the full AlphaZero
@@ -328,6 +364,7 @@ The architecture has three layers:
    pre-fused BN weights in CPU memory.  Shared (const) across all threads.
 
 2. **`ComputeContext`** (`include/compute_context.h`) — per-device GPU state.
+   For TensorRT: one `ICudaEngine` + `cudaStream` per unique GPU (engine built lazily, cached to disk).
    For CUDA: one `cudaStream` per unique GPU.
    For OpenCL: one `cl_context` + `cl_queue` + `cl_program` per unique GPU
    (avoids NVIDIA serialization).  Created on the main thread.
@@ -347,25 +384,26 @@ backend-agnostic.
 
 **Small model** (64 filters, 5 blocks):
 
-| Batch | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) | Metal FP16 (M1 Max) |
-|------:|-----------------------------:|---------------------------:|--------------------:|
-| 1     | 1,013                        | 934                        | 750                 |
-| 8     | 7,908                        | 7,336                      | 7,500               |
-| 32    | **27,060**                   | 19,886                     | 26,000              |
-| 64    | **45,247**                   | 27,383                     | 28,000              |
-| 128   | **56,452**                   | 34,005                     | 44,000              |
+| Batch | TensorRT FP16 (RTX 2080 Ti) | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) | Metal FP16 (M1 Max) |
+|------:|----------------------------:|-----------------------------:|---------------------------:|--------------------:|
+| 1     | **3,609**                   | 1,250                        | 934                        | 750                 |
+| 8     | **26,039**                  | 9,730                        | 7,336                      | 7,500               |
+| 32    | **85,254**                  | 31,466                       | 19,886                     | 26,000              |
+| 64    | **136,814**                 | 50,561                       | 27,383                     | 28,000              |
+| 128   | **175,102**                 | 59,933                       | 34,005                     | 44,000              |
 
 **Large model** (128 filters, 10 blocks):
 
-| Batch | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) |
-|------:|-----------------------------:|---------------------------:|
-| 1     | 330                          | 324                        |
-| 32    | **7,766**                    | 4,723                      |
-| 64    | **9,160**                    | 5,712                      |
-| 128   | **11,007**                   | 6,012                      |
+| Batch | TensorRT FP16 (RTX 2080 Ti) | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) |
+|------:|----------------------------:|-----------------------------:|---------------------------:|
+| 1     | **1,107**                   | 354                          | 324                        |
+| 32    | **31,965**                  | 8,145                        | 4,723                      |
+| 64    | **56,726**                  | 9,347                        | 5,712                      |
+| 128   | **82,781**                  | 10,821                       | 6,012                      |
 
-CUDA FP16+WMMA is **1.66×** faster than OpenCL FP32 at batch-128 (small model)
-and **1.83×** faster for the large model, where tensor core utilization is higher.
+TensorRT is **2.9×** faster than CUDA WMMA at batch-128 (small model) and
+**7.6×** faster for the large model, where TensorRT's layer fusion and kernel
+auto-tuning dominate.  CUDA WMMA is **1.8×** faster than OpenCL FP32.
 
 ### Self-play throughput (800 sims/move)
 
@@ -428,6 +466,7 @@ minigo-cpp/
 │   ├── eigen_compute.h         # Eigen CPU backend (context + handle)
 │   ├── opencl_compute.h        # OpenCL GPU backend (context + handle)
 │   ├── cuda_compute.h          # CUDA GPU backend (context + handle)
+│   ├── tensorrt_compute.h      # TensorRT GPU backend (context + handle)
 │   ├── metal_compute.h         # Metal/MPSGraph GPU backend (macOS)
 │   ├── onnx_loader.h           # Built-in minimal ONNX protobuf parser
 │   └── mcts.h                  # Multi-threaded MCTS (atomic MCTSNode)
@@ -439,6 +478,7 @@ minigo-cpp/
 │   ├── eigen_compute.cpp       # Eigen context + handle
 │   ├── opencl_compute.cpp      # OpenCL context + handle + embedded kernels
 │   ├── cuda_compute.cu         # CUDA context + handle + FP16 WMMA kernels
+│   ├── tensorrt_compute.cpp    # TensorRT context + handle (ONNX→engine)
 │   ├── metal_compute.mm        # Metal/MPSGraph context + handle (Obj-C++)
 │   ├── nn_evaluator.cpp        # NNEvaluator N server threads (KataGo pattern)
 │   ├── mcts.cpp                # Multi-threaded MCTS + data augmentation
@@ -529,11 +569,14 @@ minigo-cpp/
 - OpenCL 1.2 available via Intel HD/Iris GPU.
 - Accelerate provides vecLib BLAS for Eigen.
 
-### Linux — recommended: CUDA (NVIDIA) or OpenCL
+### Linux — recommended: TensorRT or CUDA (NVIDIA)
 
-- **CUDA** (default on NVIDIA): FP16 Tensor Core inference via WMMA. Requires
-  CUDA toolkit (nvcc). Auto-detected when `nvcc` is on PATH. 1.7-1.8× faster
-  than OpenCL on the same GPU.
+- **TensorRT** (default when installed): optimized inference via TensorRT's
+  ONNX parser + kernel auto-tuning + FP16. Requires CUDA toolkit +
+  `libnvinfer-dev` + `libnvonnxparsers-dev`. Auto-detected when libraries
+  are present.
+- **CUDA** (default without TensorRT): FP16 Tensor Core inference via WMMA.
+  Requires CUDA toolkit (nvcc). 1.7-1.8× faster than OpenCL on the same GPU.
 - **OpenCL** (fallback): hand-written implicit GEMM kernels.  Available on
   NVIDIA (CUDA toolkit), AMD (ROCm/Mesa), Intel (NEO).
 - Metal not available on Linux.
@@ -548,6 +591,16 @@ on macOS OpenCL ships with Xcode Command Line Tools.
 
 **Metal not found**: Requires macOS with Apple Silicon.  Check that
 Xcode Command Line Tools are installed (`xcode-select --install`).
+
+**TensorRT not found**: Install with `sudo apt install libnvinfer-dev libnvonnxparsers-dev`.
+Requires NVIDIA's CUDA apt repository. Verify with `dpkg -l | grep libnvinfer-dev`.
+
+**TensorRT CUDA version mismatch**: TensorRT must match your CUDA driver version.
+Check `nvidia-smi` (driver CUDA version) vs `dpkg -l libnvinfer10` (TensorRT CUDA version).
+If mismatched, install the TensorRT package built for your driver's CUDA version.
+
+**TensorRT engine rebuild**: The cached `.engine` file is GPU-specific and TensorRT-version-specific.
+Delete `*.trt_*.engine` files to force a rebuild after upgrading TensorRT or switching GPUs.
 
 **Build without GPU**: `cmake .. -DMINIGO_BACKEND=eigen` (CPU-only)
 

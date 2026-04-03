@@ -20,6 +20,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     };
 
     auto model = std::make_shared<LoadedModel>();
+    model->model_path = model_path;
 
     // ── Infer architecture ───────────────────────────────────────
     auto& iw = get("input_conv.weight");
