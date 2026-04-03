@@ -207,23 +207,64 @@ __global__ void conv3x3_wmma_bn(
 //
 // input  half [C_in, N*HW]   channel-major
 // output half [C_out*HW, N]   FC-ready layout
+//
+// Optimized: weights loaded into shared memory (tiny: C_out*C_in,
+// max 2*128=256 halfs), vectorized half2 inner loop.
+// Block: 256 threads, grid over (n, hw).
 // ================================================================
 __global__ void conv1x1_bn_relu_reshape_fp16(
-    const half* input, half* output,
-    const half* weight, const float* bn_scale, const float* bn_bias,
+    const half* __restrict__ input, half* __restrict__ output,
+    const half* __restrict__ weight, const float* __restrict__ bn_scale,
+    const float* __restrict__ bn_bias,
     int C_in, int C_out, int N, int HW
 ) {
-    int n  = blockIdx.x * blockDim.x + threadIdx.x;
-    int hw = blockIdx.y * blockDim.y + threadIdx.y;
-    if (n >= N || hw >= HW) return;
+    // Shared memory for weights (max C_out*C_in = 2*128 = 256 halfs)
+    // and BN params (max 2*2 = 4 floats)
+    extern __shared__ char smem_raw[];
+    half*  sw = (half*)smem_raw;                              // [C_out * C_in]
+    float* s_scale = (float*)(sw + C_out * C_in);            // [C_out]
+    float* s_bias  = s_scale + C_out;                        // [C_out]
+
+    // Cooperatively load weights and BN params into shared memory
+    int total_w = C_out * C_in;
+    for (int i = threadIdx.x; i < total_w; i += blockDim.x)
+        sw[i] = weight[i];
+    // Load BN params (very small, C_out = 1 or 2)
+    if (threadIdx.x < C_out) {
+        s_scale[threadIdx.x] = bn_scale[threadIdx.x];
+        s_bias[threadIdx.x]  = bn_bias[threadIdx.x];
+    }
+    __syncthreads();
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n  = idx % N;
+    int hw = idx / N;
+    if (hw >= HW || n >= N) return;
 
     int NHW = N * HW;
+    int C_in_half2 = C_in / 2;
+
     for (int co = 0; co < C_out; co++) {
         float acc = 0.0f;
-        for (int ci = 0; ci < C_in; ci++)
-            acc += __half2float(weight[co * C_in + ci]) *
+        const half* w_row = sw + co * C_in;
+        // Vectorized half2 inner loop
+        for (int ci2 = 0; ci2 < C_in_half2; ci2++) {
+            half2 wv = ((const half2*)w_row)[ci2];
+            int ci = ci2 * 2;
+            half2 iv = __halves2half2(
+                input[ci * NHW + n * HW + hw],
+                input[(ci + 1) * NHW + n * HW + hw]);
+            float2 wf = __half22float2(wv);
+            float2 xf = __half22float2(iv);
+            acc += wf.x * xf.x + wf.y * xf.y;
+        }
+        // Handle odd C_in
+        if (C_in & 1) {
+            int ci = C_in - 1;
+            acc += __half2float(w_row[ci]) *
                    __half2float(input[ci * NHW + n * HW + hw]);
-        float v = bn_scale[co] * acc + bn_bias[co];
+        }
+        float v = s_scale[co] * acc + s_bias[co];
         if (v < 0.0f) v = 0.0f;
         output[(co * HW + hw) * N + n] = __float2half(v);
     }
@@ -231,67 +272,120 @@ __global__ void conv1x1_bn_relu_reshape_fp16(
 
 // ================================================================
 // Fused FC + bias + optional ReLU (FP16 in/out)
+//
+// Optimized: each warp cooperatively computes one (m, n) output.
+// Threads in a warp split the K reduction, then warp-shuffle to sum.
+// Block: (32, WARPS_PER_BLOCK), grid: (M, ceil(N/WARPS_PER_BLOCK))
 // ================================================================
+#define FC_WARPS_PER_BLOCK 8
 __global__ void fc_bias_relu_fp16(
-    const half* weight, const half* input, half* output,
-    const float* bias, int M, int N, int K, int do_relu
+    const half* __restrict__ weight, const half* __restrict__ input,
+    half* __restrict__ output,
+    const float* __restrict__ bias, int M, int N, int K, int do_relu
 ) {
-    int m = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    int lane  = threadIdx.x;           // 0..31
+    int warp  = threadIdx.y;           // 0..WARPS_PER_BLOCK-1
+    int m     = blockIdx.x;
+    int n     = blockIdx.y * FC_WARPS_PER_BLOCK + warp;
     if (m >= M || n >= N) return;
 
     float acc = 0.0f;
-    for (int k = 0; k < K; k++)
+    // Each lane handles K/32 elements
+    for (int k = lane; k < K; k += 32)
         acc += __half2float(weight[m * K + k]) * __half2float(input[k * N + n]);
-    acc += bias[m];
-    if (do_relu && acc < 0.0f) acc = 0.0f;
-    output[m * N + n] = __float2half(acc);
+
+    // Warp-shuffle reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+
+    if (lane == 0) {
+        acc += bias[m];
+        if (do_relu && acc < 0.0f) acc = 0.0f;
+        output[m * N + n] = __float2half(acc);
+    }
 }
 
 // ================================================================
 // Fused FC + bias + softmax (FP16 input → FP32 output)
+//
+// Optimized: one warp per batch element n. The 32 lanes cooperate
+// on the K-reduction for each of the M output rows. Since M=82
+// (action_size) is small, we store logits in registers and use
+// shared memory only for the input column cache.
+// Block: 32 threads (1 warp), grid: N blocks.
 // ================================================================
 __global__ void fc_bias_softmax_fp16_to_fp32(
-    const half* weight, const half* input, float* output,
-    const float* bias, int M, int N, int K
+    const half* __restrict__ weight, const half* __restrict__ input,
+    float* __restrict__ output,
+    const float* __restrict__ bias, int M, int N, int K
 ) {
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = blockIdx.x;
     if (n >= N) return;
+    int lane = threadIdx.x;  // 0..31
+
+    // Cache input column in shared memory (K halfs, max ~162 = 324 bytes)
+    extern __shared__ half s_input[];
+    for (int k = lane; k < K; k += 32)
+        s_input[k] = input[k * N + n];
+    __syncwarp();
 
     float mx = -1e30f;
     for (int m = 0; m < M; m++) {
-        float acc = bias[m];
-        for (int k = 0; k < K; k++)
-            acc += __half2float(weight[m * K + k]) * __half2float(input[k * N + n]);
-        output[m * N + n] = acc;
-        mx = fmaxf(mx, acc);
+        float acc = 0.0f;
+        for (int k = lane; k < K; k += 32)
+            acc += __half2float(weight[m * K + k]) * __half2float(s_input[k]);
+        // Warp-shuffle reduction
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, offset);
+        if (lane == 0) {
+            acc += bias[m];
+            output[m * N + n] = acc;
+            mx = fmaxf(mx, acc);
+        }
     }
 
-    float sum = 0.0f;
-    for (int m = 0; m < M; m++) {
-        float e = expf(output[m * N + n] - mx);
-        output[m * N + n] = e;
-        sum += e;
+    // Broadcast max from lane 0
+    mx = __shfl_sync(0xffffffff, mx, 0);
+
+    // Softmax: exp and sum (single-threaded within lane 0, M is small)
+    if (lane == 0) {
+        float sum = 0.0f;
+        for (int m = 0; m < M; m++) {
+            float e = expf(output[m * N + n] - mx);
+            output[m * N + n] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (int m = 0; m < M; m++)
+            output[m * N + n] *= inv_sum;
     }
-    float inv_sum = 1.0f / sum;
-    for (int m = 0; m < M; m++)
-        output[m * N + n] *= inv_sum;
 }
 
 // ================================================================
 // Fused FC + bias + tanh (FP16 input → FP32 output)
+//
+// Optimized: one warp per batch element, K-reduction via shuffle.
+// Block: 32 threads (1 warp), grid: N blocks.
 // ================================================================
 __global__ void fc_bias_tanh_fp16_to_fp32(
-    const half* weight, const half* input, float* output,
-    const float* bias, int N, int K
+    const half* __restrict__ weight, const half* __restrict__ input,
+    float* __restrict__ output,
+    const float* __restrict__ bias, int N, int K
 ) {
-    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = blockIdx.x;
     if (n >= N) return;
+    int lane = threadIdx.x;  // 0..31
 
-    float acc = bias[0];
-    for (int k = 0; k < K; k++)
+    float acc = 0.0f;
+    for (int k = lane; k < K; k += 32)
         acc += __half2float(weight[k]) * __half2float(input[k * N + n]);
-    output[n] = tanhf(acc);
+
+    // Warp-shuffle reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+
+    if (lane == 0)
+        output[n] = tanhf(acc + bias[0]);
 }
 
 // ================================================================
@@ -530,10 +624,14 @@ struct CUDAComputeHandle::Impl {
 
     void run_conv1x1_bn_relu_reshape(half* input_buf, half* output_buf,
                                       const ConvBNGPU& conv, int N, int HW) {
-        dim3 block(16, 16);
-        dim3 grid((N + block.x - 1) / block.x, (HW + block.y - 1) / block.y);
+        int total = N * HW;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        // Shared memory: weights (C_out*C_in halfs) + BN params (2*C_out floats)
+        int smem = conv.c_out * conv.c_in * (int)sizeof(half) +
+                   2 * conv.c_out * (int)sizeof(float);
 
-        conv1x1_bn_relu_reshape_fp16<<<grid, block, 0, dev.stream>>>(
+        conv1x1_bn_relu_reshape_fp16<<<blocks, threads, smem, dev.stream>>>(
             input_buf, output_buf,
             conv.weight, conv.bn_scale, conv.bn_bias,
             conv.c_in, conv.c_out, N, HW);
@@ -546,8 +644,9 @@ struct CUDAComputeHandle::Impl {
         int K = fc.in_features;
         int do_relu_i = relu ? 1 : 0;
 
-        dim3 block(16, 16);
-        dim3 grid((M + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+        // One warp (32 threads) per (m, n) output; WARPS_PER_BLOCK warps per block
+        dim3 block(32, FC_WARPS_PER_BLOCK);
+        dim3 grid(M, (N + FC_WARPS_PER_BLOCK - 1) / FC_WARPS_PER_BLOCK);
 
         fc_bias_relu_fp16<<<grid, block, 0, dev.stream>>>(
             fc.weight, input_buf, output_buf, fc.bias,
@@ -661,9 +760,9 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     {
         int M = I.policy_fc_gpu.out_features;
         int K = I.policy_fc_gpu.in_features;
-        int threads = 64;
-        int blocks = (N + threads - 1) / threads;
-        fc_bias_softmax_fp16_to_fp32<<<blocks, threads, 0, I.dev.stream>>>(
+        // One warp (32 threads) per batch element
+        int smem = K * (int)sizeof(half);
+        fc_bias_softmax_fp16_to_fp32<<<N, 32, smem, I.dev.stream>>>(
             I.policy_fc_gpu.weight, I.buf_pol_out, I.buf_pol_feat,
             I.policy_fc_gpu.bias, M, N, K);
         CUDA_CHECK(cudaGetLastError());
@@ -676,9 +775,8 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
                        I.value_fc1_gpu, N, true);
     {
         int K = I.value_fc2_gpu.in_features;
-        int threads = 64;
-        int blocks = (N + threads - 1) / threads;
-        fc_bias_tanh_fp16_to_fp32<<<blocks, threads, 0, I.dev.stream>>>(
+        // One warp (32 threads) per batch element
+        fc_bias_tanh_fp16_to_fp32<<<N, 32, 0, I.dev.stream>>>(
             I.value_fc2_gpu.weight, I.buf_val_feat, I.buf_val_out,
             I.value_fc2_gpu.bias, N, K);
         CUDA_CHECK(cudaGetLastError());
