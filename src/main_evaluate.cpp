@@ -219,6 +219,7 @@ int main(int argc, char* argv[]) {
               << "x" << config.board_size << "\n"
               << "  Games:      " << num_games << "\n"
               << "  Sims:       " << config.num_simulations << "\n"
+              << "  c_puct:     " << config.c_puct << "\n"
               << "  Threads:    " << num_threads << "\n"
               << "  Threshold:  " << std::fixed << std::setprecision(1)
               << (threshold * 100.0f) << "%\n"

@@ -121,6 +121,10 @@ int main(int argc, char* argv[]) {
               << "  Blocks: "           << config.num_res_blocks << "\n"
               << "  Simulations:      " << config.num_simulations << "\n"
               << "  Search threads:   " << config.num_search_threads << "\n"
+              << "  c_puct:           " << config.c_puct << "\n"
+              << "  Dirichlet:        alpha=" << config.dirichlet_alpha
+              << "  eps=" << config.dirichlet_epsilon << "\n"
+              << "  Temp threshold:   " << config.temperature_threshold << "\n"
               << "  Games:            " << num_games << "\n"
               << "  Threads:          " << num_threads << "\n"
               << "  Backend:          " << context->backend_name() << "\n"

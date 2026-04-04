@@ -126,7 +126,8 @@ int main(int argc, char* argv[]) {
         std::cout << "\nYou are " << (human_color == BLACK ? "Black (X)" : "White (O)")
                   << "\nBoard: " << config.board_size << "x" << config.board_size
                   << "  Komi: " << config.komi
-                  << "  Sims: " << config.num_simulations;
+                  << "  Sims: " << config.num_simulations
+                  << "  c_puct: " << config.c_puct;
         if (context) std::cout << "  Backend: " << context->backend_name();
         std::cout << "\nMoves: A1-"
                   << (char)('A' + (config.board_size > 8 ? config.board_size

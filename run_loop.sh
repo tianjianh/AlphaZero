@@ -477,6 +477,7 @@ Preset:       ${preset}
 Architecture: ${board}x${board} board, ${filters} filters, ${blocks} blocks
 Batch size:   ${PLAN_BATCH_SIZE}
 Window size:  ${PLAN_WINDOW_SIZE} iterations (data streamed via mmap, no memory limit)
+MCTS:         c_puct=${PLAN_C_PUCT}  dirichlet_alpha=${PLAN_DIRICHLET_ALPHA}  dirichlet_eps=${PLAN_DIRICHLET_EPSILON}  temp_threshold=${PLAN_TEMP_THRESHOLD}
 Eval gate:    ${PLAN_EVAL_THRESHOLD} win rate threshold
 
 Training Plan:
@@ -657,6 +658,7 @@ EOF
     echo "  NN devices:       ${NN_DEVICE_IDS}"
     echo "  Max batch (NN):   ${MAX_BATCH}"
     echo "  Batch size (SGD): ${PLAN_BATCH_SIZE}"
+    echo "  MCTS:             c_puct=${PLAN_C_PUCT} alpha=${PLAN_DIRICHLET_ALPHA} eps=${PLAN_DIRICHLET_EPSILON} temp=${PLAN_TEMP_THRESHOLD}"
     echo "============================================"
     echo
 
@@ -666,6 +668,7 @@ EOF
     tlog "  Batch size:       ${PLAN_BATCH_SIZE}"
     tlog "  Data window:      last ${PLAN_WINDOW_SIZE} iterations"
     tlog "  Eval threshold:   ${PLAN_EVAL_THRESHOLD}"
+    tlog "  MCTS:             c_puct=${PLAN_C_PUCT}  alpha=${PLAN_DIRICHLET_ALPHA}  eps=${PLAN_DIRICHLET_EPSILON}  temp=${PLAN_TEMP_THRESHOLD}"
     tlog "  Hardware:"
     tlog "    Threads:          ${THREADS}"
     tlog "    Search threads:   ${SEARCH_THREADS}"
