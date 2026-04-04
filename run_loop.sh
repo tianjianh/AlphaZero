@@ -187,6 +187,9 @@ detect_hardware() {
 run_selfplay() {
     local iter_data="$1" model="$2" games_needed="$3" sims="$4"
 
+    # MCTS params from training plan
+    local mcts_flags="--c-puct ${PLAN_C_PUCT} --dirichlet-alpha ${PLAN_DIRICHLET_ALPHA} --dirichlet-epsilon ${PLAN_DIRICHLET_EPSILON} --temp-threshold ${PLAN_TEMP_THRESHOLD}"
+
     if [ "${SELFPLAY_INSTANCES}" -le 1 ]; then
         "${BUILD_DIR}/selfplay" \
             --model "${model}" \
@@ -197,7 +200,8 @@ run_selfplay() {
             --nn-server-threads ${NN_SERVER_THREADS} \
             --nn-device-ids ${NN_DEVICE_IDS} \
             --output "${iter_data}" \
-            --sims ${sims}
+            --sims ${sims} \
+            ${mcts_flags}
     else
         local gpii=$(( (games_needed + SELFPLAY_INSTANCES - 1) / SELFPLAY_INSTANCES ))
         local tpii=$(( (THREADS + SELFPLAY_INSTANCES - 1) / SELFPLAY_INSTANCES ))
@@ -214,7 +218,8 @@ run_selfplay() {
                 --nn-server-threads ${NN_SERVER_THREADS} \
                 --nn-device-ids ${NN_DEVICE_IDS} \
                 --output "${iter_data}" \
-                --sims ${sims} &
+                --sims ${sims} \
+                ${mcts_flags} &
             pids+=($!)
         done
         local failed=0
@@ -314,11 +319,18 @@ generate_plan() {
     local board=$1 filters=$2 blocks=$3 preset=$4
 
     local batch_size=1024 eval_threshold="0.55" window=20
+    local c_puct="1.5" dirichlet_alpha="0.15" dirichlet_epsilon="0.25" temp_threshold=15
 
     case "$preset" in
-        quick) batch_size=64; window=5; eval_threshold="0.5";;
+        quick) batch_size=64; window=5; eval_threshold="0.5"; temp_threshold=8;;
         large) window=30;;
     esac
+
+    # Scale dirichlet_alpha by board size: ~10/avg_legal_moves
+    if [ "$board" -ge 13 ]; then
+        dirichlet_alpha="0.03"
+        temp_threshold=30
+    fi
 
     cat > "$PLAN_FILE" << EOF
 # MiniGo Training Plan
@@ -347,6 +359,20 @@ PLAN_EVAL_THRESHOLD=${eval_threshold}
 # 500K games; KataGo uses a similar sliding window).
 # Data is streamed from disk via memory-mapped I/O — no memory limit.
 PLAN_WINDOW_SIZE=${window}
+
+# ── MCTS Parameters ─────────────────────────────────────
+# These control selfplay exploration quality.
+# UCB exploration constant — higher = explore more, lower = trust network more.
+# AlphaGo Zero used 1.0-2.5. KataGo uses ~1.1 with dynamic scaling.
+PLAN_C_PUCT=${c_puct}
+# Dirichlet noise at the root node for selfplay exploration.
+# alpha ≈ 10 / average_legal_moves (0.15 for 9x9, 0.03 for 19x19).
+# epsilon = blend ratio (0.25 = 75% network prior + 25% noise).
+PLAN_DIRICHLET_ALPHA=${dirichlet_alpha}
+PLAN_DIRICHLET_EPSILON=${dirichlet_epsilon}
+# Number of initial moves played stochastically (temp=1).
+# Remaining moves are greedy (temp=0). Lower = less noisy endgames.
+PLAN_TEMP_THRESHOLD=${temp_threshold}
 
 # ── Training Stages ──────────────────────────────────────
 # Each stage defines parameters for a range of iterations.
@@ -785,6 +811,7 @@ EOF
                 --nn-server-threads ${NN_SERVER_THREADS} \
                 --nn-device-ids ${NN_DEVICE_IDS} \
                 --sims ${STAGE_SIMS} \
+                --c-puct ${PLAN_C_PUCT} \
                 --threshold ${PLAN_EVAL_THRESHOLD} \
                 --output "${EVAL_DIR}" \
                 2>&1 | tee "$eval_tmp"

@@ -61,6 +61,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
         else if (arg == "--output"            && i+1<argc) output_dir         = argv[++i];
         else if (arg == "--sims"              && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
+        else if (arg == "--c-puct"            && i+1<argc) config.c_puct = std::stof(argv[++i]);
+        else if (arg == "--dirichlet-alpha"   && i+1<argc) config.dirichlet_alpha = std::stof(argv[++i]);
+        else if (arg == "--dirichlet-epsilon" && i+1<argc) config.dirichlet_epsilon = std::stof(argv[++i]);
+        else if (arg == "--temp-threshold"    && i+1<argc) config.temperature_threshold = std::stoi(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads  = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str  = argv[++i];
         else if (arg == "--help") {
@@ -73,6 +77,10 @@ int main(int argc, char* argv[]) {
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
                 << "  --output DIR            Output directory (default: training/selfplay)\n"
                 << "  --sims N                MCTS simulations per move (default: 800)\n"
+                << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
+                << "  --dirichlet-alpha F     Root noise concentration (default: 0.15 for 9x9)\n"
+                << "  --dirichlet-epsilon F   Root noise weight (default: 0.25)\n"
+                << "  --temp-threshold N      Moves of stochastic play (default: 15)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;

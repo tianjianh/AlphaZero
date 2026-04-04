@@ -48,6 +48,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--search-threads"    && i+1<argc) search_threads  = std::stoi(argv[++i]);
         else if (arg == "--komi"              && i+1<argc) config.komi     = std::stof(argv[++i]);
         else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
+        else if (arg == "--c-puct"            && i+1<argc) config.c_puct   = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--random") use_random = true;
@@ -58,6 +59,7 @@ int main(int argc, char* argv[]) {
                       << "  --sims N                MCTS simulations (default: 800)\n"
                       << "  --search-threads N      MCTS search threads (default: 16)\n"
                       << "  --max-batch N           Max GPU batch size (default: 256)\n"
+                      << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
                       << "  --komi F                Komi value (default: 7.5)\n"
                       << "  --nn-server-threads N   NN server threads (default: 1)\n"
                       << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n"

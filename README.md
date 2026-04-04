@@ -628,6 +628,10 @@ minigo-cpp/
   --max-batch N          Max GPU batch size (default: 256)
   --output DIR           Output directory (default: training/selfplay)
   --sims N               MCTS simulations per move (default: 800)
+  --c-puct F             UCB exploration constant (default: 1.5)
+  --dirichlet-alpha F    Root noise concentration (default: 0.15)
+  --dirichlet-epsilon F  Root noise weight (default: 0.25)
+  --temp-threshold N     Moves of stochastic play (default: 15)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
@@ -640,6 +644,7 @@ minigo-cpp/
   --sims N               MCTS simulations per move (default: 800)
   --search-threads N     MCTS search threads (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
+  --c-puct F             UCB exploration constant (default: 1.5)
   --komi F               Komi value (default: 7.5)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
@@ -659,6 +664,7 @@ minigo-cpp/
   --sims N               MCTS simulations per move (default: 800)
   --max-batch N          Max GPU batch size (default: 256)
   --threshold FLOAT      Win rate to pass (default: 0.55)
+  --c-puct F             UCB exploration constant (default: 1.5)
   --output DIR           Save game records as SGF files
   --nn-server-threads N  NN server threads per model (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")

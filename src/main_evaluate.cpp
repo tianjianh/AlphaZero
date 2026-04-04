@@ -121,6 +121,7 @@ int main(int argc, char* argv[]) {
     int sims               = -1;
     float threshold        = 0.55f;
     int max_batch_size     = 256;
+    float c_puct           = -1.0f;  // -1 = use default
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -135,6 +136,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--threshold"         && i+1<argc) threshold         = std::stof(argv[++i]);
         else if (arg == "--max-batch"         && i+1<argc) max_batch_size    = std::stoi(argv[++i]);
         else if (arg == "--output"            && i+1<argc) output_dir        = argv[++i];
+        else if (arg == "--c-puct"            && i+1<argc) c_puct            = std::stof(argv[++i]);
         else if (arg == "--help") {
             std::cout
                 << "Usage: evaluate [options]\n"
@@ -152,6 +154,7 @@ int main(int argc, char* argv[]) {
                 << "  --sims N                MCTS simulations per move (default: 800)\n"
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
                 << "  --threshold FLOAT       Win rate to pass (default: 0.55)\n"
+                << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
                 << "  --output DIR            Save game records as SGF files\n"
                 << "  --nn-server-threads N   NN server threads per model (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated GPU indices (default: \"0\")\n";
@@ -192,6 +195,7 @@ int main(int argc, char* argv[]) {
     config.num_search_threads = search_threads;
     config.max_batch_size     = max_batch_size;
     if (sims > 0) config.num_simulations = sims;
+    if (c_puct > 0) config.c_puct = c_puct;
 
     // Separate compute contexts for each model (safe across all backends)
     auto ctx1 = std::shared_ptr<ComputeContext>(
