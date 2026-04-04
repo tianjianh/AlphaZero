@@ -796,9 +796,9 @@ EOF
             # Parse evaluation results for structured log
             local wr m1w m2w drw verdict
             wr=$(grep "win rate:" "$eval_tmp" | grep -oP '[\d.]+%' | head -1)
-            m1w=$(grep "Model 1 wins:" "$eval_tmp" | grep -oP '\d+' | head -1)
-            m2w=$(grep "Model 2 wins:" "$eval_tmp" | grep -oP '\d+' | head -1)
-            drw=$(grep "Draws:" "$eval_tmp" | grep -oP '\d+' | head -1)
+            m1w=$(grep "Model 1 wins:" "$eval_tmp" | sed 's/.*: //')
+            m2w=$(grep "Model 2 wins:" "$eval_tmp" | sed 's/.*: //')
+            drw=$(grep "Draws:" "$eval_tmp" | sed 's/.*: //')
             verdict=$(grep "RESULT:" "$eval_tmp" | grep -oP 'PASS|FAIL')
             rm -f "$eval_tmp"
 
