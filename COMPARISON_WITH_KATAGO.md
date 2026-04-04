@@ -68,7 +68,7 @@ Side-by-side comparison of implementation details across all major subsystems.
 | **Handle creation** | `NeuralNet::createComputeHandle()` on server thread | `context_->create_handle()` on server thread |
 | **Queue topology** | Single shared queue, competing consumers | Single shared queue, competing consumers |
 | **Load balancing** | Self-balancing (fastest GPU drains next) | Self-balancing (fastest GPU drains next) |
-| **Per-GPU isolation** | Separate compute handle per thread | Separate `ComputeHandle` per thread; shared `cl_context`/`cl_queue` per unique GPU |
+| **Per-GPU isolation** | Separate compute handle per thread; shared `cl_context` per GPU | Same: separate `ComputeHandle` per thread; shared `cl_context`/`cl_queue` per GPU |
 | **Default servers per GPU** | 1 | 1 (but 2 can help — see below) |
 
 ## 6. Compute Backend
@@ -76,13 +76,15 @@ Side-by-side comparison of implementation details across all major subsystems.
 | Aspect | KataGo | MiniGo C++ |
 |---|---|---|
 | **Backend abstraction** | `NeuralNet::getOutput()` free function dispatch | `ComputeHandle::predict_batch()` virtual method |
-| **Supported backends** | OpenCL, CUDA, TensorRT, Eigen, Metal | OpenCL, Metal, Eigen |
+| **Supported backends** | OpenCL, CUDA, TensorRT, Eigen, Metal | TensorRT, CUDA, OpenCL, Metal, Eigen |
 | **Backend selection** | Compile-time (`#define`) | Compile-time (`cmake -DMINIGO_BACKEND=`) |
+| **TensorRT** | ONNX parser, FP16, kernel auto-tune, engine cached to disk | Same: ONNX parser, FP16, auto-tune, engine cached in `trt_cache/` |
+| **CUDA** | cuDNN + cuBLAS, FP16 | Hand-written FP16 WMMA Tensor Core implicit GEMM kernels |
 | **OpenCL kernels** | Tuned with auto-tuning pass | Hand-written implicit GEMM with register blocking |
 | **Weight format** | Custom binary (gzipped, SHA256 verified) | ONNX (built-in minimal protobuf parser) |
 | **BN fusion** | During model conversion | During `LoadedModel::load()` — `scale = gamma/sqrt(var+eps)` |
-| **Precision** | FP16/FP32 configurable per layer type | Metal: FP16 compute; OpenCL/Eigen: FP32 |
-| **Weight sharing** | Per-handle (each thread loads independently) | `LoadedModel` shared (const), each handle uploads to GPU |
+| **Precision** | FP16/FP32 configurable per layer type | TensorRT/CUDA/Metal: FP16; OpenCL/Eigen: FP32 |
+| **Weight sharing** | `ModelDesc` shared (const), each handle uploads to GPU | `LoadedModel` shared (const), each handle uploads to GPU |
 
 ## 7. Model Architecture
 
@@ -131,32 +133,58 @@ Side-by-side comparison of implementation details across all major subsystems.
 
 ### Things MiniGo does differently:
 - **ONNX model format** — industry standard, no custom converter needed
-- **Shared LoadedModel** — parse once, all handles upload from same CPU weights
-- **Per-GPU cl_context** — separate OpenCL contexts to avoid NVIDIA serialization
+- **ONNX model format** — industry standard, no custom converter needed (KataGo uses custom binary)
 - **Implicit GEMM kernel** — fused im2col computed on-the-fly in register-blocked SGEMM
+- **CUDA WMMA kernels** — hand-written FP16 Tensor Core implicit GEMM (no cuDNN dependency)
 - **CAS float accumulation** — portable C++17, no `std::atomic<double>` dependency
 - **Ring buffer history** — O(1) update vs vector operations
 - **Simpler node states** — 3 states vs 7 (no progressive resizing)
 - **`notify_one` delivery** — avoids thundering herd on result notification
+- **Evaluation gating** — dedicated `evaluate` binary plays model-vs-model matches with SGF output
+- **TRT engine cache per version** — pipeline uses versioned model files so TRT cache persists across iterations
+
+## 11. Training Pipeline
+
+| Aspect | KataGo | MiniGo C++ |
+|---|---|---|
+| **Pipeline orchestration** | Custom C++ `SelfplayManager` + Python training | Bash `run_loop.sh` (init/train/status) + Python training |
+| **Selfplay data format** | Custom binary (gzipped) | Binary `.bin` compressed with zstd |
+| **Training framework** | Custom C++ training loop (TF or PyTorch) | PyTorch with DDP via `torchrun` |
+| **Multi-GPU training** | Custom data-parallel or single GPU | PyTorch DistributedDataParallel (NCCL) |
+| **Data loading** | Streaming from compressed files | Streaming IterableDataset (zstd decompress per file, 8 workers) |
+| **Data window** | Sliding window of recent games (weighted sampling) | Sliding window of last N iterations (uniform sampling) |
+| **Evaluation gating** | Continuous Elo tracking, no hard gate | Match-based: candidate must beat best by ≥55% win rate |
+| **Evaluation games** | Ongoing Elo estimation from selfplay results | Dedicated `evaluate` binary, games saved as SGF |
+| **Model versioning** | Sequential network files, best tracked separately | `models/v0000.onnx` ... `v0100.onnx` + `best.onnx` |
+| **LR schedule** | Configured externally, manual changes | Staged plan: per-stage LR defined in `training_plan` |
+| **Resume** | Checkpoint-based, manual restart | Automatic: `run_loop.sh train` detects state and continues |
+| **Training plan** | Manual configuration files | Generated by `init`, editable text file with stage definitions |
+| **GPU auto-detection** | Manual `--config` | Auto: detects GPU count, sets NN servers + DDP processes |
+| **Selfplay compression** | gzip | zstd (faster decompress, similar ratio) |
+| **Game visualization** | External SGF viewers | Built-in `visualize.py` (reads .bin.zst and .sgf) |
+
+### Key training differences:
+- **KataGo uses Elo tracking** from selfplay results (no separate evaluation matches). MiniGo plays explicit head-to-head matches between candidate and best model.
+- **KataGo weights recent data higher** via exponential weighting. MiniGo uses a flat sliding window (all games in window are equal).
+- **KataGo runs selfplay continuously** with training happening in parallel. MiniGo runs sequential phases: selfplay → train → evaluate per iteration.
+- **KataGo's training is in C++** (with optional PyTorch). MiniGo uses Python/PyTorch exclusively for training, with DDP for multi-GPU.
 
 ---
 
-## 11. NNEvaluator Server — Full Technical Detail
+## 12. NNEvaluator Server — Full Technical Detail
 
 ### Initialization flow (MiniGo)
 
 ```
 main thread:
-  LoadedModel::load("model.onnx")       ← parse ONNX, pre-fuse BN, store CPU weights
+  LoadedModel::load("models/v0003.onnx") ← parse ONNX, pre-fuse BN, store CPU weights
        │
        ▼
-  create_compute_context(device_ids)     ← for each unique GPU:
-       │                                      clGetPlatformIDs → clGetDeviceIDs
-       │                                      clCreateContext (one per unique GPU)
-       │                                      clCreateCommandQueue (one per unique GPU)
-       │                                      clCreateProgramWithSource(OPENCL_KERNELS)
-       │                                      clBuildProgram("-cl-mad-enable")
-       │                                    store in map<int, OpenCLDeviceState>
+  create_compute_context(device_ids)     ← backend auto-detected at compile time:
+       │                                    TensorRT: cudaStream per GPU, engine built lazily
+       │                                    CUDA: cudaStream per GPU
+       │                                    OpenCL: cl_context + cl_queue + cl_program per GPU
+       │                                    Metal: MTLDevice + compiled MPSGraph
        ▼
   NNEvaluator(model, context, gpu_ids, max_batch)
        │
@@ -166,11 +194,11 @@ main thread:
                 └── ON server thread:
                       context_->create_handle(model, gpu_id, max_batch)
                         │
-                        └── OpenCLComputeHandle constructor:
-                              1. clCreateKernel × 6 from shared cl_program
-                              2. Upload weights: model->input_conv.weight → clCreateBuffer(COPY_HOST_PTR)
-                                 (repeat for all conv/bn/fc weights)
-                              3. allocate_workspace(max_batch): buf_main_, buf_temp_, etc.
+                        ├── TensorRT: build/load engine from ONNX (cached in trt_cache/),
+                        │             create IExecutionContext, allocate I/O buffers
+                        ├── CUDA: upload weights as FP16, allocate workspace
+                        ├── OpenCL: create cl_kernels, upload weights, allocate workspace
+                        └── Metal: buffers from shared MPSGraph
 ```
 
 ### Initialization flow (KataGo)
@@ -193,14 +221,15 @@ main thread:
                             compile kernels (with auto-tuning if first run)
 ```
 
-**Key difference**: In MiniGo, `cl_context` + `cl_program` are shared (created once per
-unique GPU in `ComputeContext`), and each `ComputeHandle` creates `cl_kernel` objects from
-the shared program. In KataGo, each compute handle is fully independent — owns its own
-context, program, and kernels.
+**Key similarity**: Both MiniGo and KataGo share `cl_context` per GPU — deliberately creating
+separate contexts per GPU (not per platform) to avoid NVIDIA serialization where one GPU
+locks out others.  Each `ComputeHandle` references the shared context and command queue
+from its GPU's device state. Handles own their own kernel objects and GPU buffers.
 
-MiniGo's shared `LoadedModel` means ONNX is parsed once and weights live in CPU memory;
-each handle does `clCreateBuffer(CL_MEM_COPY_HOST_PTR)` to upload. KataGo loads the model
-file per handle (each handle parses independently).
+**Key difference**: Weight format. MiniGo uses ONNX (parsed by a built-in minimal protobuf
+parser); KataGo uses a custom binary format (gzipped, SHA256 verified). Both parse the
+model file once on the main thread into shared CPU weights, then each handle uploads
+its own copy to GPU via `clCreateBuffer`.
 
 ### Server loop — step by step (MiniGo)
 
