@@ -57,12 +57,16 @@ struct MCTSNode {
     }
 
     // ── Derived values ───────────────────────────────────────────
+    // Q from PARENT's perspective (for UCB selection).
+    // Backprop stores total_value from this node's (child's) perspective,
+    // so we negate.  Virtual loss: each pending thread counts as a loss
+    // for the parent (−1), i.e. +1 from child's perspective, hence +vlc.
     float q_value() const {
         int vc  = visit_count.load(std::memory_order_relaxed);
         int vlc = virtual_loss_count.load(std::memory_order_relaxed);
         int total = vc + vlc;
         if (total == 0) return 0.0f;
-        return (total_value() - (float)vlc) / (float)total;
+        return -(total_value() + (float)vlc) / (float)total;
     }
 
     float ucb_score(float c_puct) const {
