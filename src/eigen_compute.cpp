@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <algorithm>
+#include <stdexcept>
 
 namespace minigo {
 
@@ -29,6 +30,8 @@ static Eigen::VectorXf to_vector(const std::vector<float>& data) {
 }
 
 EigenComputeHandle::EigenComputeHandle(const LoadedModel* model) {
+    if (model->model_type == "vit")
+        throw std::runtime_error("Eigen backend does not support ViT models. Use TensorRT.");
     board_size     = model->board_size;
     input_channels = model->input_channels;
     num_filters    = model->num_filters;

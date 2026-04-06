@@ -20,7 +20,7 @@ import onnx
 from onnx import numpy_helper, TensorProto
 
 sys.path.insert(0, os.path.dirname(__file__))
-from model import AlphaZeroNet
+from model import AlphaZeroNet, GoViT, create_model
 
 
 def _embed_state_dict(onnx_path, model):
@@ -45,11 +45,11 @@ def _embed_state_dict(onnx_path, model):
     onnx.save(onnx_model, onnx_path)
 
 
-def export_to_onnx(model, output_path, board_size=9, input_channels=17):
-    """Export a PyTorch AlphaZeroNet to ONNX format with dynamic batch axis.
+def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="resnet"):
+    """Export a PyTorch model to ONNX format with dynamic batch axis.
 
     The ONNX file contains:
-    1. The optimized graph (BN folded into Conv) for ONNX Runtime
+    1. The optimized graph (BN folded into Conv) for ONNX Runtime / TensorRT
     2. All raw state_dict tensors as extra initializers for the Eigen backend
     """
     model.eval()
@@ -90,47 +90,49 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export PyTorch model to ONNX",
         epilog="""Examples:
-  # Default small model (64 filters, 5 blocks)
+  # ResNet (default)
   python3 export_onnx.py --init --output ../models/model.onnx
 
-  # Large model for GPU benchmarking (128 filters, 10 blocks)
-  python3 export_onnx.py --init --filters 128 --blocks 10 --output ../models/large.onnx
+  # ViT
+  python3 export_onnx.py --init --arch vit --output ../models/vit.onnx
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--checkpoint", default="../training/checkpoints/training.pt",
-                        help="PyTorch checkpoint path")
-    parser.add_argument("--output", default="../models/model.onnx",
-                        help="Output ONNX file")
-    parser.add_argument("--board", type=int, default=9,
-                        help="Board size (default: 9)")
-    parser.add_argument("--filters", type=int, default=64,
-                        help="Conv filters / model width (default: 64)")
-    parser.add_argument("--blocks", type=int, default=5,
-                        help="Residual blocks / model depth (default: 5)")
+    parser.add_argument("--checkpoint", default="../training/checkpoints/training.pt")
+    parser.add_argument("--output", default="../models/model.onnx")
+    parser.add_argument("--board", type=int, default=9)
+    parser.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
+    # ResNet params
+    parser.add_argument("--filters", type=int, default=64)
+    parser.add_argument("--blocks", type=int, default=5)
+    # ViT params
+    parser.add_argument("--d-model", type=int, default=192)
+    parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=6)
+    parser.add_argument("--kv-groups", type=int, default=2)
+    parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--init", action="store_true",
                         help="Export an untrained (random) model")
     args = parser.parse_args()
 
-    model = AlphaZeroNet(
-        board_size=args.board,
-        input_channels=17,
-        num_filters=args.filters,
-        num_res_blocks=args.blocks,
+    model = create_model(
+        arch=args.arch, board_size=args.board, input_channels=17,
+        num_filters=args.filters, num_res_blocks=args.blocks,
+        d_model=args.d_model, depth=args.depth, heads=args.heads,
+        kv_groups=args.kv_groups, mlp_ratio=args.mlp_ratio,
     )
 
     if not args.init:
         if os.path.exists(args.checkpoint):
-            ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-            # Support both full checkpoint and state_dict-only formats
+            ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
             if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-                model.load_state_dict(ckpt["model_state_dict"])
+                model.load_state_dict(ckpt["model_state_dict"], strict=False)
             else:
-                model.load_state_dict(ckpt)
+                model.load_state_dict(ckpt, strict=False)
             print(f"Loaded checkpoint: {args.checkpoint}")
         else:
             print(f"No checkpoint at {args.checkpoint}, exporting random weights")
 
-    export_to_onnx(model, args.output, board_size=args.board)
+    export_to_onnx(model, args.output, board_size=args.board, arch=args.arch)
 
 
 if __name__ == "__main__":

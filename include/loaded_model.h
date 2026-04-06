@@ -42,6 +42,7 @@ public:
     std::string model_path;
 
     // Model architecture metadata
+    std::string model_type = "resnet";  // "resnet" or "vit"
     int board_size = 9;
     int input_channels = 17;
     int num_filters = 64;

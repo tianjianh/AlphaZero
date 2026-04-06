@@ -131,10 +131,11 @@ training plan) and `train` (run or resume training).
 
 ```bash
 # 1. Initialize — pick a preset or custom architecture
-python run_loop.py init small       # 9x9, 64f/5b,  100 iters, ~240K games
-python run_loop.py init large       # 9x9, 128f/10b, 200 iters, ~800K games
-python run_loop.py init quick       # 5x5, 32f/3b,  5 iters (pipeline test)
-python run_loop.py init --board 9 --filters 96 --blocks 8   # custom arch
+python run_loop.py init small                # 9x9 ResNet 64f/5b,  100 iters
+python run_loop.py init small --arch vit     # 9x9 ViT d192/8L/6h
+python run_loop.py init large                # 9x9 ResNet 128f/10b, 200 iters
+python run_loop.py init quick                # 5x5 ResNet 32f/3b,  5 iters (test)
+python run_loop.py init quick --arch vit     # 5x5 ViT (test)
 
 # 2. Train — GPUs are auto-detected, just run:
 python run_loop.py train
@@ -524,13 +525,24 @@ with 8 prefetch workers, keeping GPU utilization high with minimal memory.
 
 ## Neural Network
 
-Triple-headed ResNet (`scripts/model.py`):
+Two architectures (`scripts/model.py`), selected with `--arch`:
+
+**ResNet** (default): AlphaZero-style dual-conv residual blocks.
+**ViT**: Vision Transformer with one token per intersection, GQA, and
+D4-invariant positional encoding (orbit embedding + invariant relative bias).
+
+Both share the same triple-headed output:
 
 | Head | Output | Activation | Target |
 |------|--------|------------|--------|
 | **Policy** | `[batch, 82]` | softmax | MCTS visit distribution |
 | **Value** | `[batch, 1]` | tanh → [-1,1] | Game outcome (+1 win, -1 loss) |
 | **Score** | `[batch, 1]` | tanh → [-1,1] | Normalized point margin `(black - white) / board²` |
+
+**ViT positional encoding** — fully D4-invariant (compatible with dihedral augmentation):
+- *Orbit embedding*: 15 equivalence classes under rotation/reflection (`Embedding(15, d_model)`)
+- *Relative bias*: 45 displacement buckets indexed by `sorted(|dx|, |dy|)` per attention head
+- *GQA*: 6 query heads, 2 KV groups (3 queries share each K/V group)
 
 The score head (inspired by KataGo) lets MCTS prefer moves that win by more points.
 MCTS blends the two signals: `utility = value + score_weight × score`.

@@ -178,7 +178,8 @@ def generate_stages(preset, board, filters, blocks):
     ]
 
 
-def generate_plan(board, filters, blocks, preset):
+def generate_plan(board, filters, blocks, preset, arch="resnet",
+                   d_model=192, depth=8, heads=6, kv_groups=2, mlp_ratio=4):
     komi = 7.5 if board >= 13 else 6.5
     batch_size = 1024
     eval_threshold = 0.55
@@ -196,14 +197,19 @@ def generate_plan(board, filters, blocks, preset):
         dirichlet_alpha = 0.03
         temp_threshold = 30
 
-    return {
-        "board": board, "komi": komi, "filters": filters, "blocks": blocks,
+    plan = {
+        "arch": arch, "board": board, "komi": komi,
+        "filters": filters, "blocks": blocks,
         "batch_size": batch_size, "eval_threshold": eval_threshold,
         "window_size": window, "c_puct": 1.5,
         "dirichlet_alpha": dirichlet_alpha, "dirichlet_epsilon": 0.25,
         "temp_threshold": temp_threshold, "score_weight": score_weight,
         "stages": generate_stages(preset, board, filters, blocks),
     }
+    if arch == "vit":
+        plan.update({"d_model": d_model, "depth": depth, "heads": heads,
+                      "kv_groups": kv_groups, "mlp_ratio": mlp_ratio})
+    return plan
 
 
 # ══════════════════════════════════════════════════════════
@@ -341,14 +347,19 @@ def cmd_init(args):
     board = args.board
     filters = args.filters
     blocks = args.blocks
+    arch = args.arch
     preset = args.preset or "custom"
 
     print("============================================")
     print("  MiniGo Training — Init")
     print("============================================")
     print(f"  Preset:     {preset}")
+    print(f"  Arch:       {arch}")
     print(f"  Board:      {board}x{board}")
-    print(f"  Network:    {filters}f x {blocks}b")
+    if arch == "resnet":
+        print(f"  Network:    {filters}f x {blocks}b")
+    else:
+        print(f"  Network:    d={args.d_model} depth={args.depth} heads={args.heads} kv={args.kv_groups}")
     print()
 
     print("This will DELETE all existing training data:")
@@ -378,17 +389,26 @@ def cmd_init(args):
 
     # Generate training plan
     print("Generating training plan...")
-    plan = generate_plan(board, filters, blocks, preset)
+    plan = generate_plan(board, filters, blocks, preset, arch=arch,
+                         d_model=args.d_model, depth=args.depth,
+                         heads=args.heads, kv_groups=args.kv_groups,
+                         mlp_ratio=args.mlp_ratio)
     PLAN_FILE.write_text(json.dumps(plan, indent=2) + "\n")
 
     # Create initial random model (v0000) and set as best
     print("Creating initial model (v0000)...")
-    subprocess.run([
+    export_cmd = [
         sys.executable, str(SCRIPTS_DIR / "export_onnx.py"),
         "--output", str(version_onnx(0)),
-        "--board", str(board), "--filters", str(filters), "--blocks", str(blocks),
+        "--board", str(board), "--arch", arch,
+        "--filters", str(filters), "--blocks", str(blocks),
         "--init",
-    ], cwd=SCRIPTS_DIR, check=True)
+    ]
+    if arch == "vit":
+        export_cmd += ["--d-model", str(args.d_model), "--depth", str(args.depth),
+                       "--heads", str(args.heads), "--kv-groups", str(args.kv_groups),
+                       "--mlp-ratio", str(args.mlp_ratio)]
+    subprocess.run(export_cmd, cwd=SCRIPTS_DIR, check=True)
     shutil.copy2(version_onnx(0), best_onnx())
 
     # Initialize state
@@ -404,7 +424,8 @@ def cmd_init(args):
 ════════════════════════════════════════════════════════════════
 Initialized:  {timestamp()}
 Preset:       {preset}
-Architecture: {board}x{board} board, {filters} filters, {blocks} blocks
+Arch:         {arch}
+Architecture: {board}x{board} board, {f'{filters} filters, {blocks} blocks' if arch == 'resnet' else f'd_model={plan.get("d_model")}, depth={plan.get("depth")}, heads={plan.get("heads")}, kv_groups={plan.get("kv_groups")}'}
 Batch size:   {plan['batch_size']}
 Window size:  {plan['window_size']} iterations (data streamed via mmap, no memory limit)
 Komi:         {plan['komi']}
@@ -463,7 +484,12 @@ def cmd_status(args):
     print("============================================")
     print("  MiniGo Training Status")
     print("============================================")
-    print(f"  Architecture:   {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b")
+    arch = plan.get("arch", "resnet")
+    if arch == "resnet":
+        print(f"  Architecture:   {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b (resnet)")
+    else:
+        print(f"  Architecture:   {plan['board']}x{plan['board']}, d={plan['d_model']} depth={plan['depth']} "
+              f"heads={plan['heads']} kv={plan['kv_groups']} (vit)")
     print(f"  Komi:           {plan['komi']}")
     print(f"  Score weight:   {plan['score_weight']}")
     print(f"  Progress:       {state['pipeline_iter']} / {total_iters} iterations ({pct}%)")
@@ -656,6 +682,7 @@ def cmd_train(args):
             # Detect GPUs for DDP training
             train_gpus = detect_gpu_count()
 
+            arch = plan.get("arch", "resnet")
             train_args = [
                 str(SCRIPTS_DIR / "train.py"),
                 "--data", window_dirs,
@@ -664,11 +691,20 @@ def cmd_train(args):
                 "--batch-size", str(plan["batch_size"]),
                 "--lr", stage["lr"],
                 "--board", str(plan["board"]),
+                "--arch", arch,
                 "--filters", str(plan["filters"]),
                 "--blocks", str(plan["blocks"]),
                 "--output-onnx", str(candidate_onnx),
                 "--log-file", str(TRAIN_LOG),
             ]
+            if arch == "vit":
+                train_args += [
+                    "--d-model", str(plan["d_model"]),
+                    "--depth", str(plan["depth"]),
+                    "--heads", str(plan["heads"]),
+                    "--kv-groups", str(plan["kv_groups"]),
+                    "--mlp-ratio", str(plan["mlp_ratio"]),
+                ]
 
             if train_gpus > 1:
                 import random
@@ -804,9 +840,16 @@ def main():
     p_init = sub.add_parser("init", help="Initialize training (clears previous state)")
     p_init.add_argument("preset", nargs="?", choices=["quick", "small", "large"],
                         help="Preset: quick (5x5 test), small (9x9), large (9x9 deep)")
+    p_init.add_argument("--arch", default="resnet", choices=["resnet", "vit"],
+                        help="Model architecture (default: resnet)")
     p_init.add_argument("--board", type=int, default=None)
     p_init.add_argument("--filters", type=int, default=None)
     p_init.add_argument("--blocks", type=int, default=None)
+    p_init.add_argument("--d-model", type=int, default=192)
+    p_init.add_argument("--depth", type=int, default=8)
+    p_init.add_argument("--heads", type=int, default=6)
+    p_init.add_argument("--kv-groups", type=int, default=2)
+    p_init.add_argument("--mlp-ratio", type=int, default=4)
     p_init.add_argument("-y", "--yes", action="store_true",
                         help="Skip confirmation prompt")
 

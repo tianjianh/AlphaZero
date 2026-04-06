@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, IterableDataset
 import zstandard as zstd
 
 sys.path.insert(0, os.path.dirname(__file__))
-from model import AlphaZeroNet
+from model import AlphaZeroNet, GoViT, create_model
 
 
 # ═══════════════════════════════════════════════════════════
@@ -164,8 +164,14 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--board", type=int, default=9)
+    parser.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
     parser.add_argument("--filters", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=5)
+    parser.add_argument("--d-model", type=int, default=192)
+    parser.add_argument("--depth", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=6)
+    parser.add_argument("--kv-groups", type=int, default=2)
+    parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8,
                         help="DataLoader workers for prefetching (default: 8)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
@@ -216,9 +222,11 @@ def main():
         tlog(f"    Device: {device}")
 
     # ── Model + optimizer ──────────────────────────────────
-    model = AlphaZeroNet(
-        board_size=args.board, input_channels=17,
+    model = create_model(
+        arch=args.arch, board_size=args.board, input_channels=17,
         num_filters=args.filters, num_res_blocks=args.blocks,
+        d_model=args.d_model, depth=args.depth, heads=args.heads,
+        kv_groups=args.kv_groups, mlp_ratio=args.mlp_ratio,
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr,
@@ -348,9 +356,15 @@ def main():
             "model_state_dict": base_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "iteration": start_iteration + 1,
+            "arch": args.arch,
             "board_size": args.board,
             "num_filters": args.filters,
             "num_res_blocks": args.blocks,
+            "d_model": args.d_model,
+            "depth": args.depth,
+            "heads": args.heads,
+            "kv_groups": args.kv_groups,
+            "mlp_ratio": args.mlp_ratio,
         }
         torch.save(checkpoint, args.checkpoint)
         print(f"Saved checkpoint: {args.checkpoint}")
@@ -358,7 +372,7 @@ def main():
         print("Exporting ONNX model...")
         from export_onnx import export_to_onnx
         model_cpu = base_model.cpu()
-        export_to_onnx(model_cpu, args.output_onnx, board_size=args.board)
+        export_to_onnx(model_cpu, args.output_onnx, board_size=args.board, arch=args.arch)
         tlog(f"    Exported: {args.output_onnx}")
 
     if log_file:

@@ -193,6 +193,7 @@ int main(int argc, char* argv[]) {
 
     // Config — MCTS params are architecture-independent
     Config config;
+    config.model_type         = model1->model_type;
     config.board_size         = model1->board_size;
     config.input_channels     = model1->input_channels;
     config.num_filters        = model1->num_filters;

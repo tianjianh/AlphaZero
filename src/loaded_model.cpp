@@ -22,18 +22,43 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     auto model = std::make_shared<LoadedModel>();
     model->model_path = model_path;
 
-    // ── Infer architecture ───────────────────────────────────────
-    auto& iw = get("input_conv.weight");
-    model->input_channels = (int)iw.dims[1];
-    model->num_filters    = (int)iw.dims[0];
+    // ── Detect model type and infer architecture ─────────────────
+    bool is_vit = tm.count("token_proj.weight") > 0;
 
-    model->num_res_blocks = 0;
-    while (tm.count("res_blocks." + std::to_string(model->num_res_blocks) + ".conv1.weight"))
-        model->num_res_blocks++;
+    if (is_vit) {
+        // ViT model — infer from token_proj and policy_proj weights
+        model->model_type = "vit";
+        auto& tp = get("token_proj.weight");
+        model->input_channels = (int)tp.dims[1];
+        model->num_filters    = (int)tp.dims[0];  // d_model
+        model->num_res_blocks = 0;  // not applicable
 
-    auto& pfw = get("policy_fc.weight");
-    int action_size = (int)pfw.dims[0];
-    model->board_size = (int)std::round(std::sqrt((double)(action_size - 1)));
+        auto& pp = get("policy_proj.weight");
+        // policy_proj is Linear(d_model, 1), applied to hw tokens → hw logits
+        // board_size inferred from orbit_ids buffer size: hw = board_size^2
+        if (tm.count("orbit_ids")) {
+            auto& oi = get("orbit_ids");
+            int hw = 1;
+            for (auto d : oi.dims) hw *= (int)d;
+            model->board_size = (int)std::round(std::sqrt((double)hw));
+        } else {
+            model->board_size = 9;  // fallback
+        }
+    } else {
+        // ResNet model
+        model->model_type = "resnet";
+        auto& iw = get("input_conv.weight");
+        model->input_channels = (int)iw.dims[1];
+        model->num_filters    = (int)iw.dims[0];
+
+        model->num_res_blocks = 0;
+        while (tm.count("res_blocks." + std::to_string(model->num_res_blocks) + ".conv1.weight"))
+            model->num_res_blocks++;
+
+        auto& pfw = get("policy_fc.weight");
+        int action_size = (int)pfw.dims[0];
+        model->board_size = (int)std::round(std::sqrt((double)(action_size - 1)));
+    }
 
     const float eps = 1e-5f;
 
@@ -72,6 +97,16 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     };
 
     // ── Load all weights ─────────────────────────────────────────
+    // ViT models use TensorRT (ONNX graph directly) — no CPU weight loading needed
+    if (is_vit) {
+        std::cout << "Model loaded: type=vit board=" << model->board_size
+                  << " d_model=" << model->num_filters
+                  << " channels=" << model->input_channels
+                  << " score_head=" << (model->has_score_head ? "yes" : "no")
+                  << "\n";
+        return model;
+    }
+
     load_conv(model->input_conv, "input_conv.weight");
     load_bn  (model->input_conv, "input_bn");
 
@@ -103,7 +138,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         load_fc(model->score_fc2, "score_fc2");
     }
 
-    std::cout << "Model loaded: board=" << model->board_size
+    std::cout << "Model loaded: type=resnet board=" << model->board_size
               << " filters=" << model->num_filters
               << " blocks=" << model->num_res_blocks
               << " channels=" << model->input_channels

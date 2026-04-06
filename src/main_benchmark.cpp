@@ -84,6 +84,7 @@ int main(int argc, char* argv[]) {
         model = LoadedModel::load(model_path);
         context = std::shared_ptr<ComputeContext>(create_compute_context(device_ids));
         has_model = true;
+        config.model_type      = model->model_type;
         config.board_size      = model->board_size;
         config.input_channels  = model->input_channels;
         config.num_filters     = model->num_filters;

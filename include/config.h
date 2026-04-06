@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace minigo {
 
 struct Config {
@@ -8,6 +10,7 @@ struct Config {
     float komi = 6.5f;
 
     // Neural network
+    std::string model_type = "resnet";  // "resnet" or "vit"
     int num_res_blocks = 5;
     int num_filters = 64;
     int input_channels = 17;  // 8 history * 2 + 1 color

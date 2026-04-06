@@ -106,6 +106,7 @@ int main(int argc, char* argv[]) {
     // Load model once (shared CPU weights — KataGo pattern)
     auto model = LoadedModel::load(model_path);
 
+    config.model_type         = model->model_type;
     config.board_size         = model->board_size;
     config.input_channels     = model->input_channels;
     config.num_filters        = model->num_filters;
@@ -122,6 +123,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "MiniGo C++ Self-Play\n"
               << "  Board:            " << config.board_size << "x" << config.board_size << "\n"
+              << "  Arch:             " << config.model_type << "\n"
               << "  Komi:             " << config.komi << "\n"
               << "  Filters:          " << config.num_filters
               << "  Blocks: "           << config.num_res_blocks << "\n"
