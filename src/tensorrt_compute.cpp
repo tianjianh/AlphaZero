@@ -462,9 +462,13 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     if (I.has_score_head)
         CUDA_CHECK(cudaMalloc(&I.d_score, (size_t)max_batch_size * sizeof(float)));
 
-    std::cout << "TensorRT handle ready: board=" << I.board_size
-              << " filters=" << model->num_filters
-              << " blocks=" << model->num_res_blocks << "\n";
+    std::cout << "TensorRT handle ready: board=" << I.board_size;
+    if (model->model_type == "vit")
+        std::cout << " d_model=" << model->num_filters;
+    else
+        std::cout << " filters=" << model->num_filters
+                  << " blocks=" << model->num_res_blocks;
+    std::cout << "\n";
 }
 
 TensorRTComputeHandle::~TensorRTComputeHandle() {

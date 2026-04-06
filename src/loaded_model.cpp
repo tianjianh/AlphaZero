@@ -100,9 +100,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     if (is_vit) {
         std::cout << "Model loaded: type=vit board=" << model->board_size
                   << " d_model=" << model->num_filters
-                  << " channels=" << model->input_channels
-                  << " score_head=" << (model->has_score_head ? "yes" : "no")
-                  << "\n";
+                  << " channels=" << model->input_channels << "\n";
         return model;
     }
 
@@ -137,9 +135,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     std::cout << "Model loaded: type=resnet board=" << model->board_size
               << " filters=" << model->num_filters
               << " blocks=" << model->num_res_blocks
-              << " channels=" << model->input_channels
-              << " score_head=" << (model->has_score_head ? "yes" : "no")
-              << "\n";
+              << " channels=" << model->input_channels << "\n";
 
     return model;
 }
