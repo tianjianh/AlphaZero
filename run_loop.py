@@ -744,6 +744,10 @@ def cmd_train(args):
             eval_dir = PROJECT_DIR / "training" / "eval" / f"iter_{it:04d}"
             eval_dir.mkdir(parents=True, exist_ok=True)
 
+            # Evaluate loads 2 models — halve server threads to avoid GPU OOM
+            eval_servers = max(1, hw["nn_server_threads"] // 2)
+            eval_devices = ",".join(hw["nn_device_ids"].split(",")[:eval_servers])
+
             eval_cmd = [
                 str(BUILD_DIR / "evaluate"),
                 "--model1", str(candidate_onnx),
@@ -752,8 +756,8 @@ def cmd_train(args):
                 "--threads", str(hw["threads"]),
                 "--search-threads", str(hw["search_threads"]),
                 "--max-batch", str(hw["max_batch"]),
-                "--nn-server-threads", str(hw["nn_server_threads"]),
-                "--nn-device-ids", hw["nn_device_ids"],
+                "--nn-server-threads", str(eval_servers),
+                "--nn-device-ids", eval_devices,
                 "--sims", str(stage["sims"]),
                 "--c-puct", str(plan["c_puct"]),
                 "--komi", str(plan["komi"]),
@@ -768,28 +772,36 @@ def cmd_train(args):
             eval_result = result.returncode
             ev_time = int(time.time() - t0)
 
-            # Parse results
-            wr_match = re.search(r"win rate:\s*([\d.]+%)", eval_output)
-            m1w_match = re.search(r"Model 1 wins:\s*(\d+)", eval_output)
-            m2w_match = re.search(r"Model 2 wins:\s*(\d+)", eval_output)
-            drw_match = re.search(r"Draws:\s*(\d+)", eval_output)
-            verdict_match = re.search(r"RESULT:\s*(PASS|FAIL)", eval_output)
-
-            wr = wr_match.group(1) if wr_match else "?"
-            m1w = m1w_match.group(1) if m1w_match else "?"
-            m2w = m2w_match.group(1) if m2w_match else "?"
-            drw = drw_match.group(1) if drw_match else "?"
-            verdict = verdict_match.group(1) if verdict_match else "?"
-
-            tlog(f"    Win rate: {wr} ({m1w}-{m2w}-{drw})  {verdict}  {ev_time}s")
-
-            if eval_result == 0:
-                log(f"Phase 3 — PROMOTED {vstr(it)} {wr} (beats {vstr(state['best_version'])}) [{ev_time}s]")
+            # Detect crash (return code < 0 = signal, or 2 = error exit)
+            if eval_result < 0 or eval_result == 2:
+                log(f"Phase 3 — EVAL CRASHED (exit {eval_result}), auto-promoting {vstr(it)} [{ev_time}s]")
+                tlog(f"    EVAL CRASHED exit={eval_result}  {ev_time}s — auto-promote")
                 shutil.copy2(candidate_onnx, best_onnx())
                 state["best_version"] = it
                 state["total_promotions"] += 1
             else:
-                log(f"Phase 3 — REJECTED {vstr(it)} {wr} [{ev_time}s]")
+                # Parse results
+                wr_match = re.search(r"win rate:\s*([\d.]+%)", eval_output)
+                m1w_match = re.search(r"Model 1 wins:\s*(\d+)", eval_output)
+                m2w_match = re.search(r"Model 2 wins:\s*(\d+)", eval_output)
+                drw_match = re.search(r"Draws:\s*(\d+)", eval_output)
+                verdict_match = re.search(r"RESULT:\s*(PASS|FAIL)", eval_output)
+
+                wr = wr_match.group(1) if wr_match else "?"
+                m1w = m1w_match.group(1) if m1w_match else "?"
+                m2w = m2w_match.group(1) if m2w_match else "?"
+                drw = drw_match.group(1) if drw_match else "?"
+                verdict = verdict_match.group(1) if verdict_match else "?"
+
+                tlog(f"    Win rate: {wr} ({m1w}-{m2w}-{drw})  {verdict}  {ev_time}s")
+
+                if eval_result == 0:
+                    log(f"Phase 3 — PROMOTED {vstr(it)} {wr} (beats {vstr(state['best_version'])}) [{ev_time}s]")
+                    shutil.copy2(candidate_onnx, best_onnx())
+                    state["best_version"] = it
+                    state["total_promotions"] += 1
+                else:
+                    log(f"Phase 3 — REJECTED {vstr(it)} {wr} [{ev_time}s]")
         else:
             if state["best_version"] == 0:
                 log(f"Phase 3 — Auto-promote {vstr(it)} (first model)")
