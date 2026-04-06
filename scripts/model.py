@@ -139,19 +139,22 @@ def _build_rel_bias_indices(n):
 
 
 class GQAAttention(nn.Module):
-    """Grouped Query Attention with D4-invariant relative positional bias."""
+    """Grouped Query Attention with D4-invariant relative positional bias.
+
+    Fused Q + fused KV projections for efficiency.
+    """
 
     def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32):
         super().__init__()
+        assert num_heads % kv_groups == 0
         self.num_heads = num_heads
         self.kv_groups = kv_groups
         self.head_dim = head_dim
-        self.heads_per_group = num_heads // kv_groups
-        self.scale = head_dim ** -0.5
+        self.group_size = num_heads // kv_groups
+        self.scale = math.sqrt(head_dim)
 
         self.q_proj = nn.Linear(d_model, num_heads * head_dim)
-        self.k_proj = nn.Linear(d_model, kv_groups * head_dim)
-        self.v_proj = nn.Linear(d_model, kv_groups * head_dim)
+        self.kv_proj = nn.Linear(d_model, 2 * kv_groups * head_dim)
         self.out_proj = nn.Linear(num_heads * head_dim, d_model)
 
         # Per-head relative positional bias: [num_heads, num_rel_buckets]
@@ -159,25 +162,26 @@ class GQAAttention(nn.Module):
 
     def forward(self, x, rel_indices):
         B, N, _ = x.shape
-        H, G, hpg, d = self.num_heads, self.kv_groups, self.heads_per_group, self.head_dim
+        H, G, d = self.num_heads, self.kv_groups, self.head_dim
 
         q = self.q_proj(x).view(B, N, H, d).transpose(1, 2)       # [B, H, N, d]
-        k = self.k_proj(x).view(B, N, G, d).transpose(1, 2)       # [B, G, N, d]
-        v = self.v_proj(x).view(B, N, G, d).transpose(1, 2)       # [B, G, N, d]
+
+        kv = self.kv_proj(x).view(B, N, 2, G, d).permute(2, 0, 3, 1, 4)  # [2, B, G, N, d]
+        k, v = kv[0], kv[1]                                        # [B, G, N, d] each
 
         # Expand KV groups: [B, G, N, d] → [B, H, N, d]
-        k = k.unsqueeze(2).expand(B, G, hpg, N, d).reshape(B, H, N, d)
-        v = v.unsqueeze(2).expand(B, G, hpg, N, d).reshape(B, H, N, d)
+        k = k.repeat_interleave(self.group_size, dim=1)            # [B, H, N, d]
+        v = v.repeat_interleave(self.group_size, dim=1)            # [B, H, N, d]
 
         # Attention scores
-        attn = (q @ k.transpose(-2, -1)) * self.scale              # [B, H, N, N]
+        attn = (q @ k.transpose(-2, -1)) / self.scale              # [B, H, N, N]
 
         # Add D4-invariant relative positional bias
         bias = self.rel_bias[:, rel_indices]                        # [H, N, N]
         attn = attn + bias.unsqueeze(0)
 
         attn = F.softmax(attn, dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, H * d)     # [B, N, H*d]
+        out = (attn @ v).transpose(1, 2).contiguous().view(B, N, H * d)
         return self.out_proj(out)
 
 

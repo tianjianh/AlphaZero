@@ -26,24 +26,26 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     bool is_vit = tm.count("token_proj.weight") > 0;
 
     if (is_vit) {
-        // ViT model — infer from token_proj and policy_proj weights
+        // ViT model — infer from token_proj weights
         model->model_type = "vit";
         auto& tp = get("token_proj.weight");
         model->input_channels = (int)tp.dims[1];
         model->num_filters    = (int)tp.dims[0];  // d_model
         model->num_res_blocks = 0;  // not applicable
 
-        auto& pp = get("policy_proj.weight");
-        // policy_proj is Linear(d_model, 1), applied to hw tokens → hw logits
-        // board_size inferred from orbit_ids buffer size: hw = board_size^2
+        // board_size from orbit_ids buffer: length = board_size^2
         if (tm.count("orbit_ids")) {
             auto& oi = get("orbit_ids");
             int hw = 1;
             for (auto d : oi.dims) hw *= (int)d;
             model->board_size = (int)std::round(std::sqrt((double)hw));
         } else {
-            model->board_size = 9;  // fallback
+            model->board_size = 9;
         }
+
+        // ViT score head uses score_fc1 (not score_conv like ResNet)
+        if (tm.count("score_fc1.weight"))
+            model->has_score_head = true;
     } else {
         // ResNet model
         model->model_type = "resnet";
