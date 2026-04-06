@@ -462,6 +462,22 @@ add to the factory in `compute_context.cpp`, add CMake detection.  The
 NNEvaluator, MCTS, game engine, and training pipeline are completely
 backend-agnostic.
 
+### Backend Lifecycle (example: 2 GPUs, 4 server threads, `--nn-device-ids 0,0,1,1`)
+
+| | **TensorRT** | **CUDA** | **OpenCL** | **Metal** |
+|---|---|---|---|---|
+| **Context created** | Main thread | Main thread | Main thread | Main thread |
+| **Context holds** | Stream + runtime per GPU | Stream per GPU | Context + queue + **compiled kernels** per GPU | MTLDevice + command queue |
+| **Handle created** | Server thread | Server thread | Server thread | Server thread |
+| **Handles** | 4 (1 per thread) | 4 (1 per thread) | 4 (1 per thread) | 4 (1 per thread) |
+| **Engine/kernel build** | 1st server thread per GPU, mutex-guarded, cached to disk | N/A (hand-written kernels) | Main thread (1 `clBuildProgram` per GPU) | Server thread (1 MPSGraph per handle) |
+| **Weight copies on GPU** | 1 per GPU (inside TRT engine, shared by handles) | 2 per GPU (each handle uploads own FP16 copy) | 2 per GPU (each handle uploads own copy) | 4 total (embedded in MPSGraph) |
+| **Per-handle state** | Execution context + I/O buffers | Weights + workspace buffers | Kernel handles + weights + workspace | MPSGraph with embedded weights |
+
+TensorRT engine build is serialized per cache path (mutex) to prevent concurrent
+writes to the same cache file.  With identical GPUs, only **1 build** occurs across
+all 4 threads — the remaining 3 load from cache or reuse `dev.engine` in memory.
+
 ## Performance
 
 ### Batch NN inference throughput (9×9, states/s)
