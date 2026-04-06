@@ -211,7 +211,11 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
 
     // Configure builder
     auto* config = builder->createBuilderConfig();
-    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 256ULL << 20);  // 256 MiB
+    // Workspace for tactic selection and runtime scratch memory.
+    // Freed after build; generous allocation lets TRT pick faster tactics.
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, free_mem / 2);
 
     // Enable FP16 if the device supports it
     // (platformHasFastFp16/kFP16 deprecated in TRT 10.12 in favour of strong
