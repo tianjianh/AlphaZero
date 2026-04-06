@@ -509,7 +509,7 @@ The pipeline is fully resumable at every phase boundary.  Run
   version, total games played, and promotion count
 - **Selfplay resume**: skips iterations that already have enough game files
 - **Training resume**: skips iterations whose versioned ONNX + checkpoint exist
-- **Checkpoints** (`training/checkpoints/training.pt`): model weights + Adam optimizer
+- **Checkpoints** (`training/checkpoints/training.pt`): model weights + optimizer (Adam for ResNet, AdamW for ViT)
   state (momentum buffers) for smooth continuation
 - **Selfplay data**: accumulates in per-iteration directories
   (`training/selfplay/iter_0001/`, etc.) and is never deleted
