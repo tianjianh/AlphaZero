@@ -54,8 +54,8 @@ public:
     ConvBNWeights              policy_conv, value_conv;
     FCWeights                  policy_fc, value_fc1, value_fc2;
 
-    // Score head (optional — old models may not have it)
-    bool                       has_score_head = false;
+    // Score head (always present in current models)
+    bool                       has_score_head = true;
     ConvBNWeights              score_conv;
     FCWeights                  score_fc1, score_fc2;
 };
