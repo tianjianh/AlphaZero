@@ -744,10 +744,6 @@ def cmd_train(args):
             eval_dir = PROJECT_DIR / "training" / "eval" / f"iter_{it:04d}"
             eval_dir.mkdir(parents=True, exist_ok=True)
 
-            # Evaluate loads 2 models — halve server threads to avoid GPU OOM
-            eval_servers = max(1, hw["nn_server_threads"] // 2)
-            eval_devices = ",".join(hw["nn_device_ids"].split(",")[:eval_servers])
-
             eval_cmd = [
                 str(BUILD_DIR / "evaluate"),
                 "--model1", str(candidate_onnx),
@@ -756,8 +752,8 @@ def cmd_train(args):
                 "--threads", str(hw["threads"]),
                 "--search-threads", str(hw["search_threads"]),
                 "--max-batch", str(hw["max_batch"]),
-                "--nn-server-threads", str(eval_servers),
-                "--nn-device-ids", eval_devices,
+                "--nn-server-threads", str(hw["nn_server_threads"]),
+                "--nn-device-ids", hw["nn_device_ids"],
                 "--sims", str(stage["sims"]),
                 "--c-puct", str(plan["c_puct"]),
                 "--komi", str(plan["komi"]),
