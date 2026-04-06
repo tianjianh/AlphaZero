@@ -131,25 +131,25 @@ training plan) and `train` (run or resume training).
 
 ```bash
 # 1. Initialize — pick a preset or custom architecture
-./run_loop.sh init small       # 9x9, 64f/5b,  100 iters, ~240K games
-./run_loop.sh init large       # 9x9, 128f/10b, 200 iters, ~800K games
-./run_loop.sh init quick       # 5x5, 32f/3b,  5 iters (pipeline test)
-./run_loop.sh init --board 9 --filters 96 --blocks 8   # custom arch
+python run_loop.py init small       # 9x9, 64f/5b,  100 iters, ~240K games
+python run_loop.py init large       # 9x9, 128f/10b, 200 iters, ~800K games
+python run_loop.py init quick       # 5x5, 32f/3b,  5 iters (pipeline test)
+python run_loop.py init --board 9 --filters 96 --blocks 8   # custom arch
 
 # 2. Train — GPUs are auto-detected, just run:
-./run_loop.sh train
+python run_loop.py train
 
 # Or with explicit hardware settings:
-./run_loop.sh train --threads 64 --nn-device-ids 0,0,1,1 --max-batch 512
+python run_loop.py train --threads 64 --nn-device-ids 0,0,1,1 --max-batch 512
 
 # Run a limited number of iterations then pause:
-./run_loop.sh train --iterations 20
+python run_loop.py train --iterations 20
 
 # 3. Check progress:
-./run_loop.sh status
+python run_loop.py status
 ```
 
-**Resumable** — stop at any time (Ctrl+C) and re-run `./run_loop.sh train`
+**Resumable** — stop at any time (Ctrl+C) and re-run `python run_loop.py train`
 to continue from where it left off.  Pipeline state, selfplay data,
 checkpoints, and training logs are all preserved.
 
@@ -162,7 +162,7 @@ Each iteration runs three phases:
 3. **Evaluate & gate**: play games between candidate and best model; promote
    if candidate wins ≥ 55% (configurable)
 
-The pipeline is controlled by a **training plan** (`training_plan` file)
+The pipeline is controlled by a **training plan** (`training_plan.json` file)
 generated during `init`.  The plan defines staged training with escalating
 parameters:
 
@@ -502,7 +502,7 @@ threads: `total = min(games, threads) × search_threads`.
 ## Resumable Training
 
 The pipeline is fully resumable at every phase boundary.  Run
-`./run_loop.sh train` after any interruption to continue:
+`python run_loop.py train` after any interruption to continue:
 
 - **Pipeline state** (`training/state`): tracks current iteration, best model
   version, total games played, and promotion count
@@ -564,8 +564,8 @@ python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../mo
 ```
 minigo-cpp/
 ├── CMakeLists.txt              # Build (Eigen required, OpenCL/Metal optional)
-├── run_loop.sh                 # Training pipeline (init/train/status)
-├── training_plan               # Generated training schedule (editable)
+├── run_loop.py                 # Training pipeline (init/train/status)
+├── training_plan.json          # Generated training schedule (editable)
 ├── models/                     # ONNX model files
 │   ├── best.onnx               #   Current best (used for selfplay)
 │   └── v0001.onnx ...          #   Version snapshots
@@ -616,14 +616,14 @@ minigo-cpp/
 
 ## CLI Reference
 
-### run_loop.sh
+### run_loop.py
 
 ```
-./run_loop.sh init <preset>      Initialize training (clears previous state)
+python run_loop.py init <preset>      Initialize training (clears previous state)
   Presets: quick, small, large
   Custom:  init --board 9 --filters 96 --blocks 8
 
-./run_loop.sh train [options]    Start or resume training
+python run_loop.py train [options]    Start or resume training
   --threads N             Worker threads (default: all cores)
   --search-threads N      MCTS search threads per move (default: 16)
   --selfplay-instances N  Parallel selfplay processes (default: 1)
@@ -632,7 +632,7 @@ minigo-cpp/
   --max-batch N           Max GPU batch size for NN server (default: 256)
   --iterations N          Max iterations this session (default: all)
 
-./run_loop.sh status             Show training progress
+python run_loop.py status             Show training progress
 ```
 
 ### selfplay
@@ -762,8 +762,8 @@ Delete the `trt_cache/` directory to force a rebuild after upgrading TensorRT or
 **OpenCL kernel compile error**: shown in the exception message; usually means
 the GPU doesn't support the feature used.  File a bug with the error text.
 
-**Training interrupted**: Just re-run `./run_loop.sh train` — it resumes automatically
-from the last completed iteration.  Check `./run_loop.sh status` to see progress.
+**Training interrupted**: Just re-run `python run_loop.py train` — it resumes automatically
+from the last completed iteration.  Check `python run_loop.py status` to see progress.
 
 **Slow on macOS with OpenCL**: Rebuild with Metal backend:
 `cmake .. -DMINIGO_BACKEND=metal && make -j$(sysctl -n hw.ncpu)`.
