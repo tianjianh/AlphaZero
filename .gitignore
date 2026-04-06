@@ -6,7 +6,6 @@ models/
 training/
 trt_cache/
 training_plan
-training_plan.json
 pipeline_config
 
 # Data files

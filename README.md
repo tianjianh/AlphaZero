@@ -162,7 +162,7 @@ Each iteration runs three phases:
 3. **Evaluate & gate**: play games between candidate and best model; promote
    if candidate wins ≥ 55% (configurable)
 
-The pipeline is controlled by a **training plan** (`training_plan.json` file)
+The pipeline is controlled by a **training plan** (`training/plan.json` file)
 generated during `init`.  The plan defines staged training with escalating
 parameters:
 
@@ -565,7 +565,7 @@ python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../mo
 minigo-cpp/
 ├── CMakeLists.txt              # Build (Eigen required, OpenCL/Metal optional)
 ├── run_loop.py                 # Training pipeline (init/train/status)
-├── training_plan.json          # Generated training schedule (editable)
+│   ├── plan.json               #   Generated training schedule (editable)
 ├── models/                     # ONNX model files
 │   ├── best.onnx               #   Current best (used for selfplay)
 │   └── v0001.onnx ...          #   Version snapshots

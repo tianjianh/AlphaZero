@@ -38,7 +38,7 @@ DATA_DIR = PROJECT_DIR / "training" / "selfplay"
 LOGS_DIR = PROJECT_DIR / "training" / "logs"
 CHECKPOINT_DIR = PROJECT_DIR / "training" / "checkpoints"
 STATE_FILE = PROJECT_DIR / "training" / "state.json"
-PLAN_FILE = PROJECT_DIR / "training_plan.json"
+PLAN_FILE = PROJECT_DIR / "training" / "plan.json"
 TRAIN_LOG = LOGS_DIR / "train.log"
 SCRIPTS_DIR = PROJECT_DIR / "scripts"
 
@@ -113,7 +113,7 @@ def save_state(state):
 
 def read_plan():
     if not PLAN_FILE.is_file():
-        print("ERROR: No training plan found.")
+        print("ERROR: No training plan found (training/plan.json).")
         print("Run 'python run_loop.py init small' (or large/quick) first.")
         sys.exit(1)
     return json.loads(PLAN_FILE.read_text())
@@ -123,7 +123,7 @@ def get_stage_for_iter(plan, it):
     for i, s in enumerate(plan["stages"]):
         if s["start"] <= it <= s["end"]:
             return {**s, "idx": i + 1}
-    print(f"ERROR: iteration {it} is outside all stages in training_plan.json")
+    print(f"ERROR: iteration {it} is outside all stages in training/plan.json")
     sys.exit(1)
 
 
@@ -355,7 +355,7 @@ def cmd_init(args):
     print("  models/              (ONNX model files)")
     print("  training/            (selfplay data, eval games, checkpoints, logs)")
     print("  trt_cache/           (TensorRT engine cache)")
-    print("  training_plan.json   (training schedule)")
+    print("  training/plan.json   (training schedule)")
     print()
 
     if not args.yes:
@@ -368,7 +368,7 @@ def cmd_init(args):
     for d in [MODELS_DIR, PROJECT_DIR / "training", PROJECT_DIR / "trt_cache"]:
         if d.is_dir():
             shutil.rmtree(d)
-    for f in [PLAN_FILE, PROJECT_DIR / "training_plan"]:
+    for f in [PROJECT_DIR / "training_plan", PROJECT_DIR / "training_plan.json"]:
         if f.is_file():
             f.unlink()
 
