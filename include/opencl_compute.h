@@ -86,8 +86,6 @@ private:
     cl_mem buf_scr_h1_ = nullptr, buf_scr_feat_ = nullptr, buf_scr_out_ = nullptr;
     int alloc_batch_ = 0;
 
-    bool has_score_head_ = false;
-
     // Model metadata
     int board_size, input_channels, num_filters, num_res_blocks;
 

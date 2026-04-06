@@ -73,7 +73,6 @@ struct TRTDeviceState {
     std::string policy_name;
     std::string value_name;
     std::string score_name;
-    bool        has_score_head = false;
 };
 
 // ================================================================
@@ -351,7 +350,6 @@ struct TensorRTComputeHandle::Impl {
     std::string policy_name;
     std::string value_name;
     std::string score_name;
-    bool has_score_head = false;
 
     Impl(TRTDeviceState& d) : dev(d) {}
 
@@ -390,7 +388,6 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
                     std::string sname(name);
                     if (sname == "score") {
                         dev.score_name = name;
-                        dev.has_score_head = true;
                     } else {
                         // Identify policy vs value by shape:
                         // policy is [N, action_size], value is [N, 1]
@@ -424,10 +421,8 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
 
             std::cout << "TensorRT I/O: input=\"" << dev.input_name
                       << "\" policy=\"" << dev.policy_name
-                      << "\" value=\"" << dev.value_name << "\"";
-            if (dev.has_score_head)
-                std::cout << " score=\"" << dev.score_name << "\"";
-            std::cout << "\n";
+                      << "\" value=\"" << dev.value_name
+                      << "\" score=\"" << dev.score_name << "\"\n";
         }
     }
 
@@ -441,7 +436,6 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     I.policy_name    = dev.policy_name;
     I.value_name     = dev.value_name;
     I.score_name     = dev.score_name;
-    I.has_score_head = dev.has_score_head;
 
     // Create per-thread execution context
     I.exec_ctx = dev.engine->createExecutionContext();
@@ -459,8 +453,7 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     CUDA_CHECK(cudaMalloc(&I.d_input,  input_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_policy, policy_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_value,  value_bytes));
-    if (I.has_score_head)
-        CUDA_CHECK(cudaMalloc(&I.d_score, (size_t)max_batch_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&I.d_score, (size_t)max_batch_size * sizeof(float)));
 
     std::cout << "TensorRT handle ready: board=" << I.board_size;
     if (model->model_type == "vit")
@@ -520,10 +513,8 @@ TensorRTComputeHandle::predict_batch(
         throw std::runtime_error("TensorRT: setTensorAddress(policy) failed");
     if (!I.exec_ctx->setTensorAddress(I.value_name.c_str(),  I.d_value))
         throw std::runtime_error("TensorRT: setTensorAddress(value) failed");
-    if (I.has_score_head) {
-        if (!I.exec_ctx->setTensorAddress(I.score_name.c_str(), I.d_score))
-            throw std::runtime_error("TensorRT: setTensorAddress(score) failed");
-    }
+    if (!I.exec_ctx->setTensorAddress(I.score_name.c_str(), I.d_score))
+        throw std::runtime_error("TensorRT: setTensorAddress(score) failed");
 
     // Run inference
     if (!I.exec_ctx->enqueueV3(I.dev.stream))
@@ -538,12 +529,9 @@ TensorRTComputeHandle::predict_batch(
     CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.d_value,
         val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
 
-    std::vector<float> scr_flat;
-    if (I.has_score_head) {
-        scr_flat.resize((size_t)N);
-        CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
-            scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
-    }
+    std::vector<float> scr_flat((size_t)N);
+    CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
+        scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
 
     CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
 
@@ -554,7 +542,7 @@ TensorRTComputeHandle::predict_batch(
                                pol_flat.begin() + (n + 1) * action_size);
         results[n].policy = std::move(pol);
         results[n].value  = val_flat[n];
-        results[n].score  = I.has_score_head ? scr_flat[n] : 0.0f;
+        results[n].score  = scr_flat[n];
     }
     return results;
 }

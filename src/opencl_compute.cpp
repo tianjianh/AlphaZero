@@ -489,12 +489,9 @@ OpenCLComputeHandle::OpenCLComputeHandle(OpenCLDeviceState& dev,
     upload_fc(value_fc1_gpu_, model->value_fc1);
     upload_fc(value_fc2_gpu_, model->value_fc2);
 
-    has_score_head_ = model->has_score_head;
-    if (has_score_head_) {
-        upload_conv(score_conv_gpu_, model->score_conv);
-        upload_fc(score_fc1_gpu_, model->score_fc1);
-        upload_fc(score_fc2_gpu_, model->score_fc2);
-    }
+    upload_conv(score_conv_gpu_, model->score_conv);
+    upload_fc(score_fc1_gpu_, model->score_fc1);
+    upload_fc(score_fc2_gpu_, model->score_fc2);
 
     // Pre-allocate workspace
     allocate_workspace(max_batch_size > 0 ? max_batch_size : 32);
@@ -551,11 +548,9 @@ void OpenCLComputeHandle::free_weights() {
     free_fc(policy_fc_gpu_);
     free_fc(value_fc1_gpu_);
     free_fc(value_fc2_gpu_);
-    if (has_score_head_) {
-        free_conv(score_conv_gpu_);
-        free_fc(score_fc1_gpu_);
-        free_fc(score_fc2_gpu_);
-    }
+    free_conv(score_conv_gpu_);
+    free_fc(score_fc1_gpu_);
+    free_fc(score_fc2_gpu_);
     res_conv1_gpu_.clear();
     res_conv2_gpu_.clear();
 }
@@ -593,11 +588,9 @@ void OpenCLComputeHandle::allocate_workspace(int batch) {
     buf_val_feat_ = alloc((size_t)filt * batch);
     buf_val_out_  = alloc((size_t)batch);
 
-    if (has_score_head_) {
-        buf_scr_h1_   = alloc((size_t)H * W * batch);
-        buf_scr_feat_ = alloc((size_t)filt * batch);
-        buf_scr_out_  = alloc((size_t)batch);
-    }
+    buf_scr_h1_   = alloc((size_t)H * W * batch);
+    buf_scr_feat_ = alloc((size_t)filt * batch);
+    buf_scr_out_  = alloc((size_t)batch);
 
     alloc_batch_ = batch;
 }
@@ -797,23 +790,21 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
     }
 
     // ── Score head ────────────────────────────────────────────────
-    if (has_score_head_) {
-        run_conv1x1_bn_relu_reshape(buf_main_, buf_scr_h1_,
-                                    score_conv_gpu_, N, HW);
-        run_fc_bias_relu(buf_scr_h1_, buf_scr_feat_,
-                         score_fc1_gpu_, N, /*relu=*/true);
-        {
-            int K = score_fc2_gpu_.in_features;
-            size_t gs = round_up((size_t)N, 64);
-            CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 0, sizeof(cl_mem), &score_fc2_gpu_.weight));
-            CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 1, sizeof(cl_mem), &buf_scr_feat_));
-            CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 2, sizeof(cl_mem), &buf_scr_out_));
-            CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 3, sizeof(cl_mem), &score_fc2_gpu_.bias));
-            CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 4, sizeof(int), &N));
-            CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 5, sizeof(int), &K));
-            CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_tanh_, 1,
-                                            nullptr, &gs, nullptr, 0, nullptr, nullptr));
-        }
+    run_conv1x1_bn_relu_reshape(buf_main_, buf_scr_h1_,
+                                score_conv_gpu_, N, HW);
+    run_fc_bias_relu(buf_scr_h1_, buf_scr_feat_,
+                     score_fc1_gpu_, N, /*relu=*/true);
+    {
+        int K = score_fc2_gpu_.in_features;
+        size_t gs = round_up((size_t)N, 64);
+        CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 0, sizeof(cl_mem), &score_fc2_gpu_.weight));
+        CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 1, sizeof(cl_mem), &buf_scr_feat_));
+        CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 2, sizeof(cl_mem), &buf_scr_out_));
+        CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 3, sizeof(cl_mem), &score_fc2_gpu_.bias));
+        CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 4, sizeof(int), &N));
+        CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 5, sizeof(int), &K));
+        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_tanh_, 1,
+                                        nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
     // ── Read back results ────────────────────────────────────────
@@ -825,12 +816,9 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
     CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_val_out_, CL_FALSE, 0,
         val_flat.size() * sizeof(float), val_flat.data(), 0, nullptr, nullptr));
 
-    std::vector<float> scr_flat;
-    if (has_score_head_) {
-        scr_flat.resize((size_t)N);
-        CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_scr_out_, CL_FALSE, 0,
-            scr_flat.size() * sizeof(float), scr_flat.data(), 0, nullptr, nullptr));
-    }
+    std::vector<float> scr_flat((size_t)N);
+    CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_scr_out_, CL_FALSE, 0,
+        scr_flat.size() * sizeof(float), scr_flat.data(), 0, nullptr, nullptr));
 
     CL_CHECK(clFinish(dev_.queue));
 
@@ -842,7 +830,7 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
             pol[a] = pol_flat[a * N + n];
         results[n].policy = std::move(pol);
         results[n].value  = val_flat[n];
-        results[n].score  = has_score_head_ ? scr_flat[n] : 0.0f;
+        results[n].score  = scr_flat[n];
     }
     return results;
 }

@@ -68,12 +68,9 @@ EigenComputeHandle::EigenComputeHandle(const LoadedModel* model) {
     load_fc(value_fc1_, model->value_fc1);
     load_fc(value_fc2_, model->value_fc2);
 
-    has_score_head_ = model->has_score_head;
-    if (has_score_head_) {
-        load_conv(score_conv_, model->score_conv);
-        load_fc(score_fc1_, model->score_fc1);
-        load_fc(score_fc2_, model->score_fc2);
-    }
+    load_conv(score_conv_, model->score_conv);
+    load_fc(score_fc1_, model->score_fc1);
+    load_fc(score_fc2_, model->score_fc2);
 }
 
 // ================================================================
@@ -191,17 +188,14 @@ EigenComputeHandle::predict_single(const std::vector<float>& state) {
     float value = std::tanh(v_out(0));
 
     // Score head (same structure as value head)
-    float score = 0.0f;
-    if (has_score_head_) {
-        MatF s_conv;
-        conv1x1(trunk, s_conv, score_conv_);
-        bn_relu(s_conv, score_conv_);
+    MatF s_conv;
+    conv1x1(trunk, s_conv, score_conv_);
+    bn_relu(s_conv, score_conv_);
 
-        Eigen::Map<VecF> s_flat(s_conv.data(), score_conv_.c_out * hw);
-        VecF s_hidden = (score_fc1_.weight * s_flat + score_fc1_.bias).cwiseMax(0.0f);
-        VecF s_out = score_fc2_.weight * s_hidden + score_fc2_.bias;
-        score = std::tanh(s_out(0));
-    }
+    Eigen::Map<VecF> s_flat(s_conv.data(), score_conv_.c_out * hw);
+    VecF s_hidden = (score_fc1_.weight * s_flat + score_fc1_.bias).cwiseMax(0.0f);
+    VecF s_out = score_fc2_.weight * s_hidden + score_fc2_.bias;
+    float score = std::tanh(s_out(0));
 
     return { policy, value, score };
 }
