@@ -133,7 +133,19 @@ static bool cache_is_valid(const std::string& cache_path,
 
 // ================================================================
 // Build or load a TensorRT engine for a given device
+//
+// Multiple server threads may call this concurrently for the same
+// model+GPU.  A per-cache-path mutex ensures only one thread builds
+// the engine; the rest wait and load the cached result.
 // ================================================================
+
+static std::mutex build_registry_mutex;
+static std::map<std::string, std::mutex> build_mutexes;
+
+static std::mutex& get_build_mutex(const std::string& cache_path) {
+    std::lock_guard<std::mutex> lock(build_registry_mutex);
+    return build_mutexes[cache_path];
+}
 
 static nvinfer1::ICudaEngine* build_or_load_engine(
         TRTDeviceState& dev,
@@ -148,7 +160,10 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
 
     std::string cache_path = make_cache_path(model->model_path, gpu_name, max_batch_size);
 
-    // Try loading cached engine
+    // Serialize build per cache path — second thread waits for first to finish
+    std::lock_guard<std::mutex> build_lock(get_build_mutex(cache_path));
+
+    // Try loading cached engine (may have been built by another thread)
     if (cache_is_valid(cache_path, model->model_path)) {
         auto plan = read_file(cache_path);
         if (!plan.empty()) {
