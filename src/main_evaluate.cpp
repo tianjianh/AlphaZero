@@ -124,6 +124,7 @@ int main(int argc, char* argv[]) {
     float c_puct           = -1.0f;  // -1 = use default
     float komi             = -1.0f;  // -1 = use default
     float score_weight     = -1.0f;  // -1 = use default
+    float score_scale      = -1.0f;  // -1 = use default
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -141,6 +142,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--c-puct"            && i+1<argc) c_puct            = std::stof(argv[++i]);
         else if (arg == "--komi"              && i+1<argc) komi              = std::stof(argv[++i]);
         else if (arg == "--score-weight"      && i+1<argc) score_weight      = std::stof(argv[++i]);
+        else if (arg == "--score-scale"       && i+1<argc) score_scale        = std::stof(argv[++i]);
         else if (arg == "--help") {
             std::cout
                 << "Usage: evaluate [options]\n"
@@ -161,6 +163,7 @@ int main(int argc, char* argv[]) {
                 << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
                 << "  --komi F                Komi value (default: 6.5)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
+                << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
                 << "  --output DIR            Save game records as SGF files\n"
                 << "  --nn-server-threads N   NN server threads per model (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated GPU indices (default: \"0\")\n";
@@ -208,6 +211,7 @@ int main(int argc, char* argv[]) {
     if (c_puct > 0) config.c_puct = c_puct;
     if (komi >= 0) config.komi = komi;
     if (score_weight >= 0) config.score_weight = score_weight;
+    if (score_scale >= 0) config.score_scale = score_scale;
 
     // Separate compute contexts for each model (safe across all backends)
     auto ctx1 = std::shared_ptr<ComputeContext>(
@@ -240,6 +244,7 @@ int main(int argc, char* argv[]) {
               << "  Sims:       " << config.num_simulations << "\n"
               << "  c_puct:     " << config.c_puct << "\n"
               << "  Score wt:   " << config.score_weight << "\n"
+              << "  Score sc:   " << config.score_scale << "\n"
               << "  Threads:    " << num_threads << "\n"
               << "  Threshold:  " << std::fixed << std::setprecision(1)
               << (threshold * 100.0f) << "%\n"

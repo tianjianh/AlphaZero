@@ -174,6 +174,12 @@ def main():
     parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8,
                         help="DataLoader workers for prefetching (default: 8)")
+    parser.add_argument("--policy-weight", type=float, default=1.0,
+                        help="Loss weight for policy cross-entropy (default: 1.0)")
+    parser.add_argument("--value-weight", type=float, default=1.0,
+                        help="Loss weight for value BCE (default: 1.0)")
+    parser.add_argument("--score-weight-loss", type=float, default=1.0,
+                        help="Loss weight for score cross-entropy (default: 1.0)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
     parser.add_argument("--log-file", default=None,
                         help="Append structured metrics to this file")
@@ -256,6 +262,22 @@ def main():
     else:
         mprint("Starting from scratch")
 
+    # ── Mixed precision ─────────────────────────────────────
+    use_amp = device.type == "cuda"
+    scaler = None
+    if use_amp:
+        if torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+            mprint("Mixed precision: BF16")
+            tlog(f"    AMP: BF16")
+        else:
+            amp_dtype = torch.float16
+            scaler = torch.amp.GradScaler()
+            mprint("Mixed precision: FP16 + GradScaler")
+            tlog(f"    AMP: FP16 + GradScaler")
+    else:
+        amp_dtype = torch.float32
+
     if use_ddp:
         model = DDP(model, device_ids=[local_rank])
 
@@ -312,6 +334,9 @@ def main():
         n = 0
         t0 = time.time()
 
+        board_area = args.board * args.board
+        num_bins = board_area * 2 + 1
+
         for states, policies, values, scores in loader:
             if max_batches is not None and n >= max_batches:
                 break
@@ -319,19 +344,38 @@ def main():
             states = states.to(device, non_blocking=True)
             policies = policies.to(device, non_blocking=True)
             values = values.to(device, non_blocking=True).unsqueeze(1)
-            scores = scores.to(device, non_blocking=True).unsqueeze(1)
-
-            logits, pred_value, pred_score = model(states)
-            policy_loss = -torch.sum(
-                policies * torch.log_softmax(logits, dim=1)
-            ) / states.size(0)
-            value_loss = nn.functional.mse_loss(pred_value, values)
-            score_loss = nn.functional.mse_loss(pred_score, scores)
-            loss = policy_loss + value_loss + score_loss
+            scores = scores.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                logits, pred_value, pred_score = model(states)
+
+                policy_loss = -torch.sum(
+                    policies * torch.log_softmax(logits, dim=1)
+                ) / states.size(0)
+
+                # Value: BCE with logits — targets {-1,0,1} → {0, 0.5, 1}
+                value_targets = (values + 1.0) / 2.0
+                value_loss = nn.functional.binary_cross_entropy_with_logits(
+                    pred_value, value_targets)
+
+                # Score: cross-entropy over bins
+                score_bin = (torch.round(scores) + board_area).long()
+                score_bin = score_bin.clamp(0, num_bins - 1)
+                score_loss = nn.functional.cross_entropy(pred_score, score_bin)
+
+                loss = (args.policy_weight * policy_loss +
+                        args.value_weight * value_loss +
+                        args.score_weight_loss * score_loss)
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item()
             total_pl += policy_loss.item()

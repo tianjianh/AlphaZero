@@ -204,6 +204,8 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
         "window_size": window, "c_puct": 1.5,
         "dirichlet_alpha": dirichlet_alpha, "dirichlet_epsilon": 0.25,
         "temp_threshold": temp_threshold, "score_weight": score_weight,
+        "score_scale": 10.0,
+        "policy_weight": 1.0, "value_weight": 1.0, "score_weight_loss": 1.0,
         "stages": generate_stages(preset, board, filters, blocks),
     }
     if arch == "vit":
@@ -276,6 +278,7 @@ def run_selfplay(iter_data, model, games, sims, hw, plan):
         "--temp-threshold", str(plan["temp_threshold"]),
         "--komi", str(plan["komi"]),
         "--score-weight", str(plan["score_weight"]),
+        "--score-scale", str(plan.get("score_scale", 10.0)),
     ]
     base_cmd = [
         str(BUILD_DIR / "selfplay"),
@@ -431,6 +434,8 @@ Window size:  {plan['window_size']} iterations (data streamed via mmap, no memor
 Komi:         {plan['komi']}
 MCTS:         c_puct={plan['c_puct']}  dirichlet_alpha={plan['dirichlet_alpha']}  dirichlet_eps={plan['dirichlet_epsilon']}  temp_threshold={plan['temp_threshold']}
 Score weight: {plan['score_weight']}
+Score scale:  {plan['score_scale']}
+Loss weights: policy={plan['policy_weight']} value={plan['value_weight']} score={plan['score_weight_loss']}
 Eval gate:    {plan['eval_threshold']} win rate threshold
 
 Training Plan:
@@ -492,6 +497,7 @@ def cmd_status(args):
               f"heads={plan['heads']} kv={plan['kv_groups']} (vit)")
     print(f"  Komi:           {plan['komi']}")
     print(f"  Score weight:   {plan['score_weight']}")
+    print(f"  Score scale:    {plan.get('score_scale', 10.0)}")
     print(f"  Progress:       {state['pipeline_iter']} / {total_iters} iterations ({pct}%)")
     print(f"  Best model:     {vstr(state['best_version'])} ({state['total_promotions']} promotions)")
     print(f"  Total games:    {state['total_games']}")
@@ -588,6 +594,10 @@ def cmd_train(args):
     print(f"  MCTS:             c_puct={plan['c_puct']} alpha={plan['dirichlet_alpha']} "
           f"eps={plan['dirichlet_epsilon']} temp={plan['temp_threshold']}")
     print(f"  Score weight:     {plan['score_weight']}")
+    print(f"  Score scale:      {plan.get('score_scale', 10.0)}")
+    print(f"  Loss weights:     policy={plan.get('policy_weight', 1.0)} "
+          f"value={plan.get('value_weight', 1.0)} "
+          f"score={plan.get('score_weight_loss', 1.0)}")
     print("============================================")
     print()
 
@@ -604,6 +614,9 @@ def cmd_train(args):
     tlog(f"  MCTS:             c_puct={plan['c_puct']}  alpha={plan['dirichlet_alpha']}  "
          f"eps={plan['dirichlet_epsilon']}  temp={plan['temp_threshold']}")
     tlog(f"  Score weight:     {plan['score_weight']}")
+    tlog(f"  Score scale:      {plan.get('score_scale', 10.0)}")
+    tlog(f"  Loss weights:     policy={plan.get('policy_weight', 1.0)} "
+         f"value={plan.get('value_weight', 1.0)} score={plan.get('score_weight_loss', 1.0)}")
     tlog("  Hardware:")
     tlog(f"    Threads:          {hw['threads']}")
     tlog(f"    Search threads:   {hw['search_threads']}")
@@ -702,6 +715,9 @@ def cmd_train(args):
                 "--blocks", str(plan["blocks"]),
                 "--output-onnx", str(candidate_onnx),
                 "--log-file", str(TRAIN_LOG),
+                "--policy-weight", str(plan.get("policy_weight", 1.0)),
+                "--value-weight", str(plan.get("value_weight", 1.0)),
+                "--score-weight-loss", str(plan.get("score_weight_loss", 1.0)),
             ]
             if arch == "vit":
                 train_args += [
@@ -759,6 +775,7 @@ def cmd_train(args):
                 "--komi", str(plan["komi"]),
                 "--score-weight", str(plan["score_weight"]),
                 "--threshold", str(plan["eval_threshold"]),
+                "--score-scale", str(plan.get("score_scale", 10.0)),
                 "--output", str(eval_dir),
             ]
 

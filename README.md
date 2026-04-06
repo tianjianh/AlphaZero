@@ -380,7 +380,7 @@ FP16 Tensor Cores (WMMA) for maximum throughput on NVIDIA GPUs:
 | `conv1x1_bn_relu_reshape_fp16` | FP16 1×1 conv + BN + ReLU + layout reshape |
 | `fc_bias_relu_fp16` | FP16 FC + bias + ReLU |
 | `fc_bias_softmax_fp16_to_fp32` | FP16→FP32 FC + softmax (policy head) |
-| `fc_bias_tanh_fp16_to_fp32` | FP16→FP32 FC + tanh (value head) |
+| `fc_bias_tanh_fp16_to_fp32` | FP16→FP32 FC + tanh (value/score head — TODO: update for new loss design) |
 
 - **FP16 weights & activations**: halves memory bandwidth for all buffers
 - **FP32 BN scale/bias and FC bias**: small per-channel params stored natively as float (avoids conversion overhead)
@@ -419,7 +419,7 @@ forward pass using hand-written OpenCL kernels:
 | `conv1x1_bn_relu_reshape` | Fused 1×1 conv + BN + ReLU + layout reshape for FC input |
 | `fc_bias_relu` | Fused FC GEMM + bias + optional ReLU |
 | `fc_bias_softmax` | Fused FC + bias + softmax (policy head) |
-| `fc_bias_tanh` | Fused FC + bias + tanh (value head) |
+| `fc_bias_tanh` | Fused FC + bias + tanh (value/score head — TODO: update for new loss design) |
 
 The implicit GEMM kernel (`conv3x3_sgemm_bn`) computes im2col indices
 on-the-fly during B-tile loading, eliminating the separate im2col scratch
@@ -526,7 +526,8 @@ The pipeline is fully resumable at every phase boundary.  Run
 - **Selfplay resume**: skips iterations that already have enough game files
 - **Training resume**: skips iterations whose versioned ONNX + checkpoint exist
 - **Checkpoints** (`training/checkpoints/training.pt`): model weights + optimizer (Adam for ResNet, AdamW for ViT)
-  state (momentum buffers) for smooth continuation
+  state (momentum buffers) for smooth continuation.  Training uses mixed precision
+  (BF16 on Ampere+, FP16+GradScaler on Turing) automatically
 - **Selfplay data**: accumulates in per-iteration directories
   (`training/selfplay/iter_0001/`, etc.) and is never deleted
 
@@ -549,20 +550,29 @@ D4-invariant positional encoding (orbit embedding + invariant relative bias).
 
 Both share the same triple-headed output:
 
-| Head | Output | Activation | Target |
-|------|--------|------------|--------|
-| **Policy** | `[batch, 82]` | softmax | MCTS visit distribution |
-| **Value** | `[batch, 1]` | tanh → [-1,1] | Game outcome (+1 win, -1 loss) |
-| **Score** | `[batch, 1]` | tanh → [-1,1] | Normalized point margin `(black - white) / board²` |
+| Head | Model output | ONNX post-processing | Training loss |
+|------|-------------|----------------------|---------------|
+| **Policy** | `[B, 82]` logits | (none — C++ applies softmax) | Cross-entropy with MCTS visit distribution |
+| **Value** | `[B, 1]` raw logit | sigmoid × 2 − 1 → [-1, 1] | BCE with logits (targets: {0, 0.5, 1}) |
+| **Score** | `[B, num_bins]` logits | softmax → expected value (raw points) | Cross-entropy over bins (num_bins = board² × 2 + 1) |
+
+The model's `forward()` returns raw logits (no activations).  The ONNX export
+appends post-processing ops to the graph so C++ inference receives the same
+shapes as before: policy `[B, 82]`, value `[B, 1]` in [-1,1], score `[B, 1]`
+in raw points.  Training applies BCE/CE directly on raw logits for numerical
+stability.  Mixed precision (BF16 on Ampere+, FP16+GradScaler on Turing) is
+enabled automatically.
 
 **ViT positional encoding** — fully D4-invariant (compatible with dihedral augmentation):
 - *Orbit embedding*: 15 equivalence classes under rotation/reflection (`Embedding(15, d_model)`)
 - *Relative bias*: 45 displacement buckets indexed by `sorted(|dx|, |dy|)` per attention head
 - *GQA*: 6 query heads, 2 KV groups (3 queries share each K/V group)
 
-The score head (inspired by KataGo) lets MCTS prefer moves that win by more points.
-MCTS blends the two signals: `utility = value + score_weight × score`.
-`score_weight` is configurable (default 0.02, set to 0 to disable).
+The score head (inspired by KataGo) lets MCTS prefer moves that win by more
+points.  MCTS blends the two signals with KataGo-style atan compression:
+`utility = value + score_weight × atan(score / score_scale) / (π/2)`.
+`score_weight` (default 0.02) and `score_scale` (default 10.0) are
+configurable.  Set `score_weight` to 0 to disable score utility.
 
 **Komi** (compensation for white) defaults to **6.5** for 9×9 and is configurable
 via `--komi` in all executables and `PLAN_KOMI` in the training plan.
@@ -678,6 +688,7 @@ python run_loop.py status             Show training progress
   --dirichlet-alpha F    Root noise concentration (default: 0.15)
   --dirichlet-epsilon F  Root noise weight (default: 0.25)
   --temp-threshold N     Moves of stochastic play (default: 15)
+  --score-scale F        Score atan compression scale (default: 10.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
@@ -693,6 +704,7 @@ python run_loop.py status             Show training progress
   --c-puct F             UCB exploration constant (default: 1.5)
   --komi F               Komi value (default: 6.5)
   --score-weight F       Score utility weight (default: 0.0)
+  --score-scale F        Score atan compression scale (default: 10.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
   --random               Use random bot (no model needed)
@@ -712,6 +724,7 @@ python run_loop.py status             Show training progress
   --max-batch N          Max GPU batch size (default: 256)
   --threshold FLOAT      Win rate to pass (default: 0.55)
   --c-puct F             UCB exploration constant (default: 1.5)
+  --score-scale F        Score atan compression scale (default: 10.0)
   --output DIR           Save game records as SGF files
   --nn-server-threads N  NN server threads per model (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
@@ -731,6 +744,7 @@ SGF files can be reviewed with `python scripts/visualize.py`.
   --threads N            Self-play worker threads (default: 1)
   --search-threads N     MCTS search threads per move (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
+  --score-scale F        Score atan compression scale (default: 10.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```

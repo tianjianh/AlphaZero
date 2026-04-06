@@ -25,7 +25,8 @@ struct Config {
     float dirichlet_alpha = 0.15f;   // ~10/avg_legal_moves (0.15 for 9x9, 0.03 for 19x19)
     float dirichlet_epsilon = 0.25f; // blend: 75% network prior + 25% noise
     int temperature_threshold = 15;  // moves of stochastic play (rest is greedy)
-    float score_weight = 0.0f;       // blend: utility = value + score_weight * score_estimate
+    float score_weight = 0.0f;       // blend: utility = value + score_weight * score_utility
+    float score_scale = 10.0f;       // atan compression: score_utility = atan(score/scale)/(π/2)
 
     // Self-play
     int max_moves_per_game = 162;  // board_size^2 * 2

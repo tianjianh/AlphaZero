@@ -68,6 +68,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--temp-threshold"    && i+1<argc) config.temperature_threshold = std::stoi(argv[++i]);
         else if (arg == "--komi"             && i+1<argc) config.komi = std::stof(argv[++i]);
         else if (arg == "--score-weight"     && i+1<argc) config.score_weight = std::stof(argv[++i]);
+        else if (arg == "--score-scale"      && i+1<argc) config.score_scale = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads  = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str  = argv[++i];
         else if (arg == "--help") {
@@ -86,6 +87,7 @@ int main(int argc, char* argv[]) {
                 << "  --temp-threshold N      Moves of stochastic play (default: 15)\n"
                 << "  --komi F                Komi value (default: 6.5)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
+                << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -141,6 +143,7 @@ int main(int argc, char* argv[]) {
               << "  Search threads:   " << config.num_search_threads << "\n"
               << "  c_puct:           " << config.c_puct << "\n"
               << "  Score weight:     " << config.score_weight << "\n"
+              << "  Score scale:      " << config.score_scale << "\n"
               << "  Dirichlet:        alpha=" << config.dirichlet_alpha
               << "  eps=" << config.dirichlet_epsilon << "\n"
               << "  Temp threshold:   " << config.temperature_threshold << "\n"

@@ -47,6 +47,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
         else if (arg == "--komi"              && i+1<argc) config.komi = std::stof(argv[++i]);
         else if (arg == "--score-weight"      && i+1<argc) config.score_weight = std::stof(argv[++i]);
+        else if (arg == "--score-scale"       && i+1<argc) config.score_scale = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--help") {
@@ -61,6 +62,7 @@ int main(int argc, char* argv[]) {
                       << "  --max-batch N           Max GPU batch size (default: 256)\n"
                       << "  --komi F                Komi value (default: 6.5)\n"
                       << "  --score-weight F        Score utility weight (default: 0.0)\n"
+                      << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
                       << "  --nn-server-threads N   NN server threads (default: 1)\n"
                       << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -102,7 +104,8 @@ int main(int argc, char* argv[]) {
     std::cout << "MiniGo C++ Benchmark\n"
               << "  Board: " << config.board_size << "x" << config.board_size
               << "  Komi: " << config.komi
-              << "  Score wt: " << config.score_weight;
+              << "  Score wt: " << config.score_weight
+              << "  Score sc: " << config.score_scale;
     if (has_model)
         std::cout << "  Backend: " << context->backend_name();
     std::cout << "\n\n";

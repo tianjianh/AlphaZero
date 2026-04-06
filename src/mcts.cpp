@@ -215,9 +215,9 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         expand(node, result.policy, legal);
         node->state.store(NODE_EXPANDED, std::memory_order_release);
 
-        // Blend value + score for utility (higher score = better)
-        float utility = result.value + config_.score_weight * result.score;
-        utility = std::max(-1.0f, std::min(1.0f, utility));
+        // Blend value + score for utility (KataGo-style atan compression)
+        float score_utility = atanf(result.score / config_.score_scale) / (float)(M_PI / 2.0);
+        float utility = result.value + config_.score_weight * score_utility;
         backprop(path, utility);
         sims_done.fetch_add(1, std::memory_order_relaxed);
     }
@@ -310,8 +310,8 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
                 expand(leaf.leaf, res.policy, leaf.legal);
             leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
 
-            float utility = res.value + config_.score_weight * res.score;
-            utility = std::max(-1.0f, std::min(1.0f, utility));
+            float score_utility = atanf(res.score / config_.score_scale) / (float)(M_PI / 2.0);
+            float utility = res.value + config_.score_weight * score_utility;
             backprop(leaf.path, utility);
             sims_done++;
         }
@@ -341,8 +341,8 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     expand(root.get(), root_out.policy, legal);
     root->state.store(NODE_EXPANDED, std::memory_order_release);
     root->visit_count.store(1, std::memory_order_relaxed);
-    float root_utility = root_out.value + config_.score_weight * root_out.score;
-    root_utility = std::max(-1.0f, std::min(1.0f, root_utility));
+    float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
+    float root_utility = root_out.value + config_.score_weight * root_score_utility;
     root->add_value(root_utility);
     if (add_noise) add_dirichlet_noise(root.get(), action_size);
 
@@ -512,10 +512,9 @@ static std::vector<TrainingRecord> self_play_game_impl(
 
     while (!game.game_over) game.play(PASS_MOVE);
 
-    // Compute score target: normalized score from BLACK's perspective
+    // Compute score target: raw point difference from BLACK's perspective
     auto [bs, ws] = game.score();
-    float board_area = (float)(config.board_size * config.board_size);
-    float black_score_norm = (bs - ws) / board_area;  // positive = black winning
+    float black_score = bs - ws;  // raw points, e.g. +12.5
 
     std::vector<TrainingRecord> records;
     records.reserve(trajectory.size() * 8);
@@ -526,8 +525,8 @@ static std::vector<TrainingRecord> self_play_game_impl(
         else if (game.winner == step.player)  value =  1.0f;
         else                                  value = -1.0f;
 
-        // Score from current player's perspective (maximize = good)
-        float score = (step.player == BLACK) ? black_score_norm : -black_score_norm;
+        // Score from current player's perspective (raw points)
+        float score = (step.player == BLACK) ? black_score : -black_score;
 
         augment_sample(step.state, step.policy, value, score,
                        config.board_size, config.input_channels, records);

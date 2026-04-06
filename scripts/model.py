@@ -50,10 +50,11 @@ class AlphaZeroNet(nn.Module):
         self.value_fc1 = nn.Linear(board_size * board_size, 64)
         self.value_fc2 = nn.Linear(64, 1)
 
+        num_bins = board_size * board_size * 2 + 1  # score classification bins
         self.score_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
         self.score_bn = nn.BatchNorm2d(1)
         self.score_fc1 = nn.Linear(board_size * board_size, 64)
-        self.score_fc2 = nn.Linear(64, 1)
+        self.score_fc2 = nn.Linear(64, num_bins)
 
     def forward(self, x):
         out = F.relu(self.input_bn(self.input_conv(x)))
@@ -67,12 +68,12 @@ class AlphaZeroNet(nn.Module):
         v = F.relu(self.value_bn(self.value_conv(out)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.value_fc1(v))
-        v = torch.tanh(self.value_fc2(v))
+        v = self.value_fc2(v)
 
         s = F.relu(self.score_bn(self.score_conv(out)))
         s = s.view(s.size(0), -1)
         s = F.relu(self.score_fc1(s))
-        s = torch.tanh(self.score_fc2(s))
+        s = self.score_fc2(s)
 
         return p, v, s
 
@@ -80,9 +81,13 @@ class AlphaZeroNet(nn.Module):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value, score = self(x)
+            logits, value_logit, score_logits = self(x)
             probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-        return probs, value.item(), score.item()
+            value = (torch.sigmoid(value_logit) * 2 - 1).item()
+            board_area = self.board_size * self.board_size
+            bins = torch.arange(score_logits.size(1), device=x.device).float() - board_area
+            score = (F.softmax(score_logits, dim=1) * bins).sum(dim=1).item()
+        return probs, value, score
 
 
 # ══════════════════════════════════════════════════════════
@@ -249,13 +254,14 @@ class GoViT(nn.Module):
         self.policy_proj = nn.Linear(d_model, 1)
         self.pass_logit = nn.Parameter(torch.zeros(1))
 
-        # Value head: mean pool → MLP → tanh
+        # Value head: mean pool → MLP → raw logit
         self.value_fc1 = nn.Linear(d_model, d_model)
         self.value_fc2 = nn.Linear(d_model, 1)
 
-        # Score head: mean pool → MLP → tanh
+        # Score head: mean pool → MLP → bin classification
+        num_bins = board_size * board_size * 2 + 1
         self.score_fc1 = nn.Linear(d_model, d_model)
-        self.score_fc2 = nn.Linear(d_model, 1)
+        self.score_fc2 = nn.Linear(d_model, num_bins)
 
     def forward(self, x):
         B = x.size(0)
@@ -280,12 +286,12 @@ class GoViT(nn.Module):
         p_pass = self.pass_logit.expand(B, 1)                       # [B, 1]
         p = torch.cat([p_board, p_pass], dim=1)                     # [B, hw+1]
 
-        # Value: mean pool → MLP → tanh
+        # Value: mean pool → MLP → raw logit
         pooled = x.mean(dim=1)                                      # [B, d_model]
-        v = torch.tanh(self.value_fc2(F.gelu(self.value_fc1(pooled))))
+        v = self.value_fc2(F.gelu(self.value_fc1(pooled)))
 
-        # Score: mean pool → MLP → tanh
-        s = torch.tanh(self.score_fc2(F.gelu(self.score_fc1(pooled))))
+        # Score: mean pool → MLP → bin logits
+        s = self.score_fc2(F.gelu(self.score_fc1(pooled)))
 
         return p, v, s
 
@@ -293,9 +299,13 @@ class GoViT(nn.Module):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value, score = self(x)
+            logits, value_logit, score_logits = self(x)
             probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-        return probs, value.item(), score.item()
+            value = (torch.sigmoid(value_logit) * 2 - 1).item()
+            board_area = self.board_size * self.board_size
+            bins = torch.arange(score_logits.size(1), device=x.device).float() - board_area
+            score = (F.softmax(score_logits, dim=1) * bins).sum(dim=1).item()
+        return probs, value, score
 
 
 def create_model(arch="resnet", board_size=9, input_channels=17, **kwargs):

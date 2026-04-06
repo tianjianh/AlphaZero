@@ -17,7 +17,7 @@ import sys
 import torch
 import numpy as np
 import onnx
-from onnx import numpy_helper, TensorProto
+from onnx import helper, numpy_helper, TensorProto
 
 sys.path.insert(0, os.path.dirname(__file__))
 from model import AlphaZeroNet, GoViT, create_model
@@ -45,12 +45,66 @@ def _embed_state_dict(onnx_path, model):
     onnx.save(onnx_model, onnx_path)
 
 
+def _append_postprocessing(onnx_path, board_size):
+    """Append post-processing to raw model outputs for C++ inference.
+
+    value: sigmoid(logit) * 2 - 1  → [-1, 1]
+    score: softmax(logits) @ bin_values → raw points [B, 1]
+    """
+    model = onnx.load(onnx_path)
+    graph = model.graph
+    board_area = board_size * board_size
+    num_bins = board_area * 2 + 1
+
+    # Rename raw outputs to make room for post-processed versions
+    for node in graph.node:
+        new_outputs = list(node.output)
+        for i, o in enumerate(new_outputs):
+            if o == "value":
+                new_outputs[i] = "value_logit"
+            elif o == "score":
+                new_outputs[i] = "score_logits"
+        del node.output[:]
+        node.output.extend(new_outputs)
+
+    # --- Value: sigmoid(logit) * 2 - 1 ---
+    graph.node.append(helper.make_node("Sigmoid", ["value_logit"], ["value_sig"]))
+    two = numpy_helper.from_array(np.array([2.0], dtype=np.float32), "pp_two")
+    graph.initializer.append(two)
+    graph.node.append(helper.make_node("Mul", ["value_sig", "pp_two"], ["value_scaled"]))
+    one = numpy_helper.from_array(np.array([1.0], dtype=np.float32), "pp_one")
+    graph.initializer.append(one)
+    graph.node.append(helper.make_node("Sub", ["value_scaled", "pp_one"], ["value"]))
+
+    # --- Score: softmax → expected value ---
+    graph.node.append(helper.make_node("Softmax", ["score_logits"], ["score_probs"], axis=1))
+    bin_vals = (np.arange(num_bins, dtype=np.float32) - board_area).reshape(num_bins, 1)
+    bv = numpy_helper.from_array(bin_vals, "score_bin_values")
+    graph.initializer.append(bv)
+    # MatMul: [B, num_bins] @ [num_bins, 1] → [B, 1]
+    graph.node.append(helper.make_node("MatMul", ["score_probs", "score_bin_values"], ["score"]))
+
+    # Update score output shape: [batch, num_bins] → [batch, 1]
+    new_outputs = []
+    for output in graph.output:
+        if output.name == "score":
+            new_outputs.append(
+                helper.make_tensor_value_info("score", TensorProto.FLOAT, ["batch", 1]))
+        else:
+            new_outputs.append(output)
+    del graph.output[:]
+    graph.output.extend(new_outputs)
+
+    onnx.save(model, onnx_path)
+
+
 def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="resnet"):
     """Export a PyTorch model to ONNX format with dynamic batch axis.
 
     The ONNX file contains:
     1. The optimized graph (BN folded into Conv) for ONNX Runtime / TensorRT
     2. All raw state_dict tensors as extra initializers for the Eigen backend
+    3. Post-processing ops: value sigmoid*2-1, score softmax→expected_value
     """
     model.eval()
     dummy = torch.randn(1, input_channels, board_size, board_size)
@@ -75,6 +129,9 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="re
         do_constant_folding=True,
         external_data=False,
     )
+
+    # Append post-processing for C++ inference
+    _append_postprocessing(output_path, board_size)
 
     # Embed full state_dict for Eigen backend
     _embed_state_dict(output_path, model)
