@@ -74,15 +74,19 @@ private:
 
     ConvBNGPU              input_conv_gpu_;
     std::vector<ConvBNGPU> res_conv1_gpu_, res_conv2_gpu_;
-    ConvBNGPU              policy_conv_gpu_, value_conv_gpu_;
+    ConvBNGPU              policy_conv_gpu_, value_conv_gpu_, score_conv_gpu_;
     FCGPU                  policy_fc_gpu_, value_fc1_gpu_, value_fc2_gpu_;
+    FCGPU                  score_fc1_gpu_, score_fc2_gpu_;
 
     // ── Workspace buffers ──────────────────────────────────────
     cl_mem buf_flat_in_ = nullptr, buf_input_ = nullptr;
     cl_mem buf_main_ = nullptr, buf_temp_ = nullptr, buf_skip_ = nullptr;
     cl_mem buf_pol_out_ = nullptr, buf_pol_feat_ = nullptr;
     cl_mem buf_val_h1_ = nullptr, buf_val_feat_ = nullptr, buf_val_out_ = nullptr;
+    cl_mem buf_scr_h1_ = nullptr, buf_scr_feat_ = nullptr, buf_scr_out_ = nullptr;
     int alloc_batch_ = 0;
+
+    bool has_score_head_ = false;
 
     // Model metadata
     int board_size, input_channels, num_filters, num_res_blocks;

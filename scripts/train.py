@@ -74,7 +74,7 @@ def _parse_file(data, board_size, input_channels=17):
     """Parse all records from raw (decompressed) bytes into tensors."""
     state_floats = input_channels * board_size * board_size
     policy_floats = board_size * board_size + 1
-    record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4
+    record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4 + 4  # +4 for score
 
     n = struct.unpack_from("i", data, 0)[0]
     if n == 0:
@@ -84,6 +84,7 @@ def _parse_file(data, board_size, input_channels=17):
     states = np.empty((n, input_channels, board_size, board_size), dtype=np.float32)
     policies = np.empty((n, policy_floats), dtype=np.float32)
     values = np.empty(n, dtype=np.float32)
+    scores = np.empty(n, dtype=np.float32)
 
     for i in range(n):
         off = 4 + i * record_bytes + 4  # skip file header + record state_size
@@ -93,11 +94,14 @@ def _parse_file(data, board_size, input_channels=17):
         policies[i] = np.frombuffer(data, np.float32, policy_floats, off)
         off += policy_floats * 4
         values[i] = struct.unpack_from("f", data, off)[0]
+        off += 4
+        scores[i] = struct.unpack_from("f", data, off)[0]
 
     return list(zip(
         torch.from_numpy(states),
         torch.from_numpy(policies),
         torch.from_numpy(values),
+        torch.from_numpy(scores),
     ))
 
 
@@ -226,13 +230,16 @@ def main():
     if os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            model.load_state_dict(ckpt["model_state_dict"])
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
             if "optimizer_state_dict" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except (ValueError, KeyError):
+                    mprint("Optimizer state mismatch (new params), reinitializing")
             start_iteration = ckpt.get("iteration", 0)
             mprint(f"Resumed from iteration {start_iteration}")
         else:
-            model.load_state_dict(ckpt)
+            model.load_state_dict(ckpt, strict=False)
             mprint("Loaded legacy checkpoint")
     else:
         mprint("Starting from scratch")
@@ -289,24 +296,26 @@ def main():
     for epoch in range(1, args.epochs + 1):
         dataset.set_epoch(epoch)
         model.train()
-        total_loss = total_pl = total_vl = 0.0
+        total_loss = total_pl = total_vl = total_sl = 0.0
         n = 0
         t0 = time.time()
 
-        for states, policies, values in loader:
+        for states, policies, values, scores in loader:
             if max_batches is not None and n >= max_batches:
                 break
 
             states = states.to(device, non_blocking=True)
             policies = policies.to(device, non_blocking=True)
             values = values.to(device, non_blocking=True).unsqueeze(1)
+            scores = scores.to(device, non_blocking=True).unsqueeze(1)
 
-            logits, pred_value = model(states)
+            logits, pred_value, pred_score = model(states)
             policy_loss = -torch.sum(
                 policies * torch.log_softmax(logits, dim=1)
             ) / states.size(0)
             value_loss = nn.functional.mse_loss(pred_value, values)
-            loss = policy_loss + value_loss
+            score_loss = nn.functional.mse_loss(pred_score, scores)
+            loss = policy_loss + value_loss + score_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -315,16 +324,18 @@ def main():
             total_loss += loss.item()
             total_pl += policy_loss.item()
             total_vl += value_loss.item()
+            total_sl += score_loss.item()
             n += 1
 
         dt = time.time() - t0
         avg_loss = total_loss / max(n, 1)
         avg_pl = total_pl / max(n, 1)
         avg_vl = total_vl / max(n, 1)
+        avg_sl = total_sl / max(n, 1)
         mprint(f"  Epoch {epoch:3d}/{args.epochs}  loss={avg_loss:.4f}  "
-               f"policy={avg_pl:.4f}  value={avg_vl:.4f}  ({dt:.1f}s, {n} batches)")
+               f"policy={avg_pl:.4f}  value={avg_vl:.4f}  score={avg_sl:.4f}  ({dt:.1f}s, {n} batches)")
         tlog(f"    Epoch {epoch:3d}/{args.epochs}  "
-             f"loss={avg_loss:.4f}  policy={avg_pl:.4f}  value={avg_vl:.4f}  {dt:.1f}s")
+             f"loss={avg_loss:.4f}  policy={avg_pl:.4f}  value={avg_vl:.4f}  score={avg_sl:.4f}  {dt:.1f}s")
 
     train_time = time.time() - t_train_start
     mprint(f"Training complete ({train_time:.1f}s)")

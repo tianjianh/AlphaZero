@@ -45,6 +45,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--threads"           && i+1<argc) num_threads     = std::stoi(argv[++i]);
         else if (arg == "--search-threads"    && i+1<argc) search_threads  = std::stoi(argv[++i]);
         else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
+        else if (arg == "--komi"              && i+1<argc) config.komi = std::stof(argv[++i]);
+        else if (arg == "--score-weight"      && i+1<argc) config.score_weight = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--help") {
@@ -57,6 +59,8 @@ int main(int argc, char* argv[]) {
                       << "  --threads N             Self-play worker threads (default: 1)\n"
                       << "  --search-threads N      MCTS search threads per move (default: 16)\n"
                       << "  --max-batch N           Max GPU batch size (default: 256)\n"
+                      << "  --komi F                Komi value (default: 6.5)\n"
+                      << "  --score-weight F        Score utility weight (default: 0.0)\n"
                       << "  --nn-server-threads N   NN server threads (default: 1)\n"
                       << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -92,7 +96,9 @@ int main(int argc, char* argv[]) {
     config.max_moves_per_game = config.board_size * config.board_size * 2;
 
     std::cout << "MiniGo C++ Benchmark\n"
-              << "  Board: " << config.board_size << "x" << config.board_size;
+              << "  Board: " << config.board_size << "x" << config.board_size
+              << "  Komi: " << config.komi
+              << "  Score wt: " << config.score_weight;
     if (has_model)
         std::cout << "  Backend: " << context->backend_name();
     std::cout << "\n\n";

@@ -1,9 +1,9 @@
 #pragma once
 
+#include "compute_context.h"
 #include <condition_variable>
 #include <mutex>
 #include <vector>
-#include <utility>
 
 namespace minigo {
 
@@ -28,6 +28,7 @@ struct NNResultBuf {
     // Output (filled by server thread)
     std::vector<float> policy;
     float              value = 0.0f;
+    float              score = 0.0f;
 
     void reset() { done = false; }
 };
@@ -39,7 +40,7 @@ class BatchEvaluator {
 public:
     virtual ~BatchEvaluator() = default;
 
-    using Result = std::pair<std::vector<float>, float>;
+    using Result = NNOutput;
 
     // Batch evaluation (blocks until ready). Used by single-threaded search.
     virtual std::vector<Result>

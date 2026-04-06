@@ -206,16 +206,19 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         std::vector<float> state;
         game_copy.encode(state);
 
-        auto [policy, value] = evaluator_->evaluate_with_buf(result_buf, state);
+        auto result = evaluator_->evaluate_with_buf(result_buf, state);
 
         // ── Expand + backprop ────────────────────────────────────
         std::vector<float> legal;
         game_copy.get_legal_moves(legal);
-        mask_policy(policy, legal, action_size);
-        expand(node, policy, legal);
+        mask_policy(result.policy, legal, action_size);
+        expand(node, result.policy, legal);
         node->state.store(NODE_EXPANDED, std::memory_order_release);
 
-        backprop(path, value);
+        // Blend value + score for utility (higher score = better)
+        float utility = result.value + config_.score_weight * result.score;
+        utility = std::max(-1.0f, std::min(1.0f, utility));
+        backprop(path, utility);
         sims_done.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -299,15 +302,17 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
         auto results = evaluator_->evaluate(states);
 
         for (size_t i = 0; i < pending.size(); i++) {
-            auto& [res_policy, res_value] = results[i];
+            auto& res = results[i];
             auto& leaf = pending[i];
 
-            mask_policy(res_policy, leaf.legal, action_size);
+            mask_policy(res.policy, leaf.legal, action_size);
             if (leaf.leaf->children.empty())
-                expand(leaf.leaf, res_policy, leaf.legal);
+                expand(leaf.leaf, res.policy, leaf.legal);
             leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
 
-            backprop(leaf.path, res_value);
+            float utility = res.value + config_.score_weight * res.score;
+            utility = std::max(-1.0f, std::min(1.0f, utility));
+            backprop(leaf.path, utility);
             sims_done++;
         }
     }
@@ -328,15 +333,17 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     std::vector<float> state_enc;
     game.encode(state_enc);
     auto root_results = evaluator_->evaluate({ state_enc });
-    auto& [policy, value] = root_results[0];
+    auto& root_out = root_results[0];
 
     std::vector<float> legal;
     game.get_legal_moves(legal);
-    mask_policy(policy, legal, action_size);
-    expand(root.get(), policy, legal);
+    mask_policy(root_out.policy, legal, action_size);
+    expand(root.get(), root_out.policy, legal);
     root->state.store(NODE_EXPANDED, std::memory_order_release);
     root->visit_count.store(1, std::memory_order_relaxed);
-    root->add_value(value);
+    float root_utility = root_out.value + config_.score_weight * root_out.score;
+    root_utility = std::max(-1.0f, std::min(1.0f, root_utility));
+    root->add_value(root_utility);
     if (add_noise) add_dirichlet_noise(root.get(), action_size);
 
     // ── Run search (KataGo pattern: N threads, each VLP=1) ─────
@@ -422,7 +429,8 @@ int MCTS::get_action(GoGame& game, std::vector<float>& policy,
 // ================================================================
 static void augment_sample(const std::vector<float>& state,
                            const std::vector<float>& policy,
-                           float value, int board_size, int input_channels,
+                           float value, float score,
+                           int board_size, int input_channels,
                            std::vector<TrainingRecord>& out) {
     int n  = board_size;
     int hw = n * n;
@@ -435,6 +443,7 @@ static void augment_sample(const std::vector<float>& state,
             rec.state.resize((size_t)input_channels * hw);
             rec.policy.resize(action_size);
             rec.value = value;
+            rec.score = score;
 
             auto transform = [&](int r, int c) -> std::pair<int,int> {
                 int tr = r, tc = c;
@@ -503,6 +512,11 @@ static std::vector<TrainingRecord> self_play_game_impl(
 
     while (!game.game_over) game.play(PASS_MOVE);
 
+    // Compute score target: normalized score from BLACK's perspective
+    auto [bs, ws] = game.score();
+    float board_area = (float)(config.board_size * config.board_size);
+    float black_score_norm = (bs - ws) / board_area;  // positive = black winning
+
     std::vector<TrainingRecord> records;
     records.reserve(trajectory.size() * 8);
 
@@ -512,7 +526,10 @@ static std::vector<TrainingRecord> self_play_game_impl(
         else if (game.winner == step.player)  value =  1.0f;
         else                                  value = -1.0f;
 
-        augment_sample(step.state, step.policy, value,
+        // Score from current player's perspective (maximize = good)
+        float score = (step.player == BLACK) ? black_score_norm : -black_score_norm;
+
+        augment_sample(step.state, step.policy, value, score,
                        config.board_size, config.input_channels, records);
     }
 

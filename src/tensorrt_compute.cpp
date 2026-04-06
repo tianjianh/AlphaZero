@@ -72,6 +72,8 @@ struct TRTDeviceState {
     std::string input_name;
     std::string policy_name;
     std::string value_name;
+    std::string score_name;
+    bool        has_score_head = false;
 };
 
 // ================================================================
@@ -342,11 +344,14 @@ struct TensorRTComputeHandle::Impl {
     float* d_input   = nullptr;   // [max_batch, C, H, W]
     float* d_policy  = nullptr;   // [max_batch, action_size]
     float* d_value   = nullptr;   // [max_batch, 1]
+    float* d_score   = nullptr;   // [max_batch, 1]  (optional)
 
     // Tensor names from engine
     std::string input_name;
     std::string policy_name;
     std::string value_name;
+    std::string score_name;
+    bool has_score_head = false;
 
     Impl(TRTDeviceState& d) : dev(d) {}
 
@@ -356,6 +361,7 @@ struct TensorRTComputeHandle::Impl {
         if (d_input)  cudaFree(d_input);
         if (d_policy) cudaFree(d_policy);
         if (d_value)  cudaFree(d_value);
+        if (d_score)  cudaFree(d_score);
     }
 };
 
@@ -380,14 +386,21 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
                 if (mode == nvinfer1::TensorIOMode::kINPUT) {
                     dev.input_name = name;
                 } else {
-                    // Identify policy vs value by shape:
-                    // policy is [N, action_size], value is [N, 1]
-                    auto dims = dev.engine->getTensorShape(name);
-                    // Last dim > 1 → policy, else value
-                    if (dims.nbDims >= 2 && dims.d[dims.nbDims - 1] > 1)
-                        dev.policy_name = name;
-                    else
-                        dev.value_name = name;
+                    // Check for explicitly-named score head first
+                    std::string sname(name);
+                    if (sname == "score") {
+                        dev.score_name = name;
+                        dev.has_score_head = true;
+                    } else {
+                        // Identify policy vs value by shape:
+                        // policy is [N, action_size], value is [N, 1]
+                        auto dims = dev.engine->getTensorShape(name);
+                        // Last dim > 1 → policy, else value
+                        if (dims.nbDims >= 2 && dims.d[dims.nbDims - 1] > 1)
+                            dev.policy_name = name;
+                        else
+                            dev.value_name = name;
+                    }
                 }
             }
 
@@ -411,7 +424,10 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
 
             std::cout << "TensorRT I/O: input=\"" << dev.input_name
                       << "\" policy=\"" << dev.policy_name
-                      << "\" value=\"" << dev.value_name << "\"\n";
+                      << "\" value=\"" << dev.value_name << "\"";
+            if (dev.has_score_head)
+                std::cout << " score=\"" << dev.score_name << "\"";
+            std::cout << "\n";
         }
     }
 
@@ -424,6 +440,8 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     I.input_name     = dev.input_name;
     I.policy_name    = dev.policy_name;
     I.value_name     = dev.value_name;
+    I.score_name     = dev.score_name;
+    I.has_score_head = dev.has_score_head;
 
     // Create per-thread execution context
     I.exec_ctx = dev.engine->createExecutionContext();
@@ -441,6 +459,8 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     CUDA_CHECK(cudaMalloc(&I.d_input,  input_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_policy, policy_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_value,  value_bytes));
+    if (I.has_score_head)
+        CUDA_CHECK(cudaMalloc(&I.d_score, (size_t)max_batch_size * sizeof(float)));
 
     std::cout << "TensorRT handle ready: board=" << I.board_size
               << " filters=" << model->num_filters
@@ -458,7 +478,7 @@ TensorRTComputeHandle::~TensorRTComputeHandle() {
 // Inference
 // ================================================================
 
-std::vector<std::pair<std::vector<float>, float>>
+std::vector<TensorRTComputeHandle::Result>
 TensorRTComputeHandle::predict_batch(
         const std::vector<std::vector<float>>& states) {
     if (states.empty()) return {};
@@ -493,6 +513,10 @@ TensorRTComputeHandle::predict_batch(
         throw std::runtime_error("TensorRT: setTensorAddress(policy) failed");
     if (!I.exec_ctx->setTensorAddress(I.value_name.c_str(),  I.d_value))
         throw std::runtime_error("TensorRT: setTensorAddress(value) failed");
+    if (I.has_score_head) {
+        if (!I.exec_ctx->setTensorAddress(I.score_name.c_str(), I.d_score))
+            throw std::runtime_error("TensorRT: setTensorAddress(score) failed");
+    }
 
     // Run inference
     if (!I.exec_ctx->enqueueV3(I.dev.stream))
@@ -507,14 +531,23 @@ TensorRTComputeHandle::predict_batch(
     CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.d_value,
         val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
 
+    std::vector<float> scr_flat;
+    if (I.has_score_head) {
+        scr_flat.resize((size_t)N);
+        CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
+            scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
 
     // Pack results — TRT outputs are row-major [N, action_size] and [N, 1]
-    std::vector<std::pair<std::vector<float>, float>> results(N);
+    std::vector<TensorRTComputeHandle::Result> results(N);
     for (int n = 0; n < N; n++) {
         std::vector<float> pol(pol_flat.begin() + n * action_size,
                                pol_flat.begin() + (n + 1) * action_size);
-        results[n] = { std::move(pol), val_flat[n] };
+        results[n].policy = std::move(pol);
+        results[n].value  = val_flat[n];
+        results[n].score  = I.has_score_head ? scr_flat[n] : 0.0f;
     }
     return results;
 }

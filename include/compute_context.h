@@ -16,12 +16,19 @@ namespace minigo {
 //
 // Destroyed when the server thread exits.
 // ================================================================
+// ── NN output: policy + value + score ────────────────────────
+struct NNOutput {
+    std::vector<float> policy;
+    float value = 0.0f;
+    float score = 0.0f;  // normalized score estimate [-1, 1]
+};
+
 class ComputeHandle {
 public:
     virtual ~ComputeHandle() = default;
 
     // Run batch inference.  Called exclusively from the owning server thread.
-    using Result = std::pair<std::vector<float>, float>;
+    using Result = NNOutput;
     virtual std::vector<Result>
     predict_batch(const std::vector<std::vector<float>>& states) = 0;
 };

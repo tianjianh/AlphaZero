@@ -30,6 +30,7 @@ static void write_records(const std::string& path,
         out.write(reinterpret_cast<const char*>(&ps), 4);
         out.write(reinterpret_cast<const char*>(rec.policy.data()), ps * sizeof(float));
         out.write(reinterpret_cast<const char*>(&rec.value), sizeof(float));
+        out.write(reinterpret_cast<const char*>(&rec.score), sizeof(float));
     }
 }
 
@@ -65,6 +66,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--dirichlet-alpha"   && i+1<argc) config.dirichlet_alpha = std::stof(argv[++i]);
         else if (arg == "--dirichlet-epsilon" && i+1<argc) config.dirichlet_epsilon = std::stof(argv[++i]);
         else if (arg == "--temp-threshold"    && i+1<argc) config.temperature_threshold = std::stoi(argv[++i]);
+        else if (arg == "--komi"             && i+1<argc) config.komi = std::stof(argv[++i]);
+        else if (arg == "--score-weight"     && i+1<argc) config.score_weight = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads  = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str  = argv[++i];
         else if (arg == "--help") {
@@ -81,6 +84,8 @@ int main(int argc, char* argv[]) {
                 << "  --dirichlet-alpha F     Root noise concentration (default: 0.15 for 9x9)\n"
                 << "  --dirichlet-epsilon F   Root noise weight (default: 0.25)\n"
                 << "  --temp-threshold N      Moves of stochastic play (default: 15)\n"
+                << "  --komi F                Komi value (default: 6.5)\n"
+                << "  --score-weight F        Score utility weight (default: 0.0)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -117,11 +122,13 @@ int main(int argc, char* argv[]) {
 
     std::cout << "MiniGo C++ Self-Play\n"
               << "  Board:            " << config.board_size << "x" << config.board_size << "\n"
+              << "  Komi:             " << config.komi << "\n"
               << "  Filters:          " << config.num_filters
               << "  Blocks: "           << config.num_res_blocks << "\n"
               << "  Simulations:      " << config.num_simulations << "\n"
               << "  Search threads:   " << config.num_search_threads << "\n"
               << "  c_puct:           " << config.c_puct << "\n"
+              << "  Score weight:     " << config.score_weight << "\n"
               << "  Dirichlet:        alpha=" << config.dirichlet_alpha
               << "  eps=" << config.dirichlet_epsilon << "\n"
               << "  Temp threshold:   " << config.temperature_threshold << "\n"

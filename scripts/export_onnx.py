@@ -64,11 +64,12 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17):
         dummy,
         output_path,
         input_names=["state"],
-        output_names=["policy_logits", "value"],
+        output_names=["policy_logits", "value", "score"],
         dynamic_axes={
             "state": {0: "batch"},
             "policy_logits": {0: "batch"},
             "value": {0: "batch"},
+            "score": {0: "batch"},
         },
         opset_version=17,
         do_constant_folding=True,
@@ -82,7 +83,7 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17):
     print(f"Exported ONNX model to {output_path}")
     print(f"  Size: {file_size / 1024:.1f} KB")
     print(f"  Input: [batch, {input_channels}, {board_size}, {board_size}]")
-    print(f"  Output: policy_logits [batch, {action_size}], value [batch, 1]")
+    print(f"  Output: policy_logits [batch, {action_size}], value [batch, 1], score [batch, 1]")
 
 
 def main():

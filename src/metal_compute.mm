@@ -228,7 +228,9 @@ MetalComputeHandle::predict_batch(const std::vector<std::vector<float>>& states)
         std::vector<float> pol(action_size);
         for (int a = 0; a < action_size; a++)
             pol[a] = polPtr[n * action_size + a];
-        output[n] = { std::move(pol), valPtr[n] };
+        output[n].policy = std::move(pol);
+        output[n].value  = valPtr[n];
+        output[n].score  = 0.0f;  // TODO: Metal score head not yet implemented
     }
 
     free(polPtr);

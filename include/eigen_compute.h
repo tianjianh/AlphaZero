@@ -52,8 +52,9 @@ private:
 
     ConvBN input_conv_;
     std::vector<ConvBN> res_conv1_, res_conv2_;
-    ConvBN policy_conv_, value_conv_;
-    FC policy_fc_, value_fc1_, value_fc2_;
+    ConvBN policy_conv_, value_conv_, score_conv_;
+    FC policy_fc_, value_fc1_, value_fc2_, score_fc1_, score_fc2_;
+    bool has_score_head_ = false;
 
     // Workspace
     std::vector<float> im2col_buf_;

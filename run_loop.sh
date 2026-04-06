@@ -188,7 +188,7 @@ run_selfplay() {
     local iter_data="$1" model="$2" games_needed="$3" sims="$4"
 
     # MCTS params from training plan
-    local mcts_flags="--c-puct ${PLAN_C_PUCT} --dirichlet-alpha ${PLAN_DIRICHLET_ALPHA} --dirichlet-epsilon ${PLAN_DIRICHLET_EPSILON} --temp-threshold ${PLAN_TEMP_THRESHOLD}"
+    local mcts_flags="--c-puct ${PLAN_C_PUCT} --dirichlet-alpha ${PLAN_DIRICHLET_ALPHA} --dirichlet-epsilon ${PLAN_DIRICHLET_EPSILON} --temp-threshold ${PLAN_TEMP_THRESHOLD} --komi ${PLAN_KOMI} --score-weight ${PLAN_SCORE_WEIGHT}"
 
     if [ "${SELFPLAY_INSTANCES}" -le 1 ]; then
         "${BUILD_DIR}/selfplay" \
@@ -320,11 +320,17 @@ generate_plan() {
 
     local batch_size=1024 eval_threshold="0.55" window=20
     local c_puct="1.5" dirichlet_alpha="0.15" dirichlet_epsilon="0.25" temp_threshold=15
+    local komi="6.5" score_weight="0.02"
 
     case "$preset" in
         quick) batch_size=64; window=5; eval_threshold="0.5"; temp_threshold=8;;
         large) window=30;;
     esac
+
+    # Scale komi by board size
+    if [ "$board" -ge 13 ]; then
+        komi="7.5"
+    fi
 
     # Scale dirichlet_alpha by board size: ~10/avg_legal_moves
     if [ "$board" -ge 13 ]; then
@@ -340,6 +346,8 @@ generate_plan() {
 # ── Architecture ──────────────────────────────────────────
 # Board size for the Go game (9 = 9x9 board)
 PLAN_BOARD=${board}
+# Komi — compensation points for white (6.5 for 9x9, 7.5 for 19x19)
+PLAN_KOMI=${komi}
 # Number of convolutional filters — controls network width
 PLAN_FILTERS=${filters}
 # Number of residual blocks — controls network depth
@@ -373,6 +381,10 @@ PLAN_DIRICHLET_EPSILON=${dirichlet_epsilon}
 # Number of initial moves played stochastically (temp=1).
 # Remaining moves are greedy (temp=0). Lower = less noisy endgames.
 PLAN_TEMP_THRESHOLD=${temp_threshold}
+# Score estimation weight in MCTS utility: utility = value + score_weight * score.
+# Higher values make MCTS prefer moves that win by more points.
+# 0 = disabled (pure win/loss). KataGo uses ~0.02-0.1.
+PLAN_SCORE_WEIGHT=${score_weight}
 
 # ── Training Stages ──────────────────────────────────────
 # Each stage defines parameters for a range of iterations.
@@ -477,7 +489,9 @@ Preset:       ${preset}
 Architecture: ${board}x${board} board, ${filters} filters, ${blocks} blocks
 Batch size:   ${PLAN_BATCH_SIZE}
 Window size:  ${PLAN_WINDOW_SIZE} iterations (data streamed via mmap, no memory limit)
+Komi:         ${PLAN_KOMI}
 MCTS:         c_puct=${PLAN_C_PUCT}  dirichlet_alpha=${PLAN_DIRICHLET_ALPHA}  dirichlet_eps=${PLAN_DIRICHLET_EPSILON}  temp_threshold=${PLAN_TEMP_THRESHOLD}
+Score weight: ${PLAN_SCORE_WEIGHT}
 Eval gate:    ${PLAN_EVAL_THRESHOLD} win rate threshold
 
 Training Plan:
@@ -603,6 +617,7 @@ cmd_train() {
             --nn-device-ids)       NN_DEVICE_IDS=$2; shift 2;;
             --max-batch)           MAX_BATCH=$2; shift 2;;
             --iterations)          max_iters=$2; shift 2;;
+            --komi)                KOMI_OVERRIDE=$2; shift 2;;
             --help|-h)
                 cat << 'EOF'
 ./run_loop.sh train [hardware options]
@@ -615,6 +630,7 @@ Hardware options (only affects speed, not training quality):
   --nn-device-ids IDS     GPU indices, comma-sep (default: auto-detect)
   --max-batch N           Max GPU batch size for NN server (default: 256)
   --iterations N          Max iterations to run this session (default: all)
+  --komi F                Override komi from training plan
 
 GPU auto-detection: 2 server threads per GPU with pipelining.
   1 GPU  → --nn-server-threads 2 --nn-device-ids 0,0
@@ -628,6 +644,9 @@ EOF
     read_plan
     read_state
     build_if_needed
+
+    # Apply komi override if given
+    [ -n "${KOMI_OVERRIDE:-}" ] && PLAN_KOMI="$KOMI_OVERRIDE"
 
     local total_iters
     total_iters=$(get_total_iterations)
@@ -658,17 +677,21 @@ EOF
     echo "  NN devices:       ${NN_DEVICE_IDS}"
     echo "  Max batch (NN):   ${MAX_BATCH}"
     echo "  Batch size (SGD): ${PLAN_BATCH_SIZE}"
+    echo "  Komi:             ${PLAN_KOMI}"
     echo "  MCTS:             c_puct=${PLAN_C_PUCT} alpha=${PLAN_DIRICHLET_ALPHA} eps=${PLAN_DIRICHLET_EPSILON} temp=${PLAN_TEMP_THRESHOLD}"
+    echo "  Score weight:     ${PLAN_SCORE_WEIGHT}"
     echo "============================================"
     echo
 
     # Log training session to train.log
     tlog_section "TRAINING SESSION  iter ${start_iter}..${end_iter}"
     tlog "  Architecture:     ${PLAN_BOARD}x${PLAN_BOARD}, ${PLAN_FILTERS}f x ${PLAN_BLOCKS}b"
+    tlog "  Komi:             ${PLAN_KOMI}"
     tlog "  Batch size:       ${PLAN_BATCH_SIZE}"
     tlog "  Data window:      last ${PLAN_WINDOW_SIZE} iterations"
     tlog "  Eval threshold:   ${PLAN_EVAL_THRESHOLD}"
     tlog "  MCTS:             c_puct=${PLAN_C_PUCT}  alpha=${PLAN_DIRICHLET_ALPHA}  eps=${PLAN_DIRICHLET_EPSILON}  temp=${PLAN_TEMP_THRESHOLD}"
+    tlog "  Score weight:     ${PLAN_SCORE_WEIGHT}"
     tlog "  Hardware:"
     tlog "    Threads:          ${THREADS}"
     tlog "    Search threads:   ${SEARCH_THREADS}"
@@ -815,6 +838,8 @@ EOF
                 --nn-device-ids ${NN_DEVICE_IDS} \
                 --sims ${STAGE_SIMS} \
                 --c-puct ${PLAN_C_PUCT} \
+                --komi ${PLAN_KOMI} \
+                --score-weight ${PLAN_SCORE_WEIGHT} \
                 --threshold ${PLAN_EVAL_THRESHOLD} \
                 --output "${EVAL_DIR}" \
                 2>&1 | tee "$eval_tmp"

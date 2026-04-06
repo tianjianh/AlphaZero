@@ -473,6 +473,11 @@ struct CUDAComputeHandle::Impl {
     ConvBNGPU              policy_conv_gpu, value_conv_gpu;
     FCGPU                  policy_fc_gpu, value_fc1_gpu, value_fc2_gpu;
 
+    // Score head (optional)
+    bool has_score_head = false;
+    ConvBNGPU score_conv_gpu;
+    FCGPU     score_fc1_gpu, score_fc2_gpu;
+
     // Input buffer (FP32 from host)
     float* buf_flat_in = nullptr;
 
@@ -488,6 +493,10 @@ struct CUDAComputeHandle::Impl {
     // Output buffers (FP32 for softmax/tanh numerical stability)
     float* buf_pol_feat = nullptr;  // [action_size, N]
     float* buf_val_out  = nullptr;  // [N]
+
+    half* buf_scr_h1   = nullptr;   // [HW, N]
+    half* buf_scr_feat = nullptr;   // [F, N]
+    float* buf_scr_out = nullptr;   // [N]
 
     int alloc_batch = 0;
     int board_size, input_channels, num_filters, num_res_blocks;
@@ -551,6 +560,11 @@ struct CUDAComputeHandle::Impl {
         free_fc(policy_fc_gpu);
         free_fc(value_fc1_gpu);
         free_fc(value_fc2_gpu);
+        if (has_score_head) {
+            free_conv(score_conv_gpu);
+            free_fc(score_fc1_gpu);
+            free_fc(score_fc2_gpu);
+        }
         res_conv1_gpu.clear();
         res_conv2_gpu.clear();
     }
@@ -587,6 +601,12 @@ struct CUDAComputeHandle::Impl {
         buf_val_feat = alloc_h((size_t)filt * batch);
         buf_val_out  = alloc_f((size_t)batch);               // FP32 output
 
+        if (has_score_head) {
+            buf_scr_h1   = alloc_h((size_t)H * W * batch);
+            buf_scr_feat = alloc_h((size_t)filt * batch);
+            buf_scr_out  = alloc_f((size_t)batch);
+        }
+
         alloc_batch = batch;
     }
 
@@ -596,6 +616,8 @@ struct CUDAComputeHandle::Impl {
         release_buf(buf_skip);     release_buf(buf_pol_out);
         release_buf(buf_pol_feat); release_buf(buf_val_h1);
         release_buf(buf_val_feat); release_buf(buf_val_out);
+        release_buf(buf_scr_h1); release_buf(buf_scr_feat);
+        release_buf(buf_scr_out);
         alloc_batch = 0;
     }
 
@@ -685,6 +707,13 @@ CUDAComputeHandle::CUDAComputeHandle(CUDADeviceState& dev,
     I.upload_fc(I.value_fc1_gpu, model->value_fc1);
     I.upload_fc(I.value_fc2_gpu, model->value_fc2);
 
+    I.has_score_head = model->has_score_head;
+    if (I.has_score_head) {
+        I.upload_conv(I.score_conv_gpu, model->score_conv);
+        I.upload_fc(I.score_fc1_gpu, model->score_fc1);
+        I.upload_fc(I.score_fc2_gpu, model->score_fc2);
+    }
+
     I.allocate_workspace(max_batch_size > 0 ? max_batch_size : 32);
 
     std::cout << "CUDA handle ready (FP16+WMMA): board=" << I.board_size
@@ -701,7 +730,7 @@ CUDAComputeHandle::~CUDAComputeHandle() {
     }
 }
 
-std::vector<std::pair<std::vector<float>, float>>
+std::vector<CUDAComputeHandle::Result>
 CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) {
     if (states.empty()) return {};
 
@@ -782,6 +811,22 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // Score head (same structure as value head)
+    std::vector<float> scr_flat;
+    if (I.has_score_head) {
+        I.run_conv1x1_bn_relu_reshape(I.buf_main, I.buf_scr_h1,
+                                      I.score_conv_gpu, N, HW);
+        I.run_fc_bias_relu(I.buf_scr_h1, I.buf_scr_feat,
+                           I.score_fc1_gpu, N, true);
+        {
+            int K = I.score_fc2_gpu.in_features;
+            fc_bias_tanh_fp16_to_fp32<<<N, 32, 0, I.dev.stream>>>(
+                I.score_fc2_gpu.weight, I.buf_scr_feat, I.buf_scr_out,
+                I.score_fc2_gpu.bias, N, K);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
     // Read back FP32 results
     std::vector<float> pol_flat((size_t)action_size * N);
     CUDA_CHECK(cudaMemcpyAsync(pol_flat.data(), I.buf_pol_feat,
@@ -791,15 +836,23 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.buf_val_out,
         val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
 
+    if (I.has_score_head) {
+        scr_flat.resize((size_t)N);
+        CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.buf_scr_out,
+            scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+    }
+
     CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
 
-    // Pack results (same column-major→row-major unpacking)
-    std::vector<std::pair<std::vector<float>, float>> results(N);
+    // Pack results
+    std::vector<CUDAComputeHandle::Result> results(N);
     for (int n = 0; n < N; n++) {
         std::vector<float> pol(action_size);
         for (int a = 0; a < action_size; a++)
             pol[a] = pol_flat[a * N + n];
-        results[n] = { std::move(pol), val_flat[n] };
+        results[n].policy = std::move(pol);
+        results[n].value  = val_flat[n];
+        results[n].score  = I.has_score_head ? scr_flat[n] : 0.0f;
     }
     return results;
 }

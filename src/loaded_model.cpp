@@ -94,10 +94,21 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     load_fc(model->value_fc1, "value_fc1");
     load_fc(model->value_fc2, "value_fc2");
 
+    // Score head (optional — old models don't have it)
+    if (tm.count("score_conv.weight")) {
+        model->has_score_head = true;
+        load_conv(model->score_conv, "score_conv.weight");
+        load_bn  (model->score_conv, "score_bn");
+        load_fc(model->score_fc1, "score_fc1");
+        load_fc(model->score_fc2, "score_fc2");
+    }
+
     std::cout << "Model loaded: board=" << model->board_size
               << " filters=" << model->num_filters
               << " blocks=" << model->num_res_blocks
-              << " channels=" << model->input_channels << "\n";
+              << " channels=" << model->input_channels
+              << " score_head=" << (model->has_score_head ? "yes" : "no")
+              << "\n";
 
     return model;
 }

@@ -54,7 +54,7 @@ NNEvaluator::Result NNEvaluator::evaluate_with_buf(
         buf.cv.wait(lock, [&] { return buf.done; });
     }
 
-    return { std::move(buf.policy), buf.value };
+    return { std::move(buf.policy), buf.value, buf.score };
 }
 
 // Convenience wrapper — creates a temporary buf per call.
@@ -89,7 +89,7 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
     for (int i = 0; i < n; i++) {
         std::unique_lock<std::mutex> lock(bufs[i]->mu);
         bufs[i]->cv.wait(lock, [&, i] { return bufs[i]->done; });
-        results.push_back({ std::move(bufs[i]->policy), bufs[i]->value });
+        results.push_back({ std::move(bufs[i]->policy), bufs[i]->value, bufs[i]->score });
     }
     return results;
 }
@@ -145,8 +145,9 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
             NNResultBuf* buf = batch[i];
             {
                 std::lock_guard<std::mutex> lock(buf->mu);
-                buf->policy = std::move(all_results[i].first);
-                buf->value  = all_results[i].second;
+                buf->policy = std::move(all_results[i].policy);
+                buf->value  = all_results[i].value;
+                buf->score  = all_results[i].score;
                 buf->done   = true;
             }
             buf->cv.notify_one();

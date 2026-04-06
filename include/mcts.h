@@ -137,6 +137,7 @@ struct TrainingRecord {
     std::vector<float> state;
     std::vector<float> policy;
     float value;
+    float score;  // normalized score from current player's perspective [-1, 1]
 };
 
 std::vector<TrainingRecord> self_play_game(

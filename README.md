@@ -3,6 +3,7 @@
 Miniature AlphaZero Go engine modelled on KataGo's architecture:
 multi-threaded MCTS with per-leaf blocking evaluation + a KataGo-style
 `NNEvaluator` server that batches leaf evaluations into one GPU call.
+Triple-headed neural network: **policy** (move probabilities) + **value** (win/loss) + **score** (point margin estimation, like KataGo's score head).
 Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple Silicon).
 
 **Inference backends** (compile-time selectable):
@@ -521,6 +522,23 @@ Selfplay data is compressed with **zstd** after generation (~10x smaller on
 disk).  The training DataLoader streams and decompresses one file at a time
 with 8 prefetch workers, keeping GPU utilization high with minimal memory.
 
+## Neural Network
+
+Triple-headed ResNet (`scripts/model.py`):
+
+| Head | Output | Activation | Target |
+|------|--------|------------|--------|
+| **Policy** | `[batch, 82]` | softmax | MCTS visit distribution |
+| **Value** | `[batch, 1]` | tanh → [-1,1] | Game outcome (+1 win, -1 loss) |
+| **Score** | `[batch, 1]` | tanh → [-1,1] | Normalized point margin `(black - white) / board²` |
+
+The score head (inspired by KataGo) lets MCTS prefer moves that win by more points.
+MCTS blends the two signals: `utility = value + score_weight × score`.
+`score_weight` is configurable (default 0.02, set to 0 to disable).
+
+**Komi** (compensation for white) defaults to **6.5** for 9×9 and is configurable
+via `--komi` in all executables and `PLAN_KOMI` in the training plan.
+
 ## Model Format
 
 All backends use **ONNX** (`.onnx`) as the universal model format.
@@ -645,7 +663,8 @@ minigo-cpp/
   --search-threads N     MCTS search threads (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
   --c-puct F             UCB exploration constant (default: 1.5)
-  --komi F               Komi value (default: 7.5)
+  --komi F               Komi value (default: 6.5)
+  --score-weight F       Score utility weight (default: 0.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
   --random               Use random bot (no model needed)

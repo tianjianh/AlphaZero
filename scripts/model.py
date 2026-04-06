@@ -1,6 +1,6 @@
 """
 MiniGo AlphaZero — Neural Network (PyTorch)
-Dual-headed ResNet: policy head + value head.
+Triple-headed ResNet: policy head + value head + score head.
 Shared between training and weight export.
 """
 
@@ -45,6 +45,11 @@ class AlphaZeroNet(nn.Module):
         self.value_fc1 = nn.Linear(board_size * board_size, 64)
         self.value_fc2 = nn.Linear(64, 1)
 
+        self.score_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
+        self.score_bn = nn.BatchNorm2d(1)
+        self.score_fc1 = nn.Linear(board_size * board_size, 64)
+        self.score_fc2 = nn.Linear(64, 1)
+
     def forward(self, x):
         out = F.relu(self.input_bn(self.input_conv(x)))
         for block in self.res_blocks:
@@ -59,12 +64,17 @@ class AlphaZeroNet(nn.Module):
         v = F.relu(self.value_fc1(v))
         v = torch.tanh(self.value_fc2(v))
 
-        return p, v
+        s = F.relu(self.score_bn(self.score_conv(out)))
+        s = s.view(s.size(0), -1)
+        s = F.relu(self.score_fc1(s))
+        s = torch.tanh(self.score_fc2(s))
+
+        return p, v, s
 
     def predict(self, state_tensor, device="cpu"):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value = self(x)
+            logits, value, score = self(x)
             probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-        return probs, value.item()
+        return probs, value.item(), score.item()
