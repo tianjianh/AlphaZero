@@ -73,6 +73,7 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="re
         },
         opset_version=18,
         do_constant_folding=True,
+        external_data=False,
     )
 
     # Embed full state_dict for Eigen backend
