@@ -464,7 +464,10 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
 
     std::cout << "TensorRT handle ready: board=" << I.board_size;
     if (model->model_type == "vit")
-        std::cout << " d_model=" << model->num_filters;
+        std::cout << " d_model=" << model->num_filters
+                  << " depth=" << model->vit_depth
+                  << " heads=" << model->vit_heads
+                  << " kv=" << model->vit_kv_groups;
     else
         std::cout << " filters=" << model->num_filters
                   << " blocks=" << model->num_res_blocks;

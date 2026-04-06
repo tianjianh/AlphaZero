@@ -31,7 +31,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         auto& tp = get("token_proj.weight");
         model->input_channels = (int)tp.dims[1];
         model->num_filters    = (int)tp.dims[0];  // d_model
-        model->num_res_blocks = 0;  // not applicable
+        model->num_res_blocks = 0;
 
         // board_size from orbit_ids buffer: length = board_size^2
         if (tm.count("orbit_ids")) {
@@ -41,6 +41,28 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
             model->board_size = (int)std::round(std::sqrt((double)hw));
         } else {
             model->board_size = 9;
+        }
+
+        // Infer depth: count blocks.N.attn.q_proj.weight
+        model->vit_depth = 0;
+        while (tm.count("blocks." + std::to_string(model->vit_depth) + ".attn.q_proj.weight"))
+            model->vit_depth++;
+
+        // Infer heads from q_proj: shape [num_heads*head_dim, d_model]
+        // and kv_groups from kv_proj: shape [2*kv_groups*head_dim, d_model]
+        if (model->vit_depth > 0) {
+            auto& qw = get("blocks.0.attn.q_proj.weight");
+            auto& kvw = get("blocks.0.attn.kv_proj.weight");
+            int d_model = model->num_filters;
+            int q_out = (int)qw.dims[0];   // num_heads * head_dim
+            int kv_out = (int)kvw.dims[0];  // 2 * kv_groups * head_dim
+            // head_dim = d_model / num_heads, but num_heads = q_out / head_dim
+            // kv_out = 2 * kv_groups * head_dim → kv_groups = kv_out / (2 * head_dim)
+            // Since q_out == d_model (full heads), head_dim candidates: 32, 64
+            int head_dim = 32;  // standard default
+            if (d_model % 64 == 0 && q_out == d_model) head_dim = d_model > 256 ? 64 : 32;
+            model->vit_heads = q_out / head_dim;
+            model->vit_kv_groups = kv_out / (2 * head_dim);
         }
 
     } else {
@@ -100,7 +122,9 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     if (is_vit) {
         std::cout << "Model loaded: type=vit board=" << model->board_size
                   << " d_model=" << model->num_filters
-                  << " channels=" << model->input_channels << "\n";
+                  << " depth=" << model->vit_depth
+                  << " heads=" << model->vit_heads
+                  << " kv_groups=" << model->vit_kv_groups << "\n";
         return model;
     }
 

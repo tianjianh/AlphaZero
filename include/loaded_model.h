@@ -45,8 +45,13 @@ public:
     std::string model_type = "resnet";  // "resnet" or "vit"
     int board_size = 9;
     int input_channels = 17;
-    int num_filters = 64;
-    int num_res_blocks = 5;
+    int num_filters = 64;     // ResNet: conv filters; ViT: d_model
+    int num_res_blocks = 5;   // ResNet only
+
+    // ViT-specific (inferred from weights)
+    int vit_depth = 0;        // number of transformer blocks
+    int vit_heads = 0;        // number of Q heads
+    int vit_kv_groups = 0;    // number of KV groups (GQA)
 
     // Weights (all pre-fused BN, CPU-side)
     ConvBNWeights              input_conv;
