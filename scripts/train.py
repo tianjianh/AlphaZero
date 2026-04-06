@@ -229,8 +229,12 @@ def main():
         kv_groups=args.kv_groups, mlp_ratio=args.mlp_ratio,
     ).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr,
-                           weight_decay=args.weight_decay)
+    if args.arch == "vit":
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr,
+                                weight_decay=args.weight_decay)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr,
+                               weight_decay=args.weight_decay)
 
     start_iteration = 0
     if is_main:

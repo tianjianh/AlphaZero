@@ -89,6 +89,9 @@ int main(int argc, char* argv[]) {
         config.input_channels  = model->input_channels;
         config.num_filters     = model->num_filters;
         config.num_res_blocks  = model->num_res_blocks;
+        config.vit_depth       = model->vit_depth;
+        config.vit_heads       = model->vit_heads;
+        config.vit_kv_groups   = model->vit_kv_groups;
     } catch (...) {
         std::cout << "No model loaded — NN/MCTS benchmarks will be skipped.\n";
     }

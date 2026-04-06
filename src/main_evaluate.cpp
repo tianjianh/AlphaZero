@@ -198,6 +198,9 @@ int main(int argc, char* argv[]) {
     config.input_channels     = model1->input_channels;
     config.num_filters        = model1->num_filters;
     config.num_res_blocks     = model1->num_res_blocks;
+    config.vit_depth          = model1->vit_depth;
+    config.vit_heads          = model1->vit_heads;
+    config.vit_kv_groups      = model1->vit_kv_groups;
     config.max_moves_per_game = config.board_size * config.board_size * 2;
     config.num_search_threads = search_threads;
     config.max_batch_size     = max_batch_size;
@@ -217,13 +220,19 @@ int main(int argc, char* argv[]) {
     auto eval2 = std::make_shared<NNEvaluator>(
         model2, ctx2, device_ids, max_batch_size);
 
+    auto model_desc = [](const LoadedModel* m) -> std::string {
+        if (m->model_type == "vit")
+            return "d" + std::to_string(m->num_filters) + "/L" +
+                   std::to_string(m->vit_depth) + "/h" +
+                   std::to_string(m->vit_heads) + " vit";
+        return std::to_string(m->num_filters) + "f" +
+               std::to_string(m->num_res_blocks) + "b";
+    };
     std::cout << "MiniGo Evaluation Match\n"
               << "  Model 1 (candidate): " << model1_path
-              << " (" << model1->num_filters << "f"
-              << model1->num_res_blocks << "b)\n"
+              << " (" << model_desc(model1.get()) << ")\n"
               << "  Model 2 (baseline):  " << model2_path
-              << " (" << model2->num_filters << "f"
-              << model2->num_res_blocks << "b)\n"
+              << " (" << model_desc(model2.get()) << ")\n"
               << "  Board:      " << config.board_size
               << "x" << config.board_size << "\n"
               << "  Komi:       " << config.komi << "\n"

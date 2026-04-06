@@ -570,7 +570,11 @@ def cmd_train(args):
     print("============================================")
     print("  MiniGo Training")
     print("============================================")
-    print(f"  Architecture:     {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b")
+    arch = plan.get("arch", "resnet")
+    if arch == "vit":
+        print(f"  Architecture:     {plan['board']}x{plan['board']}, d={plan['d_model']} depth={plan['depth']} heads={plan['heads']} kv={plan['kv_groups']} (vit)")
+    else:
+        print(f"  Architecture:     {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b (resnet)")
     print(f"  Iterations:       {start_iter} .. {end_iter}  (of {total_iters})")
     print(f"  Best model:       {vstr(state['best_version'])}")
     print(f"  Threads:          {hw['threads']}")
@@ -589,7 +593,10 @@ def cmd_train(args):
 
     # Log training session
     tlog_section(f"TRAINING SESSION  iter {start_iter}..{end_iter}")
-    tlog(f"  Architecture:     {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b")
+    if arch == "vit":
+        tlog(f"  Architecture:     {plan['board']}x{plan['board']}, d={plan['d_model']} depth={plan['depth']} heads={plan['heads']} kv={plan['kv_groups']} (vit)")
+    else:
+        tlog(f"  Architecture:     {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b (resnet)")
     tlog(f"  Komi:             {plan['komi']}")
     tlog(f"  Batch size:       {plan['batch_size']}")
     tlog(f"  Data window:      last {plan['window_size']} iterations")
@@ -682,7 +689,6 @@ def cmd_train(args):
             # Detect GPUs for DDP training
             train_gpus = detect_gpu_count()
 
-            arch = plan.get("arch", "resnet")
             train_args = [
                 str(SCRIPTS_DIR / "train.py"),
                 "--data", window_dirs,

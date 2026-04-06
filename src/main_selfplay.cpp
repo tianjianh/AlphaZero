@@ -111,6 +111,9 @@ int main(int argc, char* argv[]) {
     config.input_channels     = model->input_channels;
     config.num_filters        = model->num_filters;
     config.num_res_blocks     = model->num_res_blocks;
+    config.vit_depth          = model->vit_depth;
+    config.vit_heads          = model->vit_heads;
+    config.vit_kv_groups      = model->vit_kv_groups;
     config.max_moves_per_game = config.board_size * config.board_size * 2;
     config.num_search_threads = search_threads;
 
@@ -124,9 +127,16 @@ int main(int argc, char* argv[]) {
     std::cout << "MiniGo C++ Self-Play\n"
               << "  Board:            " << config.board_size << "x" << config.board_size << "\n"
               << "  Arch:             " << config.model_type << "\n"
-              << "  Komi:             " << config.komi << "\n"
-              << "  Filters:          " << config.num_filters
-              << "  Blocks: "           << config.num_res_blocks << "\n"
+              << "  Komi:             " << config.komi << "\n";
+    if (config.model_type == "vit")
+        std::cout << "  d_model:          " << config.num_filters
+                  << "  depth=" << config.vit_depth
+                  << "  heads=" << config.vit_heads
+                  << "  kv=" << config.vit_kv_groups << "\n";
+    else
+        std::cout << "  Filters:          " << config.num_filters
+                  << "  Blocks: " << config.num_res_blocks << "\n";
+    std::cout
               << "  Simulations:      " << config.num_simulations << "\n"
               << "  Search threads:   " << config.num_search_threads << "\n"
               << "  c_puct:           " << config.c_puct << "\n"

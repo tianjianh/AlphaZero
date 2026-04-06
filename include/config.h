@@ -14,6 +14,10 @@ struct Config {
     int num_res_blocks = 5;
     int num_filters = 64;
     int input_channels = 17;  // 8 history * 2 + 1 color
+    // ViT-specific (copied from LoadedModel after load)
+    int vit_depth = 0;
+    int vit_heads = 0;
+    int vit_kv_groups = 0;
 
     // MCTS
     int num_simulations = 800;

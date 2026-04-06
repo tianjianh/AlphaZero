@@ -93,6 +93,9 @@ int main(int argc, char* argv[]) {
             config.input_channels     = model->input_channels;
             config.num_filters        = model->num_filters;
             config.num_res_blocks     = model->num_res_blocks;
+            config.vit_depth          = model->vit_depth;
+            config.vit_heads          = model->vit_heads;
+            config.vit_kv_groups      = model->vit_kv_groups;
             config.max_moves_per_game = config.board_size * config.board_size * 2;
             config.num_search_threads = search_threads;
 
