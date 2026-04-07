@@ -123,6 +123,7 @@ set(HAS_OPENCL FALSE)
 set(HAS_METAL FALSE)
 set(HAS_CUDA FALSE)
 set(HAS_TENSORRT FALSE)
+set(HAS_EIGEN FALSE)
 
 if(MINIGO_BACKEND STREQUAL "metal")
   if(NOT APPLE)
@@ -159,7 +160,7 @@ elseif(MINIGO_BACKEND STREQUAL "opencl")
   set(HAS_OPENCL TRUE)
 
 elseif(MINIGO_BACKEND STREQUAL "eigen")
-  # Nothing extra needed — Eigen is always available
+  set(HAS_EIGEN TRUE)
 
 else()
   message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, eigen")
@@ -171,10 +172,13 @@ set(CORE_SOURCES
     src/onnx_loader.cpp
     src/loaded_model.cpp
     src/compute_context.cpp
-    src/eigen_compute.cpp
     src/nn_evaluator.cpp
     src/mcts.cpp
 )
+
+if(HAS_EIGEN)
+  list(APPEND CORE_SOURCES src/eigen_compute.cpp)
+endif()
 
 if(HAS_OPENCL)
   list(APPEND CORE_SOURCES src/opencl_compute.cpp)
@@ -199,6 +203,10 @@ target_link_libraries(minigo_core PUBLIC Eigen3::Eigen Threads::Threads)
 if(APPLE AND ACCELERATE_LIB)
   target_compile_definitions(minigo_core PUBLIC EIGEN_USE_BLAS)
   target_link_libraries(minigo_core PUBLIC ${ACCELERATE_LIB})
+endif()
+
+if(HAS_EIGEN)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_EIGEN=1)
 endif()
 
 if(HAS_OPENCL)

@@ -1,4 +1,5 @@
 #pragma once
+#ifdef MINIGO_HAS_EIGEN
 
 #include "compute_context.h"
 #include "loaded_model.h"
@@ -64,3 +65,4 @@ private:
 };
 
 }  // namespace minigo
+#endif  // MINIGO_HAS_EIGEN

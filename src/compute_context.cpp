@@ -1,5 +1,8 @@
 #include "compute_context.h"
+
+#ifdef MINIGO_HAS_EIGEN
 #include "eigen_compute.h"
+#endif
 
 #ifdef MINIGO_HAS_OPENCL
 #include "opencl_compute.h"
@@ -30,9 +33,11 @@ std::unique_ptr<ComputeContext> create_compute_context(const std::vector<int>& d
     return std::make_unique<CUDAComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_OPENCL)
     return std::make_unique<OpenCLComputeContext>(device_ids);
-#else
+#elif defined(MINIGO_HAS_EIGEN)
     (void)device_ids;
     return std::make_unique<EigenComputeContext>();
+#else
+    #error "No inference backend compiled. Use cmake -DMINIGO_BACKEND=..."
 #endif
 }
 
@@ -45,8 +50,10 @@ std::string backend_name() {
     return "cuda";
 #elif defined(MINIGO_HAS_OPENCL)
     return "opencl";
-#else
+#elif defined(MINIGO_HAS_EIGEN)
     return "eigen";
+#else
+    return "none";
 #endif
 }
 

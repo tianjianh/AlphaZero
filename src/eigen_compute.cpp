@@ -1,3 +1,4 @@
+#ifdef MINIGO_HAS_EIGEN
 #include "eigen_compute.h"
 #include <cmath>
 #include <cstring>
@@ -214,3 +215,4 @@ EigenComputeHandle::predict_batch(const std::vector<std::vector<float>>& states)
 }
 
 }  // namespace minigo
+#endif  // MINIGO_HAS_EIGEN
