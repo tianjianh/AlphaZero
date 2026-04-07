@@ -131,8 +131,26 @@ def get_total_iterations(plan):
     return plan["stages"][-1]["end"]
 
 
-def build_data_window(plan, end_iter):
-    start = max(1, end_iter - plan["training"]["window_size"] + 1)
+def get_stage_config(stage, plan):
+    """Merge stage overrides with plan defaults for training and mcts params.
+
+    Any key from training/mcts can be overridden per-stage by adding it
+    directly to the stage dict.  E.g. a stage with "score_weight": 0.1
+    overrides the global mcts.score_weight for that stage only.
+    """
+    t = dict(plan["training"])
+    mc = dict(plan["mcts"])
+    for k in t:
+        if k in stage:
+            t[k] = stage[k]
+    for k in mc:
+        if k in stage:
+            mc[k] = stage[k]
+    return t, mc
+
+
+def build_data_window(window_size, end_iter):
+    start = max(1, end_iter - window_size + 1)
     dirs = []
     for w in range(start, end_iter + 1):
         d = DATA_DIR / f"iter_{w:04d}"
@@ -315,8 +333,7 @@ def build_if_needed():
 #  Self-play
 # ══════════════════════════════════════════════════════════
 
-def run_selfplay(iter_data, model, games, sims, hw, plan):
-    mc = plan["mcts"]
+def run_selfplay(iter_data, model, games, sims, hw, mc):
     mcts_flags = [
         "--c-puct", str(mc["c_puct"]),
         "--dirichlet-alpha", str(mc["dirichlet_alpha"]),
@@ -692,6 +709,7 @@ def cmd_train(args):
     for it in range(start_iter, end_iter + 1):
         state["pipeline_iter"] = it
         stage = get_stage_for_iter(plan, it)
+        st, smc = get_stage_config(stage, plan)
 
         print()
         log("============================================")
@@ -723,7 +741,7 @@ def cmd_train(args):
                  f"instances={hw['selfplay_instances']}")
 
             t0 = time.time()
-            run_selfplay(iter_data, selfplay_model, games_needed, stage["sims"], hw, plan)
+            run_selfplay(iter_data, selfplay_model, games_needed, stage["sims"], hw, smc)
             sp_time = int(time.time() - t0)
             state["total_games"] += games_needed
 
@@ -742,16 +760,16 @@ def cmd_train(args):
             tlog(f"  Phase 2 training: SKIP ({vstr(it)} exists)")
         else:
             train_ckpt = CHECKPOINT_DIR / "training.pt"
-            window_dirs = build_data_window(plan, it)
+            window_dirs = build_data_window(st["window_size"], it)
             if not window_dirs:
                 log("ERROR: no data in window")
                 sys.exit(1)
 
             n_window = len(window_dirs.split(","))
             log(f"Phase 2 — Training: {stage['epochs']} epochs, lr={stage['lr']}, "
-                f"batch={t['batch_size']}...")
+                f"batch={st['batch_size']}...")
             tlog(f"  Phase 2 training: {stage['epochs']} epochs, lr={stage['lr']}, "
-                 f"batch={t['batch_size']}")
+                 f"batch={st['batch_size']}")
             tlog(f"    window={n_window} dirs")
 
             t0 = time.time()
@@ -764,7 +782,7 @@ def cmd_train(args):
                 "--data", window_dirs,
                 "--checkpoint", str(train_ckpt),
                 "--epochs", str(stage["epochs"]),
-                "--batch-size", str(t["batch_size"]),
+                "--batch-size", str(st["batch_size"]),
                 "--lr", stage["lr"],
                 "--board", str(m["board"]),
                 "--arch", arch,
@@ -772,9 +790,9 @@ def cmd_train(args):
                 "--blocks", str(m.get("blocks", 5)),
                 "--output-onnx", str(candidate_onnx),
                 "--log-file", str(TRAIN_LOG),
-                "--policy-weight", str(t["policy_weight"]),
-                "--value-weight", str(t["value_weight"]),
-                "--score-weight-loss", str(t["score_weight_loss"]),
+                "--policy-weight", str(st["policy_weight"]),
+                "--value-weight", str(st["value_weight"]),
+                "--score-weight-loss", str(st["score_weight_loss"]),
             ]
             if arch == "vit":
                 train_args += [
@@ -828,11 +846,11 @@ def cmd_train(args):
                 "--nn-server-threads", str(hw["nn_server_threads"]),
                 "--nn-device-ids", hw["nn_device_ids"],
                 "--sims", str(stage["sims"]),
-                "--c-puct", str(mc["c_puct"]),
-                "--komi", str(mc["komi"]),
-                "--score-weight", str(mc["score_weight"]),
-                "--threshold", str(t["eval_threshold"]),
-                "--score-scale", str(mc["score_scale"]),
+                "--c-puct", str(smc["c_puct"]),
+                "--komi", str(smc["komi"]),
+                "--score-weight", str(smc["score_weight"]),
+                "--threshold", str(st["eval_threshold"]),
+                "--score-scale", str(smc["score_scale"]),
                 "--output", str(eval_dir),
             ]
 
