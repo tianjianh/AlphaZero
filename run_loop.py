@@ -163,50 +163,75 @@ def build_data_window(window_size, end_iter):
 #  Stage presets
 # ══════════════════════════════════════════════════════════
 
+def _stage(name, start, end, games, sims, epochs, lr, eval_games,
+           score_weight, score_weight_loss, window_size,
+           c_puct, temp_threshold, dirichlet_epsilon):
+    """Build a stage dict with all per-stage overrides."""
+    return {"name": name, "start": start, "end": end,
+            "games": games, "sims": sims, "epochs": epochs, "lr": lr,
+            "eval_games": eval_games,
+            "score_weight": score_weight, "score_weight_loss": score_weight_loss,
+            "window_size": window_size,
+            "c_puct": c_puct, "temp_threshold": temp_threshold,
+            "dirichlet_epsilon": dirichlet_epsilon}
+
+# Per-stage exploration schedule (explore→exploit as model strengthens)
+#                    score_wt  sw_loss  window  c_puct  temp  dir_eps
+_EXPLORE = [
+    # Bootstrap:     aggressive explore — network is random
+    (0.0,   0.2,     3,      2.0,    20,   0.30),
+    # Warm up:       still exploring
+    (0.03,  0.3,     3,      1.75,   18,   0.28),
+    # Early gated:   standard balance
+    (0.06,  0.4,     4,      1.5,    15,   0.25),
+    # Consolidate:   starting to exploit
+    (0.1,   0.5,     6,      1.25,   15,   0.22),
+    # Steady:        exploit for clean signal
+    (0.15,  0.5,     8,      1.1,    12,   0.20),
+    # Overnight:     same
+    (0.15,  0.5,     8,      1.1,    12,   0.20),
+]
+# Large preset uses wider windows for later stages
+_EXPLORE_LARGE = list(_EXPLORE)
+_EXPLORE_LARGE[3] = (0.1, 0.5, 8, 1.25, 15, 0.22)
+_EXPLORE_LARGE[4] = (0.15, 0.5, 10, 1.1, 12, 0.20)
+_EXPLORE_LARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
+
+
 def generate_stages(preset, board, filters, blocks, arch="resnet"):
     vit = (arch == "vit")
     if preset == "quick":
         lr = "8e-4" if vit else "2e-3"
         return [{"name": "Quick test", "start": 1, "end": 5,
                  "games": 20, "sims": 100, "epochs": 5, "lr": lr, "eval_games": 0}]
+
+    # Learning rates: ViT uses lower LRs than ResNet
+    if vit:
+        lrs = ["8e-4", "6e-4", "4e-4", "3e-4", "2e-4", "1.5e-4"]
+    else:
+        lrs = ["1.2e-3", "9e-4", "6e-4", "4.5e-4", "3e-4", "2e-4"]
+
     if preset == "small":
-        if vit:
-            return [
-                {"name": "Bootstrap",       "start": 1,  "end": 4,  "games": 400,  "sims": 200, "epochs": 8, "lr": "8e-4",   "eval_games": 0,   "score_weight": 0.0,  "score_weight_loss": 0.2, "window_size": 3},
-                {"name": "Warm up",         "start": 5,  "end": 8,  "games": 600,  "sims": 300, "epochs": 6, "lr": "6e-4",   "eval_games": 0,   "score_weight": 0.03, "score_weight_loss": 0.3, "window_size": 3},
-                {"name": "Early gated",     "start": 9,  "end": 14, "games": 900,  "sims": 400, "epochs": 4, "lr": "4e-4",   "eval_games": 100, "score_weight": 0.06, "score_weight_loss": 0.4, "window_size": 4},
-                {"name": "Consolidate",     "start": 15, "end": 22, "games": 1000, "sims": 400, "epochs": 3, "lr": "3e-4",   "eval_games": 200, "score_weight": 0.1,  "score_weight_loss": 0.5, "window_size": 6},
-                {"name": "Steady improve",  "start": 23, "end": 32, "games": 1200, "sims": 500, "epochs": 3, "lr": "2e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 8},
-                {"name": "Overnight extend","start": 33, "end": 48, "games": 1400, "sims": 500, "epochs": 3, "lr": "1.5e-4", "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 8},
-            ]
-        else:
-            return [
-                {"name": "Bootstrap",       "start": 1,  "end": 4,  "games": 400,  "sims": 200, "epochs": 8, "lr": "1.2e-3", "eval_games": 0,   "score_weight": 0.0,  "score_weight_loss": 0.2, "window_size": 3},
-                {"name": "Warm up",         "start": 5,  "end": 8,  "games": 600,  "sims": 300, "epochs": 6, "lr": "9e-4",   "eval_games": 0,   "score_weight": 0.03, "score_weight_loss": 0.3, "window_size": 3},
-                {"name": "Early gated",     "start": 9,  "end": 14, "games": 900,  "sims": 400, "epochs": 4, "lr": "6e-4",   "eval_games": 100, "score_weight": 0.06, "score_weight_loss": 0.4, "window_size": 4},
-                {"name": "Consolidate",     "start": 15, "end": 22, "games": 1000, "sims": 400, "epochs": 3, "lr": "4.5e-4", "eval_games": 200, "score_weight": 0.1,  "score_weight_loss": 0.5, "window_size": 6},
-                {"name": "Steady improve",  "start": 23, "end": 32, "games": 1200, "sims": 500, "epochs": 3, "lr": "3e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 8},
-                {"name": "Overnight extend","start": 33, "end": 48, "games": 1400, "sims": 500, "epochs": 3, "lr": "2e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 8},
-            ]
+        ex = _EXPLORE
+        return [
+            _stage("Bootstrap",       1,  4,   400, 200, 8, lrs[0], 0,   *ex[0]),
+            _stage("Warm up",         5,  8,   600, 300, 6, lrs[1], 0,   *ex[1]),
+            _stage("Early gated",     9, 14,   900, 400, 4, lrs[2], 100, *ex[2]),
+            _stage("Consolidate",    15, 22,  1000, 400, 3, lrs[3], 200, *ex[3]),
+            _stage("Steady improve", 23, 32,  1200, 500, 3, lrs[4], 200, *ex[4]),
+            _stage("Overnight extend",33,48,  1400, 500, 3, lrs[5], 200, *ex[5]),
+        ]
     if preset == "large":
-        if vit:
-            return [
-                {"name": "Bootstrap",       "start": 1,   "end": 6,   "games": 800,  "sims": 300,  "epochs": 8, "lr": "8e-4",   "eval_games": 0,   "score_weight": 0.0,  "score_weight_loss": 0.2, "window_size": 3},
-                {"name": "Warm up",         "start": 7,   "end": 15,  "games": 1200, "sims": 400,  "epochs": 6, "lr": "6e-4",   "eval_games": 0,   "score_weight": 0.03, "score_weight_loss": 0.3, "window_size": 4},
-                {"name": "Early gated",     "start": 16,  "end": 30,  "games": 2000, "sims": 600,  "epochs": 4, "lr": "4e-4",   "eval_games": 200, "score_weight": 0.06, "score_weight_loss": 0.4, "window_size": 6},
-                {"name": "Consolidate",     "start": 31,  "end": 60,  "games": 3000, "sims": 600,  "epochs": 3, "lr": "3e-4",   "eval_games": 200, "score_weight": 0.1,  "score_weight_loss": 0.5, "window_size": 8},
-                {"name": "Steady improve",  "start": 61,  "end": 120, "games": 4000, "sims": 800,  "epochs": 3, "lr": "2e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 10},
-                {"name": "Overnight extend","start": 121, "end": 200, "games": 5000, "sims": 1000, "epochs": 3, "lr": "1e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 10},
-            ]
-        else:
-            return [
-                {"name": "Bootstrap",       "start": 1,   "end": 6,   "games": 800,  "sims": 300,  "epochs": 8, "lr": "1.2e-3", "eval_games": 0,   "score_weight": 0.0,  "score_weight_loss": 0.2, "window_size": 3},
-                {"name": "Warm up",         "start": 7,   "end": 15,  "games": 1200, "sims": 400,  "epochs": 6, "lr": "9e-4",   "eval_games": 0,   "score_weight": 0.03, "score_weight_loss": 0.3, "window_size": 4},
-                {"name": "Early gated",     "start": 16,  "end": 30,  "games": 2000, "sims": 600,  "epochs": 4, "lr": "6e-4",   "eval_games": 200, "score_weight": 0.06, "score_weight_loss": 0.4, "window_size": 6},
-                {"name": "Consolidate",     "start": 31,  "end": 60,  "games": 3000, "sims": 600,  "epochs": 3, "lr": "4.5e-4", "eval_games": 200, "score_weight": 0.1,  "score_weight_loss": 0.5, "window_size": 8},
-                {"name": "Steady improve",  "start": 61,  "end": 120, "games": 4000, "sims": 800,  "epochs": 3, "lr": "3e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 10},
-                {"name": "Overnight extend","start": 121, "end": 200, "games": 5000, "sims": 1000, "epochs": 3, "lr": "2e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 10},
-            ]
+        ex = _EXPLORE_LARGE
+        return [
+            _stage("Bootstrap",        1,   6,  800, 300, 8, lrs[0], 0,   *ex[0]),
+            _stage("Warm up",          7,  15, 1200, 400, 6, lrs[1], 0,   *ex[1]),
+            _stage("Early gated",     16,  30, 2000, 600, 4, lrs[2], 200, *ex[2]),
+            _stage("Consolidate",     31,  60, 3000, 600, 3, lrs[3], 200, *ex[3]),
+            _stage("Steady improve",  61, 120, 4000, 800, 3, lrs[4], 200, *ex[4]),
+            _stage("Overnight extend",121, 200,5000,1000, 3, lrs[5], 200, *ex[5]),
+        ]
+
     # custom
     total = max(30, min(300, 60 * filters * blocks // 320))
     s1 = max(3, total * 8 // 100)
@@ -216,13 +241,14 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
     s5 = total * 67 // 100
     s6 = total
     bg = max(50, 500 * board * board // 81)
+    ex = _EXPLORE
     return [
-        {"name": "Bootstrap",       "start": 1,      "end": s1, "games": bg,     "sims": 200, "epochs": 8, "lr": "8e-4" if vit else "1.2e-3", "eval_games": 0,   "score_weight": 0.0,  "score_weight_loss": 0.2, "window_size": 3},
-        {"name": "Warm up",         "start": s1 + 1,  "end": s2, "games": bg * 2, "sims": 300, "epochs": 6, "lr": "6e-4" if vit else "9e-4",   "eval_games": 0,   "score_weight": 0.03, "score_weight_loss": 0.3, "window_size": 3},
-        {"name": "Early gated",     "start": s2 + 1,  "end": s3, "games": bg * 3, "sims": 400, "epochs": 4, "lr": "4e-4" if vit else "6e-4",   "eval_games": 100, "score_weight": 0.06, "score_weight_loss": 0.4, "window_size": 4},
-        {"name": "Consolidate",     "start": s3 + 1,  "end": s4, "games": bg * 4, "sims": 400, "epochs": 3, "lr": "3e-4" if vit else "4.5e-4", "eval_games": 200, "score_weight": 0.1,  "score_weight_loss": 0.5, "window_size": 6},
-        {"name": "Steady improve",  "start": s4 + 1,  "end": s5, "games": bg * 5, "sims": 500, "epochs": 3, "lr": "2e-4" if vit else "3e-4",   "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 8},
-        {"name": "Overnight extend","start": s5 + 1,  "end": s6, "games": bg * 6, "sims": 500, "epochs": 3, "lr": "1.5e-4" if vit else "2e-4", "eval_games": 200, "score_weight": 0.15, "score_weight_loss": 0.5, "window_size": 8},
+        _stage("Bootstrap",        1,    s1, bg,     200, 8, lrs[0], 0,   *ex[0]),
+        _stage("Warm up",         s1+1,  s2, bg*2,   300, 6, lrs[1], 0,   *ex[1]),
+        _stage("Early gated",     s2+1,  s3, bg*3,   400, 4, lrs[2], 100, *ex[2]),
+        _stage("Consolidate",     s3+1,  s4, bg*4,   400, 3, lrs[3], 200, *ex[3]),
+        _stage("Steady improve",  s4+1,  s5, bg*5,   500, 3, lrs[4], 200, *ex[4]),
+        _stage("Overnight extend",s5+1,  s6, bg*6,   500, 3, lrs[5], 200, *ex[5]),
     ]
 
 
