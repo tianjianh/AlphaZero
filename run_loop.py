@@ -132,7 +132,7 @@ def get_total_iterations(plan):
 
 
 def build_data_window(plan, end_iter):
-    start = max(1, end_iter - plan["window_size"] + 1)
+    start = max(1, end_iter - plan["training"]["window_size"] + 1)
     dirs = []
     for w in range(start, end_iter + 1):
         d = DATA_DIR / f"iter_{w:04d}"
@@ -145,36 +145,66 @@ def build_data_window(plan, end_iter):
 #  Stage presets
 # ══════════════════════════════════════════════════════════
 
-def generate_stages(preset, board, filters, blocks):
+def generate_stages(preset, board, filters, blocks, arch="resnet"):
+    vit = (arch == "vit")
     if preset == "quick":
+        lr = "8e-4" if vit else "2e-3"
         return [{"name": "Quick test", "start": 1, "end": 5,
-                 "games": 20, "sims": 100, "epochs": 5, "lr": "2e-3", "eval_games": 0}]
+                 "games": 20, "sims": 100, "epochs": 5, "lr": lr, "eval_games": 0}]
     if preset == "small":
-        return [
-            {"name": "Warm up",     "start": 1,  "end": 5,   "games": 500,  "sims": 400, "epochs": 10, "lr": "2e-3", "eval_games": 0},
-            {"name": "Explore",     "start": 6,  "end": 25,  "games": 1500, "sims": 600, "epochs": 15, "lr": "1e-3", "eval_games": 100},
-            {"name": "Strengthen",  "start": 26, "end": 60,  "games": 2500, "sims": 600, "epochs": 15, "lr": "5e-4", "eval_games": 100},
-            {"name": "Polish",      "start": 61, "end": 100, "games": 3000, "sims": 800, "epochs": 20, "lr": "1e-4", "eval_games": 100},
-        ]
+        if vit:
+            return [
+                {"name": "Bootstrap",       "start": 1,  "end": 4,  "games": 400,  "sims": 200, "epochs": 8, "lr": "8e-4",   "eval_games": 0},
+                {"name": "Warm up",         "start": 5,  "end": 8,  "games": 600,  "sims": 300, "epochs": 6, "lr": "6e-4",   "eval_games": 0},
+                {"name": "Early gated",     "start": 9,  "end": 14, "games": 900,  "sims": 400, "epochs": 4, "lr": "4e-4",   "eval_games": 100},
+                {"name": "Consolidate",     "start": 15, "end": 22, "games": 1000, "sims": 400, "epochs": 3, "lr": "3e-4",   "eval_games": 200},
+                {"name": "Steady improve",  "start": 23, "end": 32, "games": 1200, "sims": 500, "epochs": 3, "lr": "2e-4",   "eval_games": 200},
+                {"name": "Overnight extend","start": 33, "end": 48, "games": 1400, "sims": 500, "epochs": 3, "lr": "1.5e-4", "eval_games": 200},
+            ]
+        else:
+            return [
+                {"name": "Bootstrap",       "start": 1,  "end": 4,  "games": 400,  "sims": 200, "epochs": 8, "lr": "1.2e-3", "eval_games": 0},
+                {"name": "Warm up",         "start": 5,  "end": 8,  "games": 600,  "sims": 300, "epochs": 6, "lr": "9e-4",   "eval_games": 0},
+                {"name": "Early gated",     "start": 9,  "end": 14, "games": 900,  "sims": 400, "epochs": 4, "lr": "6e-4",   "eval_games": 100},
+                {"name": "Consolidate",     "start": 15, "end": 22, "games": 1000, "sims": 400, "epochs": 3, "lr": "4.5e-4", "eval_games": 200},
+                {"name": "Steady improve",  "start": 23, "end": 32, "games": 1200, "sims": 500, "epochs": 3, "lr": "3e-4",   "eval_games": 200},
+                {"name": "Overnight extend","start": 33, "end": 48, "games": 1400, "sims": 500, "epochs": 3, "lr": "2e-4",   "eval_games": 200},
+            ]
     if preset == "large":
-        return [
-            {"name": "Warm up",     "start": 1,   "end": 10,  "games": 1000, "sims": 600,  "epochs": 10, "lr": "2e-3", "eval_games": 0},
-            {"name": "Explore",     "start": 11,  "end": 50,  "games": 3000, "sims": 800,  "epochs": 15, "lr": "1e-3", "eval_games": 200},
-            {"name": "Strengthen",  "start": 51,  "end": 130, "games": 4000, "sims": 1000, "epochs": 20, "lr": "5e-4", "eval_games": 200},
-            {"name": "Master",      "start": 131, "end": 200, "games": 5000, "sims": 1200, "epochs": 20, "lr": "1e-4", "eval_games": 200},
-        ]
+        if vit:
+            return [
+                {"name": "Bootstrap",       "start": 1,   "end": 6,   "games": 800,  "sims": 300,  "epochs": 8, "lr": "8e-4",   "eval_games": 0},
+                {"name": "Warm up",         "start": 7,   "end": 15,  "games": 1200, "sims": 400,  "epochs": 6, "lr": "6e-4",   "eval_games": 0},
+                {"name": "Early gated",     "start": 16,  "end": 30,  "games": 2000, "sims": 600,  "epochs": 4, "lr": "4e-4",   "eval_games": 200},
+                {"name": "Consolidate",     "start": 31,  "end": 60,  "games": 3000, "sims": 600,  "epochs": 3, "lr": "3e-4",   "eval_games": 200},
+                {"name": "Steady improve",  "start": 61,  "end": 120, "games": 4000, "sims": 800,  "epochs": 3, "lr": "2e-4",   "eval_games": 200},
+                {"name": "Overnight extend","start": 121, "end": 200, "games": 5000, "sims": 1000, "epochs": 3, "lr": "1e-4",   "eval_games": 200},
+            ]
+        else:
+            return [
+                {"name": "Bootstrap",       "start": 1,   "end": 6,   "games": 800,  "sims": 300,  "epochs": 8, "lr": "1.2e-3", "eval_games": 0},
+                {"name": "Warm up",         "start": 7,   "end": 15,  "games": 1200, "sims": 400,  "epochs": 6, "lr": "9e-4",   "eval_games": 0},
+                {"name": "Early gated",     "start": 16,  "end": 30,  "games": 2000, "sims": 600,  "epochs": 4, "lr": "6e-4",   "eval_games": 200},
+                {"name": "Consolidate",     "start": 31,  "end": 60,  "games": 3000, "sims": 600,  "epochs": 3, "lr": "4.5e-4", "eval_games": 200},
+                {"name": "Steady improve",  "start": 61,  "end": 120, "games": 4000, "sims": 800,  "epochs": 3, "lr": "3e-4",   "eval_games": 200},
+                {"name": "Overnight extend","start": 121, "end": 200, "games": 5000, "sims": 1000, "epochs": 3, "lr": "2e-4",   "eval_games": 200},
+            ]
     # custom
     total = max(30, min(300, 60 * filters * blocks // 320))
     s1 = max(3, total * 8 // 100)
-    s2 = total * 25 // 100
-    s3 = total * 58 // 100
-    s4 = total
+    s2 = total * 17 // 100
+    s3 = total * 29 // 100
+    s4 = total * 46 // 100
+    s5 = total * 67 // 100
+    s6 = total
     bg = max(50, 500 * board * board // 81)
     return [
-        {"name": "Warm up",     "start": 1,      "end": s1, "games": bg,     "sims": 400, "epochs": 10, "lr": "2e-3", "eval_games": 0},
-        {"name": "Explore",     "start": s1 + 1,  "end": s2, "games": bg * 3, "sims": 600, "epochs": 15, "lr": "1e-3", "eval_games": 100},
-        {"name": "Strengthen",  "start": s2 + 1,  "end": s3, "games": bg * 5, "sims": 600, "epochs": 15, "lr": "5e-4", "eval_games": 100},
-        {"name": "Polish",      "start": s3 + 1,  "end": s4, "games": bg * 6, "sims": 800, "epochs": 20, "lr": "1e-4", "eval_games": 100},
+        {"name": "Bootstrap",       "start": 1,      "end": s1, "games": bg,     "sims": 200, "epochs": 8, "lr": "8e-4" if vit else "1.2e-3", "eval_games": 0},
+        {"name": "Warm up",         "start": s1 + 1,  "end": s2, "games": bg * 2, "sims": 300, "epochs": 6, "lr": "6e-4" if vit else "9e-4",   "eval_games": 0},
+        {"name": "Early gated",     "start": s2 + 1,  "end": s3, "games": bg * 3, "sims": 400, "epochs": 4, "lr": "4e-4" if vit else "6e-4",   "eval_games": 100},
+        {"name": "Consolidate",     "start": s3 + 1,  "end": s4, "games": bg * 4, "sims": 400, "epochs": 3, "lr": "3e-4" if vit else "4.5e-4", "eval_games": 200},
+        {"name": "Steady improve",  "start": s4 + 1,  "end": s5, "games": bg * 5, "sims": 500, "epochs": 3, "lr": "2e-4" if vit else "3e-4",   "eval_games": 200},
+        {"name": "Overnight extend","start": s5 + 1,  "end": s6, "games": bg * 6, "sims": 500, "epochs": 3, "lr": "1.5e-4" if vit else "2e-4", "eval_games": 200},
     ]
 
 
@@ -182,8 +212,8 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
                    d_model=192, depth=8, heads=6, kv_groups=2, mlp_ratio=4):
     komi = 7.5 if board >= 13 else 6.5
     batch_size = 1024
-    eval_threshold = 0.55
-    window = 20
+    eval_threshold = 0.52
+    window = 6
     temp_threshold = 15
     dirichlet_alpha = 0.15
     score_weight = 0.02
@@ -191,27 +221,42 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
     if preset == "quick":
         batch_size = 64; window = 5; eval_threshold = 0.5; temp_threshold = 8
     elif preset == "large":
-        window = 30
+        window = 10
 
     if board >= 13:
         dirichlet_alpha = 0.03
         temp_threshold = 30
 
-    plan = {
-        "arch": arch, "board": board, "komi": komi,
-        "filters": filters, "blocks": blocks,
-        "batch_size": batch_size, "eval_threshold": eval_threshold,
-        "window_size": window, "c_puct": 1.5,
-        "dirichlet_alpha": dirichlet_alpha, "dirichlet_epsilon": 0.25,
-        "temp_threshold": temp_threshold, "score_weight": score_weight,
-        "score_scale": 10.0,
-        "policy_weight": 1.0, "value_weight": 1.0, "score_weight_loss": 1.0,
-        "stages": generate_stages(preset, board, filters, blocks),
-    }
+    # Model config (read-only — architecture identity for logging)
     if arch == "vit":
-        plan.update({"d_model": d_model, "depth": depth, "heads": heads,
-                      "kv_groups": kv_groups, "mlp_ratio": mlp_ratio})
-    return plan
+        model_cfg = {"arch": arch, "board": board,
+                     "d_model": d_model, "depth": depth, "heads": heads,
+                     "kv_groups": kv_groups, "mlp_ratio": mlp_ratio}
+    else:
+        model_cfg = {"arch": arch, "board": board,
+                     "filters": filters, "blocks": blocks}
+
+    return {
+        "model": model_cfg,
+        "training": {
+            "batch_size": batch_size,
+            "window_size": window,
+            "eval_threshold": eval_threshold,
+            "policy_weight": 1.0,
+            "value_weight": 1.0,
+            "score_weight_loss": 1.0,
+        },
+        "mcts": {
+            "komi": komi,
+            "c_puct": 1.5,
+            "dirichlet_alpha": dirichlet_alpha,
+            "dirichlet_epsilon": 0.25,
+            "temp_threshold": temp_threshold,
+            "score_weight": score_weight,
+            "score_scale": 10.0,
+        },
+        "stages": generate_stages(preset, board, filters, blocks, arch),
+    }
 
 
 # ══════════════════════════════════════════════════════════
@@ -271,14 +316,15 @@ def build_if_needed():
 # ══════════════════════════════════════════════════════════
 
 def run_selfplay(iter_data, model, games, sims, hw, plan):
+    mc = plan["mcts"]
     mcts_flags = [
-        "--c-puct", str(plan["c_puct"]),
-        "--dirichlet-alpha", str(plan["dirichlet_alpha"]),
-        "--dirichlet-epsilon", str(plan["dirichlet_epsilon"]),
-        "--temp-threshold", str(plan["temp_threshold"]),
-        "--komi", str(plan["komi"]),
-        "--score-weight", str(plan["score_weight"]),
-        "--score-scale", str(plan.get("score_scale", 10.0)),
+        "--c-puct", str(mc["c_puct"]),
+        "--dirichlet-alpha", str(mc["dirichlet_alpha"]),
+        "--dirichlet-epsilon", str(mc["dirichlet_epsilon"]),
+        "--temp-threshold", str(mc["temp_threshold"]),
+        "--komi", str(mc["komi"]),
+        "--score-weight", str(mc["score_weight"]),
+        "--score-scale", str(mc["score_scale"]),
     ]
     base_cmd = [
         str(BUILD_DIR / "selfplay"),
@@ -422,21 +468,27 @@ def cmd_init(args):
     total_iters = get_total_iterations(plan)
     total_games = sum(s["games"] * (s["end"] - s["start"] + 1) for s in plan["stages"])
 
+    m = plan["model"]
+    t = plan["training"]
+    mc = plan["mcts"]
+
     with open(TRAIN_LOG, "w") as f:
+        arch_desc = (f'{m["filters"]} filters, {m["blocks"]} blocks' if arch == 'resnet'
+                     else f'd_model={m["d_model"]}, depth={m["depth"]}, heads={m["heads"]}, kv_groups={m["kv_groups"]}')
         f.write(f"""MiniGo AlphaZero — Training Log
 ════════════════════════════════════════════════════════════════
 Initialized:  {timestamp()}
 Preset:       {preset}
 Arch:         {arch}
-Architecture: {board}x{board} board, {f'{filters} filters, {blocks} blocks' if arch == 'resnet' else f'd_model={plan.get("d_model")}, depth={plan.get("depth")}, heads={plan.get("heads")}, kv_groups={plan.get("kv_groups")}'}
-Batch size:   {plan['batch_size']}
-Window size:  {plan['window_size']} iterations (data streamed via mmap, no memory limit)
-Komi:         {plan['komi']}
-MCTS:         c_puct={plan['c_puct']}  dirichlet_alpha={plan['dirichlet_alpha']}  dirichlet_eps={plan['dirichlet_epsilon']}  temp_threshold={plan['temp_threshold']}
-Score weight: {plan['score_weight']}
-Score scale:  {plan['score_scale']}
-Loss weights: policy={plan['policy_weight']} value={plan['value_weight']} score={plan['score_weight_loss']}
-Eval gate:    {plan['eval_threshold']} win rate threshold
+Architecture: {board}x{board} board, {arch_desc}
+Batch size:   {t['batch_size']}
+Window size:  {t['window_size']} iterations (data streamed via mmap, no memory limit)
+Komi:         {mc['komi']}
+MCTS:         c_puct={mc['c_puct']}  dirichlet_alpha={mc['dirichlet_alpha']}  dirichlet_eps={mc['dirichlet_epsilon']}  temp_threshold={mc['temp_threshold']}
+Score weight: {mc['score_weight']}
+Score scale:  {mc['score_scale']}
+Loss weights: policy={t['policy_weight']} value={t['value_weight']} score={t['score_weight_loss']}
+Eval gate:    {t['eval_threshold']} win rate threshold
 
 Training Plan:
 """)
@@ -482,6 +534,8 @@ def cmd_status(args):
 
     plan = read_plan()
     state = read_state()
+    m = plan["model"]
+    mc = plan["mcts"]
     total_iters = get_total_iterations(plan)
     pct = state["pipeline_iter"] * 100 // total_iters if total_iters > 0 else 0
 
@@ -489,15 +543,15 @@ def cmd_status(args):
     print("============================================")
     print("  MiniGo Training Status")
     print("============================================")
-    arch = plan.get("arch", "resnet")
+    arch = m["arch"]
     if arch == "resnet":
-        print(f"  Architecture:   {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b (resnet)")
+        print(f"  Architecture:   {m['board']}x{m['board']}, {m['filters']}f x {m['blocks']}b (resnet)")
     else:
-        print(f"  Architecture:   {plan['board']}x{plan['board']}, d={plan['d_model']} depth={plan['depth']} "
-              f"heads={plan['heads']} kv={plan['kv_groups']} (vit)")
-    print(f"  Komi:           {plan['komi']}")
-    print(f"  Score weight:   {plan['score_weight']}")
-    print(f"  Score scale:    {plan.get('score_scale', 10.0)}")
+        print(f"  Architecture:   {m['board']}x{m['board']}, d={m['d_model']} depth={m['depth']} "
+              f"heads={m['heads']} kv={m['kv_groups']} (vit)")
+    print(f"  Komi:           {mc['komi']}")
+    print(f"  Score weight:   {mc['score_weight']}")
+    print(f"  Score scale:    {mc['score_scale']}")
     print(f"  Progress:       {state['pipeline_iter']} / {total_iters} iterations ({pct}%)")
     print(f"  Best model:     {vstr(state['best_version'])} ({state['total_promotions']} promotions)")
     print(f"  Total games:    {state['total_games']}")
@@ -551,9 +605,14 @@ def cmd_train(args):
     state = read_state()
     build_if_needed()
 
+    m = plan["model"]
+    t = plan["training"]
+    mc = plan["mcts"]
+    arch = m["arch"]
+
     # Apply komi override
     if args.komi is not None:
-        plan["komi"] = args.komi
+        mc["komi"] = args.komi
 
     total_iters = get_total_iterations(plan)
     if state["pipeline_iter"] >= total_iters:
@@ -576,11 +635,10 @@ def cmd_train(args):
     print("============================================")
     print("  MiniGo Training")
     print("============================================")
-    arch = plan.get("arch", "resnet")
     if arch == "vit":
-        print(f"  Architecture:     {plan['board']}x{plan['board']}, d={plan['d_model']} depth={plan['depth']} heads={plan['heads']} kv={plan['kv_groups']} (vit)")
+        print(f"  Architecture:     {m['board']}x{m['board']}, d={m['d_model']} depth={m['depth']} heads={m['heads']} kv={m['kv_groups']} (vit)")
     else:
-        print(f"  Architecture:     {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b (resnet)")
+        print(f"  Architecture:     {m['board']}x{m['board']}, {m['filters']}f x {m['blocks']}b (resnet)")
     print(f"  Iterations:       {start_iter} .. {end_iter}  (of {total_iters})")
     print(f"  Best model:       {vstr(state['best_version'])}")
     print(f"  Threads:          {hw['threads']}")
@@ -589,34 +647,33 @@ def cmd_train(args):
     print(f"  NN servers:       {hw['nn_server_threads']}")
     print(f"  NN devices:       {hw['nn_device_ids']}")
     print(f"  Max batch (NN):   {hw['max_batch']}")
-    print(f"  Batch size (SGD): {plan['batch_size']}")
-    print(f"  Komi:             {plan['komi']}")
-    print(f"  MCTS:             c_puct={plan['c_puct']} alpha={plan['dirichlet_alpha']} "
-          f"eps={plan['dirichlet_epsilon']} temp={plan['temp_threshold']}")
-    print(f"  Score weight:     {plan['score_weight']}")
-    print(f"  Score scale:      {plan.get('score_scale', 10.0)}")
-    print(f"  Loss weights:     policy={plan.get('policy_weight', 1.0)} "
-          f"value={plan.get('value_weight', 1.0)} "
-          f"score={plan.get('score_weight_loss', 1.0)}")
+    print(f"  Batch size (SGD): {t['batch_size']}")
+    print(f"  Komi:             {mc['komi']}")
+    print(f"  MCTS:             c_puct={mc['c_puct']} alpha={mc['dirichlet_alpha']} "
+          f"eps={mc['dirichlet_epsilon']} temp={mc['temp_threshold']}")
+    print(f"  Score weight:     {mc['score_weight']}")
+    print(f"  Score scale:      {mc['score_scale']}")
+    print(f"  Loss weights:     policy={t['policy_weight']} "
+          f"value={t['value_weight']} score={t['score_weight_loss']}")
     print("============================================")
     print()
 
     # Log training session
     tlog_section(f"TRAINING SESSION  iter {start_iter}..{end_iter}")
     if arch == "vit":
-        tlog(f"  Architecture:     {plan['board']}x{plan['board']}, d={plan['d_model']} depth={plan['depth']} heads={plan['heads']} kv={plan['kv_groups']} (vit)")
+        tlog(f"  Architecture:     {m['board']}x{m['board']}, d={m['d_model']} depth={m['depth']} heads={m['heads']} kv={m['kv_groups']} (vit)")
     else:
-        tlog(f"  Architecture:     {plan['board']}x{plan['board']}, {plan['filters']}f x {plan['blocks']}b (resnet)")
-    tlog(f"  Komi:             {plan['komi']}")
-    tlog(f"  Batch size:       {plan['batch_size']}")
-    tlog(f"  Data window:      last {plan['window_size']} iterations")
-    tlog(f"  Eval threshold:   {plan['eval_threshold']}")
-    tlog(f"  MCTS:             c_puct={plan['c_puct']}  alpha={plan['dirichlet_alpha']}  "
-         f"eps={plan['dirichlet_epsilon']}  temp={plan['temp_threshold']}")
-    tlog(f"  Score weight:     {plan['score_weight']}")
-    tlog(f"  Score scale:      {plan.get('score_scale', 10.0)}")
-    tlog(f"  Loss weights:     policy={plan.get('policy_weight', 1.0)} "
-         f"value={plan.get('value_weight', 1.0)} score={plan.get('score_weight_loss', 1.0)}")
+        tlog(f"  Architecture:     {m['board']}x{m['board']}, {m['filters']}f x {m['blocks']}b (resnet)")
+    tlog(f"  Komi:             {mc['komi']}")
+    tlog(f"  Batch size:       {t['batch_size']}")
+    tlog(f"  Data window:      last {t['window_size']} iterations")
+    tlog(f"  Eval threshold:   {t['eval_threshold']}")
+    tlog(f"  MCTS:             c_puct={mc['c_puct']}  alpha={mc['dirichlet_alpha']}  "
+         f"eps={mc['dirichlet_epsilon']}  temp={mc['temp_threshold']}")
+    tlog(f"  Score weight:     {mc['score_weight']}")
+    tlog(f"  Score scale:      {mc['score_scale']}")
+    tlog(f"  Loss weights:     policy={t['policy_weight']} "
+         f"value={t['value_weight']} score={t['score_weight_loss']}")
     tlog("  Hardware:")
     tlog(f"    Threads:          {hw['threads']}")
     tlog(f"    Search threads:   {hw['search_threads']}")
@@ -692,9 +749,9 @@ def cmd_train(args):
 
             n_window = len(window_dirs.split(","))
             log(f"Phase 2 — Training: {stage['epochs']} epochs, lr={stage['lr']}, "
-                f"batch={plan['batch_size']}...")
+                f"batch={t['batch_size']}...")
             tlog(f"  Phase 2 training: {stage['epochs']} epochs, lr={stage['lr']}, "
-                 f"batch={plan['batch_size']}")
+                 f"batch={t['batch_size']}")
             tlog(f"    window={n_window} dirs")
 
             t0 = time.time()
@@ -707,25 +764,25 @@ def cmd_train(args):
                 "--data", window_dirs,
                 "--checkpoint", str(train_ckpt),
                 "--epochs", str(stage["epochs"]),
-                "--batch-size", str(plan["batch_size"]),
+                "--batch-size", str(t["batch_size"]),
                 "--lr", stage["lr"],
-                "--board", str(plan["board"]),
+                "--board", str(m["board"]),
                 "--arch", arch,
-                "--filters", str(plan["filters"]),
-                "--blocks", str(plan["blocks"]),
+                "--filters", str(m.get("filters", 64)),
+                "--blocks", str(m.get("blocks", 5)),
                 "--output-onnx", str(candidate_onnx),
                 "--log-file", str(TRAIN_LOG),
-                "--policy-weight", str(plan.get("policy_weight", 1.0)),
-                "--value-weight", str(plan.get("value_weight", 1.0)),
-                "--score-weight-loss", str(plan.get("score_weight_loss", 1.0)),
+                "--policy-weight", str(t["policy_weight"]),
+                "--value-weight", str(t["value_weight"]),
+                "--score-weight-loss", str(t["score_weight_loss"]),
             ]
             if arch == "vit":
                 train_args += [
-                    "--d-model", str(plan["d_model"]),
-                    "--depth", str(plan["depth"]),
-                    "--heads", str(plan["heads"]),
-                    "--kv-groups", str(plan["kv_groups"]),
-                    "--mlp-ratio", str(plan["mlp_ratio"]),
+                    "--d-model", str(m["d_model"]),
+                    "--depth", str(m["depth"]),
+                    "--heads", str(m["heads"]),
+                    "--kv-groups", str(m["kv_groups"]),
+                    "--mlp-ratio", str(m["mlp_ratio"]),
                 ]
 
             if train_gpus > 1:
@@ -771,11 +828,11 @@ def cmd_train(args):
                 "--nn-server-threads", str(hw["nn_server_threads"]),
                 "--nn-device-ids", hw["nn_device_ids"],
                 "--sims", str(stage["sims"]),
-                "--c-puct", str(plan["c_puct"]),
-                "--komi", str(plan["komi"]),
-                "--score-weight", str(plan["score_weight"]),
-                "--threshold", str(plan["eval_threshold"]),
-                "--score-scale", str(plan.get("score_scale", 10.0)),
+                "--c-puct", str(mc["c_puct"]),
+                "--komi", str(mc["komi"]),
+                "--score-weight", str(mc["score_weight"]),
+                "--threshold", str(t["eval_threshold"]),
+                "--score-scale", str(mc["score_scale"]),
                 "--output", str(eval_dir),
             ]
 
