@@ -6,7 +6,7 @@
 #include <iostream>
 #include <numeric>
 #include <thread>
-#include <pthread.h>
+#include <memory>
 
 namespace minigo {
 
@@ -129,18 +129,17 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
                                std::atomic<int>& sims_done,
                                int num_simulations) {
     // Pre-allocate ONE NNResultBuf for this thread's entire lifetime.
-    // Reused for every evaluation call — the mutex + condvar are created
-    // once here, not per eval.  Matches KataGo: one buf per SearchThread.
     NNResultBuf result_buf;
+    // Pre-allocate GoGame on heap — reused across playouts (avoids ~4KB on stack)
+    auto game_copy_ptr = std::make_unique<GoGame>(game.copy());
 
     while (true) {
-        // Check termination BEFORE doing work (KataGo pattern)
         if (sims_done.load(std::memory_order_relaxed) >= num_simulations)
             break;
 
         // ── Descend with virtual loss ────────────────────────────
         MCTSNode* node = root;
-        GoGame game_copy = game.copy();
+        *game_copy_ptr = game.copy();
         std::vector<MCTSNode*> path;
         path.push_back(node);
         node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
@@ -157,20 +156,16 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
                 path.push_back(child);
                 int action = child->action;
                 if (action == action_size - 1)
-                    game_copy.play(PASS_MOVE);
+                    game_copy_ptr->play(PASS_MOVE);
                 else
-                    game_copy.play(action);
+                    game_copy_ptr->play(action);
                 node = child;
 
             } else if (st == NODE_EXPANDING) {
-                // ── Collision: another thread is evaluating this node ──
-                // Revert virtual losses, yield, retry.  Don't count playout.
-                // (KataGo: shouldCountPlayout=false, revertVirtualLosses)
                 collision = true;
                 break;
 
             } else {
-                // NODE_UNEVALUATED — reached a leaf
                 break;
             }
         }
@@ -178,15 +173,15 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         if (collision) {
             revert_virtual_losses(path);
             std::this_thread::yield();
-            continue;  // retry from root — playout doesn't count
+            continue;
         }
 
         // ── Terminal node ────────────────────────────────────────
-        if (game_copy.game_over) {
+        if (game_copy_ptr->game_over) {
             float leaf_value;
-            if      (game_copy.winner == EMPTY)                     leaf_value =  0.0f;
-            else if (game_copy.winner == game_copy.current_player)  leaf_value =  1.0f;
-            else                                                     leaf_value = -1.0f;
+            if      (game_copy_ptr->winner == EMPTY)                            leaf_value =  0.0f;
+            else if (game_copy_ptr->winner == game_copy_ptr->current_player)    leaf_value =  1.0f;
+            else                                                                 leaf_value = -1.0f;
             backprop(path, leaf_value);
             sims_done.fetch_add(1, std::memory_order_relaxed);
             continue;
@@ -196,21 +191,20 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         int expected = NODE_UNEVALUATED;
         if (!node->state.compare_exchange_strong(expected, NODE_EXPANDING,
                 std::memory_order_acq_rel)) {
-            // Extremely rare: another thread claimed between our state check and CAS
             revert_virtual_losses(path);
             std::this_thread::yield();
-            continue;  // retry, don't count
+            continue;
         }
 
         // ── Evaluate (blocks until server processes batch) ──────
         std::vector<float> state;
-        game_copy.encode(state);
+        game_copy_ptr->encode(state);
 
         auto result = evaluator_->evaluate_with_buf(result_buf, state);
 
         // ── Expand + backprop ────────────────────────────────────
         std::vector<float> legal;
-        game_copy.get_legal_moves(legal);
+        game_copy_ptr->get_legal_moves(legal);
         mask_policy(result.policy, legal, action_size);
         expand(node, result.policy, legal);
         node->state.store(NODE_EXPANDED, std::memory_order_release);
@@ -249,11 +243,14 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
         std::vector<PendingLeaf> pending;
         pending.reserve(batch_count);
 
+        // Pre-allocate GoGame on heap — reused across batch
+        auto game_copy_ptr = std::make_unique<GoGame>(game.copy());
+
         for (int i = 0; i < batch_count; i++) {
             PendingLeaf leaf;
 
             MCTSNode* node = root;
-            GoGame game_copy = game.copy();
+            *game_copy_ptr = game.copy();
             leaf.path.push_back(node);
             node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
 
@@ -264,9 +261,9 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
                 leaf.path.push_back(node);
                 int action = node->action;
                 if (action == action_size - 1)
-                    game_copy.play(PASS_MOVE);
+                    game_copy_ptr->play(PASS_MOVE);
                 else
-                    game_copy.play(action);
+                    game_copy_ptr->play(action);
             }
 
             if (!node) {
@@ -277,18 +274,18 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 
             leaf.leaf = node;
 
-            if (game_copy.game_over) {
+            if (game_copy_ptr->game_over) {
                 float v;
-                if      (game_copy.winner == EMPTY)                     v =  0.0f;
-                else if (game_copy.winner == game_copy.current_player)  v =  1.0f;
-                else                                                     v = -1.0f;
+                if      (game_copy_ptr->winner == EMPTY)                            v =  0.0f;
+                else if (game_copy_ptr->winner == game_copy_ptr->current_player)    v =  1.0f;
+                else                                                                 v = -1.0f;
                 backprop(leaf.path, v);
                 sims_done++;
                 continue;
             }
 
-            game_copy.encode(leaf.state);
-            game_copy.get_legal_moves(leaf.legal);
+            game_copy_ptr->encode(leaf.state);
+            game_copy_ptr->get_legal_moves(leaf.legal);
             pending.push_back(std::move(leaf));
         }
 
@@ -350,38 +347,19 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     int nthreads = std::max(1, config_.num_search_threads);
     std::atomic<int> sims_done{0};
 
-    // Spawn search threads with explicit 2MB stack (GoGame is 4KB per frame;
-    // default 512KB can be tight with deep call stacks on some platforms)
-    struct ThreadArg {
-        MCTS* self;
-        MCTSNode* root;
-        const GoGame* game;
-        int action_size;
-        std::atomic<int>* sims_done;
-        int num_simulations;
-    };
-    auto thread_fn = [](void* arg) -> void* {
-        auto* a = static_cast<ThreadArg*>(arg);
-        a->self->search_thread_loop(a->root, *a->game, a->action_size,
-                                     *a->sims_done, a->num_simulations);
-        return nullptr;
-    };
-
-    std::vector<ThreadArg> args(nthreads - 1);
-    std::vector<pthread_t> pthreads(nthreads - 1);
-    for (int t = 0; t < nthreads - 1; t++) {
-        args[t] = { this, root.get(), &game, action_size, &sims_done, num_simulations };
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);  // 8MB stack (match main thread)
-        pthread_create(&pthreads[t], &attr, thread_fn, &args[t]);
-        pthread_attr_destroy(&attr);
-    }
+    // Spawn search threads — GoGame is heap-allocated inside each thread,
+    // so default stack size is fine (no large stack objects).
+    std::vector<std::thread> search_threads;
+    search_threads.reserve(nthreads - 1);
+    for (int t = 0; t < nthreads - 1; t++)
+        search_threads.emplace_back(&MCTS::search_thread_loop, this,
+                                     root.get(), std::cref(game), action_size,
+                                     std::ref(sims_done), num_simulations);
 
     search_thread_loop(root.get(), game, action_size, sims_done, num_simulations);
 
-    for (int t = 0; t < nthreads - 1; t++)
-        pthread_join(pthreads[t], nullptr);
+    for (auto& t : search_threads)
+        t.join();
 
     // ── Extract visit counts ─────────────────────────────────────
     visits.assign(action_size, 0.0f);
