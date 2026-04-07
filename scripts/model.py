@@ -68,7 +68,7 @@ class AlphaZeroNet(nn.Module):
         v = F.relu(self.value_bn(self.value_conv(out)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.value_fc1(v))
-        v = self.value_fc2(v)
+        v = torch.tanh(self.value_fc2(v))
 
         s = F.relu(self.score_bn(self.score_conv(out)))
         s = s.view(s.size(0), -1)
@@ -81,13 +81,12 @@ class AlphaZeroNet(nn.Module):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value_logit, score_logits = self(x)
+            logits, value, score_logits = self(x)
             probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-            value = (torch.sigmoid(value_logit) * 2 - 1).item()
             board_area = self.board_size * self.board_size
             bins = torch.arange(score_logits.size(1), device=x.device).float() - board_area
             score = (F.softmax(score_logits, dim=1) * bins).sum(dim=1).item()
-        return probs, value, score
+        return probs, value.item(), score
 
 
 # ══════════════════════════════════════════════════════════
@@ -254,7 +253,7 @@ class GoViT(nn.Module):
         self.policy_proj = nn.Linear(d_model, 1)
         self.pass_logit = nn.Parameter(torch.zeros(1))
 
-        # Value head: mean pool → MLP → raw logit
+        # Value head: mean pool → MLP → tanh
         self.value_fc1 = nn.Linear(d_model, d_model)
         self.value_fc2 = nn.Linear(d_model, 1)
 
@@ -286,9 +285,9 @@ class GoViT(nn.Module):
         p_pass = self.pass_logit.expand(B, 1)                       # [B, 1]
         p = torch.cat([p_board, p_pass], dim=1)                     # [B, hw+1]
 
-        # Value: mean pool → MLP → raw logit
+        # Value: mean pool → MLP → tanh
         pooled = x.mean(dim=1)                                      # [B, d_model]
-        v = self.value_fc2(F.gelu(self.value_fc1(pooled)))
+        v = torch.tanh(self.value_fc2(F.gelu(self.value_fc1(pooled))))
 
         # Score: mean pool → MLP → bin logits
         s = self.score_fc2(F.gelu(self.score_fc1(pooled)))
@@ -299,13 +298,12 @@ class GoViT(nn.Module):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value_logit, score_logits = self(x)
+            logits, value, score_logits = self(x)
             probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-            value = (torch.sigmoid(value_logit) * 2 - 1).item()
             board_area = self.board_size * self.board_size
             bins = torch.arange(score_logits.size(1), device=x.device).float() - board_area
             score = (F.softmax(score_logits, dim=1) * bins).sum(dim=1).item()
-        return probs, value, score
+        return probs, value.item(), score
 
 
 def create_model(arch="resnet", board_size=9, input_channels=17, **kwargs):

@@ -177,7 +177,7 @@ def main():
     parser.add_argument("--policy-weight", type=float, default=1.0,
                         help="Loss weight for policy cross-entropy (default: 1.0)")
     parser.add_argument("--value-weight", type=float, default=1.0,
-                        help="Loss weight for value BCE (default: 1.0)")
+                        help="Loss weight for value MSE (default: 1.0)")
     parser.add_argument("--score-weight-loss", type=float, default=1.0,
                         help="Loss weight for score cross-entropy (default: 1.0)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
@@ -355,10 +355,7 @@ def main():
                     policies * torch.log_softmax(logits, dim=1)
                 ) / states.size(0)
 
-                # Value: BCE with logits — targets {-1,0,1} → {0, 0.5, 1}
-                value_targets = (values + 1.0) / 2.0
-                value_loss = nn.functional.binary_cross_entropy_with_logits(
-                    pred_value, value_targets)
+                value_loss = nn.functional.mse_loss(pred_value, values)
 
                 # Score: cross-entropy over bins
                 score_bin = (torch.round(scores) + board_area).long()

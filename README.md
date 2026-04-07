@@ -553,14 +553,13 @@ Both share the same triple-headed output:
 | Head | Model output | ONNX post-processing | Training loss |
 |------|-------------|----------------------|---------------|
 | **Policy** | `[B, 82]` logits | (none — C++ applies softmax) | Cross-entropy with MCTS visit distribution |
-| **Value** | `[B, 1]` raw logit | sigmoid × 2 − 1 → [-1, 1] | BCE with logits (targets: {0, 0.5, 1}) |
+| **Value** | `[B, 1]` tanh → [-1, 1] | (none) | MSE (targets: {-1, 0, 1}) |
 | **Score** | `[B, num_bins]` logits | softmax → expected value (raw points) | Cross-entropy over bins (num_bins = board² × 2 + 1) |
 
 The model's `forward()` returns raw logits (no activations).  The ONNX export
 appends post-processing ops to the graph so C++ inference receives the same
 shapes as before: policy `[B, 82]`, value `[B, 1]` in [-1,1], score `[B, 1]`
-in raw points.  Training applies BCE/CE directly on raw logits for numerical
-stability.  Mixed precision (BF16 on Ampere+, FP16+GradScaler on Turing) is
+in raw points.  Training applies MSE for value and CE for score.  Mixed precision (BF16 on Ampere+, FP16+GradScaler on Turing) is
 enabled automatically.
 
 **ViT positional encoding** — fully D4-invariant (compatible with dihedral augmentation):
