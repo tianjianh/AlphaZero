@@ -75,13 +75,13 @@ __global__ void convert_fp32_to_fp16(const float* in, half* out, int n) {
 // Add per-channel bias + ReLU to NCHW tensor (works for FP16 or FP32)
 // act: 0=none, 1=relu
 template<typename T>
-__global__ void bias_act_nchw(T* data, const float* bias, int C, int HW, int total, int act) {
+__global__ void bias_act_nchw(T* data, const T* bias, int C, int HW, int total, int act) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int c = (i / HW) % C;
     float v;
     if constexpr (std::is_same_v<T, half>)
-        v = __half2float(data[i]) + bias[c];
+        v = __half2float(data[i]) + __half2float(bias[c]);
     else
         v = data[i] + bias[c];
     if (act == 1 && v < 0.0f) v = 0.0f;
@@ -93,14 +93,14 @@ __global__ void bias_act_nchw(T* data, const float* bias, int C, int HW, int tot
 
 // Add per-channel bias + residual + ReLU to NCHW tensor
 template<typename T>
-__global__ void bias_res_relu_nchw(T* data, const float* bias, const T* residual,
+__global__ void bias_res_relu_nchw(T* data, const T* bias, const T* residual,
                                     int C, int HW, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     int c = (i / HW) % C;
-    float v, r;
+    float v;
     if constexpr (std::is_same_v<T, half>) {
-        v = __half2float(data[i]) + bias[c] + __half2float(residual[i]);
+        v = __half2float(data[i]) + __half2float(bias[c]) + __half2float(residual[i]);
     } else {
         v = data[i] + bias[c] + residual[i];
     }
@@ -288,7 +288,7 @@ struct CUDAComputeHandle::Impl {
     // Per-conv-layer GPU data
     struct ConvGPU {
         void*  weight   = nullptr; // pre-scaled by bn_scale, FP16 or FP32
-        float* bias     = nullptr; // bn_bias, always FP32
+        void*  bias     = nullptr; // bn_bias, same type as weight (FP16 or FP32)
         cudnnFilterDescriptor_t filter_desc = nullptr;
         cudnnConvolutionDescriptor_t conv_desc = nullptr;
         cudnnTensorDescriptor_t bias_desc = nullptr;  // [1, c_out, 1, 1]
@@ -369,10 +369,20 @@ struct CUDAComputeHandle::Impl {
             CUDA_CHECK(cudaMemcpy(buf, scaled.data(), n * sizeof(float), cudaMemcpyHostToDevice));
             g.weight = buf;
         }
-        // Bias = bn_bias (always FP32)
-        CUDA_CHECK(cudaMalloc(&g.bias, src.c_out * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(g.bias, src.bn_bias.data(), src.c_out * sizeof(float),
-                               cudaMemcpyHostToDevice));
+        // Bias = bn_bias — same type as weights (required by fused conv API)
+        if (use_fp16) {
+            float* tmp; CUDA_CHECK(cudaMalloc(&tmp, src.c_out * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(tmp, src.bn_bias.data(), src.c_out * sizeof(float), cudaMemcpyHostToDevice));
+            half* hb; CUDA_CHECK(cudaMalloc(&hb, src.c_out * sizeof(half)));
+            convert_fp32_to_fp16<<<(src.c_out+255)/256, 256, 0, dev.stream>>>(tmp, hb, src.c_out);
+            CUDA_CHECK(cudaStreamSynchronize(dev.stream));
+            cudaFree(tmp);
+            g.bias = hb;
+        } else {
+            float* buf; CUDA_CHECK(cudaMalloc(&buf, src.c_out * sizeof(float)));
+            CUDA_CHECK(cudaMemcpy(buf, src.bn_bias.data(), src.c_out * sizeof(float), cudaMemcpyHostToDevice));
+            g.bias = buf;
+        }
         // cuDNN descriptors
         CUDNN_CHECK(cudnnCreateFilterDescriptor(&g.filter_desc));
         CUDNN_CHECK(cudnnSetFilter4dDescriptor(g.filter_desc, dt, CUDNN_TENSOR_NCHW,
@@ -384,7 +394,7 @@ struct CUDAComputeHandle::Impl {
         if (dev.sm_major >= 7)
             CUDNN_CHECK(cudnnSetConvolutionMathType(g.conv_desc, CUDNN_TENSOR_OP_MATH));
         CUDNN_CHECK(cudnnCreateTensorDescriptor(&g.bias_desc));
-        CUDNN_CHECK(cudnnSetTensor4dDescriptor(g.bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(g.bias_desc, CUDNN_TENSOR_NCHW, dt,
                                                 1, g.c_out, 1, 1));
     }
 
@@ -412,7 +422,7 @@ struct CUDAComputeHandle::Impl {
 
     void free_conv(ConvGPU& c) {
         if (c.weight) cudaFree(c.weight);
-        if (c.bias) cudaFree(c.bias);
+        if (c.bias) cudaFree((void*)c.bias);
         if (c.filter_desc) cudnnDestroyFilterDescriptor(c.filter_desc);
         if (c.conv_desc) cudnnDestroyConvolutionDescriptor(c.conv_desc);
         if (c.bias_desc) cudnnDestroyTensorDescriptor(c.bias_desc);
@@ -488,7 +498,7 @@ struct CUDAComputeHandle::Impl {
         alloc_batch = 0;
     }
 
-    // ── cuDNN conv + bias + relu (cached descriptors, no per-call alloc) ──
+    // ── cuDNN conv + bias + relu (cached descriptors) ──────────
     void conv_bias_relu(cudnnTensorDescriptor_t in_d, void* input,
                         cudnnTensorDescriptor_t out_d, void* output,
                         ConvGPU& conv) {
@@ -501,9 +511,9 @@ struct CUDAComputeHandle::Impl {
         int HW = board_size * board_size;
         int blk = (total + 255) / 256;
         if (use_fp16)
-            bias_act_nchw<half><<<blk, 256, 0, dev.stream>>>((half*)output, conv.bias, conv.c_out, HW, total, 1);
+            bias_act_nchw<half><<<blk, 256, 0, dev.stream>>>((half*)output, (const half*)conv.bias, conv.c_out, HW, total, 1);
         else
-            bias_act_nchw<float><<<blk, 256, 0, dev.stream>>>((float*)output, conv.bias, conv.c_out, HW, total, 1);
+            bias_act_nchw<float><<<blk, 256, 0, dev.stream>>>((float*)output, (const float*)conv.bias, conv.c_out, HW, total, 1);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -520,10 +530,10 @@ struct CUDAComputeHandle::Impl {
         int blk = (total + 255) / 256;
         if (use_fp16)
             bias_res_relu_nchw<half><<<blk, 256, 0, dev.stream>>>(
-                (half*)output, conv.bias, (const half*)residual, conv.c_out, HW, total);
+                (half*)output, (const half*)conv.bias, (const half*)residual, conv.c_out, HW, total);
         else
             bias_res_relu_nchw<float><<<blk, 256, 0, dev.stream>>>(
-                (float*)output, conv.bias, (const float*)residual, conv.c_out, HW, total);
+                (float*)output, (const float*)conv.bias, (const float*)residual, conv.c_out, HW, total);
         CUDA_CHECK(cudaGetLastError());
     }
 
