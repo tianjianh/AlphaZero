@@ -291,6 +291,7 @@ struct CUDAComputeHandle::Impl {
         float* bias     = nullptr; // bn_bias, always FP32
         cudnnFilterDescriptor_t filter_desc = nullptr;
         cudnnConvolutionDescriptor_t conv_desc = nullptr;
+        cudnnTensorDescriptor_t bias_desc = nullptr;  // [1, c_out, 1, 1]
         int c_out, c_in, k;
     };
     struct FCGPU {
@@ -308,7 +309,17 @@ struct CUDAComputeHandle::Impl {
     // Score bin values on GPU [-board_area, ..., +board_area]
     float* bin_values_gpu = nullptr;
 
+    // Shared activation descriptor + cached tensor descriptors
+    cudnnActivationDescriptor_t relu_act = nullptr;
+    cudnnTensorDescriptor_t desc_input = nullptr; // [N, C_in, H, W]
+    cudnnTensorDescriptor_t desc_trunk = nullptr; // [N, F, H, W]
+    cudnnTensorDescriptor_t desc_pol   = nullptr; // [N, 2, H, W]
+    cudnnTensorDescriptor_t desc_vs    = nullptr; // [N, 1, H, W]
+    int desc_batch = 0;
+
     // Workspace buffers (void* — actual type depends on use_fp16)
+    float* buf_input_f32 = nullptr; // pre-allocated FP32 staging
+    void*  buf_input  = nullptr;  // [N, C_in, H, W] compute type
     void*  buf_main   = nullptr;  // [N, F, H, W]
     void*  buf_temp   = nullptr;  // [N, F, H, W]
     void*  buf_head   = nullptr;  // [N, max_head_channels, H, W]
@@ -372,6 +383,9 @@ struct CUDAComputeHandle::Impl {
                                                      CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
         if (dev.sm_major >= 7)
             CUDNN_CHECK(cudnnSetConvolutionMathType(g.conv_desc, CUDNN_TENSOR_OP_MATH));
+        CUDNN_CHECK(cudnnCreateTensorDescriptor(&g.bias_desc));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(g.bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
+                                                1, g.c_out, 1, 1));
     }
 
     void upload_fc(FCGPU& g, const FCWeights& src) {
@@ -401,6 +415,7 @@ struct CUDAComputeHandle::Impl {
         if (c.bias) cudaFree(c.bias);
         if (c.filter_desc) cudnnDestroyFilterDescriptor(c.filter_desc);
         if (c.conv_desc) cudnnDestroyConvolutionDescriptor(c.conv_desc);
+        if (c.bias_desc) cudnnDestroyTensorDescriptor(c.bias_desc);
         c = {};
     }
     void free_fc(FCGPU& f) {
@@ -410,6 +425,18 @@ struct CUDAComputeHandle::Impl {
     }
 
     // ── Workspace allocation ─────────────────────────────────
+    void ensure_descs(int N) {
+        if (N == desc_batch) return;
+        int H = board_size, W = board_size;
+        auto mk = [&]() { cudnnTensorDescriptor_t d; CUDNN_CHECK(cudnnCreateTensorDescriptor(&d)); return d; };
+        if (!desc_input) { desc_input = mk(); desc_trunk = mk(); desc_pol = mk(); desc_vs = mk(); }
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc_input, CUDNN_TENSOR_NCHW, dt, N, input_channels, H, W));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc_trunk, CUDNN_TENSOR_NCHW, dt, N, num_filters, H, W));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc_pol,   CUDNN_TENSOR_NCHW, dt, N, 2, H, W));
+        CUDNN_CHECK(cudnnSetTensor4dDescriptor(desc_vs,    CUDNN_TENSOR_NCHW, dt, N, 1, H, W));
+        desc_batch = N;
+    }
+
     void allocate(int batch) {
         if (batch <= alloc_batch) return;
         free_workspace();
@@ -420,6 +447,8 @@ struct CUDAComputeHandle::Impl {
                                     (int)score_fc1.out_features});
         int max_fc2     = std::max({as, num_score_bins, 1});
 
+        CUDA_CHECK(cudaMalloc(&buf_input_f32, (size_t)batch * input_channels * HW * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&buf_input, (size_t)batch * input_channels * HW * elem));
         CUDA_CHECK(cudaMalloc(&buf_main, (size_t)batch * F * HW * elem));
         CUDA_CHECK(cudaMalloc(&buf_temp, (size_t)batch * F * HW * elem));
         CUDA_CHECK(cudaMalloc(&buf_head, (size_t)batch * max_head_ch * HW * elem));
@@ -430,26 +459,18 @@ struct CUDAComputeHandle::Impl {
         CUDA_CHECK(cudaMalloc(&buf_scr_out, (size_t)batch * sizeof(float)));
 
         // Query max cuDNN workspace across all conv configs
+        ensure_descs(batch);
         cudnn_ws_sz = 0;
-        auto query_ws = [&](ConvGPU& conv, int c_in_spatial, int c_out_spatial, int N) {
-            cudnnTensorDescriptor_t in_d, out_d;
-            CUDNN_CHECK(cudnnCreateTensorDescriptor(&in_d));
-            CUDNN_CHECK(cudnnCreateTensorDescriptor(&out_d));
-            CUDNN_CHECK(cudnnSetTensor4dDescriptor(in_d, CUDNN_TENSOR_NCHW, dt, N, conv.c_in, H, W));
-            CUDNN_CHECK(cudnnSetTensor4dDescriptor(out_d, CUDNN_TENSOR_NCHW, dt, N, conv.c_out, H, W));
+        auto query_ws = [&](ConvGPU& conv, cudnnTensorDescriptor_t in_d, cudnnTensorDescriptor_t out_d) {
             size_t sz = 0;
-            auto status = cudnnGetConvolutionForwardWorkspaceSize(dev.cudnn, in_d, conv.filter_desc,
+            cudnnGetConvolutionForwardWorkspaceSize(dev.cudnn, in_d, conv.filter_desc,
                 conv.conv_desc, out_d, CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM, &sz);
-            if (status != CUDNN_STATUS_SUCCESS) sz = 0;
             cudnn_ws_sz = std::max(cudnn_ws_sz, sz);
-            cudnnDestroyTensorDescriptor(in_d);
-            cudnnDestroyTensorDescriptor(out_d);
         };
-        query_ws(input_conv, input_channels, F, batch);
-        if (!res_conv1.empty()) query_ws(res_conv1[0], F, F, batch);
-        query_ws(policy_conv, F, policy_conv.c_out, batch);
-        query_ws(value_conv, F, value_conv.c_out, batch);
-        query_ws(score_conv, F, score_conv.c_out, batch);
+        query_ws(input_conv, desc_input, desc_trunk);
+        if (!res_conv1.empty()) query_ws(res_conv1[0], desc_trunk, desc_trunk);
+        query_ws(policy_conv, desc_trunk, desc_pol);
+        query_ws(value_conv, desc_trunk, desc_vs);
 
         if (cudnn_ws_sz > 0)
             CUDA_CHECK(cudaMalloc(&cudnn_ws, cudnn_ws_sz));
@@ -458,54 +479,51 @@ struct CUDAComputeHandle::Impl {
 
     void free_workspace() {
         auto fr = [](void*& p) { if (p) { cudaFree(p); p = nullptr; } };
-        fr(buf_main); fr(buf_temp); fr(buf_head); fr(buf_fc); fr(buf_fc2);
         auto frf = [](float*& p) { if (p) { cudaFree(p); p = nullptr; } };
+        frf(buf_input_f32); fr(buf_input);
+        fr(buf_main); fr(buf_temp); fr(buf_head); fr(buf_fc); fr(buf_fc2);
         frf(buf_pol_out); frf(buf_val_out); frf(buf_scr_out);
         fr(cudnn_ws);
         cudnn_ws_sz = 0;
         alloc_batch = 0;
     }
 
-    // ── cuDNN convolution ────────────────────────────────────
-    void run_conv(void* input, void* output, ConvGPU& conv, int N, int H, int W, int c_in) {
-        cudnnTensorDescriptor_t in_d, out_d;
-        CUDNN_CHECK(cudnnCreateTensorDescriptor(&in_d));
-        CUDNN_CHECK(cudnnCreateTensorDescriptor(&out_d));
-        CUDNN_CHECK(cudnnSetTensor4dDescriptor(in_d, CUDNN_TENSOR_NCHW, dt, N, c_in, H, W));
-        CUDNN_CHECK(cudnnSetTensor4dDescriptor(out_d, CUDNN_TENSOR_NCHW, dt, N, conv.c_out, H, W));
-        float alpha = 1.0f, beta = 0.0f;
-        CUDNN_CHECK(cudnnConvolutionForward(dev.cudnn, &alpha,
+    // ── cuDNN conv + bias + relu (cached descriptors, no per-call alloc) ──
+    void conv_bias_relu(cudnnTensorDescriptor_t in_d, void* input,
+                        cudnnTensorDescriptor_t out_d, void* output,
+                        ConvGPU& conv) {
+        float a1 = 1.0f, b = 0.0f;
+        CUDNN_CHECK(cudnnConvolutionForward(dev.cudnn, &a1,
             in_d, input, conv.filter_desc, conv.weight, conv.conv_desc,
             CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
-            cudnn_ws, cudnn_ws_sz, &beta, out_d, output));
-        cudnnDestroyTensorDescriptor(in_d);
-        cudnnDestroyTensorDescriptor(out_d);
-    }
-
-    // Conv + bias + ReLU
-    void conv_bias_relu(void* input, void* output, ConvGPU& conv, int N, int H, int W, int c_in) {
-        run_conv(input, output, conv, N, H, W, c_in);
-        int total = N * conv.c_out * H * W;
+            cudnn_ws, cudnn_ws_sz, &b, out_d, output));
+        int total = desc_batch * conv.c_out * board_size * board_size;
+        int HW = board_size * board_size;
         int blk = (total + 255) / 256;
         if (use_fp16)
-            bias_act_nchw<half><<<blk, 256, 0, dev.stream>>>((half*)output, conv.bias, conv.c_out, H*W, total, 1);
+            bias_act_nchw<half><<<blk, 256, 0, dev.stream>>>((half*)output, conv.bias, conv.c_out, HW, total, 1);
         else
-            bias_act_nchw<float><<<blk, 256, 0, dev.stream>>>((float*)output, conv.bias, conv.c_out, H*W, total, 1);
+            bias_act_nchw<float><<<blk, 256, 0, dev.stream>>>((float*)output, conv.bias, conv.c_out, HW, total, 1);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Conv + bias + residual + ReLU
-    void conv_bias_res_relu(void* input, void* output, ConvGPU& conv, void* residual,
-                             int N, int H, int W, int c_in) {
-        run_conv(input, output, conv, N, H, W, c_in);
-        int total = N * conv.c_out * H * W;
+    void conv_bias_res_relu(cudnnTensorDescriptor_t in_d, void* input,
+                            cudnnTensorDescriptor_t out_d, void* output,
+                            ConvGPU& conv, void* residual) {
+        float a1 = 1.0f, b = 0.0f;
+        CUDNN_CHECK(cudnnConvolutionForward(dev.cudnn, &a1,
+            in_d, input, conv.filter_desc, conv.weight, conv.conv_desc,
+            CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
+            cudnn_ws, cudnn_ws_sz, &b, out_d, output));
+        int total = desc_batch * conv.c_out * board_size * board_size;
+        int HW = board_size * board_size;
         int blk = (total + 255) / 256;
         if (use_fp16)
             bias_res_relu_nchw<half><<<blk, 256, 0, dev.stream>>>(
-                (half*)output, conv.bias, (const half*)residual, conv.c_out, H*W, total);
+                (half*)output, conv.bias, (const half*)residual, conv.c_out, HW, total);
         else
             bias_res_relu_nchw<float><<<blk, 256, 0, dev.stream>>>(
-                (float*)output, conv.bias, (const float*)residual, conv.c_out, H*W, total);
+                (float*)output, conv.bias, (const float*)residual, conv.c_out, HW, total);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -558,6 +576,10 @@ CUDAComputeHandle::CUDAComputeHandle(CUDADeviceState& dev,
     I.num_res_blocks = model->num_res_blocks;
     I.num_score_bins = model->score_fc2.out_features;
 
+    CUDNN_CHECK(cudnnCreateActivationDescriptor(&I.relu_act));
+    CUDNN_CHECK(cudnnSetActivationDescriptor(I.relu_act, CUDNN_ACTIVATION_RELU,
+                                              CUDNN_PROPAGATE_NAN, 0.0));
+
     // Upload weights
     I.upload_conv(I.input_conv, model->input_conv);
     I.res_conv1.resize(I.num_res_blocks);
@@ -608,6 +630,11 @@ CUDAComputeHandle::~CUDAComputeHandle() {
         impl_->free_fc(impl_->score_fc1);
         impl_->free_fc(impl_->score_fc2);
         if (impl_->bin_values_gpu) cudaFree(impl_->bin_values_gpu);
+        if (impl_->relu_act) cudnnDestroyActivationDescriptor(impl_->relu_act);
+        if (impl_->desc_input) cudnnDestroyTensorDescriptor(impl_->desc_input);
+        if (impl_->desc_trunk) cudnnDestroyTensorDescriptor(impl_->desc_trunk);
+        if (impl_->desc_pol) cudnnDestroyTensorDescriptor(impl_->desc_pol);
+        if (impl_->desc_vs) cudnnDestroyTensorDescriptor(impl_->desc_vs);
         impl_->res_conv1.clear();
         impl_->res_conv2.clear();
         delete impl_;
@@ -627,50 +654,37 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     int action_size = HW + 1;
 
     I.allocate(N);
+    I.ensure_descs(N);
 
-    // Upload input [N, C_in, H, W] as FP32, then convert if needed
+    // Upload input to pre-allocated buffers (no per-batch malloc)
     size_t input_floats = (size_t)N * I.input_channels * HW;
     std::vector<float> flat;
     flat.reserve(input_floats);
     for (auto& s : states)
         flat.insert(flat.end(), s.begin(), s.end());
 
-    void* buf_input = nullptr;
+    CUDA_CHECK(cudaMemcpyAsync(I.buf_input_f32, flat.data(), input_floats * sizeof(float),
+                                cudaMemcpyHostToDevice, I.dev.stream));
     if (I.use_fp16) {
-        // Upload FP32 → GPU → convert to FP16
-        float* tmp;
-        CUDA_CHECK(cudaMalloc(&tmp, input_floats * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(tmp, flat.data(), input_floats * sizeof(float),
-                                    cudaMemcpyHostToDevice, I.dev.stream));
-        half* inp_h;
-        CUDA_CHECK(cudaMalloc(&inp_h, input_floats * sizeof(half)));
         int blk = (int)((input_floats + 255) / 256);
-        convert_fp32_to_fp16<<<blk, 256, 0, I.dev.stream>>>(tmp, inp_h, (int)input_floats);
+        convert_fp32_to_fp16<<<blk, 256, 0, I.dev.stream>>>(I.buf_input_f32, (half*)I.buf_input, (int)input_floats);
         CUDA_CHECK(cudaGetLastError());
-        buf_input = inp_h;
-        cudaFree(tmp);
     } else {
-        float* inp_f;
-        CUDA_CHECK(cudaMalloc(&inp_f, input_floats * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(inp_f, flat.data(), input_floats * sizeof(float),
-                                    cudaMemcpyHostToDevice, I.dev.stream));
-        buf_input = inp_f;
+        CUDA_CHECK(cudaMemcpyAsync(I.buf_input, I.buf_input_f32, input_floats * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, I.dev.stream));
     }
 
-    // ── Input conv + BN + ReLU ───────────────────────────────
-    I.conv_bias_relu(buf_input, I.buf_main, I.input_conv, N, H, W, I.input_channels);
+    // ── Input conv + BN + ReLU ─────────────────────────────────
+    I.conv_bias_relu(I.desc_input, I.buf_input, I.desc_trunk, I.buf_main, I.input_conv);
 
     // ── Residual blocks ──────────────────────────────────────
     for (int i = 0; i < I.num_res_blocks; i++) {
-        // Conv1 + BN + ReLU
-        I.conv_bias_relu(I.buf_main, I.buf_temp, I.res_conv1[i], N, H, W, F);
-        // Conv2 + BN + residual(buf_main) + ReLU → buf_main
-        I.conv_bias_res_relu(I.buf_temp, I.buf_main, I.res_conv2[i], I.buf_main, N, H, W, F);
+        I.conv_bias_relu(I.desc_trunk, I.buf_main, I.desc_trunk, I.buf_temp, I.res_conv1[i]);
+        I.conv_bias_res_relu(I.desc_trunk, I.buf_temp, I.desc_trunk, I.buf_main, I.res_conv2[i], I.buf_main);
     }
 
     // ── Policy head ──────────────────────────────────────────
-    // 1×1 conv + BN + ReLU → [N, 2, H, W]
-    I.conv_bias_relu(I.buf_main, I.buf_head, I.policy_conv, N, H, W, F);
+    I.conv_bias_relu(I.desc_trunk, I.buf_main, I.desc_pol, I.buf_head, I.policy_conv);
     // FC → [N, action_size] in compute type, then softmax → FP32
     I.run_fc(I.buf_head, I.buf_fc2, I.policy_fc, N);
     // Add bias (no activation) then softmax
@@ -693,8 +707,7 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     }
 
     // ── Value head ───────────────────────────────────────────
-    // 1×1 conv + BN + ReLU → [N, 1, H, W]
-    I.conv_bias_relu(I.buf_main, I.buf_head, I.value_conv, N, H, W, F);
+    I.conv_bias_relu(I.desc_trunk, I.buf_main, I.desc_vs, I.buf_head, I.value_conv);
     // FC1 + bias + ReLU → [N, 64]
     I.fc_bias_act(I.buf_head, I.buf_fc, I.value_fc1, N, 1);
     // FC2 (out=1) + bias + tanh → FP32
@@ -709,8 +722,7 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     }
 
     // ── Score head ───────────────────────────────────────────
-    // 1×1 conv + BN + ReLU → [N, 1, H, W]
-    I.conv_bias_relu(I.buf_main, I.buf_head, I.score_conv, N, H, W, F);
+    I.conv_bias_relu(I.desc_trunk, I.buf_main, I.desc_vs, I.buf_head, I.score_conv);
     // FC1 + bias + ReLU → [N, 64]
     I.fc_bias_act(I.buf_head, I.buf_fc, I.score_fc1, N, 1);
     // FC2 → [N, num_bins] + bias (no activation)
@@ -740,9 +752,6 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
         scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
 
     CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
-
-    // Free per-batch input buffer
-    cudaFree(buf_input);
 
     // Pack results
     std::vector<Result> results(N);
