@@ -54,19 +54,29 @@ static void move_cursor(int row, int col) { printf("\033[%d;%dH", row, col); }
 static void hide_cursor() { printf("\033[?25l"); }
 static void show_cursor() { printf("\033[?25h"); }
 
-// Colors
+// Colors (ANSI text + 256-color for pixels)
 #define C_RESET   "\033[0m"
 #define C_BOLD    "\033[1m"
 #define C_DIM     "\033[2m"
-#define C_BLACK   "\033[30m"
 #define C_RED     "\033[31m"
 #define C_GREEN   "\033[32m"
 #define C_YELLOW  "\033[33m"
-#define C_BLUE    "\033[34m"
 #define C_CYAN    "\033[36m"
 #define C_WHITE   "\033[37m"
-#define C_BG_BOARD "\033[48;5;180m"  // warm tan/wood color
-#define C_BG_RESET "\033[49m"
+
+// 256-color pixel palette for board rendering
+enum PColor : uint8_t {
+    P_BOARD    = 180,  // warm tan (wood)
+    P_GRID     = 94,   // dark brown (grid lines)
+    P_BLACK    = 233,  // near-black stone
+    P_BLACK_HI = 240,  // gray highlight (3D gloss)
+    P_WHITE    = 255,  // bright white stone
+    P_WHITE_SH = 249,  // gray shadow (3D depth)
+    P_STAR     = 130,  // star point dot
+    P_LAST_DOT = 160,  // red dot for last move marker
+    P_CURSOR   = 214,  // orange for cursor ghost
+    P_CURSOR_D = 136,  // dimmer cursor
+};
 
 // Key codes
 enum { KEY_NONE = 0, KEY_UP = 256, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ENTER = '\r', KEY_ESC = 27 };
@@ -102,81 +112,185 @@ static int read_key() {
 static const char* COLS = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
 
 // ================================================================
-// Board rendering — Unicode with ANSI colors
+// Pixel-based board rendering — half-block chars for 2x resolution
+//
+// Each board intersection = CW×CH pixel sprite (4×4 default).
+// Sprites: grid cross, round stones (black/white with 3D shading),
+// star points, last-move dot, cursor ghost.
+// Rendered via ▀ (U+2580) with fg=top_pixel, bg=bottom_pixel.
 // ================================================================
 
+static constexpr int CW = 4;  // pixels per cell (width)
+static constexpr int CH = 4;  // pixels per cell (height), must be even
+
 static bool is_star_point(int r, int c, int n) {
-    if (n == 9) {
-        return (r == 2 || r == 4 || r == 6) && (c == 2 || c == 4 || c == 6);
-    } else if (n == 19) {
-        return (r == 3 || r == 9 || r == 15) && (c == 3 || c == 9 || c == 15);
-    } else if (n == 13) {
-        return (r == 3 || r == 6 || r == 9) && (c == 3 || c == 6 || c == 9);
-    }
+    if (n == 9)  return (r==2||r==4||r==6) && (c==2||c==4||c==6);
+    if (n == 19) return (r==3||r==9||r==15) && (c==3||c==9||c==15);
+    if (n == 13) return (r==3||r==6||r==9) && (c==3||c==6||c==9);
     return false;
 }
 
-// Render the full board to a string buffer (ANSI colored)
-static std::string render_board(const GoGame& game, int cursor_r = -1, int cursor_c = -1,
-                                 int last_r = -1, int last_c = -1,
-                                 const std::string& input_buf = "") {
+// Stone mask: 1 = stone pixel, 0 = board (for 4×4 round stone)
+static const int STONE_MASK[CH][CW] = {
+    {0,1,1,0},
+    {1,1,1,1},
+    {1,1,1,1},
+    {0,1,1,0},
+};
+
+static void fill_cell_pixels(uint8_t* px, int stride,
+                              int board_r, int board_c, int n,
+                              const GoGame& game,
+                              int cursor_r, int cursor_c,
+                              int last_r, int last_c) {
+    Stone cell = game.board[board_r][board_c];
+    bool is_cursor = (board_r == cursor_r && board_c == cursor_c && cell == EMPTY);
+    bool is_last   = (board_r == last_r && board_c == last_c);
+    bool star      = is_star_point(board_r, board_c, n);
+
+    // Direction flags for grid lines
+    bool gU = (board_r > 0), gD = (board_r < n-1);
+    bool gL = (board_c > 0), gR = (board_c < n-1);
+
+    // Fill board color first
+    for (int y = 0; y < CH; y++)
+        for (int x = 0; x < CW; x++)
+            px[y * stride + x] = P_BOARD;
+
+    // Draw grid lines (thin: center column and center row)
+    int cx = CW / 2 - 1, cy = CH / 2 - 1;  // cross center at (cx, cy)~(1,1)
+    // Vertical line
+    for (int y = 0; y < CH; y++) {
+        if ((y <= cy && gU) || (y >= cy && gD) || y == cy)
+            px[y * stride + cx] = P_GRID;
+    }
+    // Horizontal line
+    for (int x = 0; x < CW; x++) {
+        if ((x <= cx && gL) || (x >= cx && gR) || x == cx)
+            px[cy * stride + x] = P_GRID;
+    }
+
+    // Star point
+    if (star && cell == EMPTY && !is_cursor) {
+        px[cy * stride + cx] = P_STAR;
+        // Make star slightly larger
+        if (cy+1 < CH) px[(cy+1) * stride + cx] = P_STAR;
+    }
+
+    // Stone
+    if (cell == BLACK || cell == WHITE) {
+        uint8_t sc = (cell == BLACK) ? P_BLACK : P_WHITE;
+        uint8_t hi = (cell == BLACK) ? P_BLACK_HI : P_WHITE_SH;
+        for (int y = 0; y < CH; y++)
+            for (int x = 0; x < CW; x++)
+                if (STONE_MASK[y][x])
+                    px[y * stride + x] = sc;
+        // 3D highlight (top-left for black, bottom-right for white)
+        if (cell == BLACK)
+            px[1 * stride + 1] = hi;
+        else
+            px[2 * stride + 2] = hi;
+        // Last move marker (dot in center)
+        if (is_last)
+            px[cy * stride + cx] = P_LAST_DOT;
+    }
+
+    // Cursor ghost (dimmed stone shape)
+    if (is_cursor) {
+        uint8_t gc = (game.current_player == BLACK) ? P_CURSOR_D : P_CURSOR;
+        for (int y = 0; y < CH; y++)
+            for (int x = 0; x < CW; x++)
+                if (STONE_MASK[y][x])
+                    px[y * stride + x] = gc;
+    }
+}
+
+static std::string render_board_pixels(const GoGame& game,
+                                        int cursor_r, int cursor_c,
+                                        int last_r, int last_c) {
     int n = game.board_size;
+    int pw = n * CW;   // pixel width
+    int ph = n * CH;   // pixel height
+
+    // Allocate pixel buffer
+    std::vector<uint8_t> pixels(pw * ph, P_BOARD);
+
+    // Fill each cell
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++)
+            fill_cell_pixels(&pixels[(r * CH) * pw + c * CW], pw,
+                             r, c, n, game, cursor_r, cursor_c, last_r, last_c);
+
+    // Render to string with half-block technique
     std::string out;
-    auto add = [&](const char* s) { out += s; };
+    out.reserve(pw * ph * 20);  // generous estimate for ANSI codes
 
-    // Column header
-    add("    ");
-    for (int c = 0; c < n; c++) { char buf[8]; snprintf(buf, sizeof(buf), " %c", COLS[c]); out += buf; }
-    add("\n");
+    // Column labels
+    out += "     ";
+    for (int c = 0; c < n; c++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), " %-*c", CW - 1, COLS[c]);
+        out += buf;
+    }
+    out += "\n";
 
-    for (int r = 0; r < n; r++) {
-        int row_num = n - r;
-        char rowbuf[8];
-        snprintf(rowbuf, sizeof(rowbuf), " %2d ", row_num);
-        out += rowbuf;
-
-        for (int c = 0; c < n; c++) {
-            bool is_cursor = (r == cursor_r && c == cursor_c);
-
-            if (game.board[r][c] == BLACK) {
-                if (r == last_r && c == last_c)
-                    add(C_RED C_BOLD);  // last move highlight
-                else
-                    add(C_BOLD);
-                add(is_cursor ? "[#]" : " #");
-                add(C_RESET);
-            } else if (game.board[r][c] == WHITE) {
-                if (r == last_r && c == last_c)
-                    add(C_RED C_BOLD);
-                else
-                    add(C_BOLD C_WHITE);
-                add(is_cursor ? "[O]" : " O");
-                add(C_RESET);
-            } else {
-                // Empty intersection
-                if (is_cursor) {
-                    // Show candidate stone
-                    const char* sym = (game.current_player == BLACK) ? "#" : "O";
-                    add(C_DIM);
-                    out += "["; out += sym; out += "]";
-                    add(C_RESET);
-                } else if (is_star_point(r, c, n)) {
-                    add(C_YELLOW " +" C_RESET);
-                } else {
-                    add(C_DIM " ." C_RESET);
-                }
-            }
+    // Board rows (2 pixel rows per terminal row)
+    for (int py = 0; py < ph; py += 2) {
+        // Row label on first pixel pair of each cell
+        if (py % CH == 0) {
+            int row_num = n - py / CH;
+            char buf[8];
+            snprintf(buf, sizeof(buf), " %2d  ", row_num);
+            out += buf;
+        } else {
+            out += "     ";
         }
 
-        snprintf(rowbuf, sizeof(rowbuf), " %d", row_num);
-        out += rowbuf;
+        int prev_fg = -1, prev_bg = -1;
+        for (int px = 0; px < pw; px++) {
+            uint8_t top = pixels[py * pw + px];
+            uint8_t bot = (py + 1 < ph) ? pixels[(py + 1) * pw + px] : P_BOARD;
+
+            if (top == bot) {
+                // Both same — use space with background
+                if ((int)top != prev_bg || prev_fg != -1) {
+                    char buf[24];
+                    snprintf(buf, sizeof(buf), "\033[48;5;%dm", top);
+                    out += buf;
+                    prev_bg = top; prev_fg = -1;
+                }
+                out += ' ';
+            } else {
+                // Different — use ▀ with fg=top, bg=bot
+                if ((int)top != prev_fg || (int)bot != prev_bg) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "\033[38;5;%d;48;5;%dm", top, bot);
+                    out += buf;
+                    prev_fg = top; prev_bg = bot;
+                }
+                out += "\xe2\x96\x80";  // ▀ (UTF-8: E2 96 80)
+            }
+        }
+        out += "\033[0m";
+
+        // Row label on right
+        if (py % CH == 0) {
+            int row_num = n - py / CH;
+            char buf[8];
+            snprintf(buf, sizeof(buf), " %d", row_num);
+            out += buf;
+        }
         out += "\n";
     }
 
-    // Column footer
-    add("    ");
-    for (int c = 0; c < n; c++) { char buf[8]; snprintf(buf, sizeof(buf), " %c", COLS[c]); out += buf; }
-    add("\n");
+    // Column labels bottom
+    out += "     ";
+    for (int c = 0; c < n; c++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), " %-*c", CW - 1, COLS[c]);
+        out += buf;
+    }
+    out += "\n";
 
     return out;
 }
@@ -200,27 +314,24 @@ static void draw_screen(const GoGame& game, const Config& config,
     printf(C_BOLD C_CYAN "  MINIGO" C_RESET " — %dx%d  Komi: %.1f  Sims: %d\n",
            n, n, config.komi, config.num_simulations);
     printf("  You: %s    AI: %s    Move: %d\n\n",
-           human_color == BLACK ? C_BOLD "#" C_RESET " Black" : C_BOLD C_WHITE "O" C_RESET " White",
-           ai_color == BLACK ? C_BOLD "#" C_RESET " Black" : C_BOLD C_WHITE "O" C_RESET " White",
+           human_color == BLACK ? C_BOLD "Black" C_RESET : C_BOLD C_WHITE "White" C_RESET,
+           ai_color == BLACK ? C_BOLD "Black" C_RESET : C_BOLD C_WHITE "White" C_RESET,
            game.move_count + 1);
 
-    std::string board = render_board(game, cursor_r, cursor_c, last_r, last_c, input_buf);
+    std::string board = render_board_pixels(game, cursor_r, cursor_c, last_r, last_c);
     printf("%s\n", board.c_str());
 
     if (!ai_info.empty())
         printf("  %s\n", ai_info.c_str());
 
-    // Input area
-    if (!status_line.empty()) {
+    if (!status_line.empty())
         printf("  %s\n", status_line.c_str());
-    }
 
     if (game.current_player == human_color && !game.game_over) {
-        printf("  Move: " C_BOLD "%s" C_RESET "█", input_buf.c_str());
+        printf("  Move: " C_BOLD "%s" C_RESET "\xe2\x96\x88", input_buf.c_str());
         printf("   " C_DIM "(arrows/type A1-J9, P=pass, Q=quit)" C_RESET);
     }
 
-    // Clear remaining lines
     printf("\033[J");
     fflush(stdout);
 }
