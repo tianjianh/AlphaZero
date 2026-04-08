@@ -104,7 +104,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
         wattroff(win, COLOR_PAIR(CP_LABEL));
     }
 
-    // Board grid + stones
+    // Board grid + stones using ACS line-drawing (works on ALL terminals)
     for (int r = 0; r < n; r++) {
         // Row label
         char rl[4];
@@ -119,56 +119,56 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
             int x = ox + c * 2;
             int y = oy + r;
 
-            // Grid character for this intersection
-            const char* bg;
+            // Grid ACS character for this intersection
+            chtype grid_ch;
             if (r == 0) {
-                if (c == 0) bg = "\u250C";       // ┌
-                else if (c == n-1) bg = "\u2510"; // ┐
-                else bg = "\u252C";               // ┬
+                if (c == 0) grid_ch = ACS_ULCORNER;
+                else if (c == n-1) grid_ch = ACS_URCORNER;
+                else grid_ch = ACS_TTEE;
             } else if (r == n-1) {
-                if (c == 0) bg = "\u2514";       // └
-                else if (c == n-1) bg = "\u2518"; // ┘
-                else bg = "\u2534";               // ┴
+                if (c == 0) grid_ch = ACS_LLCORNER;
+                else if (c == n-1) grid_ch = ACS_LRCORNER;
+                else grid_ch = ACS_BTEE;
             } else {
-                if (c == 0) bg = "\u251C";       // ├
-                else if (c == n-1) bg = "\u2524"; // ┤
-                else bg = "\u253C";               // ┼
+                if (c == 0) grid_ch = ACS_LTEE;
+                else if (c == n-1) grid_ch = ACS_RTEE;
+                else grid_ch = ACS_PLUS;
             }
 
             bool is_cursor = (r == cursor_r && c == cursor_c);
             bool is_last   = (r == last_r && c == last_c);
             int cell = game.board[r][c];
 
-            // Choose character and attribute
-            const char* ch;
-            int attr;
-
             if (cell == BLACK) {
-                ch = "\u25CF";  // ● filled circle
-                attr = COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD;
+                int attr = COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD;
+                wattron(win, attr);
+                mvwaddch(win, y, x, '#');
+                wattroff(win, attr);
             } else if (cell == WHITE) {
-                ch = "\u25CB";  // ○ open circle
-                attr = COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD;
-            } else if (is_star_point(r, c, n)) {
-                ch = "\u2022";  // • bullet
-                attr = COLOR_PAIR(CP_GRID);
+                int attr = COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD;
+                wattron(win, attr);
+                mvwaddch(win, y, x, 'O');
+                wattroff(win, attr);
+            } else if (is_star_point(r, c, n) && !is_cursor) {
+                wattron(win, COLOR_PAIR(CP_ACCENT));
+                mvwaddch(win, y, x, '*');
+                wattroff(win, COLOR_PAIR(CP_ACCENT));
+            } else if (is_cursor && !game.game_over) {
+                // Show ghost stone at cursor
+                char ghost = (game.current_player == BLACK) ? '#' : 'O';
+                wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+                mvwaddch(win, y, x, ghost);
+                wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
             } else {
-                ch = bg;
-                attr = COLOR_PAIR(CP_GRID);
+                wattron(win, COLOR_PAIR(CP_GRID));
+                mvwaddch(win, y, x, grid_ch);
+                wattroff(win, COLOR_PAIR(CP_GRID));
             }
 
-            if (is_cursor && !game.game_over)
-                attr = COLOR_PAIR(CP_CURSOR) | A_BOLD;
-
-            // Draw intersection
-            wattron(win, attr);
-            mvwaddstr(win, y, x, ch);
-            wattroff(win, attr);
-
-            // Draw horizontal connector to the right
+            // Horizontal connector
             if (c < n - 1) {
                 wattron(win, COLOR_PAIR(CP_GRID));
-                mvwaddstr(win, y, x + 1, "\u2500");  // ─
+                mvwaddch(win, y, x + 1, ACS_HLINE);
                 wattroff(win, COLOR_PAIR(CP_GRID));
             }
         }
@@ -179,9 +179,11 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
         int cx = ox + cursor_c * 2;
         int cy = oy + cursor_r;
         wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
-        if (cx > 0)
-            mvwaddstr(win, cy, cx - 1, "[");
-        mvwaddstr(win, cy, cx + 1, "]");
+        if (cx > ox)
+            mvwaddch(win, cy, cx - 1, '[');
+        else
+            mvwaddch(win, cy, cx - 1, '[');
+        mvwaddch(win, cy, cx + 1, ']');
         wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
     }
 
@@ -341,8 +343,6 @@ int main(int argc, char* argv[]) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-    // Set locale for Unicode
-    setlocale(LC_ALL, "");
 
     bool keep_playing = true;
 
