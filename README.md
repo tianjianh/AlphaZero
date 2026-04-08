@@ -523,6 +523,54 @@ TensorRT engine build is serialized per cache path (mutex) to prevent concurrent
 writes to the same cache file.  With identical GPUs, only **1 build** occurs across
 all 4 threads — the remaining 3 load from cache or reuse `dev.engine` in memory.
 
+### Handle Initialization Timeline
+
+**Selfplay** (1 model, 2 GPUs, 4 server threads, `--nn-device-ids 0,0,1,1`):
+
+```
+Main thread:  LoadedModel::load()  →  create_compute_context({0,0,1,1})
+              │                        │→ DeviceState[GPU0]: runtime, stream
+              │                        │→ DeviceState[GPU1]: runtime, stream
+              └→ NNEvaluator(model, ctx, {0,0,1,1}) → spawns 4 threads, returns
+
+Thread 0 (GPU0): ──lock dev[0].mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #0
+Thread 1 (GPU0): ──lock dev[0].mutex── WAIT ─────────────────→ engine exists → create ExecCtx #1
+Thread 2 (GPU1): ──lock dev[1].mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #2
+Thread 3 (GPU1): ──lock dev[1].mutex── WAIT ─────────────────→ engine exists → create ExecCtx #3
+                  ↑ parallel (different GPUs)      ↑ serialized (same GPU)
+```
+
+Threads on different GPUs run in parallel.  Threads on the same GPU are serialized
+by `dev.build_mutex` — the first thread deserializes the engine, subsequent threads
+find `dev.engine` already set and skip to creating their own `IExecutionContext`.
+
+**Evaluation** (2 models, 2 GPUs, 4 server threads each):
+
+Each model gets a **separate** `ComputeContext` with its own `DeviceState` per GPU.
+Without serialization, both models' server threads would call `deserializeCudaEngine()`
+concurrently on the same GPU through different `IRuntime` objects — causing a CUDA
+driver-level race (SIGSEGV ~70% of the time).
+
+Fix: `eval1->wait_ready()` blocks until all of model 1's handles are created before
+model 2's `NNEvaluator` is constructed.  This adds ~1-2s to eval startup but
+eliminates the race.  Runtime game play is fully parallel (both models' server
+threads process batches concurrently — different `IExecutionContext`, no conflict).
+
+### GPU Memory: Weight Sharing
+
+| Backend | Weights on GPU | Sharing |
+|---|---|---|
+| **TensorRT** | 1 copy per GPU (baked into `ICudaEngine`) | Shared across all handles — engine is immutable, handles get their own `IExecutionContext` + I/O buffers |
+| **CUDA+CUTLASS** | 1 copy per handle (FP16 upload) | No sharing — each handle owns its weight buffers |
+| **OpenCL** | 1 copy per handle (`cl_mem` upload) | No sharing — each handle creates own buffers |
+| **Metal** | 1 copy per handle (embedded in `MPSGraph`) | No sharing — weights are graph constants |
+
+TensorRT is the most memory-efficient because the compiled engine separates
+immutable weights (shared) from mutable execution state (per-thread).  For our
+small model (~800KB weights), the duplication in other backends is negligible.
+For larger models (128f/10b = ~6MB), 4 server threads on 1 GPU would use
+24MB with CUDA vs 6MB with TensorRT.
+
 ## Performance
 
 ### Batch NN inference throughput (9×9, states/s)
