@@ -134,7 +134,8 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
     auto game_copy_ptr = std::make_unique<GoGame>(game.copy());
 
     while (true) {
-        if (sims_done.load(std::memory_order_relaxed) >= num_simulations)
+        if (sims_done.load(std::memory_order_relaxed) >= num_simulations
+            || should_stop_.load(std::memory_order_relaxed))
             break;
 
         // ── Descend with virtual loss ────────────────────────────
@@ -322,6 +323,7 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 void MCTS::search(GoGame& game, std::vector<float>& visits,
                   int num_simulations, bool add_noise) {
     if (num_simulations < 0) num_simulations = config_.num_simulations;
+    should_stop_.store(false, std::memory_order_relaxed);
 
     action_size_ = config_.action_size();
     int action_size = action_size_;

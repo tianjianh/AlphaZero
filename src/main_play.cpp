@@ -11,6 +11,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <locale.h>
 #include <curses.h>
 
@@ -363,13 +364,18 @@ int main(int argc, char* argv[]) {
 
     bool keep_playing = true;
 
+    // Analysis parameters
+    int pvs = 5;  // top K moves to show
+    for (int i = 1; i < argc; i++)
+        if (std::string(argv[i]) == "--pvs" && i+1 < argc) pvs = std::stoi(argv[++i]);
+
     while (keep_playing) {
-        // Choose color
+        // Choose mode
         werase(stdscr);
         attron(COLOR_PAIR(CP_ACCENT) | A_BOLD);
-        mvaddstr(2, 4, "MiniGo — Human vs AI");
+        mvaddstr(2, 4, "MiniGo");
         attroff(COLOR_PAIR(CP_ACCENT) | A_BOLD);
-        mvaddstr(4, 4, "Play as (B)lack or (W)hite? [B]: ");
+        mvaddstr(4, 4, "Play as (B)lack, (W)hite, or (H)uman vs Human? [B]: ");
         refresh();
         curs_set(1);
         echo();
@@ -378,6 +384,7 @@ int main(int argc, char* argv[]) {
         noecho();
         curs_set(0);
 
+        bool human_vs_human = (choice_buf[0] == 'H' || choice_buf[0] == 'h');
         Stone human_color = BLACK;
         if (choice_buf[0] == 'W' || choice_buf[0] == 'w')
             human_color = WHITE;
@@ -389,62 +396,96 @@ int main(int argc, char* argv[]) {
         std::string input_buf;
         std::string status_msg;
         std::string ai_info;
-        std::vector<std::pair<int,int>> history;
+        bool analysis_on = false;
+        std::thread analysis_thread;
+
+        // Helper: stop any running analysis
+        auto stop_analysis = [&]() {
+            if (analysis_on && mcts) {
+                mcts->request_stop();
+                if (analysis_thread.joinable())
+                    analysis_thread.join();
+                analysis_on = false;
+            }
+            ai_info.clear();
+        };
+
+        // Helper: start background analysis
+        auto start_analysis = [&]() {
+            if (!mcts) return;
+            stop_analysis();
+            analysis_on = true;
+            // Launch search in background (large sim count, interruptible)
+            analysis_thread = std::thread([&]() {
+                std::vector<float> visits;
+                mcts->search(game, visits, 1000000, false);
+            });
+        };
+
+        // Helper: poll analysis and update ai_info string
+        auto poll_analysis = [&]() {
+            if (!analysis_on || !mcts) return;
+            auto info = mcts->get_analysis(pvs);
+            if (info.total_visits == 0) return;
+            char buf[256];
+            float wr = (info.root_utility + 1.0f) / 2.0f * 100.0f;
+            snprintf(buf, sizeof(buf), "WR %.1f%%  Score %+.1f  N=%d",
+                     wr, info.root_score, info.total_visits);
+            ai_info = buf;
+            for (auto& m : info.moves) {
+                std::string ms = (m.action == config.action_size() - 1)
+                    ? "PASS" : game.action_to_str(m.action);
+                float mwr = (m.utility + 1.0f) / 2.0f * 100.0f;
+                snprintf(buf, sizeof(buf), "| %-3s %5.1f%% n=%-5d", ms.c_str(), mwr, m.visits);
+                ai_info += buf;
+            }
+        };
+
+        // Helper: check if current player is human
+        auto is_human_turn = [&]() {
+            return human_vs_human || game.current_player == human_color;
+        };
 
         while (true) {
+            // Set getch timeout: 500ms during analysis, blocking otherwise
+            timeout(analysis_on ? 500 : -1);
+
+            if (analysis_on) poll_analysis();
+
             draw_board(stdscr, game, config, cursor_r, cursor_c, cursor_active,
                        last_r, last_c, human_color, use_random,
                        status_msg, ai_info, input_buf);
 
             if (game.game_over) {
+                stop_analysis();
                 auto [bs, ws] = game.score();
                 char buf[128];
-                if (game.winner == human_color)
-                    snprintf(buf, sizeof(buf), "You win! B:%.1f W:%.1f  [r]restart [q]quit", bs, ws);
-                else if (game.winner == EMPTY)
-                    snprintf(buf, sizeof(buf), "Draw! B:%.1f W:%.1f  [r]restart [q]quit", bs, ws);
-                else
-                    snprintf(buf, sizeof(buf), "AI wins! B:%.1f W:%.1f  [r]restart [q]quit", bs, ws);
+                snprintf(buf, sizeof(buf), "Game over  B:%.1f  W:%.1f  [r]restart [q]quit", bs, ws);
                 status_msg = buf;
                 draw_board(stdscr, game, config, -1, -1, false,
                            last_r, last_c, human_color, use_random,
                            status_msg, ai_info, "");
-
+                timeout(-1);
                 int key = getch();
                 if (key == 'q' || key == 'Q') { keep_playing = false; break; }
                 if (key == 'r' || key == 'R') break;
                 continue;
             }
 
-            if (game.current_player != human_color) {
+            if (!is_human_turn()) {
                 // AI turn
+                stop_analysis();
                 status_msg = "AI thinking...";
                 draw_board(stdscr, game, config, -1, -1, false,
                            last_r, last_c, human_color, use_random,
-                           status_msg, ai_info, "");
+                           status_msg, "", "");
 
                 int action;
                 if (use_random) {
                     action = random_legal_move(game);
-                    ai_info.clear(); cursor_active = false;
                 } else {
                     std::vector<float> pi;
                     action = mcts->get_action(game, pi, 0.0f, -1, false);
-                    auto info = mcts->get_analysis(3);
-                    float wr = (info.root_utility + 1.0f) / 2.0f * 100.0f;
-                    char buf[256];
-                    snprintf(buf, sizeof(buf), "WR=%.1f%%  score=%+.1f  visits=%d",
-                             wr, info.root_score, info.total_visits);
-                    ai_info = buf;
-                    for (int i = 1; i < (int)info.moves.size(); i++) {
-                        auto& m = info.moves[i];
-                        std::string ms = (m.action == config.action_size() - 1)
-                            ? "PASS" : game.action_to_str(m.action);
-                        float mwr = (m.utility + 1.0f) / 2.0f * 100.0f;
-                        snprintf(buf, sizeof(buf), "  | %s %.0f%% n=%d",
-                                 ms.c_str(), mwr, m.visits);
-                        ai_info += buf;
-                    }
                 }
 
                 if (action == config.action_size() - 1) {
@@ -453,7 +494,6 @@ int main(int argc, char* argv[]) {
                     status_msg = "AI plays: PASS";
                 } else {
                     int r = action / n, c = action % n;
-                    history.push_back({action, game.current_player});
                     game.play(action);
                     last_r = r; last_c = c;
                     char buf[32];
@@ -463,70 +503,75 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // Human turn — read input
+            // ── Human turn — read input ─────────────────────
             int key = getch();
+            if (key == ERR) continue;  // timeout during analysis polling
             status_msg.clear();
 
-            if (key == 'q' || key == 'Q') { keep_playing = false; break; }
+            if (key == 'q' || key == 'Q') { stop_analysis(); keep_playing = false; break; }
 
-            // Movement
+            // Toggle analysis
+            if (key == 'a') {
+                if (analysis_on) stop_analysis();
+                else start_analysis();
+                continue;
+            }
+
+            // Movement (arrows + WASD, but not 'a' which is analysis toggle)
             if (key == KEY_UP    || key == 'w' || key == 'W') { cursor_r = std::max(0, cursor_r - 1); input_buf.clear(); cursor_active = true; }
             else if (key == KEY_DOWN  || key == 's' || key == 'S') { cursor_r = std::min(n-1, cursor_r + 1); input_buf.clear(); cursor_active = true; }
-            else if (key == KEY_LEFT  || key == 'a' || key == 'A') { cursor_c = std::max(0, cursor_c - 1); input_buf.clear(); cursor_active = true; }
+            else if (key == KEY_LEFT) { cursor_c = std::max(0, cursor_c - 1); input_buf.clear(); cursor_active = true; }
             else if (key == KEY_RIGHT || key == 'd' || key == 'D') { cursor_c = std::min(n-1, cursor_c + 1); input_buf.clear(); cursor_active = true; }
 
-            // Place stone (Enter/Space)
+            // Place stone
             else if (key == 10 || key == 13 || key == ' ') {
                 int r = -1, c = -1;
                 if (!input_buf.empty() && try_parse_coord(input_buf, n, r, c)) {
-                    // typed coordinate
-                } else {
+                    /* typed */
+                } else if (cursor_active) {
                     r = cursor_r; c = cursor_c;
                 }
-                int action = r * n + c;
-                if (r >= 0 && game.is_legal(action)) {
-                    history.push_back({action, game.current_player});
-                    game.play(action);
-                    last_r = r; last_c = c;
-                    input_buf.clear();
-                    ai_info.clear(); cursor_active = false;
-                } else {
-                    status_msg = "Illegal move!";
+                if (r >= 0) {
+                    int action = r * n + c;
+                    if (game.is_legal(action)) {
+                        stop_analysis();
+                        game.play(action);
+                        last_r = r; last_c = c;
+                        input_buf.clear();
+                        cursor_active = false;
+                    } else {
+                        status_msg = "Illegal move!";
+                    }
                 }
             }
 
             // Pass
             else if (key == 'p' || key == 'P') {
+                stop_analysis();
                 game.play(PASS_MOVE);
                 last_r = last_c = -1;
                 input_buf.clear();
-                ai_info.clear();
             }
 
-            // Undo
-            else if (key == 'u' || key == 'U') {
-                // Undo requires game reset + replay — simplified: just note
-                status_msg = "Undo not supported yet";
-            }
-
-            // Typed coordinate input
+            // Typed coordinate
             else if (isalpha(key) || isdigit(key)) {
+                cursor_active = false;
                 if (input_buf.size() < 3)
                     input_buf += (char)toupper(key);
                 int r, c;
                 if (try_parse_coord(input_buf, n, r, c)) {
                     int action = r * n + c;
                     if (game.is_legal(action)) {
+                        stop_analysis();
                         cursor_r = r; cursor_c = c; cursor_active = true;
                         draw_board(stdscr, game, config, cursor_r, cursor_c, true,
                                    last_r, last_c, human_color, use_random,
                                    status_msg, ai_info, input_buf);
                         napms(120);
-                        history.push_back({action, game.current_player});
                         game.play(action);
                         last_r = r; last_c = c;
                         input_buf.clear();
-                        ai_info.clear(); cursor_active = false;
+                        cursor_active = false;
                     } else {
                         status_msg = "Illegal move!";
                         input_buf.clear();
@@ -539,6 +584,8 @@ int main(int argc, char* argv[]) {
                 if (!input_buf.empty()) input_buf.pop_back();
             }
         }
+
+        stop_analysis();
     }
 
     endwin();

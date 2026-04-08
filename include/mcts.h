@@ -119,6 +119,11 @@ public:
                    float temperature = 1.0f, int num_simulations = -1,
                    bool add_noise = true);
 
+    // ── Lifecycle (KataGo pattern) ──────────────────────────
+    // Request early stop of a running search. Safe to call from any thread.
+    // The search threads will exit at their next check point.
+    void request_stop() { should_stop_.store(true, std::memory_order_relaxed); }
+
 private:
     BatchEvaluator* evaluator_;
     Config          config_;
@@ -128,6 +133,9 @@ private:
     std::unique_ptr<MCTSNode> root_;
     float root_nn_score_ = 0.0f;
     int   action_size_   = 0;
+
+    // Stop flag — checked by search threads, set by request_stop()
+    std::atomic<bool> should_stop_{false};
 
     void mask_policy(std::vector<float>& policy,
                      const std::vector<float>& legal, int action_size);
