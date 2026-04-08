@@ -27,7 +27,7 @@ Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching K
 
 ```bash
 xcode-select --install      # provides Metal frameworks + OpenCL
-brew install cmake eigen
+brew install cmake eigen     # ncurses ships with macOS
 ```
 
 Metal (MPSGraph) is auto-detected.  No additional GPU libraries needed.
@@ -36,7 +36,7 @@ Metal (MPSGraph) is auto-detected.  No additional GPU libraries needed.
 
 ```bash
 xcode-select --install      # provides OpenCL
-brew install cmake eigen
+brew install cmake eigen     # ncurses ships with macOS
 ```
 
 Metal is not available on Intel Macs; OpenCL or Eigen is used.
@@ -44,7 +44,7 @@ Metal is not available on Intel Macs; OpenCL or Eigen is used.
 ### Linux (Ubuntu / Debian)
 
 ```bash
-sudo apt install cmake g++ libeigen3-dev
+sudo apt install cmake g++ libeigen3-dev libncurses-dev
 
 # For NVIDIA GPU (TensorRT — recommended, fastest):
 # 1. Install CUDA toolkit: https://developer.nvidia.com/cuda-downloads
@@ -60,6 +60,9 @@ sudo apt install libnvinfer-dev libnvonnxparsers-dev
 
 # For NVIDIA GPU (CUDA — alternative, no TensorRT dependency):
 # Install CUDA toolkit only (provides nvcc compiler + runtime)
+# CUTLASS headers (header-only, for optimized GEMM):
+#   git clone --depth 1 https://github.com/NVIDIA/cutlass.git /tmp/cutlass
+#   sudo cp -r /tmp/cutlass/include/cutlass /usr/local/include/
 
 # For NVIDIA GPU (OpenCL — portable alternative):
 sudo apt install ocl-icd-opencl-dev
@@ -76,11 +79,28 @@ sudo apt install libopenblas-dev
 
 ```bash
 pip install torch numpy onnx onnxscript zstandard
+
+# Optional: FP8 training on Blackwell+ GPUs (SM 10.0)
+pip install transformer_engine
 ```
 
 Python is NOT required for inference — only for training (`train.py`)
 and model export (`export_onnx.py`).  Multi-GPU training uses PyTorch
 DistributedDataParallel via `torchrun` (included with PyTorch).
+
+### Build dependencies summary
+
+| Component | Required | Package |
+|---|---|---|
+| CMake, C++17 | All | `cmake`, `g++` |
+| Eigen3 | All | `libeigen3-dev` / `brew install eigen` |
+| ncurses | Play UI | `libncurses-dev` (Linux) / ships with macOS |
+| CUDA toolkit | CUDA/TensorRT backends | [nvidia.com](https://developer.nvidia.com/cuda-downloads) |
+| TensorRT | TensorRT backend | `libnvinfer-dev`, `libnvonnxparsers-dev` |
+| CUTLASS | CUDA backend (headers only) | [github.com/NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) |
+| OpenCL | OpenCL backend | `ocl-icd-opencl-dev` |
+| PyTorch | Training | `pip install torch` |
+| Transformer Engine | FP8 training (optional) | `pip install transformer_engine` |
 
 ## Build
 
@@ -619,8 +639,8 @@ The pipeline is fully resumable at every phase boundary.  Run
 - **Selfplay resume**: skips iterations that already have enough game files
 - **Training resume**: skips iterations whose versioned ONNX + checkpoint exist
 - **Checkpoints** (`training/checkpoints/training.pt`): model weights + optimizer (Adam for ResNet, AdamW for ViT)
-  state (momentum buffers) for smooth continuation.  Training uses mixed precision
-  (BF16 on Ampere+, FP16+GradScaler on Turing) automatically
+  state (momentum buffers) for smooth continuation.  Mixed precision
+  auto-detected (FP8/BF16/FP16, see Precision table above)
 - **Selfplay data**: accumulates in per-iteration directories
   (`training/selfplay/iter_0001/`, etc.) and is never deleted
 
@@ -653,8 +673,24 @@ Both share the same triple-headed output:
 The model's `forward()` returns raw logits (no activations).  The ONNX export
 appends post-processing ops to the graph so C++ inference receives the same
 shapes as before: policy `[B, 82]`, value `[B, 1]` in [-1,1], score `[B, 1]`
-in raw points.  Training applies MSE for value and CE for score.  Mixed precision (BF16 on Ampere+, FP16+GradScaler on Turing) is
-enabled automatically.
+in raw points.  Training applies MSE for value and CE for score.
+
+### Precision
+
+Auto-detected per GPU — best available precision used for both training
+and inference:
+
+| GPU | Training | Inference (TensorRT) |
+|---|---|---|
+| **Blackwell** (SM 10.0+) | FP8 via Transformer Engine (`te.Linear`, E4M3 fwd / E5M2 bwd) | FP8 (`kFP8` builder flag) |
+| **Ampere/Ada** (SM 8.0+) | BF16 (`torch.amp.autocast`) | FP16 |
+| **Turing** (SM 7.5) | FP16 + GradScaler | FP16 |
+| **Pascal** (SM 6.x) | FP16 + GradScaler | FP16 |
+| **CPU / older** | FP32 | N/A |
+
+FP8 training requires `pip install transformer_engine` and `"fp8": true` in
+the training plan.  Without it, Blackwell falls back to BF16.  FP8 inference
+via TensorRT is automatic (no extra config needed).
 
 **ViT positional encoding** — directional (D4 symmetry via data augmentation):
 - *Factorized position*: `row_embed[r] + col_embed[c]` — 9+9=18 learned embeddings, full spatial resolution
