@@ -267,9 +267,9 @@ python scripts/visualize.py training/eval/iter_0006/game_0.sgf
 python scripts/visualize.py training/eval/iter_0006/
 ```
 
-The visualizer shows the board after each move with narration
-(e.g. "Black X plays D4").  Controls:
-Enter = next, `b` = back, `s` = skip to end, number = jump to move, `q` = quit.
+The visualizer uses ncurses with the same board style as the play UI.
+Controls: Arrow keys or Enter = next/prev, `s` = skip to end, `q` = quit.
+For `.bin` files: shows value (V) and score (S) per move from training data.
 
 ### Play
 
@@ -436,16 +436,19 @@ in the hot path.
 ### CUDA GPU Backend (NVIDIA)
 
 `CUDAComputeHandle` (`src/cuda_compute.cu`) implements the forward pass using
-FP16 Tensor Cores (WMMA) for maximum throughput on NVIDIA GPUs:
+FP16 Tensor Cores via **CUTLASS GEMM** for conv3x3 (with im2col precompute)
+and hand-written WMMA kernels for FC/head layers.  FP32 fallback for SM < 7.0.
 
 | Kernel | Purpose |
 |---|---|
 | `transpose_nchw_fp32_to_fp16` | Fused transpose + FP32→FP16 conversion |
-| `conv3x3_wmma_bn` | **WMMA Tensor Core** implicit GEMM: fused im2col + 16×16×16 MMA + BN/residual/ReLU |
+| `CutlassGemm` (im2col + GEMM) | **CUTLASS** conv3x3: software-pipelined tensor core GEMM |
+| `conv3x3_wmma_bn` | Legacy WMMA fallback (used for FP32 path) |
 | `conv1x1_bn_relu_reshape_fp16` | FP16 1×1 conv + BN + ReLU + layout reshape |
 | `fc_bias_relu_fp16` | FP16 FC + bias + ReLU |
 | `fc_bias_softmax_fp16_to_fp32` | FP16→FP32 FC + softmax (policy head) |
-| `fc_bias_tanh_fp16_to_fp32` | FP16→FP32 FC + tanh (value/score head — TODO: update for new loss design) |
+| `fc_bias_tanh_fp16_to_fp32` | FP16→FP32 FC + tanh (value head) |
+| `score_softmax_ev_fp16` | FP16→FP32 softmax over bins → expected value (score head) |
 
 - **FP16 weights & activations**: halves memory bandwidth for all buffers
 - **FP32 BN scale/bias and FC bias**: small per-channel params stored natively as float (avoids conversion overhead)
@@ -484,7 +487,7 @@ forward pass using hand-written OpenCL kernels:
 | `conv1x1_bn_relu_reshape` | Fused 1×1 conv + BN + ReLU + layout reshape for FC input |
 | `fc_bias_relu` | Fused FC GEMM + bias + optional ReLU |
 | `fc_bias_softmax` | Fused FC + bias + softmax (policy head) |
-| `fc_bias_tanh` | Fused FC + bias + tanh (value/score head — TODO: update for new loss design) |
+| `fc_bias_tanh` | Fused FC + bias + tanh (value head) |
 
 The implicit GEMM kernel (`conv3x3_sgemm_bn`) computes im2col indices
 on-the-fly during B-tile loading, eliminating the separate im2col scratch
@@ -597,13 +600,13 @@ For larger models (128f/10b = ~6MB), 4 server threads on 1 GPU would use
 
 **Small model** (64 filters, 5 blocks):
 
-| Batch | TensorRT FP16 (RTX 2080 Ti) | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) | Metal FP16 (M1 Max) |
-|------:|----------------------------:|-----------------------------:|---------------------------:|--------------------:|
-| 1     | **3,609**                   | 1,250                        | 934                        | 750                 |
-| 8     | **26,039**                  | 9,730                        | 7,336                      | 7,500               |
-| 32    | **85,254**                  | 31,466                       | 19,886                     | 26,000              |
-| 64    | **136,814**                 | 50,561                       | 27,383                     | 28,000              |
-| 128   | **175,102**                 | 59,933                       | 34,005                     | 44,000              |
+| Batch | TensorRT FP16 (RTX 2080 Ti) | CUDA+CUTLASS FP16 (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) | Metal FP16 (M1 Max) |
+|------:|----------------------------:|-------------------------------:|---------------------------:|--------------------:|
+| 1     | **3,609**                   | 2,620                          | 934                        | 750                 |
+| 8     | **26,039**                  | 20,986                         | 7,336                      | 7,500               |
+| 32    | **85,254**                  | 45,083                         | 19,886                     | 26,000              |
+| 64    | **136,814**                 | 55,482                         | 27,383                     | 28,000              |
+| 128   | **175,102**                 | 66,495                         | 34,005                     | 44,000              |
 
 **Large model** (128 filters, 10 blocks):
 
@@ -614,9 +617,10 @@ For larger models (128f/10b = ~6MB), 4 server threads on 1 GPU would use
 | 64    | **56,726**                  | 9,347                        | 5,712                      |
 | 128   | **82,781**                  | 10,821                       | 6,012                      |
 
-TensorRT is **2.9×** faster than CUDA WMMA at batch-128 (small model) and
-**7.6×** faster for the large model, where TensorRT's layer fusion and kernel
-auto-tuning dominate.  CUDA WMMA is **1.8×** faster than OpenCL FP32.
+TensorRT is **2.6×** faster than CUDA+CUTLASS at batch-128 (small model) due
+to whole-graph layer fusion.  CUDA+CUTLASS is **2.0×** faster than OpenCL FP32.
+At single inference, CUDA+CUTLASS closes to within **1.4×** of TensorRT
+(2,620 vs 3,609) thanks to CUTLASS's optimized software pipelining.
 
 ### Self-play throughput (800 sims/move)
 
