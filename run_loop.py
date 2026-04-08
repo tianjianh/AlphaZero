@@ -205,24 +205,37 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
         return [{"name": "Quick test", "start": 1, "end": 5,
                  "games": 20, "sims": 100, "epochs": 5, "lr": lr, "eval_games": 0}]
 
-    # Learning rates: ViT uses lower LR, scaled for batch_size=128
     if vit:
         lrs = ["6e-4", "5e-4", "4e-4", "3e-4", "2.5e-4", "1.5e-4"]
     else:
         lrs = ["1.2e-3", "9e-4", "6e-4", "4.5e-4", "3e-4", "2e-4"]
 
     if preset == "small":
+        if vit:
+            #        score_wt swl    win  cpuct temp  eps
+            return [
+                _stage("Bootstrap",       1,  4,  500, 256, 3, lrs[0], 0,
+                       0.0,  0.05, 3,  2.0,  20, 0.30),
+                _stage("Warm up",         5,  8,  700, 384, 3, lrs[1], 0,
+                       0.0,  0.05, 4,  1.75, 18, 0.28),
+                _stage("Early gated",     9, 14, 1000, 512, 4, lrs[2], 120,
+                       0.02, 0.08, 4,  1.5,  15, 0.25),
+                _stage("Consolidate",    15, 22, 1200, 512, 5, lrs[3], 200,
+                       0.03, 0.10, 6,  1.4,  14, 0.23),
+                _stage("Steady improve", 23, 32, 1400, 640, 5, lrs[4], 240,
+                       0.05, 0.12, 8,  1.25, 12, 0.20),
+                _stage("Overnight extend",33,48, 1600, 768, 5, lrs[5], 240,
+                       0.08, 0.15, 8,  1.1,  10, 0.18),
+            ]
         ex = _EXPLORE
-        # Fewer epochs early (noisy data), more later (quality data)
-        # ViT gets slightly more than ResNet (no conv inductive bias)
-        vit_e = [3, 3, 4, 5, 6, 6] if vit else [3, 3, 3, 4, 5, 5]
+        ep = [3, 3, 3, 4, 5, 5]
         return [
-            _stage("Bootstrap",       1,  4,   400, 200, vit_e[0], lrs[0], 0,   *ex[0]),
-            _stage("Warm up",         5,  8,   600, 300, vit_e[1], lrs[1], 0,   *ex[1]),
-            _stage("Early gated",     9, 14,   900, 400, vit_e[2], lrs[2], 100, *ex[2]),
-            _stage("Consolidate",    15, 22,  1000, 400, vit_e[3], lrs[3], 200, *ex[3]),
-            _stage("Steady improve", 23, 32,  1200, 500, vit_e[4], lrs[4], 200, *ex[4]),
-            _stage("Overnight extend",33,48,  1400, 500, vit_e[5], lrs[5], 200, *ex[5]),
+            _stage("Bootstrap",       1,  4,   400, 200, ep[0], lrs[0], 0,   *ex[0]),
+            _stage("Warm up",         5,  8,   600, 300, ep[1], lrs[1], 0,   *ex[1]),
+            _stage("Early gated",     9, 14,   900, 400, ep[2], lrs[2], 100, *ex[2]),
+            _stage("Consolidate",    15, 22,  1000, 400, ep[3], lrs[3], 200, *ex[3]),
+            _stage("Steady improve", 23, 32,  1200, 500, ep[4], lrs[4], 200, *ex[4]),
+            _stage("Overnight extend",33,48,  1400, 500, ep[5], lrs[5], 200, *ex[5]),
         ]
     if preset == "large":
         ex = _EXPLORE_LARGE
@@ -260,11 +273,11 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
                    d_model=192, depth=8, heads=6, kv_groups=2, mlp_ratio=4):
     komi = 7.5 if board >= 13 else 6.5
     batch_size = 128 if arch == "vit" else 512
-    eval_threshold = 0.52
-    window = 6
-    temp_threshold = 15
+    eval_threshold = 0.53 if arch == "vit" else 0.52
+    window = 8 if arch == "vit" else 6
+    temp_threshold = 14 if arch == "vit" else 15
     dirichlet_alpha = 0.15
-    score_weight = 0.02
+    score_weight = 0.03 if arch == "vit" else 0.02
 
     if preset == "quick":
         batch_size = 64; window = 3; eval_threshold = 0.5; temp_threshold = 8
@@ -292,11 +305,11 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "eval_threshold": eval_threshold,
             "policy_weight": 1.0,
             "value_weight": 1.0,
-            "score_weight_loss": 0.5,
+            "score_weight_loss": 0.15 if arch == "vit" else 0.5,
         },
         "mcts": {
             "komi": komi,
-            "c_puct": 1.5,
+            "c_puct": 1.45 if arch == "vit" else 1.5,
             "dirichlet_alpha": dirichlet_alpha,
             "dirichlet_epsilon": 0.25,
             "temp_threshold": temp_threshold,
