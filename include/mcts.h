@@ -93,26 +93,41 @@ class MCTS {
 public:
     MCTS(BatchEvaluator* evaluator, const Config& config);
 
-    // Stats from the MCTS root after search (no extra compute)
-    struct SearchInfo {
-        float root_utility = 0.0f; // mean blended utility (value + score) from MCTS
-        float root_score = 0.0f;   // NN's raw score estimate in points (+ = current player leads)
+    // ── Analysis info — poll the live MCTS tree ─────────────
+    // Safe to call during search (reads atomics) or after search.
+    // Returns top moves sorted by visit count.
+    struct MoveInfo {
+        int   action = -1;
+        int   visits = 0;
+        float prior  = 0.0f;    // policy prior from NN
+        float utility = 0.0f;   // mean Q (blended value+score)
+    };
+    struct AnalysisInfo {
+        std::vector<MoveInfo> moves;   // top moves, sorted by visits desc
         int   total_visits = 0;
-        int   best_visits = 0;     // visits on the selected move
+        float root_utility = 0.0f;    // mean Q at root
+        float root_score   = 0.0f;    // NN raw score estimate (points, komi incl.)
     };
 
+    AnalysisInfo get_analysis(int max_moves = 5) const;
+
+    // ── Search ──────────────────────────────────────────────
     void search(GoGame& game, std::vector<float>& visits,
-                int num_simulations = -1, bool add_noise = true,
-                SearchInfo* info = nullptr);
+                int num_simulations = -1, bool add_noise = true);
 
     int get_action(GoGame& game, std::vector<float>& policy,
                    float temperature = 1.0f, int num_simulations = -1,
-                   bool add_noise = true, SearchInfo* info = nullptr);
+                   bool add_noise = true);
 
 private:
     BatchEvaluator* evaluator_;
     Config          config_;
     std::mt19937    rng_;
+
+    // Live tree state (persists between search() and get_analysis())
+    std::unique_ptr<MCTSNode> root_;
+    float root_nn_score_ = 0.0f;
+    int   action_size_   = 0;
 
     void mask_policy(std::vector<float>& policy,
                      const std::vector<float>& legal, int action_size);

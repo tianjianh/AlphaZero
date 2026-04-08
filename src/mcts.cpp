@@ -320,28 +320,30 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 // ================================================================
 
 void MCTS::search(GoGame& game, std::vector<float>& visits,
-                  int num_simulations, bool add_noise, SearchInfo* info) {
+                  int num_simulations, bool add_noise) {
     if (num_simulations < 0) num_simulations = config_.num_simulations;
 
-    int action_size = config_.action_size();
-    auto root = std::make_unique<MCTSNode>();
+    action_size_ = config_.action_size();
+    int action_size = action_size_;
+    root_ = std::make_unique<MCTSNode>();
 
     // ── Evaluate root ────────────────────────────────────────────
     std::vector<float> state_enc;
     game.encode(state_enc);
     auto root_results = evaluator_->evaluate({ state_enc });
     auto& root_out = root_results[0];
+    root_nn_score_ = root_out.score;
 
     std::vector<float> legal;
     game.get_legal_moves(legal);
     mask_policy(root_out.policy, legal, action_size);
-    expand(root.get(), root_out.policy, legal);
-    root->state.store(NODE_EXPANDED, std::memory_order_release);
-    root->visit_count.store(1, std::memory_order_relaxed);
+    expand(root_.get(), root_out.policy, legal);
+    root_->state.store(NODE_EXPANDED, std::memory_order_release);
+    root_->visit_count.store(1, std::memory_order_relaxed);
     float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
     float root_utility = root_out.value + config_.score_weight * root_score_utility;
-    root->add_value(root_utility);
-    if (add_noise) add_dirichlet_noise(root.get(), action_size);
+    root_->add_value(root_utility);
+    if (add_noise) add_dirichlet_noise(root_.get(), action_size);
 
     // ── Run search (KataGo pattern: N threads, each VLP=1) ─────
     int nthreads = std::max(1, config_.num_search_threads);
@@ -353,37 +355,28 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     search_threads.reserve(nthreads - 1);
     for (int t = 0; t < nthreads - 1; t++)
         search_threads.emplace_back(&MCTS::search_thread_loop, this,
-                                     root.get(), std::cref(game), action_size,
+                                     root_.get(), std::cref(game), action_size,
                                      std::ref(sims_done), num_simulations);
 
-    search_thread_loop(root.get(), game, action_size, sims_done, num_simulations);
+    search_thread_loop(root_.get(), game, action_size, sims_done, num_simulations);
 
     for (auto& t : search_threads)
         t.join();
 
-    // ── Extract visit counts + root stats ──────────────────────────
+    // ── Extract visit counts ─────────────────────────────────────
     visits.assign(action_size, 0.0f);
-    for (int a = 0; a < (int)root->children.size(); a++)
-        if (root->children[a])
-            visits[a] = (float)root->children[a]->visit_count.load(std::memory_order_relaxed);
-
-    if (info) {
-        int vc = root->visit_count.load(std::memory_order_relaxed);
-        info->root_utility = (vc > 0) ? root->total_value() / (float)vc : 0.0f;
-        info->root_score   = root_out.score;  // raw NN score (points, komi included)
-        info->total_visits = vc;
-        int best = (int)(std::max_element(visits.begin(), visits.end()) - visits.begin());
-        info->best_visits = (int)visits[best];
-    }
+    for (int a = 0; a < (int)root_->children.size(); a++)
+        if (root_->children[a])
+            visits[a] = (float)root_->children[a]->visit_count.load(std::memory_order_relaxed);
 }
 
 int MCTS::get_action(GoGame& game, std::vector<float>& policy,
                      float temperature, int num_simulations,
-                     bool add_noise, SearchInfo* info) {
+                     bool add_noise) {
     int action_size = config_.action_size();
 
     std::vector<float> visits;
-    search(game, visits, num_simulations, add_noise, info);
+    search(game, visits, num_simulations, add_noise);
 
     if (temperature == 0.0f) {
         int best = (int)(std::max_element(visits.begin(), visits.end())
@@ -410,6 +403,44 @@ int MCTS::get_action(GoGame& game, std::vector<float>& policy,
 
     std::discrete_distribution<int> dist(policy.begin(), policy.end());
     return dist(rng_);
+}
+
+// ================================================================
+// get_analysis — poll the live MCTS tree (thread-safe via atomics)
+// ================================================================
+
+MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
+    AnalysisInfo info;
+    info.root_score = root_nn_score_;
+
+    if (!root_) return info;
+
+    int vc = root_->visit_count.load(std::memory_order_relaxed);
+    info.total_visits = vc;
+    info.root_utility = (vc > 0) ? root_->total_value() / (float)vc : 0.0f;
+
+    // Collect child moves
+    for (int a = 0; a < (int)root_->children.size(); a++) {
+        auto& child = root_->children[a];
+        if (!child) continue;
+        int cv = child->visit_count.load(std::memory_order_relaxed);
+        if (cv == 0) continue;
+        MoveInfo mi;
+        mi.action  = a;
+        mi.visits  = cv;
+        mi.prior   = child->prior;
+        mi.utility = -child->total_value() / (float)cv;  // negate: child stores from child's perspective
+        info.moves.push_back(mi);
+    }
+
+    // Sort by visits descending
+    std::sort(info.moves.begin(), info.moves.end(),
+              [](const MoveInfo& a, const MoveInfo& b) { return a.visits > b.visits; });
+
+    if (max_moves > 0 && (int)info.moves.size() > max_moves)
+        info.moves.resize(max_moves);
+
+    return info;
 }
 
 // ================================================================

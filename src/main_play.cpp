@@ -179,12 +179,11 @@ int main(int argc, char* argv[]) {
                 std::cout << "AI thinking (" << config.num_simulations << " sims)...\n";
 
                 int action;
-                MCTS::SearchInfo si;
                 if (use_random) {
                     action = random_legal_move(game);
                 } else {
                     std::vector<float> pi;
-                    action = mcts->get_action(game, pi, 0.0f, -1, false, &si);
+                    action = mcts->get_action(game, pi, 0.0f, -1, false);
                 }
 
                 std::string move_str;
@@ -195,15 +194,25 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "AI plays: " << move_str;
                 if (!use_random) {
-                    float winrate = (si.root_utility + 1.0f) / 2.0f * 100.0f;
+                    auto info = mcts->get_analysis(3);
+                    float wr = (info.root_utility + 1.0f) / 2.0f * 100.0f;
                     std::cout << std::fixed << std::setprecision(1)
-                              << "  (WR=" << winrate << "%"
-                              << " score=" << std::showpos << si.root_score
-                              << std::noshowpos
-                              << " visits=" << si.best_visits
-                              << "/" << si.total_visits << ")";
+                              << "  (WR=" << wr << "%"
+                              << " score=" << std::showpos << info.root_score
+                              << std::noshowpos << "pts"
+                              << " visits=" << info.total_visits << ")\n";
+                    // Show top alternative moves
+                    for (int i = 1; i < (int)info.moves.size(); i++) {
+                        auto& m = info.moves[i];
+                        std::string ms = (m.action == config.action_size() - 1)
+                            ? "PASS" : game.action_to_str(m.action);
+                        float mwr = (m.utility + 1.0f) / 2.0f * 100.0f;
+                        std::cout << "    alt: " << ms
+                                  << " WR=" << mwr << "%"
+                                  << " visits=" << m.visits << "\n";
+                    }
                 }
-                std::cout << "\n\n";
+                std::cout << "\n";
             }
         }
 
