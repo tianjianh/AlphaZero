@@ -51,9 +51,10 @@ static void init_colors() {
 // Star points for standard board sizes
 // ================================================================
 static bool is_star_point(int r, int c, int n) {
-    if (n == 9)  return (r==2||r==4||r==6) && (c==2||c==4||c==6);
-    if (n == 13) return (r==3||r==6||r==9) && (c==3||c==6||c==9);
-    if (n == 19) return (r==3||r==9||r==15) && (c==3||c==9||c==15);
+    if (n == 9)  return (r==2||r==6)&&(c==2||c==6) || (r==4&&c==4);  // 4 corners + tengen
+    if (n == 13) return (r==3||r==9)&&(c==3||c==9) || (r==6&&c==6);
+    if (n == 19) return (r==3||r==15)&&(c==3||c==15) || (r==9&&c==9)
+                     || (r==3||r==15)&&c==9 || r==9&&(c==3||c==15);  // 9 points but keep standard
     return false;
 }
 
@@ -61,7 +62,7 @@ static bool is_star_point(int r, int c, int n) {
 // Board drawing (ncurses)
 // ================================================================
 static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
-                        int cursor_r, int cursor_c,
+                        int cursor_r, int cursor_c, bool cursor_active,
                         int last_r, int last_c,
                         Stone human_color, bool use_random,
                         const std::string& status_msg,
@@ -132,27 +133,27 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
                 else grid_ch = ACS_PLUS;
             }
 
-            bool is_cursor = (r == cursor_r && c == cursor_c);
+            bool is_cursor = cursor_active && (r == cursor_r && c == cursor_c);
             bool is_last   = (r == last_r && c == last_c);
             int cell = game.board[r][c];
 
             if (cell == BLACK) {
-                wattron(win, COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD);
+                wattron(win, COLOR_PAIR(CP_BLACK_STONE) | A_BOLD);
                 mvwaddch(win, y, x, 'X');
-                wattroff(win, COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD);
+                wattroff(win, COLOR_PAIR(CP_BLACK_STONE) | A_BOLD);
             } else if (cell == WHITE) {
-                wattron(win, COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD);
+                wattron(win, COLOR_PAIR(CP_WHITE_STONE) | A_BOLD);
                 mvwaddch(win, y, x, 'O');
-                wattroff(win, COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD);
+                wattroff(win, COLOR_PAIR(CP_WHITE_STONE) | A_BOLD);
             } else if (is_cursor && !game.game_over) {
                 char ghost = (game.current_player == BLACK) ? 'X' : 'O';
-                wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+                wattron(win, A_BOLD);
                 mvwaddch(win, y, x, ghost);
-                wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+                wattroff(win, A_BOLD);
             } else if (is_star_point(r, c, n)) {
-                wattron(win, COLOR_PAIR(CP_ACCENT));
+                wattron(win, COLOR_PAIR(CP_GRID));
                 mvwaddch(win, y, x, '*');
-                wattroff(win, COLOR_PAIR(CP_ACCENT));
+                wattroff(win, COLOR_PAIR(CP_GRID));
             } else {
                 wattron(win, COLOR_PAIR(CP_GRID));
                 mvwaddch(win, y, x, grid_ch);
@@ -181,14 +182,12 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
         mvwaddch(win, oy + n, ox + c * cell_w, GO_COLS[c]);
     wattroff(win, COLOR_PAIR(CP_LABEL));
 
-    // Cursor brackets
-    if (!game.game_over && cursor_r >= 0 && cursor_c >= 0) {
+    // Cursor brackets — only when arrow keys active
+    if (!game.game_over && cursor_r >= 0 && cursor_c >= 0 && cursor_active) {
         int cx = ox + cursor_c * cell_w;
         int cy = oy + cursor_r;
-        wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
         mvwaddch(win, cy, cx - 1, '[');
         mvwaddch(win, cy, cx + 1, ']');
-        wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
     }
 
     // ── Right-side info panel ──
@@ -385,6 +384,7 @@ int main(int argc, char* argv[]) {
 
         GoGame game(config.board_size, config.komi);
         int cursor_r = n / 2, cursor_c = n / 2;
+        bool cursor_active = false;
         int last_r = -1, last_c = -1;
         std::string input_buf;
         std::string status_msg;
@@ -392,7 +392,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::pair<int,int>> history;
 
         while (true) {
-            draw_board(stdscr, game, config, cursor_r, cursor_c,
+            draw_board(stdscr, game, config, cursor_r, cursor_c, cursor_active,
                        last_r, last_c, human_color, use_random,
                        status_msg, ai_info, input_buf);
 
@@ -406,7 +406,7 @@ int main(int argc, char* argv[]) {
                 else
                     snprintf(buf, sizeof(buf), "AI wins! B:%.1f W:%.1f  [r]restart [q]quit", bs, ws);
                 status_msg = buf;
-                draw_board(stdscr, game, config, -1, -1,
+                draw_board(stdscr, game, config, -1, -1, false,
                            last_r, last_c, human_color, use_random,
                            status_msg, ai_info, "");
 
@@ -419,14 +419,14 @@ int main(int argc, char* argv[]) {
             if (game.current_player != human_color) {
                 // AI turn
                 status_msg = "AI thinking...";
-                draw_board(stdscr, game, config, -1, -1,
+                draw_board(stdscr, game, config, -1, -1, false,
                            last_r, last_c, human_color, use_random,
                            status_msg, ai_info, "");
 
                 int action;
                 if (use_random) {
                     action = random_legal_move(game);
-                    ai_info.clear();
+                    ai_info.clear(); cursor_active = false;
                 } else {
                     std::vector<float> pi;
                     action = mcts->get_action(game, pi, 0.0f, -1, false);
@@ -470,10 +470,10 @@ int main(int argc, char* argv[]) {
             if (key == 'q' || key == 'Q') { keep_playing = false; break; }
 
             // Movement
-            if (key == KEY_UP    || key == 'w' || key == 'W') { cursor_r = std::max(0, cursor_r - 1); input_buf.clear(); }
-            else if (key == KEY_DOWN  || key == 's' || key == 'S') { cursor_r = std::min(n-1, cursor_r + 1); input_buf.clear(); }
-            else if (key == KEY_LEFT  || key == 'a' || key == 'A') { cursor_c = std::max(0, cursor_c - 1); input_buf.clear(); }
-            else if (key == KEY_RIGHT || key == 'd' || key == 'D') { cursor_c = std::min(n-1, cursor_c + 1); input_buf.clear(); }
+            if (key == KEY_UP    || key == 'w' || key == 'W') { cursor_r = std::max(0, cursor_r - 1); input_buf.clear(); cursor_active = true; }
+            else if (key == KEY_DOWN  || key == 's' || key == 'S') { cursor_r = std::min(n-1, cursor_r + 1); input_buf.clear(); cursor_active = true; }
+            else if (key == KEY_LEFT  || key == 'a' || key == 'A') { cursor_c = std::max(0, cursor_c - 1); input_buf.clear(); cursor_active = true; }
+            else if (key == KEY_RIGHT || key == 'd' || key == 'D') { cursor_c = std::min(n-1, cursor_c + 1); input_buf.clear(); cursor_active = true; }
 
             // Place stone (Enter/Space)
             else if (key == 10 || key == 13 || key == ' ') {
@@ -489,7 +489,7 @@ int main(int argc, char* argv[]) {
                     game.play(action);
                     last_r = r; last_c = c;
                     input_buf.clear();
-                    ai_info.clear();
+                    ai_info.clear(); cursor_active = false;
                 } else {
                     status_msg = "Illegal move!";
                 }
@@ -517,8 +517,8 @@ int main(int argc, char* argv[]) {
                 if (try_parse_coord(input_buf, n, r, c)) {
                     int action = r * n + c;
                     if (game.is_legal(action)) {
-                        cursor_r = r; cursor_c = c;
-                        draw_board(stdscr, game, config, cursor_r, cursor_c,
+                        cursor_r = r; cursor_c = c; cursor_active = true;
+                        draw_board(stdscr, game, config, cursor_r, cursor_c, true,
                                    last_r, last_c, human_color, use_random,
                                    status_msg, ai_info, input_buf);
                         napms(120);
@@ -526,7 +526,7 @@ int main(int argc, char* argv[]) {
                         game.play(action);
                         last_r = r; last_c = c;
                         input_buf.clear();
-                        ai_info.clear();
+                        ai_info.clear(); cursor_active = false;
                     } else {
                         status_msg = "Illegal move!";
                         input_buf.clear();
