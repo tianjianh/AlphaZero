@@ -195,11 +195,11 @@ int main(int argc, char* argv[]) {
                 }
                 std::cout << "AI plays: " << move_str;
                 if (!use_random) {
-                    // Show MCTS stats — value from AI's perspective
-                    float winrate = (si.root_value + 1.0f) / 2.0f * 100.0f;
+                    float winrate = (si.root_utility + 1.0f) / 2.0f * 100.0f;
                     std::cout << std::fixed << std::setprecision(1)
-                              << "  (V=" << si.root_value
-                              << " WR=" << winrate << "%"
+                              << "  (WR=" << winrate << "%"
+                              << " score=" << std::showpos << si.root_score
+                              << std::noshowpos
                               << " visits=" << si.best_visits
                               << "/" << si.total_visits << ")";
                 }

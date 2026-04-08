@@ -95,9 +95,10 @@ public:
 
     // Stats from the MCTS root after search (no extra compute)
     struct SearchInfo {
-        float root_value = 0.0f;  // mean Q from current player's perspective
+        float root_utility = 0.0f; // mean blended utility (value + score) from MCTS
+        float root_score = 0.0f;   // NN's raw score estimate in points (+ = current player leads)
         int   total_visits = 0;
-        int   best_visits = 0;    // visits on the selected move
+        int   best_visits = 0;     // visits on the selected move
     };
 
     void search(GoGame& game, std::vector<float>& visits,

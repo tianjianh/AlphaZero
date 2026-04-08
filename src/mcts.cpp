@@ -369,8 +369,8 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
 
     if (info) {
         int vc = root->visit_count.load(std::memory_order_relaxed);
-        // Root's total_value is from current player's perspective
-        info->root_value  = (vc > 0) ? root->total_value() / (float)vc : 0.0f;
+        info->root_utility = (vc > 0) ? root->total_value() / (float)vc : 0.0f;
+        info->root_score   = root_out.score;  // raw NN score (points, komi included)
         info->total_visits = vc;
         int best = (int)(std::max_element(visits.begin(), visits.end()) - visits.begin());
         info->best_visits = (int)visits[best];
