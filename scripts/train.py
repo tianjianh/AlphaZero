@@ -262,18 +262,23 @@ def main():
     else:
         mprint("Starting from scratch")
 
-    # ── Mixed precision ─────────────────────────────────────
+    # ── Mixed precision: BF16 > FP16 > FP32 ─────────────────
+    # FP8 training requires NVIDIA Transformer Engine (te.Linear) for
+    # proper E4M3 forward / E5M2 backward switching + per-tensor scaling.
+    # Not worth the complexity for our small model. FP8 is used for
+    # inference only (TensorRT handles it automatically).
     use_amp = device.type == "cuda"
     scaler = None
     if use_amp:
+        sm = torch.cuda.get_device_capability()
         if torch.cuda.is_bf16_supported():
             amp_dtype = torch.bfloat16
-            mprint("Mixed precision: BF16")
+            mprint(f"Mixed precision: BF16 (SM {sm[0]}.{sm[1]})")
             tlog(f"    AMP: BF16")
         else:
             amp_dtype = torch.float16
             scaler = torch.amp.GradScaler()
-            mprint("Mixed precision: FP16 + GradScaler")
+            mprint(f"Mixed precision: FP16 + GradScaler (SM {sm[0]}.{sm[1]})")
             tlog(f"    AMP: FP16 + GradScaler")
     else:
         amp_dtype = torch.float32

@@ -73,6 +73,7 @@ struct TRTDeviceState {
     std::string policy_name;
     std::string value_name;
     std::string score_name;
+    std::string precision;   // "FP8", "FP16", or "FP32"
 };
 
 // ================================================================
@@ -217,14 +218,21 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
     cudaMemGetInfo(&free_mem, &total_mem);
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, free_mem / 2);
 
-    // Enable FP16 if the device supports it
-    // (platformHasFastFp16/kFP16 deprecated in TRT 10.12 in favour of strong
-    //  typing, but still functional and the simplest path for our use case)
+    // Enable best available precision: FP8 > FP16 > FP32
+    // Detect from SM version (set in init_device) and TRT capability.
+    std::string build_prec = "FP32";
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    if (builder->platformHasFastFp16())
+    if (dev.precision == "FP8") {
+        config->setFlag(nvinfer1::BuilderFlag::kFP8);
+        config->setFlag(nvinfer1::BuilderFlag::kFP16);  // FP8 needs FP16 fallback layers
+        build_prec = "FP8";
+    } else if (builder->platformHasFastFp16()) {
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
+        build_prec = "FP16";
+    }
 #pragma GCC diagnostic pop
+    std::cout << "TensorRT: building with " << build_prec << " precision\n";
 
     // Optimization profile for dynamic batch size [1, max_batch_size]
     auto* profile = builder->createOptimizationProfile();
@@ -298,8 +306,17 @@ static void init_device(TRTDeviceState& ds, int device_id) {
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
+    // Detect best precision from SM version
+    if (prop.major >= 10)
+        ds.precision = "FP8";
+    else if (prop.major >= 7 || (prop.major == 6 && prop.minor >= 0))
+        ds.precision = "FP16";
+    else
+        ds.precision = "FP32";
+
     std::cout << "TensorRT device " << device_id << ": " << prop.name
-              << " (SM " << prop.major << "." << prop.minor << ")\n";
+              << " (SM " << prop.major << "." << prop.minor
+              << ", " << ds.precision << ")\n";
 
     CUDA_CHECK(cudaStreamCreate(&ds.stream));
 
@@ -474,7 +491,7 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     CUDA_CHECK(cudaMalloc(&I.d_value,  value_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_score, (size_t)max_batch_size * sizeof(float)));
 
-    std::cout << "TensorRT handle ready: board=" << I.board_size;
+    std::cout << "TensorRT handle ready (" << I.dev.precision << "): board=" << I.board_size;
     if (model->model_type == "vit")
         std::cout << " d_model=" << model->num_filters
                   << " depth=" << model->vit_depth
