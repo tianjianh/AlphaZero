@@ -5,6 +5,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+
+// CUTLASS GEMM for optimized convolution
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/numeric_types.h>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -211,6 +216,75 @@ __global__ void conv3x3_bn_fp32(
 }
 
 // ================================================================
+// ================================================================
+// Im2col kernel: [C_in, NHW] → [C_in*9, NHW] for 3×3 conv pad=1
+// ================================================================
+__global__ void im2col_3x3_fp16(
+    const half* __restrict__ input, half* __restrict__ col,
+    int C_in, int NHW, int H, int W
+) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int K = C_in * 9;
+    int total = K * NHW;
+    if (gid >= total) return;
+    int k_row = gid / NHW;
+    int nhw   = gid % NHW;
+    int HW = H * W;
+    int ci = k_row / 9, rem = k_row % 9;
+    int kh = rem / 3, kw = rem % 3;
+    int n = nhw / HW, hw = nhw % HW;
+    int ih = hw / W + kh - 1, iw = hw % W + kw - 1;
+    col[gid] = (ih >= 0 && ih < H && iw >= 0 && iw < W)
+        ? input[ci * NHW + n * HW + ih * W + iw] : __float2half(0.0f);
+}
+
+// BN + optional residual + ReLU on GEMM output [C_out, NHW]
+__global__ void bn_relu_fp16(
+    half* __restrict__ data, const float* __restrict__ bn_scale,
+    const float* __restrict__ bn_bias, const half* __restrict__ residual,
+    int C_out, int NHW, int mode
+) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= C_out * NHW) return;
+    int c = gid / NHW;
+    float v = bn_scale[c] * __half2float(data[gid]) + bn_bias[c];
+    if (mode == 2) v += __half2float(residual[gid]);
+    if (v < 0.0f) v = 0.0f;
+    data[gid] = __float2half(v);
+}
+
+// ================================================================
+// CUTLASS GEMM conv3x3 — uses im2col + optimized GEMM
+//
+// Tile sizes tuned for M=64 (small filter count):
+// - ThreadblockShape: 64×128×32 — covers full M in one tile
+// - WarpShape: 32×64×32 — 2×2 warp arrangement
+// - InstructionShape: 16×8×16 — WMMA on Turing+
+// ================================================================
+
+// CUTLASS GEMM type for FP16 Tensor Core with FP32 accumulation
+// Alignment=1 to support any N (e.g., N=81 for single-sample inference)
+using CutlassGemm = cutlass::gemm::device::Gemm<
+    cutlass::half_t,                           // A type
+    cutlass::layout::RowMajor,                 // A layout
+    cutlass::half_t,                           // B type
+    cutlass::layout::RowMajor,                 // B layout
+    cutlass::half_t,                           // C type
+    cutlass::layout::RowMajor,                 // C layout
+    float,                                      // accumulator
+    cutlass::arch::OpClassTensorOp,             // use tensor cores
+    cutlass::arch::Sm75,                        // Turing
+    cutlass::gemm::GemmShape<64, 64, 32>,       // threadblock tile
+    cutlass::gemm::GemmShape<32, 32, 32>,       // warp tile
+    cutlass::gemm::GemmShape<16, 8, 8>,         // Turing mma instruction
+    cutlass::epilogue::thread::LinearCombination<
+        cutlass::half_t, 1, float, float>,      // alignment=1 for arbitrary N
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    2,                                          // pipeline stages
+    1,                                          // A alignment
+    1                                           // B alignment
+>;
+
 // Fused 1×1 conv + BN + ReLU + reshape — FP16 and FP32 versions
 // ================================================================
 __global__ void conv1x1_bn_relu_reshape_fp16(
@@ -560,6 +634,7 @@ struct CUDAComputeHandle::Impl {
     FCGPU                  score_fc1_gpu, score_fc2_gpu;
     float*                 bin_values_gpu = nullptr;
 
+    half*  buf_im2col  = nullptr;  // [C_in*9, N*HW] for CUTLASS GEMM im2col workspace
     float* buf_flat_in = nullptr;  // FP32 from host
     void*  buf_input   = nullptr;  // [C_in, N*HW]
     void*  buf_main    = nullptr;  // [F, N*HW]
@@ -641,6 +716,9 @@ struct CUDAComputeHandle::Impl {
         int H = board_size, W = board_size, HW = H * W;
         int F = num_filters, as = HW + 1;
 
+        // Im2col workspace for CUTLASS (max K = F*9 for res convs)
+        if (use_fp16)
+            CUDA_CHECK(cudaMalloc(&buf_im2col, (size_t)num_filters * 9 * batch * HW * sizeof(half)));
         CUDA_CHECK(cudaMalloc(&buf_flat_in, (size_t)input_channels * batch * HW * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&buf_input,   (size_t)input_channels * batch * HW * elem));
         CUDA_CHECK(cudaMalloc(&buf_main,    (size_t)F * batch * HW * elem));
@@ -660,7 +738,7 @@ struct CUDAComputeHandle::Impl {
 
     void free_workspace() {
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
-        fr(buf_flat_in); fr(buf_input); fr(buf_main); fr(buf_temp); fr(buf_skip);
+        fr(buf_im2col); fr(buf_flat_in); fr(buf_input); fr(buf_main); fr(buf_temp); fr(buf_skip);
         fr(buf_pol_out); fr(buf_pol_feat); fr(buf_val_h1); fr(buf_val_feat); fr(buf_val_out);
         fr(buf_scr_h1); fr(buf_scr_feat); fr(buf_scr_bins); fr(buf_scr_out);
         if (graph_exec) { cudaGraphExecDestroy(graph_exec); graph_exec = nullptr; }
@@ -758,18 +836,59 @@ struct CUDAComputeHandle::Impl {
     }
 
     // ── Dispatch helpers ────────────────────────────────────
+
+    // CUTLASS conv3x3: im2col + GEMM + BN/ReLU (FP16 tensor core path)
+    void run_conv3x3_cutlass(half* in, half* out, const ConvBNGPU& conv, half* residual,
+                              int N, int H, int W, int mode) {
+        int NHW = N * H * W;
+        int C_out = conv.c_out, C_in = conv.c_in, K = C_in * 9;
+
+        // Im2col: [C_in, NHW] → [K, NHW]
+        int total_im2col = K * NHW;
+        im2col_3x3_fp16<<<(total_im2col + 255) / 256, 256, 0, dev.stream>>>(
+            in, buf_im2col, C_in, NHW, H, W);
+
+        // CUTLASS GEMM: C[C_out, NHW] = A[C_out, K] × B[K, NHW]
+        CutlassGemm gemm_op;
+        cutlass::half_t alpha(1.0f), beta(0.0f);
+        CutlassGemm::Arguments args(
+            {C_out, NHW, K},
+            {(cutlass::half_t*)conv.weight, K},
+            {(cutlass::half_t*)buf_im2col, NHW},
+            {(cutlass::half_t*)out, NHW},
+            {(cutlass::half_t*)out, NHW},
+            {alpha, beta}
+        );
+        cutlass::Status status = gemm_op.can_implement(args);
+        if (status != cutlass::Status::kSuccess) {
+            std::cerr << "CUTLASS: can_implement failed (" << (int)status
+                      << ") M=" << C_out << " N=" << NHW << " K=" << K << "\n";
+            throw std::runtime_error("CUTLASS GEMM cannot implement");
+        }
+        size_t ws_size = CutlassGemm::get_workspace_size(args);
+        void* ws = nullptr;
+        if (ws_size > 0) CUDA_CHECK(cudaMalloc(&ws, ws_size));
+        status = gemm_op(args, ws, dev.stream);
+        if (ws) cudaFree(ws);
+        if (status != cutlass::Status::kSuccess)
+            throw std::runtime_error("CUTLASS GEMM launch failed");
+        CUDA_CHECK(cudaGetLastError());
+
+        // BN + optional residual + ReLU
+        int total = C_out * NHW;
+        bn_relu_fp16<<<(total + 255) / 256, 256, 0, dev.stream>>>(
+            out, conv.bn_scale, conv.bn_bias,
+            (mode == 2 && residual) ? residual : nullptr,
+            C_out, NHW, mode);
+    }
+
     void run_conv3x3(void* in, void* out, const ConvBNGPU& conv, void* residual,
                      int N, int H, int W, int mode, bool relu) {
         int NHW = N * H * W, do_relu = relu ? 1 : 0;
         if (use_fp16) {
-            int C_out = conv.c_out, K = conv.c_in * 9;
-            half* res_arg = (mode == 2 && residual) ? (half*)residual : (half*)out;
-            dim3 block(256);
-            dim3 grid((NHW + TILE_N - 1) / TILE_N, (C_out + TILE_M - 1) / TILE_M);
-            conv3x3_wmma_bn<<<grid, block, WMMA_SMEM_BYTES, dev.stream>>>(
-                (const half*)conv.weight, (const half*)in, (half*)out,
-                conv.bn_scale, conv.bn_bias, res_arg,
-                C_out, NHW, K, H, W, mode, do_relu);
+            // Use CUTLASS GEMM for optimized tensor core performance
+            run_conv3x3_cutlass((half*)in, (half*)out, conv, (half*)residual,
+                                N, H, W, mode);
         } else {
             int total = conv.c_out * NHW;
             conv3x3_bn_fp32<<<(total + 255) / 256, 256, 0, dev.stream>>>(
