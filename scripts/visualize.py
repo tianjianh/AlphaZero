@@ -13,7 +13,9 @@ Usage:
 """
 
 import argparse
+import curses
 import glob
+import locale
 import os
 import struct
 import sys
@@ -232,82 +234,216 @@ def _replay_to(moves_data, board_size, target, is_sgf):
     return board
 
 
-def view_game_interactive(board_size, moves_data, title="", is_sgf=False):
-    """Step through a game move by move with forward/backward navigation."""
-    print(f"\n{'=' * 50}")
-    print(f"  {title}")
-    print(f"  Board: {board_size}x{board_size}  Moves: {len(moves_data)}")
-    print(f"{'=' * 50}")
+def view_game_curses(board_size, moves_data, title="", is_sgf=False):
+    """Curses-based game viewer. Left/Right arrows, Q to quit."""
 
-    board = make_board(board_size)
-    print(display_board(board, board_size))
-    print("\n[Enter]=next  [b]=back  [s]=skip to end  [number]=jump  [q]=quit")
+    def is_star(r, c, n):
+        if n == 9:  return (r==2 or r==6) and (c==2 or c==6) or (r==4 and c==4)
+        if n == 13: return (r==3 or r==9) and (c==3 or c==9) or (r==6 and c==6)
+        if n == 19: return (r==3 or r==15) and (c==3 or c==15) or (r==9 and c==9)
+        return False
 
-    move_idx = 0
-    while True:
-        if move_idx >= len(moves_data):
-            prompt = "Game over"
-        else:
-            prompt = f"Move {move_idx + 1}/{len(moves_data)}"
+    # ACS char map (set after initscr)
+    ACS = {}
+
+    def draw(stdscr, board, move_idx, last_r, last_c):
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        n = board_size
+
+        # Title
+        stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+        stdscr.addnstr(0, 2, title.split('\n')[0], w - 4)
+        stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+
+        ox, oy = 5, 2
+        cell_w = 2
+
+        # Column labels
+        stdscr.attron(curses.color_pair(5))
+        for c in range(n):
+            stdscr.addch(oy - 1, ox + c * cell_w, COLS[c])
+        stdscr.attroff(curses.color_pair(5))
+
+        # Grid + stones
+        for r in range(n):
+            y = oy + r
+            # Row label
+            stdscr.attron(curses.color_pair(5))
+            stdscr.addstr(y, ox - 3, f"{n-r:2d}")
+            stdscr.attroff(curses.color_pair(5))
+
+            for c in range(n):
+                x = ox + c * cell_w
+                cell = board[r][c]
+
+                # Grid char
+                if r == 0:
+                    gc = ACS['ul'] if c == 0 else ACS['ur'] if c == n-1 else ACS['tt']
+                elif r == n-1:
+                    gc = ACS['ll'] if c == 0 else ACS['lr'] if c == n-1 else ACS['bt']
+                else:
+                    gc = ACS['lt'] if c == 0 else ACS['rt'] if c == n-1 else ACS['pl']
+
+                if cell == BLACK:
+                    stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
+                    stdscr.addch(y, x, ord('X'))
+                    stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
+                elif cell == WHITE:
+                    stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                    stdscr.addch(y, x, ord('O'))
+                    stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                elif is_star(r, c, n):
+                    stdscr.attron(curses.color_pair(1))
+                    stdscr.addch(y, x, ord('*'))
+                    stdscr.attroff(curses.color_pair(1))
+                else:
+                    stdscr.attron(curses.color_pair(1))
+                    stdscr.addch(y, x, gc)
+                    stdscr.attroff(curses.color_pair(1))
+
+                # Horizontal connector
+                if c < n - 1:
+                    stdscr.attron(curses.color_pair(1))
+                    stdscr.addch(y, x + 1, ACS['hl'])
+                    stdscr.attroff(curses.color_pair(1))
+
+            # Row label right
+            stdscr.attron(curses.color_pair(5))
+            try:
+                stdscr.addstr(y, ox + (n-1) * cell_w + 2, str(n - r))
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(5))
+
+        # Last move marker
+        if last_r >= 0 and last_c >= 0:
+            lx = ox + last_c * cell_w
+            ly = oy + last_r
+            stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+            try:
+                stdscr.addch(ly, lx - 1, ord('['))
+                stdscr.addch(ly, lx + 1, ord(']'))
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+
+        # ── Right-side info panel ──
+        px = ox + n * cell_w + 4
+        py = oy
+
+        # Move counter
+        total = len(moves_data)
+        stdscr.attron(curses.color_pair(2))
+        stdscr.addnstr(py, px, f"Move {move_idx}/{total}", w - px - 1)
+        stdscr.attroff(curses.color_pair(2))
+        py += 1
+
+        # Current move info
+        if move_idx > 0:
+            color, r, c, extra = _get_move_info(moves_data, move_idx - 1, is_sgf)
+            name = "Black X" if color == BLACK else "White O"
+            coord = "PASS" if r is None else coord_to_str(r, c, board_size)
+            stdscr.attron(curses.color_pair(3))
+            stdscr.addnstr(py, px, f"{name}: {coord}", w - px - 1)
+            stdscr.attroff(curses.color_pair(3))
+            py += 1
+            if extra.strip():
+                stdscr.attron(curses.color_pair(8))
+                stdscr.addnstr(py, px, extra.strip(), w - px - 1)
+                stdscr.attroff(curses.color_pair(8))
+                py += 1
+        py += 1
+
+        # Title info (remaining lines)
+        for line in title.split('\n')[1:]:
+            line = line.strip()
+            if line and py < h - 2:
+                stdscr.attron(curses.color_pair(5))
+                stdscr.addnstr(py, px, line, w - px - 1)
+                stdscr.attroff(curses.color_pair(5))
+                py += 1
+
+        # Help
+        help_y = max(oy + n, py + 1)
+        stdscr.attron(curses.color_pair(5))
         try:
-            cmd = input(f"{prompt}: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
+            stdscr.addnstr(min(help_y, h-1), 2,
+                           "Left/Right: step  Home/End: jump  Q: quit", w - 4)
+        except curses.error:
+            pass
+        stdscr.attroff(curses.color_pair(5))
 
-        if cmd == 'q':
-            return
+        stdscr.refresh()
 
-        elif cmd == 'b' or cmd == 'p':
-            # Go back one move
-            if move_idx > 0:
-                move_idx -= 1
-            board = _replay_to(moves_data, board_size, move_idx, is_sgf)
-            if move_idx > 0:
-                color, r, c, extra = _get_move_info(moves_data, move_idx - 1, is_sgf)
-                color_name = "Black X" if color == BLACK else "White O"
-                if r is None:
-                    print(f"  {color_name} plays PASS{extra}")
-                else:
-                    print(f"  {color_name} plays {coord_to_str(r, c, board_size)}{extra}")
-            print(display_board(board, board_size))
+    def run(stdscr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.init_pair(1, 237, -1)   # grid
+        curses.init_pair(2, 252, -1)   # status
+        curses.init_pair(3, 214, -1)   # accent
+        curses.init_pair(4, 252, -1)   # last move brackets
+        curses.init_pair(5, 245, -1)   # labels
+        curses.init_pair(6, 255, -1)   # black stone
+        curses.init_pair(7, 252, -1)   # white stone
+        curses.init_pair(8, 81,  -1)   # info
 
-        elif cmd == 's':
-            move_idx = len(moves_data)
-            board = _replay_to(moves_data, board_size, move_idx, is_sgf)
-            print(display_board(board, board_size))
+        ACS['ul'] = curses.ACS_ULCORNER
+        ACS['ur'] = curses.ACS_URCORNER
+        ACS['ll'] = curses.ACS_LLCORNER
+        ACS['lr'] = curses.ACS_LRCORNER
+        ACS['tt'] = curses.ACS_TTEE
+        ACS['bt'] = curses.ACS_BTEE
+        ACS['lt'] = curses.ACS_LTEE
+        ACS['rt'] = curses.ACS_RTEE
+        ACS['pl'] = curses.ACS_PLUS
+        ACS['hl'] = curses.ACS_HLINE
 
-        elif cmd.isdigit():
-            move_idx = max(0, min(int(cmd), len(moves_data)))
-            board = _replay_to(moves_data, board_size, move_idx, is_sgf)
-            if move_idx > 0:
-                color, r, c, extra = _get_move_info(moves_data, move_idx - 1, is_sgf)
-                color_name = "Black X" if color == BLACK else "White O"
-                if r is None:
-                    print(f"  {color_name} plays PASS{extra}")
-                else:
-                    print(f"  {color_name} plays {coord_to_str(r, c, board_size)}{extra}")
-            print(display_board(board, board_size))
+        move_idx = 0
+        board = make_board(board_size)
+        last_r, last_c = -1, -1
 
-        else:
-            # Default: next move
-            if move_idx >= len(moves_data):
-                print("Game over. [b]=back  [number]=jump  [q]=quit")
-                continue
+        while True:
+            draw(stdscr, board, move_idx, last_r, last_c)
+            key = stdscr.getch()
 
-            color, r, c, extra = _get_move_info(moves_data, move_idx, is_sgf)
-            color_name = "Black X" if color == BLACK else "White O"
+            if key in (ord('q'), ord('Q')):
+                break
 
-            if r is None:
-                print(f"  {color_name} plays PASS{extra}")
-            else:
-                board[r][c] = color
-                captures = find_captures(board, board_size, r, c)
-                cap_str = f"  captures {len(captures)}" if captures else ""
-                print(f"  {color_name} plays {coord_to_str(r, c, board_size)}{extra}{cap_str}")
+            elif key == curses.KEY_RIGHT or key == ord(' ') or key == 10:
+                if move_idx < len(moves_data):
+                    color, r, c, _ = _get_move_info(moves_data, move_idx, is_sgf)
+                    if r is not None:
+                        board[r][c] = color
+                        find_captures(board, board_size, r, c)
+                        last_r, last_c = r, c
+                    else:
+                        last_r, last_c = -1, -1
+                    move_idx += 1
 
-            move_idx += 1
-            print(display_board(board, board_size))
+            elif key == curses.KEY_LEFT:
+                if move_idx > 0:
+                    move_idx -= 1
+                    board = _replay_to(moves_data, board_size, move_idx, is_sgf)
+                    if move_idx > 0:
+                        _, lr, lc, _ = _get_move_info(moves_data, move_idx - 1, is_sgf)
+                        last_r, last_c = lr if lr is not None else -1, lc if lc is not None else -1
+                    else:
+                        last_r, last_c = -1, -1
+
+            elif key == curses.KEY_HOME:
+                move_idx = 0
+                board = make_board(board_size)
+                last_r, last_c = -1, -1
+
+            elif key == curses.KEY_END:
+                move_idx = len(moves_data)
+                board = _replay_to(moves_data, board_size, move_idx, is_sgf)
+                if move_idx > 0:
+                    _, lr, lc, _ = _get_move_info(moves_data, move_idx - 1, is_sgf)
+                    last_r, last_c = lr if lr is not None else -1, lc if lc is not None else -1
+
+    curses.wrapper(run)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -344,12 +480,6 @@ def main():
         print(f"Found {len(files)} game files in {path}")
         for f in files:
             view_single_file(f, args.board, args.game)
-            try:
-                cmd = input("\n[Enter]=next file  [q]=quit: ").strip()
-                if cmd == 'q':
-                    return
-            except (EOFError, KeyboardInterrupt):
-                return
         return
 
     view_single_file(path, args.board, args.game)
@@ -361,7 +491,7 @@ def view_single_file(path, board_size, game_idx):
         title = (f"{os.path.basename(path)}\n"
                  f"  Black: {pb}  vs  White: {pw}\n"
                  f"  Komi: {komi}  Result: {result}")
-        view_game_interactive(bs, moves, title=title, is_sgf=True)
+        view_game_curses(bs, moves, title=title, is_sgf=True)
     elif ".bin" in path:
         records = read_bin_file(path)
         print(f"  Loaded {len(records)} records ({len(records)//8} moves × 8 augmentations)")
@@ -378,7 +508,7 @@ def view_single_file(path, board_size, game_idx):
         title = (f"{os.path.basename(path)}\n"
                  f"  {len(moves)} moves  {outcome}\n"
                  f"  Value: {first_val:+.2f}  Score: {first_score:+.1f} pts")
-        view_game_interactive(board_size, moves, title=title, is_sgf=False)
+        view_game_curses(board_size, moves, title=title, is_sgf=False)
     else:
         print(f"Unknown file format: {path}")
 
