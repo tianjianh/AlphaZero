@@ -179,17 +179,17 @@ def _stage(name, start, end, games, sims, epochs, lr, eval_games,
 #                    score_wt  sw_loss  window  c_puct  temp  dir_eps
 _EXPLORE = [
     # Bootstrap:     aggressive explore — network is random
-    (0.0,   0.2,     3,      2.0,    20,   0.30),
-    # Warm up:       still exploring
-    (0.03,  0.3,     3,      1.75,   18,   0.28),
-    # Early gated:   standard balance
-    (0.06,  0.4,     4,      1.5,    15,   0.25),
-    # Consolidate:   starting to exploit
-    (0.1,   0.5,     6,      1.25,   15,   0.22),
-    # Steady:        exploit for clean signal
-    (0.15,  0.5,     8,      1.1,    12,   0.20),
-    # Overnight:     same
-    (0.15,  0.5,     8,      1.1,    12,   0.20),
+    (0.0,   0.1,     3,      2.0,    20,   0.30),
+    # Warm up:       still exploring, score head too noisy to use
+    (0.0,   0.2,     3,      1.75,   18,   0.28),
+    # Early gated:   tiny score influence, keep exploring
+    (0.02,  0.3,     4,      1.5,    15,   0.25),
+    # Consolidate:   still exploring — model needs diverse data
+    (0.02,  0.3,     6,      1.5,    15,   0.25),
+    # Steady:        start exploiting, score head becoming useful
+    (0.05,  0.4,     8,      1.25,   12,   0.22),
+    # Overnight:     moderate exploitation
+    (0.1,   0.5,     8,      1.1,    12,   0.20),
 ]
 # Large preset uses wider windows for later stages
 _EXPLORE_LARGE = list(_EXPLORE)
@@ -205,31 +205,34 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
         return [{"name": "Quick test", "start": 1, "end": 5,
                  "games": 20, "sims": 100, "epochs": 5, "lr": lr, "eval_games": 0}]
 
-    # Learning rates: ViT uses lower LRs than ResNet
+    # Learning rates: ViT needs higher LR for longer than ResNet
     if vit:
-        lrs = ["8e-4", "6e-4", "4e-4", "3e-4", "2e-4", "1.5e-4"]
+        lrs = ["8e-4", "6e-4", "5e-4", "4e-4", "3e-4", "2e-4"]
     else:
         lrs = ["1.2e-3", "9e-4", "6e-4", "4.5e-4", "3e-4", "2e-4"]
 
     if preset == "small":
         ex = _EXPLORE
+        # ViT needs more epochs than ResNet (no conv inductive bias)
+        vit_e = [8, 6, 5, 5, 4, 3] if vit else [8, 6, 4, 3, 3, 3]
         return [
-            _stage("Bootstrap",       1,  4,   400, 200, 8, lrs[0], 0,   *ex[0]),
-            _stage("Warm up",         5,  8,   600, 300, 6, lrs[1], 0,   *ex[1]),
-            _stage("Early gated",     9, 14,   900, 400, 4, lrs[2], 100, *ex[2]),
-            _stage("Consolidate",    15, 22,  1000, 400, 3, lrs[3], 200, *ex[3]),
-            _stage("Steady improve", 23, 32,  1200, 500, 3, lrs[4], 200, *ex[4]),
-            _stage("Overnight extend",33,48,  1400, 500, 3, lrs[5], 200, *ex[5]),
+            _stage("Bootstrap",       1,  4,   400, 200, vit_e[0], lrs[0], 0,   *ex[0]),
+            _stage("Warm up",         5,  8,   600, 300, vit_e[1], lrs[1], 0,   *ex[1]),
+            _stage("Early gated",     9, 14,   900, 400, vit_e[2], lrs[2], 100, *ex[2]),
+            _stage("Consolidate",    15, 22,  1000, 400, vit_e[3], lrs[3], 200, *ex[3]),
+            _stage("Steady improve", 23, 32,  1200, 500, vit_e[4], lrs[4], 200, *ex[4]),
+            _stage("Overnight extend",33,48,  1400, 500, vit_e[5], lrs[5], 200, *ex[5]),
         ]
     if preset == "large":
         ex = _EXPLORE_LARGE
+        vit_e = [8, 6, 5, 5, 4, 3] if vit else [8, 6, 4, 3, 3, 3]
         return [
-            _stage("Bootstrap",        1,   6,  800, 300, 8, lrs[0], 0,   *ex[0]),
-            _stage("Warm up",          7,  15, 1200, 400, 6, lrs[1], 0,   *ex[1]),
-            _stage("Early gated",     16,  30, 2000, 600, 4, lrs[2], 200, *ex[2]),
-            _stage("Consolidate",     31,  60, 3000, 600, 3, lrs[3], 200, *ex[3]),
-            _stage("Steady improve",  61, 120, 4000, 800, 3, lrs[4], 200, *ex[4]),
-            _stage("Overnight extend",121, 200,5000,1000, 3, lrs[5], 200, *ex[5]),
+            _stage("Bootstrap",        1,   6,  800, 300, vit_e[0], lrs[0], 0,   *ex[0]),
+            _stage("Warm up",          7,  15, 1200, 400, vit_e[1], lrs[1], 0,   *ex[1]),
+            _stage("Early gated",     16,  30, 2000, 600, vit_e[2], lrs[2], 200, *ex[2]),
+            _stage("Consolidate",     31,  60, 3000, 600, vit_e[3], lrs[3], 200, *ex[3]),
+            _stage("Steady improve",  61, 120, 4000, 800, vit_e[4], lrs[4], 200, *ex[4]),
+            _stage("Overnight extend",121, 200,5000,1000, vit_e[5], lrs[5], 200, *ex[5]),
         ]
 
     # custom
