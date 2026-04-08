@@ -105,7 +105,7 @@ def decompress(filepath):
 
 
 def read_bin_file(filepath):
-    """Read selfplay .bin file, return list of (state, policy, value) records."""
+    """Read selfplay .bin file, return list of (state, policy, value, score) records."""
     data = decompress(filepath)
     pos = 0
     n = struct.unpack_from("i", data, pos)[0]; pos += 4
@@ -116,14 +116,15 @@ def read_bin_file(filepath):
         ps = struct.unpack_from("i", data, pos)[0]; pos += 4
         policy = struct.unpack_from(f"{ps}f", data, pos); pos += ps * 4
         value = struct.unpack_from("f", data, pos)[0]; pos += 4
-        records.append((state, policy, value))
+        score = struct.unpack_from("f", data, pos)[0]; pos += 4
+        records.append((state, policy, value, score))
     return records
 
 
 def extract_games_from_bin(records, board_size):
     """Group augmented records into games (8 augmentations per position).
 
-    Returns list of games. Each game is a list of (board_state, policy, value).
+    Returns list of games. Each game is a list of (board_state, policy, value, score).
     The first augmentation (identity) is used for display.
     """
     # Records come in groups of 8 (dihedral augmentation)
@@ -133,19 +134,18 @@ def extract_games_from_bin(records, board_size):
 
     game = []
     for i in range(0, len(records), 8):
-        state, policy, value = records[i]  # identity augmentation
-        game.append((state, policy, value))
+        state, policy, value, score = records[i]  # identity augmentation
+        game.append((state, policy, value, score))
 
     return [game]  # one game per .bin file
 
 
 def replay_game_from_bin(game, board_size):
     """Extract the move sequence from binary state data by diffing boards."""
-    input_ch = 17
     hw = board_size * board_size
     moves = []
 
-    for i, (state, policy, value) in enumerate(game):
+    for i, (state, policy, value, score) in enumerate(game):
         # State layout: [ch0..ch16] where ch0 = current player's stones,
         # ch1 = opponent's stones (current frame)
         # The color plane (ch16) tells us who is playing: 1.0 = black
@@ -158,10 +158,10 @@ def replay_game_from_bin(game, board_size):
         best_action = max(range(action_size), key=lambda a: policy[a])
 
         if best_action == board_size * board_size:
-            moves.append((current, None, None, policy, value))  # pass
+            moves.append((current, None, None, policy, value, score))  # pass
         else:
             r, c = best_action // board_size, best_action % board_size
-            moves.append((current, r, c, policy, value))
+            moves.append((current, r, c, policy, value, score))
 
     return moves
 
@@ -214,8 +214,11 @@ def _get_move_info(moves_data, idx, is_sgf):
         return color, r, c, ""
     else:
         m = moves_data[idx]
-        val_str = f"  value={m[4]:.2f}" if len(m) > 4 else ""
-        return m[0], m[1], m[2], val_str
+        parts = []
+        if len(m) > 4: parts.append(f"V={m[4]:+.2f}")
+        if len(m) > 5: parts.append(f"S={m[5]:+.1f}")
+        extra = "  " + " ".join(parts) if parts else ""
+        return m[0], m[1], m[2], extra
 
 
 def _replay_to(moves_data, board_size, target, is_sgf):
@@ -355,19 +358,26 @@ def main():
 def view_single_file(path, board_size, game_idx):
     if path.endswith(".sgf"):
         bs, komi, moves, result, pb, pw = read_sgf(path)
-        title = f"{os.path.basename(path)}  B={pb} W={pw}  Result={result}"
+        title = (f"{os.path.basename(path)}\n"
+                 f"  Black: {pb}  vs  White: {pw}\n"
+                 f"  Komi: {komi}  Result: {result}")
         view_game_interactive(bs, moves, title=title, is_sgf=True)
     elif ".bin" in path:
         records = read_bin_file(path)
+        print(f"  Loaded {len(records)} records ({len(records)//8} moves × 8 augmentations)")
         game = extract_games_from_bin(records, board_size)
         if not game:
             print(f"No games in {path}")
             return
         g = game[0]
         moves = replay_game_from_bin(g, board_size)
-        result_val = g[0][2]  # value from first position
-        title = (f"{os.path.basename(path)}  "
-                 f"{len(moves)} moves  value={result_val:+.2f}")
+        # Show outcome from first position's value and final score
+        first_val = g[0][2]
+        first_score = g[0][3]
+        outcome = "Black wins" if first_val > 0 else "White wins" if first_val < 0 else "Draw"
+        title = (f"{os.path.basename(path)}\n"
+                 f"  {len(moves)} moves  {outcome}\n"
+                 f"  Value: {first_val:+.2f}  Score: {first_score:+.1f} pts")
         view_game_interactive(board_size, moves, title=title, is_sgf=False)
     else:
         print(f"Unknown file format: {path}")
