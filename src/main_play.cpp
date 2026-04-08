@@ -92,126 +92,107 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
     }
 
     // Board left-aligned; right side reserved for info
-    // Each cell = 4 chars wide (intersection + 3 hlines), 2 rows tall (grid + vline)
     int ox = 5;   // left margin for row labels
     int oy = 3;
-    int cell_w = 4;  // chars per cell horizontally
+    int cell_w = 2;  // chars per cell (intersection + 1 hline)
 
-    // Column labels (spaced by cell_w)
+    // Column labels
     wattron(win, COLOR_PAIR(CP_LABEL));
     for (int c = 0; c < n; c++)
         mvwaddch(win, oy - 1, ox + c * cell_w, GO_COLS[c]);
     wattroff(win, COLOR_PAIR(CP_LABEL));
 
-    // Board grid with vertical connectors
-    // Each board row r occupies 2 screen rows: grid row + vline row
-    // except the last row has no vline row below
-    int board_h = n * 2 - 1;  // total screen rows for board
+    // Board: single-height rows, 2 chars per cell
+    for (int r = 0; r < n; r++) {
+        int y = oy + r;
 
-    for (int sr = 0; sr < board_h; sr++) {
-        bool is_grid_row = (sr % 2 == 0);
-        int r = sr / 2;  // board row
-        int y = oy + sr;
-
-        if (is_grid_row) {
-            // Row label
-            char rl[4];
-            snprintf(rl, sizeof(rl), "%2d", n - r);
-            wattron(win, COLOR_PAIR(CP_LABEL));
-            mvwaddstr(win, y, ox - 3, rl);
-            wattroff(win, COLOR_PAIR(CP_LABEL));
-        }
+        // Row label
+        char rl[4];
+        snprintf(rl, sizeof(rl), "%2d", n - r);
+        wattron(win, COLOR_PAIR(CP_LABEL));
+        mvwaddstr(win, y, ox - 3, rl);
+        wattroff(win, COLOR_PAIR(CP_LABEL));
 
         for (int c = 0; c < n; c++) {
             int x = ox + c * cell_w;
 
-            if (is_grid_row) {
-                // ── Grid row: intersections + horizontal lines ──
-                chtype grid_ch;
-                if (r == 0) {
-                    if (c == 0) grid_ch = ACS_ULCORNER;
-                    else if (c == n-1) grid_ch = ACS_URCORNER;
-                    else grid_ch = ACS_TTEE;
-                } else if (r == n-1) {
-                    if (c == 0) grid_ch = ACS_LLCORNER;
-                    else if (c == n-1) grid_ch = ACS_LRCORNER;
-                    else grid_ch = ACS_BTEE;
-                } else {
-                    if (c == 0) grid_ch = ACS_LTEE;
-                    else if (c == n-1) grid_ch = ACS_RTEE;
-                    else grid_ch = ACS_PLUS;
-                }
-
-                bool is_cursor = (r == cursor_r && c == cursor_c);
-                bool is_last   = (r == last_r && c == last_c);
-                int cell = game.board[r][c];
-
-                if (cell == BLACK) {
-                    int attr = COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD;
-                    wattron(win, attr);
-                    mvwprintw(win, y, x, "\xe2\xac\xa4");  // ⬤ U+2B24
-                    wattroff(win, attr);
-                } else if (cell == WHITE) {
-                    int attr = COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD;
-                    wattron(win, attr);
-                    mvwprintw(win, y, x, " \xe2\x83\x9d");  // space + U+20DD combining circle
-                    wattroff(win, attr);
-                } else if (is_cursor && !game.game_over) {
-                    wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
-                    if (game.current_player == BLACK)
-                        mvwprintw(win, y, x, "\xe2\xac\xa4");  // ⬤
-                    else
-                        mvwprintw(win, y, x, " \xe2\x83\x9d");  // space + combining circle
-                    wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
-                } else if (is_star_point(r, c, n)) {
-                    wattron(win, COLOR_PAIR(CP_ACCENT));
-                    mvwaddch(win, y, x, '*');
-                    wattroff(win, COLOR_PAIR(CP_ACCENT));
-                } else {
-                    wattron(win, COLOR_PAIR(CP_GRID));
-                    mvwaddch(win, y, x, grid_ch);
-                    wattroff(win, COLOR_PAIR(CP_GRID));
-                }
-
-                // Horizontal connector to the right
-                if (c < n - 1) {
-                    // U+2B24 = 1 wide, space+U+20DD = 2 wide
-                    bool is_white = (cell == WHITE || (is_cursor && !game.game_over && game.current_player == WHITE));
-                    int stone_w = (cell != EMPTY || (is_cursor && !game.game_over)) ? (is_white ? 2 : 1) : 1;
-                    wattron(win, COLOR_PAIR(CP_GRID));
-                    for (int k = x + stone_w; k < x + cell_w; k++)
-                        mvwaddch(win, y, k, ACS_HLINE);
-                    wattroff(win, COLOR_PAIR(CP_GRID));
-                }
+            // Grid character
+            chtype grid_ch;
+            if (r == 0) {
+                if (c == 0) grid_ch = ACS_ULCORNER;
+                else if (c == n-1) grid_ch = ACS_URCORNER;
+                else grid_ch = ACS_TTEE;
+            } else if (r == n-1) {
+                if (c == 0) grid_ch = ACS_LLCORNER;
+                else if (c == n-1) grid_ch = ACS_LRCORNER;
+                else grid_ch = ACS_BTEE;
             } else {
-                // ── Vertical connector row ──
-                if (r < n - 1) {
-                    wattron(win, COLOR_PAIR(CP_GRID));
-                    mvwaddch(win, y, x, ACS_VLINE);
-                    wattroff(win, COLOR_PAIR(CP_GRID));
-                }
+                if (c == 0) grid_ch = ACS_LTEE;
+                else if (c == n-1) grid_ch = ACS_RTEE;
+                else grid_ch = ACS_PLUS;
+            }
+
+            bool is_cursor = (r == cursor_r && c == cursor_c);
+            bool is_last   = (r == last_r && c == last_c);
+            int cell = game.board[r][c];
+
+            if (cell == BLACK) {
+                wattron(win, COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD);
+                mvwaddch(win, y, x, 'X');
+                wattroff(win, COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD);
+            } else if (cell == WHITE) {
+                wattron(win, COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD);
+                mvwaddch(win, y, x, 'O');
+                wattroff(win, COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD);
+            } else if (is_cursor && !game.game_over) {
+                char ghost = (game.current_player == BLACK) ? 'X' : 'O';
+                wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+                mvwaddch(win, y, x, ghost);
+                wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+            } else if (is_star_point(r, c, n)) {
+                wattron(win, COLOR_PAIR(CP_ACCENT));
+                mvwaddch(win, y, x, '*');
+                wattroff(win, COLOR_PAIR(CP_ACCENT));
+            } else {
+                wattron(win, COLOR_PAIR(CP_GRID));
+                mvwaddch(win, y, x, grid_ch);
+                wattroff(win, COLOR_PAIR(CP_GRID));
+            }
+
+            // Horizontal connector
+            if (c < n - 1) {
+                wattron(win, COLOR_PAIR(CP_GRID));
+                mvwaddch(win, y, x + 1, ACS_HLINE);
+                wattroff(win, COLOR_PAIR(CP_GRID));
             }
         }
 
-        // Row label on right (grid rows only)
-        if (is_grid_row) {
-            wattron(win, COLOR_PAIR(CP_LABEL));
-            char rl[4];
-            snprintf(rl, sizeof(rl), "%d", n - r);
-            mvwaddstr(win, y, ox + (n - 1) * cell_w + 3, rl);
-            wattroff(win, COLOR_PAIR(CP_LABEL));
-        }
+        // Row label right
+        wattron(win, COLOR_PAIR(CP_LABEL));
+        char rr[4];
+        snprintf(rr, sizeof(rr), "%d", n - r);
+        mvwaddstr(win, y, ox + (n - 1) * cell_w + 2, rr);
+        wattroff(win, COLOR_PAIR(CP_LABEL));
     }
 
     // Column labels bottom
-    int bot_y = oy + board_h;
     wattron(win, COLOR_PAIR(CP_LABEL));
     for (int c = 0; c < n; c++)
-        mvwaddch(win, bot_y, ox + c * cell_w, GO_COLS[c]);
+        mvwaddch(win, oy + n, ox + c * cell_w, GO_COLS[c]);
     wattroff(win, COLOR_PAIR(CP_LABEL));
 
+    // Cursor brackets
+    if (!game.game_over && cursor_r >= 0 && cursor_c >= 0) {
+        int cx = ox + cursor_c * cell_w;
+        int cy = oy + cursor_r;
+        wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+        mvwaddch(win, cy, cx - 1, '[');
+        mvwaddch(win, cy, cx + 1, ']');
+        wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
+    }
+
     // ── Right-side info panel ──
-    int panel_x = ox + n * cell_w + 5;  // right of board
+    int panel_x = ox + n * cell_w + 4;  // right of board
     int panel_y = oy;
     int panel_w = w - panel_x - 1;
     if (panel_w < 10) panel_w = 10;
@@ -251,7 +232,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
     }
 
     // Help at bottom
-    int help_y = std::max(oy + board_h + 1, (int)(panel_y + 2));
+    int help_y = std::max(oy + n + 1, (int)(panel_y + 2));
     const char* help = "Arrows/WASD: move  Enter: place  P: pass  Q: quit";
     wattron(win, COLOR_PAIR(CP_LABEL));
     mvwaddnstr(win, std::min(help_y, h - 1), 2, help, w - 4);
