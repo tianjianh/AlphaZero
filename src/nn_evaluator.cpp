@@ -22,8 +22,14 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
     std::cout << "], backend=" << context_->backend_name() << "\n";
 
     // Spawn N server threads — each creates its own ComputeHandle
+    num_threads_ = num_threads;
     for (int i = 0; i < num_threads; i++)
         server_threads_.emplace_back(&NNEvaluator::server_loop, this, i, gpu_ids[i]);
+}
+
+void NNEvaluator::wait_ready() {
+    std::unique_lock<std::mutex> lock(ready_mutex_);
+    ready_cv_.wait(lock, [this] { return handles_ready_ >= num_threads_; });
 }
 
 NNEvaluator::~NNEvaluator() {
@@ -102,6 +108,13 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
 void NNEvaluator::server_loop(int thread_id, int gpu_id) {
     // Create ComputeHandle ON this thread — uploads weights to GPU
     auto handle = context_->create_handle(model_.get(), gpu_id, max_batch_size_);
+
+    // Signal that this thread's handle is ready
+    {
+        std::lock_guard<std::mutex> lock(ready_mutex_);
+        handles_ready_++;
+    }
+    ready_cv_.notify_all();
 
     std::vector<NNResultBuf*> batch;
     batch.reserve(max_batch_size_);

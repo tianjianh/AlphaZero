@@ -46,6 +46,11 @@ public:
     // Convenience: creates a temporary buf (for root eval, once per move)
     Result evaluate_single(const std::vector<float>& state) override;
 
+    // Block until all server threads have created their ComputeHandles.
+    // Call this after construction to ensure GPU resources are fully
+    // initialized before starting another NNEvaluator on the same GPUs.
+    void wait_ready();
+
 private:
     void server_loop(int thread_id, int gpu_id);
 
@@ -61,6 +66,12 @@ private:
 
     // N server threads (one per GPU assignment)
     std::vector<std::thread>      server_threads_;
+
+    // Ready synchronization — server threads signal when handle is created
+    std::mutex                    ready_mutex_;
+    std::condition_variable       ready_cv_;
+    int                           handles_ready_ = 0;
+    int                           num_threads_   = 0;
 };
 
 }  // namespace minigo

@@ -213,16 +213,22 @@ int main(int argc, char* argv[]) {
     if (score_weight >= 0) config.score_weight = score_weight;
     if (score_scale >= 0) config.score_scale = score_scale;
 
-    // Separate compute contexts for each model (safe across all backends)
+    // Separate compute contexts for each model
     auto ctx1 = std::shared_ptr<ComputeContext>(
         create_compute_context(device_ids));
     auto ctx2 = std::shared_ptr<ComputeContext>(
         create_compute_context(device_ids));
 
+    // Serialize handle creation — TensorRT engine deserialization on the
+    // same GPU from two different runtimes can race at the CUDA driver
+    // level.  Wait for eval1's server threads to finish creating their
+    // handles (engine loaded, buffers allocated) before starting eval2.
     auto eval1 = std::make_shared<NNEvaluator>(
         model1, ctx1, device_ids, max_batch_size);
+    eval1->wait_ready();
     auto eval2 = std::make_shared<NNEvaluator>(
         model2, ctx2, device_ids, max_batch_size);
+    eval2->wait_ready();
 
     auto model_desc = [](const LoadedModel* m) -> std::string {
         if (m->model_type == "vit")
