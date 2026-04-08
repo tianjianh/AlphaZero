@@ -257,13 +257,30 @@ Enter = next, `b` = back, `s` = skip to end, number = jump to move, `q` = quit.
 # Against trained model (backend selected at compile time)
 ./build/play --model models/best.onnx --sims 800
 
-# Multi-GPU with larger batch
-./build/play --model models/best.onnx --sims 800 \
-    --max-batch 512 --nn-server-threads 2 --nn-device-ids 0,0
+# Human vs Human (with optional analysis)
+./build/play --model models/best.onnx  # choose H at mode prompt
 
 # Against random bot (no model needed)
 ./build/play --random --board 9
 ```
+
+The play UI uses **ncurses** with ACS line-drawing for a clean terminal board.
+Arrow keys or coordinate typing (e.g., `D4`) to place stones — no Enter needed
+for movement.
+
+**Modes**: (B)lack vs AI, (W)hite vs AI, (H)uman vs Human.
+
+**Live analysis**: Press `a` during your turn to toggle MCTS analysis. The search
+runs in a background thread; the UI polls the tree every 500ms (KataGo pattern)
+and shows the top moves with win rate and visit counts:
+```
+WR 65.0%  Score +5.3  N=1234
+| D5   65.0% n=523
+| E3   22.1% n=234
+| C6   12.4% n=128
+```
+Press `a` again or make a move to stop analysis. `--pvs K` sets the number of
+top moves shown (default 5).
 
 ### Benchmark
 
@@ -355,6 +372,34 @@ threads descend and submit leaves for batch N+1.  Steady-state batch size
 ```
 total_search_threads = min(games, threads) × search_threads
 ```
+
+### Analysis Polling API (KataGo pattern)
+
+`MCTS::get_analysis(max_moves)` reads the live search tree via atomics — safe
+to call from any thread while search is running, no locks needed.  Returns:
+
+```cpp
+struct AnalysisInfo {
+    vector<MoveInfo> moves;   // top moves sorted by visits
+    int   total_visits;       // root visit count
+    float root_utility;       // mean Q (blended value + score)
+    float root_score;         // NN raw score estimate (points)
+};
+```
+
+Each `MoveInfo` contains: action, visits, prior (policy), utility (Q-value).
+
+**Live analysis** in the play UI uses this: a background thread runs
+`search()` with a large sim count, while the main thread polls
+`get_analysis()` every 500ms and redraws the display.  `request_stop()`
+sets an atomic flag that search threads check each playout, enabling
+clean early termination when the user makes a move.
+
+The tree persists as an `MCTS` member (`root_`) between `search()` and
+`get_analysis()` calls.  It is only replaced when the next `search()` starts.
+No separate reporter thread — the main thread handles both polling and input
+sequentially, avoiding the tree-lifetime race that KataGo's independent
+reporter thread must coordinate around.
 
 ### KataGo-style NNEvaluator
 
@@ -546,7 +591,8 @@ Two architectures (`scripts/model.py`), selected with `--arch`:
 
 **ResNet** (default): AlphaZero-style dual-conv residual blocks.
 **ViT**: Vision Transformer with one token per intersection, GQA, and
-D4-invariant positional encoding (orbit embedding + invariant relative bias).
+directional positional encoding (factorized row/col embedding + signed
+relative bias for full spatial and directional awareness).
 
 Both share the same triple-headed output:
 
@@ -562,9 +608,11 @@ shapes as before: policy `[B, 82]`, value `[B, 1]` in [-1,1], score `[B, 1]`
 in raw points.  Training applies MSE for value and CE for score.  Mixed precision (BF16 on Ampere+, FP16+GradScaler on Turing) is
 enabled automatically.
 
-**ViT positional encoding** — fully D4-invariant (compatible with dihedral augmentation):
-- *Orbit embedding*: 15 equivalence classes under rotation/reflection (`Embedding(15, d_model)`)
-- *Relative bias*: 45 displacement buckets indexed by `sorted(|dx|, |dy|)` per attention head
+**ViT positional encoding** — directional (D4 symmetry via data augmentation):
+- *Factorized position*: `row_embed[r] + col_embed[c]` — 9+9=18 learned embeddings, full spatial resolution
+- *Directional relative bias*: signed `(dx, dy)` offsets — 289 buckets for 9×9. Each direction is unique
+  (north ≠ south ≠ east ≠ west), enabling the model to learn directional attention for captures,
+  ladders, and edge awareness
 - *GQA*: 6 query heads, 2 KV groups (3 queries share each K/V group)
 
 The score head (inspired by KataGo) lets MCTS prefer moves that win by more
