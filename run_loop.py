@@ -205,9 +205,9 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
         return [{"name": "Quick test", "start": 1, "end": 5,
                  "games": 20, "sims": 100, "epochs": 5, "lr": lr, "eval_games": 0}]
 
-    # Learning rates: ViT needs higher LR for longer than ResNet
+    # Learning rates: ViT uses lower LR, scaled for batch_size=128
     if vit:
-        lrs = ["8e-4", "6e-4", "5e-4", "4e-4", "3e-4", "2e-4"]
+        lrs = ["6e-4", "5e-4", "4e-4", "3e-4", "2.5e-4", "1.5e-4"]
     else:
         lrs = ["1.2e-3", "9e-4", "6e-4", "4.5e-4", "3e-4", "2e-4"]
 
@@ -259,7 +259,7 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
 def generate_plan(board, filters, blocks, preset, arch="resnet",
                    d_model=192, depth=8, heads=6, kv_groups=2, mlp_ratio=4):
     komi = 7.5 if board >= 13 else 6.5
-    batch_size = 512
+    batch_size = 128 if arch == "vit" else 512
     eval_threshold = 0.52
     window = 6
     temp_threshold = 15
