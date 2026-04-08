@@ -320,7 +320,7 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 // ================================================================
 
 void MCTS::search(GoGame& game, std::vector<float>& visits,
-                  int num_simulations, bool add_noise) {
+                  int num_simulations, bool add_noise, SearchInfo* info) {
     if (num_simulations < 0) num_simulations = config_.num_simulations;
 
     int action_size = config_.action_size();
@@ -361,19 +361,29 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     for (auto& t : search_threads)
         t.join();
 
-    // ── Extract visit counts ─────────────────────────────────────
+    // ── Extract visit counts + root stats ──────────────────────────
     visits.assign(action_size, 0.0f);
     for (int a = 0; a < (int)root->children.size(); a++)
         if (root->children[a])
             visits[a] = (float)root->children[a]->visit_count.load(std::memory_order_relaxed);
+
+    if (info) {
+        int vc = root->visit_count.load(std::memory_order_relaxed);
+        // Root's total_value is from current player's perspective
+        info->root_value  = (vc > 0) ? root->total_value() / (float)vc : 0.0f;
+        info->total_visits = vc;
+        int best = (int)(std::max_element(visits.begin(), visits.end()) - visits.begin());
+        info->best_visits = (int)visits[best];
+    }
 }
 
 int MCTS::get_action(GoGame& game, std::vector<float>& policy,
-                     float temperature, int num_simulations, bool add_noise) {
+                     float temperature, int num_simulations,
+                     bool add_noise, SearchInfo* info) {
     int action_size = config_.action_size();
 
     std::vector<float> visits;
-    search(game, visits, num_simulations, add_noise);
+    search(game, visits, num_simulations, add_noise, info);
 
     if (temperature == 0.0f) {
         int best = (int)(std::max_element(visits.begin(), visits.end())

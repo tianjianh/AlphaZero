@@ -5,6 +5,7 @@
 #include "compute_context.h"
 #include "nn_evaluator.h"
 #include <algorithm>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <random>
@@ -178,11 +179,12 @@ int main(int argc, char* argv[]) {
                 std::cout << "AI thinking (" << config.num_simulations << " sims)...\n";
 
                 int action;
+                MCTS::SearchInfo si;
                 if (use_random) {
                     action = random_legal_move(game);
                 } else {
                     std::vector<float> pi;
-                    action = mcts->get_action(game, pi, 0.0f, -1, false);
+                    action = mcts->get_action(game, pi, 0.0f, -1, false, &si);
                 }
 
                 std::string move_str;
@@ -191,7 +193,17 @@ int main(int argc, char* argv[]) {
                 } else {
                     move_str = game.action_to_str(action); game.play(action);
                 }
-                std::cout << "AI plays: " << move_str << "\n\n";
+                std::cout << "AI plays: " << move_str;
+                if (!use_random) {
+                    // Show MCTS stats — value from AI's perspective
+                    float winrate = (si.root_value + 1.0f) / 2.0f * 100.0f;
+                    std::cout << std::fixed << std::setprecision(1)
+                              << "  (V=" << si.root_value
+                              << " WR=" << winrate << "%"
+                              << " visits=" << si.best_visits
+                              << "/" << si.total_visits << ")";
+                }
+                std::cout << "\n\n";
             }
         }
 

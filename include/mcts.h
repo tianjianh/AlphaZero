@@ -93,12 +93,20 @@ class MCTS {
 public:
     MCTS(BatchEvaluator* evaluator, const Config& config);
 
+    // Stats from the MCTS root after search (no extra compute)
+    struct SearchInfo {
+        float root_value = 0.0f;  // mean Q from current player's perspective
+        int   total_visits = 0;
+        int   best_visits = 0;    // visits on the selected move
+    };
+
     void search(GoGame& game, std::vector<float>& visits,
-                int num_simulations = -1, bool add_noise = true);
+                int num_simulations = -1, bool add_noise = true,
+                SearchInfo* info = nullptr);
 
     int get_action(GoGame& game, std::vector<float>& policy,
                    float temperature = 1.0f, int num_simulations = -1,
-                   bool add_noise = true);
+                   bool add_noise = true, SearchInfo* info = nullptr);
 
 private:
     BatchEvaluator* evaluator_;
