@@ -179,17 +179,17 @@ def _stage(name, start, end, games, sims, epochs, lr, eval_games,
 #                    score_wt  sw_loss  window  c_puct  temp  dir_eps
 _EXPLORE = [
     # Bootstrap:     aggressive explore — network is random
-    (0.0,   0.1,     3,      2.0,    20,   0.30),
-    # Warm up:       still exploring, score head too noisy to use
-    (0.0,   0.2,     3,      1.75,   18,   0.28),
-    # Early gated:   tiny score influence, keep exploring
-    (0.02,  0.3,     4,      1.5,    15,   0.25),
+    (0.0,   0.05,    3,      2.0,    20,   0.30),
+    # Warm up:       still exploring, score head too noisy
+    (0.0,   0.05,    3,      1.75,   18,   0.28),
+    # Early gated:   tiny score, keep exploring
+    (0.02,  0.1,     4,      1.5,    15,   0.25),
     # Consolidate:   still exploring — model needs diverse data
-    (0.02,  0.3,     6,      1.5,    15,   0.25),
+    (0.02,  0.1,     6,      1.5,    15,   0.25),
     # Steady:        start exploiting, score head becoming useful
-    (0.05,  0.4,     8,      1.25,   12,   0.22),
+    (0.05,  0.15,    8,      1.25,   12,   0.22),
     # Overnight:     moderate exploitation
-    (0.1,   0.5,     8,      1.1,    12,   0.20),
+    (0.1,   0.2,     8,      1.1,    12,   0.20),
 ]
 # Large preset uses wider windows for later stages
 _EXPLORE_LARGE = list(_EXPLORE)
@@ -213,8 +213,9 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
 
     if preset == "small":
         ex = _EXPLORE
-        # ViT needs more epochs than ResNet (no conv inductive bias)
-        vit_e = [8, 6, 5, 5, 4, 3] if vit else [8, 6, 4, 3, 3, 3]
+        # Fewer epochs early (noisy data), more later (quality data)
+        # ViT gets slightly more than ResNet (no conv inductive bias)
+        vit_e = [3, 3, 4, 5, 6, 6] if vit else [3, 3, 3, 4, 5, 5]
         return [
             _stage("Bootstrap",       1,  4,   400, 200, vit_e[0], lrs[0], 0,   *ex[0]),
             _stage("Warm up",         5,  8,   600, 300, vit_e[1], lrs[1], 0,   *ex[1]),
@@ -225,7 +226,7 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
         ]
     if preset == "large":
         ex = _EXPLORE_LARGE
-        vit_e = [8, 6, 5, 5, 4, 3] if vit else [8, 6, 4, 3, 3, 3]
+        vit_e = [3, 3, 4, 5, 6, 6] if vit else [3, 3, 3, 4, 5, 5]
         return [
             _stage("Bootstrap",        1,   6,  800, 300, vit_e[0], lrs[0], 0,   *ex[0]),
             _stage("Warm up",          7,  15, 1200, 400, vit_e[1], lrs[1], 0,   *ex[1]),
