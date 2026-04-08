@@ -575,6 +575,16 @@ struct CUDAComputeHandle::Impl {
     void*  buf_scr_bins= nullptr;  // [num_bins, N]
     float* buf_scr_out = nullptr;  // [N] FP32
 
+    // CUDA graph cache — replays the entire compute pipeline without
+    // per-kernel launch overhead (~5-10µs × 21 kernels eliminated)
+    cudaGraph_t     graph      = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    int             graph_batch = 0;
+
+    // Host-side pre-allocated buffers (avoid per-call std::vector alloc)
+    std::vector<float> host_input;
+    std::vector<float> host_pol, host_val, host_scr;
+
     int alloc_batch = 0;
     int board_size, input_channels, num_filters, num_res_blocks, num_score_bins;
 
@@ -653,10 +663,99 @@ struct CUDAComputeHandle::Impl {
         fr(buf_flat_in); fr(buf_input); fr(buf_main); fr(buf_temp); fr(buf_skip);
         fr(buf_pol_out); fr(buf_pol_feat); fr(buf_val_h1); fr(buf_val_feat); fr(buf_val_out);
         fr(buf_scr_h1); fr(buf_scr_feat); fr(buf_scr_bins); fr(buf_scr_out);
+        if (graph_exec) { cudaGraphExecDestroy(graph_exec); graph_exec = nullptr; }
+        if (graph) { cudaGraphDestroy(graph); graph = nullptr; }
+        graph_batch = 0;
         alloc_batch = 0;
     }
 
     static constexpr int WMMA_SMEM_BYTES = TILE_M * (TILE_N + 8) * (int)sizeof(float);
+
+    // Launch the entire compute pipeline (transpose + trunk + heads).
+    // Called during graph capture AND during non-graph execution.
+    // Uses local pointer copies for ping-pong (doesn't modify members).
+    void launch_compute(int N) {
+        int H = board_size, W = board_size, HW = H * W;
+        int action_size = HW + 1;
+
+        // Transpose
+        size_t input_floats = (size_t)N * input_channels * HW;
+        int thr = 256, blk = (int)((input_floats + thr - 1) / thr);
+        if (use_fp16)
+            transpose_nchw_fp32_to_fp16<<<blk, thr, 0, dev.stream>>>(
+                buf_flat_in, (half*)buf_input, N, input_channels, HW);
+        else
+            transpose_nchw_fp32<<<blk, thr, 0, dev.stream>>>(
+                buf_flat_in, (float*)buf_input, N, input_channels, HW);
+
+        // Input conv
+        run_conv3x3(buf_input, buf_main, input_conv_gpu, nullptr, N, H, W, 1, true);
+
+        // Residual blocks — use local pointers for ping-pong
+        void* cur = buf_main;
+        void* alt = buf_skip;
+        for (int i = 0; i < num_res_blocks; i++) {
+            run_conv3x3(cur, buf_temp, res_conv1_gpu[i], nullptr, N, H, W, 1, true);
+            run_conv3x3(buf_temp, alt, res_conv2_gpu[i], cur, N, H, W, 2, true);
+            std::swap(cur, alt);
+        }
+        // cur now points to the trunk output
+
+        // Policy head
+        run_conv1x1(cur, buf_pol_out, policy_conv_gpu, N, HW);
+        {
+            int M = policy_fc_gpu.out_features, K = policy_fc_gpu.in_features;
+            int smem = use_fp16 ? K * (int)sizeof(half) : K * (int)sizeof(float);
+            if (use_fp16)
+                fc_bias_softmax_fp16_to_fp32<<<N, 32, smem, dev.stream>>>(
+                    (const half*)policy_fc_gpu.weight, (const half*)buf_pol_out, buf_pol_feat,
+                    policy_fc_gpu.bias, M, N, K);
+            else
+                fc_bias_softmax_fp32<<<N, 32, smem, dev.stream>>>(
+                    (const float*)policy_fc_gpu.weight, (const float*)buf_pol_out, buf_pol_feat,
+                    policy_fc_gpu.bias, M, N, K);
+        }
+
+        // Value head
+        run_conv1x1(cur, buf_val_h1, value_conv_gpu, N, HW);
+        run_fc(buf_val_h1, buf_val_feat, value_fc1_gpu, N, true);
+        {
+            int K = value_fc2_gpu.in_features;
+            if (use_fp16)
+                fc_bias_tanh_fp16_to_fp32<<<N, 32, 0, dev.stream>>>(
+                    (const half*)value_fc2_gpu.weight, (const half*)buf_val_feat, buf_val_out,
+                    value_fc2_gpu.bias, N, K);
+            else
+                fc_bias_tanh_fp32<<<N, 32, 0, dev.stream>>>(
+                    (const float*)value_fc2_gpu.weight, (const float*)buf_val_feat, buf_val_out,
+                    value_fc2_gpu.bias, N, K);
+        }
+
+        // Score head
+        run_conv1x1(cur, buf_scr_h1, score_conv_gpu, N, HW);
+        run_fc(buf_scr_h1, buf_scr_feat, score_fc1_gpu, N, true);
+        run_fc(buf_scr_feat, buf_scr_bins, score_fc2_gpu, N, false);
+        {
+            if (use_fp16)
+                score_softmax_ev_fp16<<<N, 32, 0, dev.stream>>>(
+                    (const half*)buf_scr_bins, buf_scr_out, bin_values_gpu, N, num_score_bins);
+            else
+                score_softmax_ev_fp32<<<N, 32, 0, dev.stream>>>(
+                    (const float*)buf_scr_bins, buf_scr_out, bin_values_gpu, N, num_score_bins);
+        }
+    }
+
+    void ensure_graph(int N) {
+        if (N == graph_batch) return;
+        if (graph_exec) { cudaGraphExecDestroy(graph_exec); graph_exec = nullptr; }
+        if (graph) { cudaGraphDestroy(graph); graph = nullptr; }
+
+        CUDA_CHECK(cudaStreamBeginCapture(dev.stream, cudaStreamCaptureModeGlobal));
+        launch_compute(N);
+        CUDA_CHECK(cudaStreamEndCapture(dev.stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        graph_batch = N;
+    }
 
     // ── Dispatch helpers ────────────────────────────────────
     void run_conv3x3(void* in, void* out, const ConvBNGPU& conv, void* residual,
@@ -792,96 +891,33 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
 
     I.allocate_workspace(N);
 
-    // Upload FP32 inputs
+    // Flatten input into pre-allocated host buffer
     size_t input_floats = (size_t)N * I.input_channels * HW;
-    std::vector<float> flat_input;
-    flat_input.reserve(input_floats);
-    for (auto& s : states)
-        flat_input.insert(flat_input.end(), s.begin(), s.end());
+    I.host_input.resize(input_floats);
+    float* dst = I.host_input.data();
+    for (auto& s : states) {
+        std::memcpy(dst, s.data(), s.size() * sizeof(float));
+        dst += s.size();
+    }
 
-    CUDA_CHECK(cudaMemcpyAsync(I.buf_flat_in, flat_input.data(),
+    // Upload input (not part of graph — source address changes)
+    CUDA_CHECK(cudaMemcpyAsync(I.buf_flat_in, I.host_input.data(),
         input_floats * sizeof(float), cudaMemcpyHostToDevice, I.dev.stream));
 
-    // Transpose NCHW → channel-major (+ FP16 convert if needed)
-    {
-        int C = I.input_channels;
-        int threads = 256, blocks = (int)((input_floats + threads - 1) / threads);
-        if (I.use_fp16)
-            transpose_nchw_fp32_to_fp16<<<blocks, threads, 0, I.dev.stream>>>(
-                I.buf_flat_in, (half*)I.buf_input, N, C, HW);
-        else
-            transpose_nchw_fp32<<<blocks, threads, 0, I.dev.stream>>>(
-                I.buf_flat_in, (float*)I.buf_input, N, C, HW);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    // Execute compute pipeline via CUDA graph (or capture on first call / batch change)
+    I.ensure_graph(N);
+    CUDA_CHECK(cudaGraphLaunch(I.graph_exec, I.dev.stream));
 
-    // Input conv 3×3 + BN + ReLU
-    I.run_conv3x3(I.buf_input, I.buf_main, I.input_conv_gpu, nullptr, N, H, W, 1, true);
+    // Read back results into pre-allocated host buffers
+    I.host_pol.resize((size_t)action_size * N);
+    I.host_val.resize(N);
+    I.host_scr.resize(N);
 
-    // Residual blocks
-    for (int i = 0; i < I.num_res_blocks; i++) {
-        I.run_conv3x3(I.buf_main, I.buf_temp, I.res_conv1_gpu[i], nullptr, N, H, W, 1, true);
-        I.run_conv3x3(I.buf_temp, I.buf_skip, I.res_conv2_gpu[i], I.buf_main, N, H, W, 2, true);
-        std::swap(I.buf_main, I.buf_skip);
-    }
-
-    // ── Policy head ──────────────────────────────────────────
-    I.run_conv1x1(I.buf_main, I.buf_pol_out, I.policy_conv_gpu, N, HW);
-    {
-        int M = I.policy_fc_gpu.out_features, K = I.policy_fc_gpu.in_features;
-        int smem = I.use_fp16 ? K * (int)sizeof(half) : K * (int)sizeof(float);
-        if (I.use_fp16)
-            fc_bias_softmax_fp16_to_fp32<<<N, 32, smem, I.dev.stream>>>(
-                (const half*)I.policy_fc_gpu.weight, (const half*)I.buf_pol_out, I.buf_pol_feat,
-                I.policy_fc_gpu.bias, M, N, K);
-        else
-            fc_bias_softmax_fp32<<<N, 32, smem, I.dev.stream>>>(
-                (const float*)I.policy_fc_gpu.weight, (const float*)I.buf_pol_out, I.buf_pol_feat,
-                I.policy_fc_gpu.bias, M, N, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ── Value head ───────────────────────────────────────────
-    I.run_conv1x1(I.buf_main, I.buf_val_h1, I.value_conv_gpu, N, HW);
-    I.run_fc(I.buf_val_h1, I.buf_val_feat, I.value_fc1_gpu, N, true);
-    {
-        int K = I.value_fc2_gpu.in_features;
-        if (I.use_fp16)
-            fc_bias_tanh_fp16_to_fp32<<<N, 32, 0, I.dev.stream>>>(
-                (const half*)I.value_fc2_gpu.weight, (const half*)I.buf_val_feat, I.buf_val_out,
-                I.value_fc2_gpu.bias, N, K);
-        else
-            fc_bias_tanh_fp32<<<N, 32, 0, I.dev.stream>>>(
-                (const float*)I.value_fc2_gpu.weight, (const float*)I.buf_val_feat, I.buf_val_out,
-                I.value_fc2_gpu.bias, N, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ── Score head ───────────────────────────────────────────
-    I.run_conv1x1(I.buf_main, I.buf_scr_h1, I.score_conv_gpu, N, HW);
-    I.run_fc(I.buf_scr_h1, I.buf_scr_feat, I.score_fc1_gpu, N, true);
-    // FC2: [64, N] → [num_bins, N] + bias, no activation
-    I.run_fc(I.buf_scr_feat, I.buf_scr_bins, I.score_fc2_gpu, N, false);
-    // Softmax over bins → expected value → FP32
-    {
-        if (I.use_fp16)
-            score_softmax_ev_fp16<<<N, 32, 0, I.dev.stream>>>(
-                (const half*)I.buf_scr_bins, I.buf_scr_out, I.bin_values_gpu, N, I.num_score_bins);
-        else
-            score_softmax_ev_fp32<<<N, 32, 0, I.dev.stream>>>(
-                (const float*)I.buf_scr_bins, I.buf_scr_out, I.bin_values_gpu, N, I.num_score_bins);
-        CUDA_CHECK(cudaGetLastError());
-    }
-
-    // ── Read back FP32 results ───────────────────────────────
-    std::vector<float> pol_flat((size_t)action_size * N);
-    std::vector<float> val_flat(N), scr_flat(N);
-
-    CUDA_CHECK(cudaMemcpyAsync(pol_flat.data(), I.buf_pol_feat,
-        pol_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
-    CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.buf_val_out,
+    CUDA_CHECK(cudaMemcpyAsync(I.host_pol.data(), I.buf_pol_feat,
+        I.host_pol.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+    CUDA_CHECK(cudaMemcpyAsync(I.host_val.data(), I.buf_val_out,
         N * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
-    CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.buf_scr_out,
+    CUDA_CHECK(cudaMemcpyAsync(I.host_scr.data(), I.buf_scr_out,
         N * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
 
     CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
@@ -891,10 +927,10 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     for (int n = 0; n < N; n++) {
         std::vector<float> pol(action_size);
         for (int a = 0; a < action_size; a++)
-            pol[a] = pol_flat[a * N + n];
+            pol[a] = I.host_pol[a * N + n];
         results[n].policy = std::move(pol);
-        results[n].value  = val_flat[n];
-        results[n].score  = scr_flat[n];
+        results[n].value  = I.host_val[n];
+        results[n].score  = I.host_scr[n];
     }
     return results;
 }
