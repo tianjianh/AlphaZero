@@ -32,6 +32,7 @@ struct GameRecord {
     bool model1_is_black;
     std::vector<int> moves;   // action indices (-1 = pass)
     int result;               // +1 = model1 wins, -1 = model2 wins, 0 = draw
+    float black_score;        // black - white (komi included)
 };
 
 // Play one game between two evaluators.
@@ -66,6 +67,8 @@ static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
 
     while (!game.game_over) game.play(PASS_MOVE);
 
+    rec.black_score = game.final_black_score;
+
     if (game.winner == EMPTY) rec.result = 0;
     else {
         Stone eval1_color = eval1_is_black ? BLACK : WHITE;
@@ -83,11 +86,15 @@ static void write_sgf(const std::string& path, const GameRecord& rec,
     std::string black_name = rec.model1_is_black ? m1_name : m2_name;
     std::string white_name = rec.model1_is_black ? m2_name : m1_name;
     std::string result_str;
-    if (rec.result == 0) result_str = "0";
-    else {
+    if (rec.result == 0) {
+        result_str = "0";
+    } else {
         bool m1_won = rec.result > 0;
         bool black_won = (m1_won == rec.model1_is_black);
-        result_str = black_won ? "B+R" : "W+R";
+        float margin = std::abs(rec.black_score);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s+%.1f", black_won ? "B" : "W", margin);
+        result_str = buf;
     }
 
     out << "(;GM[1]FF[4]SZ[" << n << "]KM[" << rec.komi << "]"

@@ -46,6 +46,7 @@ public:
     int consecutive_passes;
     bool game_over;
     Stone winner;
+    float final_black_score;   // bs - ws (komi included), set by score_game()
 
     Stone board[MAX_BOARD][MAX_BOARD];
 

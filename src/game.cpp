@@ -22,6 +22,7 @@ void GoGame::reset() {
     consecutive_passes = 0;
     game_over = false;
     winner = EMPTY;
+    final_black_score = 0.0f;
     ring_head_ = 0;
     ring_size_ = 0;
     update_history();
@@ -309,6 +310,7 @@ std::pair<float, float> GoGame::score() const {
 
 void GoGame::score_game() {
     auto [b, w] = score();
+    final_black_score = b - w;
     if (b > w) winner = BLACK;
     else if (w > b) winner = WHITE;
     else winner = EMPTY;
