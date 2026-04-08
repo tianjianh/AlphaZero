@@ -316,18 +316,6 @@ def view_game_curses(board_size, moves_data, title="", is_sgf=False):
                 pass
             stdscr.attroff(curses.color_pair(5))
 
-        # Last move marker
-        if last_r >= 0 and last_c >= 0:
-            lx = ox + last_c * cell_w
-            ly = oy + last_r
-            stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-            try:
-                stdscr.addch(ly, lx - 1, ord('['))
-                stdscr.addch(ly, lx + 1, ord(']'))
-            except curses.error:
-                pass
-            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-
         # ── Right-side info panel ──
         px = ox + n * cell_w + 4
         py = oy
@@ -337,16 +325,16 @@ def view_game_curses(board_size, moves_data, title="", is_sgf=False):
         stdscr.attron(curses.color_pair(2))
         stdscr.addnstr(py, px, f"Move {move_idx}/{total}", w - px - 1)
         stdscr.attroff(curses.color_pair(2))
-        py += 1
+        py += 2
 
-        # Current move info
+        # Last move info
         if move_idx > 0:
             color, r, c, extra = _get_move_info(moves_data, move_idx - 1, is_sgf)
-            name = "Black X" if color == BLACK else "White O"
+            name = "Black" if color == BLACK else "White"
             coord = "PASS" if r is None else coord_to_str(r, c, board_size)
-            stdscr.attron(curses.color_pair(3))
-            stdscr.addnstr(py, px, f"{name}: {coord}", w - px - 1)
-            stdscr.attroff(curses.color_pair(3))
+            stdscr.attron(curses.color_pair(2))
+            stdscr.addnstr(py, px, f"{name} plays {coord}", w - px - 1)
+            stdscr.attroff(curses.color_pair(2))
             py += 1
             if extra.strip():
                 stdscr.attron(curses.color_pair(8))
