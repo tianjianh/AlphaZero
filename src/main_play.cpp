@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <locale.h>
 #include <curses.h>
 
@@ -233,7 +234,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
 
     // Help at bottom
     int help_y = std::max(oy + n + 1, (int)(panel_y + 2));
-    const char* help = "Arrows/WASD: move  Enter: place  P: pass  Q: quit";
+    const char* help = "Arrows: move  Enter: place  P: pass  A: analysis  R: refresh  Q: quit";
     wattron(win, COLOR_PAIR(CP_LABEL));
     mvwaddnstr(win, std::min(help_y, h - 1), 2, help, w - 4);
     wattroff(win, COLOR_PAIR(CP_LABEL));
@@ -353,8 +354,19 @@ int main(int argc, char* argv[]) {
 
     int n = config.board_size;
 
+    // ── Redirect stdout/stderr to log file before curses ────
+    // Model/GPU init already printed. Redirect remaining output
+    // (TensorRT engine build, NNEvaluator threads) to a log file
+    // so it doesn't corrupt the curses display.
+    FILE* log_fp = fopen("play.log", "w");
+    if (log_fp) {
+        dup2(fileno(log_fp), STDOUT_FILENO);
+        dup2(fileno(log_fp), STDERR_FILENO);
+        fclose(log_fp);
+    }
+
     // ── ncurses init ────────────────────────────────────────
-    setlocale(LC_ALL, "");  // enable UTF-8 for wide chars (must be before initscr)
+    setlocale(LC_ALL, "");
     initscr();
     init_colors();
     cbreak();
@@ -509,6 +521,12 @@ int main(int argc, char* argv[]) {
             status_msg.clear();
 
             if (key == 'q' || key == 'Q') { stop_analysis(); keep_playing = false; break; }
+
+            // Refresh screen
+            if (key == 'r') {
+                clearok(stdscr, TRUE);
+                continue;
+            }
 
             // Toggle analysis
             if (key == 'a') {
