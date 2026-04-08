@@ -93,53 +93,24 @@ class AlphaZeroNet(nn.Module):
 #  GoViT — Vision Transformer for Go
 # ══════════════════════════════════════════════════════════
 
-def _build_orbit_ids(n):
-    """Compute D4 orbit id for each board position. Returns [n*n] int tensor.
+def _build_directional_rel_indices(n):
+    """Signed (dx, dy) relative bias for all (i, j) token pairs.
 
-    orbit = index of sorted(min(r, n-1-r), min(c, n-1-c)) in the canonical list.
-    For 9x9: 15 unique orbits.
+    Each unique (dx, dy) offset gets its own bucket. For 9x9: (2*9-1)^2 = 289 buckets.
+    NOT D4-invariant — the model can distinguish all 4 directions.
+    D4 data augmentation handles symmetry instead.
     """
-    half = (n - 1) / 2.0
-    orbits = {}
-    idx = 0
-    ids = []
-    for r in range(n):
-        for c in range(n):
-            a, b = min(r, n - 1 - r), min(c, n - 1 - c)
-            key = (min(a, b), max(a, b))
-            if key not in orbits:
-                orbits[key] = idx
-                idx += 1
-            ids.append(orbits[key])
-    return torch.tensor(ids, dtype=torch.long)
-
-
-def _build_rel_bias_indices(n):
-    """Compute D4-invariant relative bias index for all (i, j) token pairs.
-
-    bias_bucket = index of sorted(|dx|, |dy|) in canonical list.
-    For 9x9: 45 unique buckets. Returns [n*n, n*n] int tensor.
-    """
-    coords = []
-    for r in range(n):
-        for c in range(n):
-            coords.append((r, c))
-
-    buckets = {}
-    idx = 0
     hw = n * n
+    span = 2 * n - 1
     indices = torch.zeros(hw, hw, dtype=torch.long)
-
-    for i, (r1, c1) in enumerate(coords):
-        for j, (r2, c2) in enumerate(coords):
-            adx, ady = abs(r1 - r2), abs(c1 - c2)
-            key = (min(adx, ady), max(adx, ady))
-            if key not in buckets:
-                buckets[key] = idx
-                idx += 1
-            indices[i, j] = buckets[key]
-
-    return indices, idx  # indices [hw, hw], num_buckets
+    for i in range(hw):
+        r1, c1 = i // n, i % n
+        for j in range(hw):
+            r2, c2 = j // n, j % n
+            dx = r2 - r1 + (n - 1)  # shift to [0, 2n-2]
+            dy = c2 - c1 + (n - 1)
+            indices[i, j] = dx * span + dy
+    return indices, span * span
 
 
 class GQAAttention(nn.Module):
@@ -211,12 +182,13 @@ class TransformerBlock(nn.Module):
 
 
 class GoViT(nn.Module):
-    """Vision Transformer for Go with D4-invariant positional encoding.
+    """Vision Transformer for Go with directional positional encoding.
 
     Positional encoding:
-      - Absolute: orbit embedding (15 classes for 9x9) — D4-invariant
-      - Relative: per-head bias indexed by sorted(|dx|, |dy|) — 45 buckets for 9x9
+      - Absolute: factorized row + col embeddings (9+9 params for 9x9)
+      - Relative: per-head bias indexed by signed (dx, dy) — 289 buckets for 9x9
 
+    D4 symmetry handled by data augmentation, not architecture.
     Attention: Grouped Query Attention (6 Q heads, 2 KV groups by default)
     """
 
@@ -231,14 +203,16 @@ class GoViT(nn.Module):
         # Token embedding: per-intersection linear projection
         self.token_proj = nn.Linear(input_channels, d_model)
 
-        # Orbit embedding: D4-invariant absolute position (15 classes for 9x9)
-        orbit_ids = _build_orbit_ids(board_size)
-        self.register_buffer("orbit_ids", orbit_ids)
-        num_orbits = orbit_ids.max().item() + 1
-        self.orbit_embed = nn.Embedding(num_orbits, d_model)
+        # Factorized 2D position embedding: row + col
+        self.row_embed = nn.Embedding(board_size, d_model)
+        self.col_embed = nn.Embedding(board_size, d_model)
+        row_ids = torch.arange(board_size).unsqueeze(1).expand(board_size, board_size).reshape(-1)
+        col_ids = torch.arange(board_size).unsqueeze(0).expand(board_size, board_size).reshape(-1)
+        self.register_buffer("row_ids", row_ids)
+        self.register_buffer("col_ids", col_ids)
 
-        # Relative bias indices: D4-invariant (45 buckets for 9x9)
-        rel_indices, num_rel_buckets = _build_rel_bias_indices(board_size)
+        # Directional relative bias: signed (dx, dy), 289 buckets for 9x9
+        rel_indices, num_rel_buckets = _build_directional_rel_indices(board_size)
         self.register_buffer("rel_indices", rel_indices)
 
         # Transformer blocks
@@ -271,8 +245,8 @@ class GoViT(nn.Module):
         x = x.view(B, x.size(1), hw).permute(0, 2, 1)             # [B, hw, C_in]
         x = self.token_proj(x)                                      # [B, hw, d_model]
 
-        # Add orbit embedding
-        x = x + self.orbit_embed(self.orbit_ids)                    # broadcast over B
+        # Add factorized position embedding
+        x = x + self.row_embed(self.row_ids) + self.col_embed(self.col_ids)
 
         # Transformer blocks
         for block in self.blocks:
