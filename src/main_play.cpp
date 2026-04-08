@@ -149,19 +149,19 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
                 if (cell == BLACK) {
                     int attr = COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD;
                     wattron(win, attr);
-                    mvwprintw(win, y, x, "\xe2\x9a\xab");  // ⚫ U+26AB (2-wide)
+                    mvwprintw(win, y, x, "\xe2\xac\xa4");  // ⬤ U+2B24
                     wattroff(win, attr);
                 } else if (cell == WHITE) {
                     int attr = COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD;
                     wattron(win, attr);
-                    mvwprintw(win, y, x, "\xe2\x9a\xaa");  // ⚪ U+26AA (2-wide)
+                    mvwprintw(win, y, x, " \xe2\x83\x9d");  // space + U+20DD combining circle
                     wattroff(win, attr);
                 } else if (is_cursor && !game.game_over) {
                     wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
                     if (game.current_player == BLACK)
-                        mvwprintw(win, y, x, "\xe2\x9a\xab");  // ⚫
+                        mvwprintw(win, y, x, "\xe2\xac\xa4");  // ⬤
                     else
-                        mvwprintw(win, y, x, "\xe2\x9a\xaa");  // ⚪
+                        mvwprintw(win, y, x, " \xe2\x83\x9d");  // space + combining circle
                     wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
                 } else if (is_star_point(r, c, n)) {
                     wattron(win, COLOR_PAIR(CP_ACCENT));
@@ -175,10 +175,11 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
 
                 // Horizontal connector to the right
                 if (c < n - 1) {
-                    bool wide = (cell != EMPTY || (is_cursor && !game.game_over));
-                    int hx = wide ? x + 2 : x + 1;  // wide chars occupy 2 columns
+                    // U+2B24 = 1 wide, space+U+20DD = 2 wide
+                    bool is_white = (cell == WHITE || (is_cursor && !game.game_over && game.current_player == WHITE));
+                    int stone_w = (cell != EMPTY || (is_cursor && !game.game_over)) ? (is_white ? 2 : 1) : 1;
                     wattron(win, COLOR_PAIR(CP_GRID));
-                    for (int k = hx; k < x + cell_w; k++)
+                    for (int k = x + stone_w; k < x + cell_w; k++)
                         mvwaddch(win, y, k, ACS_HLINE);
                     wattroff(win, COLOR_PAIR(CP_GRID));
                 }
