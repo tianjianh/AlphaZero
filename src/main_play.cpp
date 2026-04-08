@@ -11,6 +11,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <locale.h>
 #include <curses.h>
 
 using namespace minigo;
@@ -148,21 +149,19 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
                 if (cell == BLACK) {
                     int attr = COLOR_PAIR(is_last ? CP_RED : CP_BLACK_STONE) | A_BOLD;
                     wattron(win, attr);
-                    mvwaddstr(win, y, x - 1, "(#)");
+                    mvwprintw(win, y, x, "\xe2\x9a\xab");  // ⚫ U+26AB (2-wide)
                     wattroff(win, attr);
                 } else if (cell == WHITE) {
                     int attr = COLOR_PAIR(is_last ? CP_RED : CP_WHITE_STONE) | A_BOLD;
                     wattron(win, attr);
-                    mvwaddstr(win, y, x - 1, "(O)");
+                    mvwprintw(win, y, x, "\xe2\x9a\xaa");  // ⚪ U+26AA (2-wide)
                     wattroff(win, attr);
                 } else if (is_cursor && !game.game_over) {
-                    char buf[4];
-                    buf[0] = '[';
-                    buf[1] = (game.current_player == BLACK) ? '#' : 'O';
-                    buf[2] = ']';
-                    buf[3] = 0;
                     wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
-                    mvwaddstr(win, y, x - 1, buf);
+                    if (game.current_player == BLACK)
+                        mvwprintw(win, y, x, "\xe2\x9a\xab");  // ⚫
+                    else
+                        mvwprintw(win, y, x, "\xe2\x9a\xaa");  // ⚪
                     wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
                 } else if (is_star_point(r, c, n)) {
                     wattron(win, COLOR_PAIR(CP_ACCENT));
@@ -174,12 +173,10 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
                     wattroff(win, COLOR_PAIR(CP_GRID));
                 }
 
-                // Horizontal connector (3 hline chars to the right)
+                // Horizontal connector to the right
                 if (c < n - 1) {
-                    // Don't overwrite stone brackets
-                    int hx = x + 1;
-                    if (game.board[r][c] != EMPTY || (is_cursor && !game.game_over))
-                        hx = x + 2;  // skip the right bracket
+                    bool wide = (cell != EMPTY || (is_cursor && !game.game_over));
+                    int hx = wide ? x + 2 : x + 1;  // wide chars occupy 2 columns
                     wattron(win, COLOR_PAIR(CP_GRID));
                     for (int k = hx; k < x + cell_w; k++)
                         mvwaddch(win, y, k, ACS_HLINE);
@@ -375,6 +372,7 @@ int main(int argc, char* argv[]) {
     int n = config.board_size;
 
     // ── ncurses init ────────────────────────────────────────
+    setlocale(LC_ALL, "");  // enable UTF-8 for wide chars (must be before initscr)
     initscr();
     init_colors();
     cbreak();
