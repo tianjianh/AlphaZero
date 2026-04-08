@@ -306,6 +306,7 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "policy_weight": 1.0,
             "value_weight": 1.0,
             "score_weight_loss": 0.15 if arch == "vit" else 0.5,
+            "fp8": False,
         },
         "mcts": {
             "komi": komi,
@@ -836,7 +837,7 @@ def cmd_train(args):
                 "--policy-weight", str(st["policy_weight"]),
                 "--value-weight", str(st["value_weight"]),
                 "--score-weight-loss", str(st["score_weight_loss"]),
-            ]
+            ] + (["--fp8"] if st.get("fp8", False) else [])
             if arch == "vit":
                 train_args += [
                     "--d-model", str(m["d_model"]),

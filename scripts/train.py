@@ -30,6 +30,12 @@ import zstandard as zstd
 sys.path.insert(0, os.path.dirname(__file__))
 from model import AlphaZeroNet, GoViT, create_model
 
+# Optional: NVIDIA Transformer Engine for FP8 training
+try:
+    import transformer_engine.pytorch as te
+except ImportError:
+    te = None
+
 
 # ═══════════════════════════════════════════════════════════
 # Streaming dataset — decompresses one file at a time
@@ -180,6 +186,8 @@ def main():
                         help="Loss weight for value MSE (default: 1.0)")
     parser.add_argument("--score-weight-loss", type=float, default=1.0,
                         help="Loss weight for score cross-entropy (default: 1.0)")
+    parser.add_argument("--fp8", action="store_true",
+                        help="Use FP8 training via NVIDIA Transformer Engine (Blackwell+)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
     parser.add_argument("--log-file", default=None,
                         help="Append structured metrics to this file")
@@ -233,6 +241,7 @@ def main():
         num_filters=args.filters, num_res_blocks=args.blocks,
         d_model=args.d_model, depth=args.depth, heads=args.heads,
         kv_groups=args.kv_groups, mlp_ratio=args.mlp_ratio,
+        use_fp8=args.fp8,
     ).to(device)
 
     if args.arch == "vit":
@@ -262,24 +271,32 @@ def main():
     else:
         mprint("Starting from scratch")
 
-    # ── Mixed precision: BF16 > FP16 > FP32 ─────────────────
-    # FP8 training requires NVIDIA Transformer Engine (te.Linear) for
-    # proper E4M3 forward / E5M2 backward switching + per-tensor scaling.
-    # Not worth the complexity for our small model. FP8 is used for
-    # inference only (TensorRT handles it automatically).
+    # ── Mixed precision: FP8 > BF16 > FP16 > FP32 ──────────
     use_amp = device.type == "cuda"
+    use_te_fp8 = False
     scaler = None
     if use_amp:
         sm = torch.cuda.get_device_capability()
-        if torch.cuda.is_bf16_supported():
-            amp_dtype = torch.bfloat16
-            mprint(f"Mixed precision: BF16 (SM {sm[0]}.{sm[1]})")
-            tlog(f"    AMP: BF16")
-        else:
-            amp_dtype = torch.float16
-            scaler = torch.amp.GradScaler()
-            mprint(f"Mixed precision: FP16 + GradScaler (SM {sm[0]}.{sm[1]})")
-            tlog(f"    AMP: FP16 + GradScaler")
+        if args.fp8:
+            try:
+                import transformer_engine.pytorch as te
+                use_te_fp8 = True
+                amp_dtype = torch.bfloat16  # TE handles FP8 internally; BF16 for non-TE ops
+                mprint(f"Mixed precision: FP8 via Transformer Engine (SM {sm[0]}.{sm[1]})")
+                tlog(f"    AMP: FP8 (Transformer Engine)")
+            except ImportError:
+                mprint("WARNING: --fp8 requested but transformer_engine not installed, falling back")
+                args.fp8 = False
+        if not use_te_fp8:
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+                mprint(f"Mixed precision: BF16 (SM {sm[0]}.{sm[1]})")
+                tlog(f"    AMP: BF16")
+            else:
+                amp_dtype = torch.float16
+                scaler = torch.amp.GradScaler()
+                mprint(f"Mixed precision: FP16 + GradScaler (SM {sm[0]}.{sm[1]})")
+                tlog(f"    AMP: FP16 + GradScaler")
     else:
         amp_dtype = torch.float32
 
@@ -353,7 +370,11 @@ def main():
 
             optimizer.zero_grad()
 
-            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            # FP8: TE autocast handles E4M3 forward / E5M2 backward + scaling
+            # BF16/FP16: standard torch AMP autocast
+            te_ctx = te.fp8_autocast(enabled=True) if use_te_fp8 else \
+                     torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
+            with te_ctx:
                 logits, pred_value, pred_score = model(states)
 
                 policy_loss = -torch.sum(

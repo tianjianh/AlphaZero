@@ -13,6 +13,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Optional: NVIDIA Transformer Engine for FP8 training on Blackwell+
+_te = None
+try:
+    import transformer_engine.pytorch as _te
+except ImportError:
+    pass
+
+
+def _linear(in_f, out_f, bias=True, use_fp8=False):
+    """Create nn.Linear or te.Linear based on fp8 flag."""
+    if use_fp8 and _te is not None:
+        return _te.Linear(in_f, out_f, bias=bias)
+    return nn.Linear(in_f, out_f, bias=bias)
+
 
 class ResBlock(nn.Module):
     def __init__(self, num_filters):
@@ -30,7 +44,8 @@ class ResBlock(nn.Module):
 
 
 class AlphaZeroNet(nn.Module):
-    def __init__(self, board_size=9, input_channels=17, num_filters=64, num_res_blocks=5):
+    def __init__(self, board_size=9, input_channels=17, num_filters=64, num_res_blocks=5,
+                 use_fp8=False):
         super().__init__()
         self.board_size = board_size
         action_size = board_size * board_size + 1
@@ -43,18 +58,18 @@ class AlphaZeroNet(nn.Module):
 
         self.policy_conv = nn.Conv2d(num_filters, 2, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * board_size * board_size, action_size)
+        self.policy_fc = _linear(2 * board_size * board_size, action_size, use_fp8=use_fp8)
 
         self.value_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(board_size * board_size, 64)
-        self.value_fc2 = nn.Linear(64, 1)
+        self.value_fc1 = _linear(board_size * board_size, 64, use_fp8=use_fp8)
+        self.value_fc2 = _linear(64, 1, use_fp8=use_fp8)
 
-        num_bins = board_size * board_size * 2 + 1  # score classification bins
+        num_bins = board_size * board_size * 2 + 1
         self.score_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
         self.score_bn = nn.BatchNorm2d(1)
-        self.score_fc1 = nn.Linear(board_size * board_size, 64)
-        self.score_fc2 = nn.Linear(64, num_bins)
+        self.score_fc1 = _linear(board_size * board_size, 64, use_fp8=use_fp8)
+        self.score_fc2 = _linear(64, num_bins, use_fp8=use_fp8)
 
     def forward(self, x):
         out = F.relu(self.input_bn(self.input_conv(x)))
@@ -119,7 +134,8 @@ class GQAAttention(nn.Module):
     Fused Q + fused KV projections for efficiency.
     """
 
-    def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32):
+    def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32,
+                 use_fp8=False):
         super().__init__()
         assert num_heads % kv_groups == 0
         self.num_heads = num_heads
@@ -128,9 +144,9 @@ class GQAAttention(nn.Module):
         self.group_size = num_heads // kv_groups
         self.scale = math.sqrt(head_dim)
 
-        self.q_proj = nn.Linear(d_model, num_heads * head_dim)
-        self.kv_proj = nn.Linear(d_model, 2 * kv_groups * head_dim)
-        self.out_proj = nn.Linear(num_heads * head_dim, d_model)
+        self.q_proj = _linear(d_model, num_heads * head_dim, use_fp8=use_fp8)
+        self.kv_proj = _linear(d_model, 2 * kv_groups * head_dim, use_fp8=use_fp8)
+        self.out_proj = _linear(num_heads * head_dim, d_model, use_fp8=use_fp8)
 
         # Per-head relative positional bias: [num_heads, num_rel_buckets]
         self.rel_bias = nn.Parameter(torch.zeros(num_heads, num_rel_buckets))
@@ -163,16 +179,18 @@ class GQAAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block with GQA."""
 
-    def __init__(self, d_model, num_heads, kv_groups, mlp_ratio, num_rel_buckets, head_dim=32):
+    def __init__(self, d_model, num_heads, kv_groups, mlp_ratio, num_rel_buckets, head_dim=32,
+                 use_fp8=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = GQAAttention(d_model, num_heads, kv_groups, num_rel_buckets, head_dim)
+        self.attn = GQAAttention(d_model, num_heads, kv_groups, num_rel_buckets, head_dim,
+                                  use_fp8=use_fp8)
         self.norm2 = nn.LayerNorm(d_model)
         mlp_hidden = d_model * mlp_ratio
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_hidden),
+            _linear(d_model, mlp_hidden, use_fp8=use_fp8),
             nn.GELU(),
-            nn.Linear(mlp_hidden, d_model),
+            _linear(mlp_hidden, d_model, use_fp8=use_fp8),
         )
 
     def forward(self, x, rel_indices):
@@ -194,14 +212,14 @@ class GoViT(nn.Module):
 
     def __init__(self, board_size=9, input_channels=17,
                  d_model=192, depth=8, num_heads=6, kv_groups=2,
-                 mlp_ratio=4, head_dim=32):
+                 mlp_ratio=4, head_dim=32, use_fp8=False):
         super().__init__()
         self.board_size = board_size
         hw = board_size * board_size
         action_size = hw + 1
 
         # Token embedding: per-intersection linear projection
-        self.token_proj = nn.Linear(input_channels, d_model)
+        self.token_proj = _linear(input_channels, d_model, use_fp8=use_fp8)
 
         # Factorized 2D position embedding: row + col
         self.row_embed = nn.Embedding(board_size, d_model)
@@ -218,23 +236,23 @@ class GoViT(nn.Module):
         # Transformer blocks
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, num_heads, kv_groups, mlp_ratio,
-                             num_rel_buckets, head_dim)
+                             num_rel_buckets, head_dim, use_fp8=use_fp8)
             for _ in range(depth)
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
         # Policy head: per-token logit + learnable pass logit
-        self.policy_proj = nn.Linear(d_model, 1)
+        self.policy_proj = _linear(d_model, 1, use_fp8=use_fp8)
         self.pass_logit = nn.Parameter(torch.zeros(1))
 
         # Value head: mean pool → MLP → tanh
-        self.value_fc1 = nn.Linear(d_model, d_model)
-        self.value_fc2 = nn.Linear(d_model, 1)
+        self.value_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
+        self.value_fc2 = _linear(d_model, 1, use_fp8=use_fp8)
 
         # Score head: mean pool → MLP → bin classification
         num_bins = board_size * board_size * 2 + 1
-        self.score_fc1 = nn.Linear(d_model, d_model)
-        self.score_fc2 = nn.Linear(d_model, num_bins)
+        self.score_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
+        self.score_fc2 = _linear(d_model, num_bins, use_fp8=use_fp8)
 
     def forward(self, x):
         B = x.size(0)
@@ -280,13 +298,37 @@ class GoViT(nn.Module):
         return probs, value.item(), score
 
 
+def convert_te_to_nn(model):
+    """Replace te.Linear with nn.Linear for ONNX export compatibility."""
+    if _te is None:
+        return
+    for name, module in list(model.named_modules()):
+        if isinstance(module, _te.Linear):
+            replacement = nn.Linear(module.in_features, module.out_features,
+                                     bias=module.bias is not None)
+            replacement.weight.data.copy_(module.weight.data)
+            if module.bias is not None:
+                replacement.bias.data.copy_(module.bias.data)
+            # Navigate to parent and replace
+            parts = name.split('.')
+            parent = model
+            for p in parts[:-1]:
+                if p.isdigit():
+                    parent = parent[int(p)]
+                else:
+                    parent = getattr(parent, p)
+            setattr(parent, parts[-1], replacement)
+
+
 def create_model(arch="resnet", board_size=9, input_channels=17, **kwargs):
     """Factory: create model by architecture name."""
+    use_fp8 = kwargs.get("use_fp8", False)
     if arch == "resnet":
         return AlphaZeroNet(
             board_size=board_size, input_channels=input_channels,
             num_filters=kwargs.get("num_filters", 64),
             num_res_blocks=kwargs.get("num_res_blocks", 5),
+            use_fp8=use_fp8,
         )
     elif arch == "vit":
         return GoViT(
@@ -297,6 +339,7 @@ def create_model(arch="resnet", board_size=9, input_channels=17, **kwargs):
             kv_groups=kwargs.get("kv_groups", 2),
             mlp_ratio=kwargs.get("mlp_ratio", 4),
             head_dim=kwargs.get("head_dim", 32),
+            use_fp8=use_fp8,
         )
     else:
         raise ValueError(f"Unknown architecture: {arch}")

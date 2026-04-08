@@ -95,6 +95,10 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="re
     2. All raw state_dict tensors as extra initializers for the Eigen backend
     3. Post-processing ops: score softmax→expected_value
     """
+    # Convert te.Linear → nn.Linear for ONNX compatibility
+    from model import convert_te_to_nn
+    convert_te_to_nn(model)
+
     model.eval()
     dummy = torch.randn(1, input_channels, board_size, board_size)
 
