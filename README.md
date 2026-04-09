@@ -129,6 +129,13 @@ cmake .. -DMINIGO_BACKEND=opencl   # OpenCL (Linux, macOS)
 cmake .. -DMINIGO_BACKEND=eigen    # CPU only (no GPU)
 ```
 
+> **Tip (conda environments):** If CUDA was installed via conda, the conda
+> GCC toolchain's sysroot can conflict with the host's glibc headers
+> (`__time64_t` errors).  Fix by pointing CMake at the system compiler:
+> ```bash
+> cmake .. -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++
+> ```
+
 CUDA and TensorRT share the same `CMAKE_CUDA_ARCHITECTURES` default:
 Turing/Ampere/Ada SASS + Hopper PTX (forward-compat with Blackwell and beyond).
 Note: this flag only affects `.cu` files (CUDA backend); TensorRT has no `.cu`
