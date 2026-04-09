@@ -370,11 +370,16 @@ def main():
 
             optimizer.zero_grad()
 
-            # FP8: TE autocast handles E4M3 forward / E5M2 backward + scaling
-            # BF16/FP16: standard torch AMP autocast
-            te_ctx = te.fp8_autocast(enabled=True) if use_te_fp8 else \
-                     torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
-            with te_ctx:
+            # FP8: TE autocast for te.Linear layers + torch autocast for
+            # non-TE ops (LayerNorm, GELU, nn.Linear fallbacks) in BF16.
+            # BF16/FP16: standard torch AMP autocast only.
+            if use_te_fp8:
+                te_ctx = te.fp8_autocast(enabled=True)
+                amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
+            else:
+                te_ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
+                amp_ctx = torch.amp.autocast("cuda", enabled=False)  # no-op
+            with te_ctx, amp_ctx:
                 logits, pred_value, pred_score = model(states)
 
                 policy_loss = -torch.sum(
