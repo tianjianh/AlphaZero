@@ -309,6 +309,31 @@ std::pair<float, float> GoGame::score() const {
 }
 
 void GoGame::score_game() {
+    // Atari cleanup: repeatedly capture groups with 1 liberty.
+    // Early-stage models often pass with dead stones still on the board.
+    // Under Chinese rules the game should be played out; this automates it.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int r = 0; r < board_size; r++) {
+            for (int c = 0; c < board_size; c++) {
+                if (board[r][c] == EMPTY) continue;
+                std::vector<Pos> grp; int libs;
+                get_group(r, c, grp, libs);
+                if (libs == 0) {
+                    // Already captured (shouldn't happen, but safety)
+                    remove_group(grp);
+                    changed = true;
+                } else if (libs == 1) {
+                    // Dead group in atari — the opponent could capture
+                    // in one move. Remove it as if played out.
+                    remove_group(grp);
+                    changed = true;
+                }
+            }
+        }
+    }
+
     auto [b, w] = score();
     final_black_score = b - w;
     if (b > w) winner = BLACK;
