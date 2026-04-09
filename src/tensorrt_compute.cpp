@@ -314,14 +314,13 @@ static void init_device(TRTDeviceState& ds, int device_id) {
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
-    // Detect best precision from SM version
-    // BF16 preferred over FP16 on Ampere+ (SM 8.0+): same speed,
+    // Detect best precision from SM version.
+    // BF16 preferred on Ampere+ (SM 8.0+): same throughput as FP16,
     // but 8 exponent bits (same as FP32) so no overflow at 65504.
-    // FP16 has only 5 exponent bits → intermediate activations in the
-    // score head can overflow to Inf/NaN on some board positions.
-    if (prop.major >= 10)
-        ds.precision = "FP8";
-    else if (prop.major >= 8)
+    // FP16 has only 5 exponent bits → score head can overflow to NaN.
+    // FP8 is NOT auto-selected — it requires calibration and explicit
+    // opt-in.  Use BF16 as the default for SM 8.0+ (Ampere/Blackwell).
+    if (prop.major >= 8)
         ds.precision = "BF16";
     else if (prop.major >= 7 || (prop.major == 6 && prop.minor >= 0))
         ds.precision = "FP16";
