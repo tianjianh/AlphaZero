@@ -88,20 +88,54 @@ if(MINIGO_BACKEND STREQUAL "auto")
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
-      # Check for TensorRT (preferred over raw CUDA on Turing+ SM≥7.5)
-      find_library(NVINFER_LIB nvinfer
-        PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
-              /usr/lib/aarch64-linux-gnu
-        PATH_SUFFIXES lib lib64)
-      find_path(NVINFER_INCLUDE_DIR NvInfer.h
-        PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
-              /usr/include/aarch64-linux-gnu)
-      find_library(NVONNXPARSER_LIB nvonnxparser
-        PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
-              /usr/lib/aarch64-linux-gnu
-        PATH_SUFFIXES lib lib64)
-      if(NVINFER_LIB AND NVINFER_INCLUDE_DIR AND NVONNXPARSER_LIB)
-        set(MINIGO_BACKEND "tensorrt")
+      # Detect GPU SM version to decide backend.
+      # TensorRT 10.x requires SM >= 7.5 (Turing+).
+      # V100 (SM 7.0) and older must use the CUDA backend.
+      set(_trt_sm_ok FALSE)
+      find_program(NVIDIA_SMI nvidia-smi)
+      if(NVIDIA_SMI)
+        execute_process(
+          COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits
+          OUTPUT_VARIABLE _gpu_caps
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          ERROR_QUIET
+          RESULT_VARIABLE _smi_rc)
+        if(_smi_rc EQUAL 0 AND _gpu_caps)
+          # Take the first GPU's compute capability (e.g. "7.5" or "8.9")
+          string(REGEX MATCH "([0-9]+)\\.([0-9]+)" _cap_match "${_gpu_caps}")
+          set(_sm_major "${CMAKE_MATCH_1}")
+          set(_sm_minor "${CMAKE_MATCH_2}")
+          message(STATUS "Detected GPU: SM ${_sm_major}.${_sm_minor}")
+          if(_sm_major GREATER 7 OR (_sm_major EQUAL 7 AND _sm_minor GREATER_EQUAL 5))
+            set(_trt_sm_ok TRUE)
+          else()
+            message(STATUS "SM ${_sm_major}.${_sm_minor} < 7.5 — TensorRT 10.x not supported, using CUDA backend")
+          endif()
+        endif()
+      endif()
+      if(NOT _trt_sm_ok AND NOT NVIDIA_SMI)
+        # No nvidia-smi (cross-compile or headless) — assume TensorRT OK
+        set(_trt_sm_ok TRUE)
+        message(STATUS "No nvidia-smi found — assuming TensorRT compatible (override with -DMINIGO_BACKEND=cuda)")
+      endif()
+
+      if(_trt_sm_ok)
+        find_library(NVINFER_LIB nvinfer
+          PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+                /usr/lib/aarch64-linux-gnu
+          PATH_SUFFIXES lib lib64)
+        find_path(NVINFER_INCLUDE_DIR NvInfer.h
+          PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+                /usr/include/aarch64-linux-gnu)
+        find_library(NVONNXPARSER_LIB nvonnxparser
+          PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+                /usr/lib/aarch64-linux-gnu
+          PATH_SUFFIXES lib lib64)
+        if(NVINFER_LIB AND NVINFER_INCLUDE_DIR AND NVONNXPARSER_LIB)
+          set(MINIGO_BACKEND "tensorrt")
+        else()
+          set(MINIGO_BACKEND "cuda")
+        endif()
       else()
         set(MINIGO_BACKEND "cuda")
       endif()
