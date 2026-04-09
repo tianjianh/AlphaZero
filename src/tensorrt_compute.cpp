@@ -82,7 +82,8 @@ struct TRTDeviceState {
 
 static std::string make_cache_path(const std::string& model_path,
                                    const std::string& gpu_name,
-                                   int max_batch_size) {
+                                   int max_batch_size,
+                                   const std::string& precision) {
     // Sanitize GPU name for filesystem
     std::string safe_name;
     for (char c : gpu_name) {
@@ -101,8 +102,12 @@ static std::string make_cache_path(const std::string& model_path,
     std::string cache_dir = "trt_cache";
     system(("mkdir -p " + cache_dir).c_str());
 
+    // Include precision so FP16/BF16/FP8 engines don't collide
+    std::string prec_tag;
+    for (char c : precision) prec_tag += (char)std::tolower(c);
+
     return cache_dir + "/" + base + ".trt_" + safe_name + "_b" +
-           std::to_string(max_batch_size) + ".engine";
+           std::to_string(max_batch_size) + "_" + prec_tag + ".engine";
 }
 
 static std::vector<char> read_file(const std::string& path) {
@@ -159,7 +164,7 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
     CUDA_CHECK(cudaGetDeviceProperties(&prop, dev.device_id));
     std::string gpu_name(prop.name);
 
-    std::string cache_path = make_cache_path(model->model_path, gpu_name, max_batch_size);
+    std::string cache_path = make_cache_path(model->model_path, gpu_name, max_batch_size, dev.precision);
 
     // Serialize build per cache path — second thread waits for first to finish
     std::lock_guard<std::mutex> build_lock(get_build_mutex(cache_path));
@@ -227,6 +232,9 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
         config->setFlag(nvinfer1::BuilderFlag::kFP8);
         config->setFlag(nvinfer1::BuilderFlag::kFP16);  // FP8 needs FP16 fallback layers
         build_prec = "FP8";
+    } else if (dev.precision == "BF16") {
+        config->setFlag(nvinfer1::BuilderFlag::kBF16);
+        build_prec = "BF16";
     } else if (builder->platformHasFastFp16()) {
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
         build_prec = "FP16";
@@ -307,8 +315,14 @@ static void init_device(TRTDeviceState& ds, int device_id) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
     // Detect best precision from SM version
+    // BF16 preferred over FP16 on Ampere+ (SM 8.0+): same speed,
+    // but 8 exponent bits (same as FP32) so no overflow at 65504.
+    // FP16 has only 5 exponent bits → intermediate activations in the
+    // score head can overflow to Inf/NaN on some board positions.
     if (prop.major >= 10)
         ds.precision = "FP8";
+    else if (prop.major >= 8)
+        ds.precision = "BF16";
     else if (prop.major >= 7 || (prop.major == 6 && prop.minor >= 0))
         ds.precision = "FP16";
     else

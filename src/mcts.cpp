@@ -58,14 +58,28 @@ void MCTS::expand(MCTSNode* node, const std::vector<float>& policy,
 
 void MCTS::mask_policy(std::vector<float>& policy,
                        const std::vector<float>& legal, int action_size) {
-    float policy_sum = 0.0f;
+    // Softmax over legal moves only (raw logits → proper [0,1] priors).
+    // Without this, raw logits normalized by sum can produce negative priors,
+    // concentrating search on a handful of children and making NaN-poisoning
+    // of ALL children far more likely → livelock.
+    float max_logit = -1e30f;
+    for (int a = 0; a < action_size; a++)
+        if (legal[a] > 0.0f && std::isfinite(policy[a]))
+            max_logit = std::max(max_logit, policy[a]);
+
+    float exp_sum = 0.0f;
     for (int a = 0; a < action_size; a++) {
-        policy[a] *= legal[a];
-        policy_sum += policy[a];
+        if (legal[a] > 0.0f && std::isfinite(policy[a])) {
+            policy[a] = std::exp(policy[a] - max_logit);
+            exp_sum += policy[a];
+        } else {
+            policy[a] = 0.0f;
+        }
     }
-    if (policy_sum > 0.0f) {
-        for (auto& p : policy) p /= policy_sum;
+    if (exp_sum > 0.0f) {
+        for (auto& p : policy) p /= exp_sum;
     } else {
+        // All logits were NaN/Inf or no legal moves — fall back to uniform
         float ls = std::accumulate(legal.begin(), legal.end(), 0.0f);
         for (int a = 0; a < action_size; a++)
             policy[a] = legal[a] / ls;
@@ -177,6 +191,17 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
             continue;
         }
 
+        // ── Expanded node with no selectable child ───────────────
+        // select_child returned nullptr on an expanded node (all children
+        // have NaN UCB scores).  Without this guard the thread retries
+        // forever: CAS fails (node is EXPANDED, not UNEVALUATED),
+        // sims_done never increments → livelock, 3000% CPU, 0% GPU.
+        if (node->state.load(std::memory_order_acquire) == NODE_EXPANDED) {
+            backprop(path, 0.0f);
+            sims_done.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+
         // ── Terminal node ────────────────────────────────────────
         if (game_copy_ptr->game_over) {
             float leaf_value;
@@ -211,8 +236,12 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         node->state.store(NODE_EXPANDED, std::memory_order_release);
 
         // Blend value + score for utility (KataGo-style atan compression)
-        float score_utility = atanf(result.score / config_.score_scale) / (float)(M_PI / 2.0);
-        float utility = result.value + config_.score_weight * score_utility;
+        float utility = result.value;
+        if (config_.score_weight != 0.0f) {
+            float score_utility = atanf(result.score / config_.score_scale) / (float)(M_PI / 2.0);
+            utility += config_.score_weight * score_utility;
+        }
+        if (!std::isfinite(utility)) utility = 0.0f;
         backprop(path, utility);
         sims_done.fetch_add(1, std::memory_order_relaxed);
     }
@@ -308,8 +337,12 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
                 expand(leaf.leaf, res.policy, leaf.legal);
             leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
 
-            float score_utility = atanf(res.score / config_.score_scale) / (float)(M_PI / 2.0);
-            float utility = res.value + config_.score_weight * score_utility;
+            float utility = res.value;
+            if (config_.score_weight != 0.0f) {
+                float score_utility = atanf(res.score / config_.score_scale) / (float)(M_PI / 2.0);
+                utility += config_.score_weight * score_utility;
+            }
+            if (!std::isfinite(utility)) utility = 0.0f;
             backprop(leaf.path, utility);
             sims_done++;
         }
@@ -342,8 +375,12 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     expand(root_.get(), root_out.policy, legal);
     root_->state.store(NODE_EXPANDED, std::memory_order_release);
     root_->visit_count.store(1, std::memory_order_relaxed);
-    float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
-    float root_utility = root_out.value + config_.score_weight * root_score_utility;
+    float root_utility = root_out.value;
+    if (config_.score_weight != 0.0f) {
+        float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
+        root_utility += config_.score_weight * root_score_utility;
+    }
+    if (!std::isfinite(root_utility)) root_utility = 0.0f;
     root_->add_value(root_utility);
     if (add_noise) add_dirichlet_noise(root_.get(), action_size);
 
