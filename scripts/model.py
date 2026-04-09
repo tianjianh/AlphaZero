@@ -22,8 +22,9 @@ except ImportError:
 
 
 def _linear(in_f, out_f, bias=True, use_fp8=False):
-    """Create nn.Linear or te.Linear based on fp8 flag."""
-    if use_fp8 and _te is not None:
+    """Create nn.Linear or te.Linear based on fp8 flag.
+    FP8 tensor cores require both dimensions divisible by 16."""
+    if use_fp8 and _te is not None and in_f % 16 == 0 and out_f % 16 == 0:
         return _te.Linear(in_f, out_f, bias=bias)
     return nn.Linear(in_f, out_f, bias=bias)
 
