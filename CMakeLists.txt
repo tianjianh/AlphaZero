@@ -88,11 +88,18 @@ if(MINIGO_BACKEND STREQUAL "auto")
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
-      # Check for TensorRT (preferred over raw CUDA)
-      find_library(NVINFER_LIB nvinfer)
+      # Check for TensorRT (preferred over raw CUDA on Turing+ SM≥7.5)
+      find_library(NVINFER_LIB nvinfer
+        PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+              /usr/lib/aarch64-linux-gnu
+        PATH_SUFFIXES lib lib64)
       find_path(NVINFER_INCLUDE_DIR NvInfer.h
-        PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include)
-      find_library(NVONNXPARSER_LIB nvonnxparser)
+        PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+              /usr/include/aarch64-linux-gnu)
+      find_library(NVONNXPARSER_LIB nvonnxparser
+        PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+              /usr/lib/aarch64-linux-gnu
+        PATH_SUFFIXES lib lib64)
       if(NVINFER_LIB AND NVINFER_INCLUDE_DIR AND NVONNXPARSER_LIB)
         set(MINIGO_BACKEND "tensorrt")
       else()
@@ -142,11 +149,18 @@ elseif(MINIGO_BACKEND STREQUAL "tensorrt")
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  find_library(NVINFER_LIB nvinfer REQUIRED)
+  find_library(NVINFER_LIB nvinfer REQUIRED
+    PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+          /usr/lib/aarch64-linux-gnu
+    PATH_SUFFIXES lib lib64)
   find_path(NVINFER_INCLUDE_DIR NvInfer.h
     PATHS /usr/include/x86_64-linux-gnu /usr/include /usr/local/include
+          /usr/include/aarch64-linux-gnu
     REQUIRED)
-  find_library(NVONNXPARSER_LIB nvonnxparser REQUIRED)
+  find_library(NVONNXPARSER_LIB nvonnxparser REQUIRED
+    PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
+          /usr/lib/aarch64-linux-gnu
+    PATH_SUFFIXES lib lib64)
   set(HAS_TENSORRT TRUE)
 
 elseif(MINIGO_BACKEND STREQUAL "cuda")
