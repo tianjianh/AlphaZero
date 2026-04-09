@@ -23,7 +23,10 @@ except ImportError:
 
 def _linear(in_f, out_f, bias=True, use_fp8=False):
     """Create nn.Linear or te.Linear based on fp8 flag.
-    FP8 tensor cores require both dimensions divisible by 16."""
+    FP8 cuBLASLt requires both feature dims AND the batch leading-dimension
+    divisible by 16.  For 3D sequence inputs (transformer blocks), the wgrad
+    backward GEMM can use strides based on seq_len which may not be aligned.
+    Callers that process sequences should pass use_fp8=False."""
     if use_fp8 and _te is not None and in_f % 16 == 0 and out_f % 16 == 0:
         return _te.Linear(in_f, out_f, bias=bias)
     return nn.Linear(in_f, out_f, bias=bias)
@@ -135,8 +138,7 @@ class GQAAttention(nn.Module):
     Fused Q + fused KV projections for efficiency.
     """
 
-    def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32,
-                 use_fp8=False):
+    def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32):
         super().__init__()
         assert num_heads % kv_groups == 0
         self.num_heads = num_heads
@@ -145,9 +147,11 @@ class GQAAttention(nn.Module):
         self.group_size = num_heads // kv_groups
         self.scale = math.sqrt(head_dim)
 
-        self.q_proj = _linear(d_model, num_heads * head_dim, use_fp8=use_fp8)
-        self.kv_proj = _linear(d_model, 2 * kv_groups * head_dim, use_fp8=use_fp8)
-        self.out_proj = _linear(num_heads * head_dim, d_model, use_fp8=use_fp8)
+        # Never use te.Linear here — 3D [B, seq, d] input causes FP8 wgrad
+        # alignment failures (seq_len not divisible by 16 on some backends)
+        self.q_proj = nn.Linear(d_model, num_heads * head_dim)
+        self.kv_proj = nn.Linear(d_model, 2 * kv_groups * head_dim)
+        self.out_proj = nn.Linear(num_heads * head_dim, d_model)
 
         # Per-head relative positional bias: [num_heads, num_rel_buckets]
         self.rel_bias = nn.Parameter(torch.zeros(num_heads, num_rel_buckets))
@@ -180,18 +184,18 @@ class GQAAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block with GQA."""
 
-    def __init__(self, d_model, num_heads, kv_groups, mlp_ratio, num_rel_buckets, head_dim=32,
-                 use_fp8=False):
+    def __init__(self, d_model, num_heads, kv_groups, mlp_ratio, num_rel_buckets, head_dim=32):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = GQAAttention(d_model, num_heads, kv_groups, num_rel_buckets, head_dim,
-                                  use_fp8=use_fp8)
+        self.attn = GQAAttention(d_model, num_heads, kv_groups, num_rel_buckets, head_dim)
         self.norm2 = nn.LayerNorm(d_model)
         mlp_hidden = d_model * mlp_ratio
+        # nn.Linear for sequence layers — runs in BF16 via torch autocast.
+        # te.Linear fails on 3D sequence input (FP8 wgrad stride alignment).
         self.mlp = nn.Sequential(
-            _linear(d_model, mlp_hidden, use_fp8=use_fp8),
+            nn.Linear(d_model, mlp_hidden),
             nn.GELU(),
-            _linear(mlp_hidden, d_model, use_fp8=use_fp8),
+            nn.Linear(mlp_hidden, d_model),
         )
 
     def forward(self, x, rel_indices):
@@ -219,11 +223,6 @@ class GoViT(nn.Module):
         hw = board_size * board_size
         action_size = hw + 1
 
-        # FP8 GEMM requires all dimensions (including token count) divisible
-        # by 16.  Board 9x9 = 81 tokens, not aligned.  Pad to next multiple
-        # of 16 before transformer blocks, slice back after.
-        self.seq_pad = (16 - hw % 16) % 16 if use_fp8 else 0
-
         # Token embedding: per-intersection linear projection
         self.token_proj = _linear(input_channels, d_model, use_fp8=use_fp8)
 
@@ -239,10 +238,10 @@ class GoViT(nn.Module):
         rel_indices, num_rel_buckets = _build_directional_rel_indices(board_size)
         self.register_buffer("rel_indices", rel_indices)  # always [hw, hw]
 
-        # Transformer blocks
+        # Transformer blocks (nn.Linear only — BF16 via torch autocast)
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, num_heads, kv_groups, mlp_ratio,
-                             num_rel_buckets, head_dim, use_fp8=use_fp8)
+                             num_rel_buckets, head_dim)
             for _ in range(depth)
         ])
         self.final_norm = nn.LayerNorm(d_model)
@@ -272,25 +271,11 @@ class GoViT(nn.Module):
         # Add factorized position embedding
         x = x + self.row_embed(self.row_ids) + self.col_embed(self.col_ids)
 
-        # Pad sequence for FP8 GEMM alignment (81 → 96 for 9x9)
-        if self.seq_pad > 0:
-            x = F.pad(x, (0, 0, 0, self.seq_pad))                  # [B, hw+pad, d_model]
-            # Extend rel_indices with dummy bucket 0 for padding tokens
-            padded_len = hw + self.seq_pad
-            ri = x.new_zeros(padded_len, padded_len, dtype=torch.long)
-            ri[:hw, :hw] = self.rel_indices
-        else:
-            ri = self.rel_indices
-
         # Transformer blocks
         for block in self.blocks:
-            x = block(x, ri)
+            x = block(x, self.rel_indices)
 
-        x = self.final_norm(x)
-
-        # Remove padding before heads
-        if self.seq_pad > 0:
-            x = x[:, :hw]                                           # [B, hw, d_model]
+        x = self.final_norm(x)                                      # [B, hw, d_model]
 
         # Policy: per-token logit + pass
         p_board = self.policy_proj(x).squeeze(-1)                   # [B, hw]
