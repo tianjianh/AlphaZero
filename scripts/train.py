@@ -68,40 +68,56 @@ def _decompress(filepath):
 
 
 def _read_header(filepath):
-    """Read the 4-byte record count from a data file header."""
+    """Read the 4-byte record count without decompressing the whole file."""
     try:
-        data = _decompress(filepath)
-        return struct.unpack_from("i", data, 0)[0]
+        if filepath.endswith(".zst"):
+            dctx = zstd.ZstdDecompressor()
+            with open(filepath, "rb") as f:
+                reader = dctx.stream_reader(f)
+                hdr = reader.read(4)
+                return struct.unpack("i", hdr)[0] if len(hdr) == 4 else 0
+        else:
+            data = _decompress(filepath)
+            return struct.unpack_from("i", data, 0)[0]
     except (OSError, struct.error, zstd.ZstdError):
         return 0
 
 
 def _parse_file(data, board_size, input_channels=17):
-    """Parse all records from raw (decompressed) bytes into tensors."""
+    """Parse all records from raw (decompressed) bytes into tensors.
+    Zero-copy bulk parse — no per-record Python loop."""
     state_floats = input_channels * board_size * board_size
     policy_floats = board_size * board_size + 1
-    record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4 + 4  # +4 for score
+    # Record layout: [state_size(i32)] [state(f32×S)] [policy_size(i32)] [policy(f32×P)] [value(f32)] [score(f32)]
+    record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4 + 4
 
     n = struct.unpack_from("i", data, 0)[0]
     if n == 0:
         return []
 
-    # Bulk parse into numpy arrays, then convert to tensors once
-    states = np.empty((n, input_channels, board_size, board_size), dtype=np.float32)
-    policies = np.empty((n, policy_floats), dtype=np.float32)
-    values = np.empty(n, dtype=np.float32)
-    scores = np.empty(n, dtype=np.float32)
+    # View entire payload as float32 array (skip 4-byte file header)
+    payload = np.frombuffer(data, dtype=np.uint8, offset=4, count=n * record_bytes)
+    records = payload.reshape(n, record_bytes)
 
-    for i in range(n):
-        off = 4 + i * record_bytes + 4  # skip file header + record state_size
-        states[i] = np.frombuffer(data, np.float32, state_floats, off).reshape(
-            input_channels, board_size, board_size)
-        off += state_floats * 4 + 4  # skip policy_size
-        policies[i] = np.frombuffer(data, np.float32, policy_floats, off)
-        off += policy_floats * 4
-        values[i] = struct.unpack_from("f", data, off)[0]
-        off += 4
-        scores[i] = struct.unpack_from("f", data, off)[0]
+    # Byte offsets within each record
+    s_off = 4                                        # skip state_size(i32)
+    s_end = s_off + state_floats * 4
+    p_off = s_end + 4                                # skip policy_size(i32)
+    p_end = p_off + policy_floats * 4
+    v_off = p_end
+    v_end = v_off + 4
+    sc_off = v_end
+
+    # Bulk extract via views — no Python per-record loop
+    states = np.ndarray((n, state_floats), dtype=np.float32,
+                        buffer=records[:, s_off:s_end].tobytes()
+                        ).reshape(n, input_channels, board_size, board_size).copy()
+    policies = np.ndarray((n, policy_floats), dtype=np.float32,
+                          buffer=records[:, p_off:p_end].tobytes()).copy()
+    values = np.ndarray((n,), dtype=np.float32,
+                        buffer=records[:, v_off:v_end].tobytes()).copy()
+    scores = np.ndarray((n,), dtype=np.float32,
+                        buffer=records[:, sc_off:sc_off+4].tobytes()).copy()
 
     return list(zip(
         torch.from_numpy(states),
@@ -326,6 +342,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,  # max_batches cap handles DDP sync
+        persistent_workers=args.num_workers > 0,
     )
 
     mprint(f"Dataset: {dataset.total} samples, {len(files)} files ({index_time:.1f}s)")
