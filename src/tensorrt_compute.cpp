@@ -357,12 +357,10 @@ TensorRTComputeContext::TensorRTComputeContext(const std::vector<int>& device_id
 TensorRTComputeContext::~TensorRTComputeContext() {
     if (impl_) {
         for (auto& [id, ds] : impl_->devices) {
-            if (ds.engine) delete ds.engine;
+            cudaSetDevice(ds.device_id);
+            if (ds.engine)  delete ds.engine;
             if (ds.runtime) delete ds.runtime;
-            if (ds.stream) {
-                cudaSetDevice(ds.device_id);
-                cudaStreamDestroy(ds.stream);
-            }
+            if (ds.stream)  cudaStreamDestroy(ds.stream);
         }
         delete impl_;
     }

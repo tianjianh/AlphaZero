@@ -143,9 +143,17 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
         std::vector<ComputeHandle::Result> all_results;
         try {
             all_results = handle->predict_batch(all_states);
-        } catch (...) {
+        } catch (const std::exception& e) {
+            std::cerr << "NNEvaluator: predict_batch failed: " << e.what() << "\n";
+            // Return zero-logit policy so mask_policy's softmax produces
+            // uniform priors over legal moves instead of crashing on an
+            // empty vector.
+            int action_size = model_->board_size * model_->board_size + 1;
             for (auto* buf : batch) {
                 std::lock_guard<std::mutex> lock(buf->mu);
+                buf->policy.assign(action_size, 0.0f);
+                buf->value = 0.0f;
+                buf->score = 0.0f;
                 buf->done = true;
                 buf->cv.notify_one();
             }
