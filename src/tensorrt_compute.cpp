@@ -106,8 +106,14 @@ static std::string make_cache_path(const std::string& model_path,
     std::string prec_tag;
     for (char c : precision) prec_tag += (char)std::tolower(c);
 
-    return cache_dir + "/" + base + ".trt_" + safe_name + "_b" +
-           std::to_string(max_batch_size) + "_" + prec_tag + ".engine";
+    // Include TRT version: serialized engines are not portable across versions
+    std::string trt_ver = std::to_string(NV_TENSORRT_MAJOR) + "."
+                        + std::to_string(NV_TENSORRT_MINOR) + "."
+                        + std::to_string(NV_TENSORRT_PATCH);
+
+    return cache_dir + "/" + base + ".trt" + trt_ver + "_" + safe_name
+           + "_b" + std::to_string(max_batch_size)
+           + "_" + prec_tag + ".engine";
 }
 
 static std::vector<char> read_file(const std::string& path) {
