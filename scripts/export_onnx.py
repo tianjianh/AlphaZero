@@ -35,6 +35,9 @@ def _embed_state_dict(onnx_path, model):
     sd = model.state_dict()
 
     existing_names = {init.name for init in onnx_model.graph.initializer}
+    # TorchScript exporter may also use param names as node outputs (SSA)
+    for node in onnx_model.graph.node:
+        existing_names.update(node.output)
 
     for name, tensor in sd.items():
         if name not in existing_names:
@@ -121,6 +124,7 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="re
         opset_version=18,
         do_constant_folding=True,
         external_data=False,
+        dynamo=False,
     )
 
     # Append post-processing for C++ inference

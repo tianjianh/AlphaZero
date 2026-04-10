@@ -133,25 +133,26 @@ def _build_directional_rel_indices(n):
 
 
 class GQAAttention(nn.Module):
-    """Grouped Query Attention with D4-invariant relative positional bias.
+    """Grouped Query Attention with directional relative positional bias.
 
-    Fused Q + fused KV projections for efficiency.
+    Packed QKV projection (one GEMM) and fused scaled_dot_product_attention.
     """
 
-    def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32):
+    def __init__(self, d_model, num_heads, kv_groups, num_rel_buckets, head_dim=32,
+                 attn_dropout=0.0):
         super().__init__()
         assert num_heads % kv_groups == 0
         self.num_heads = num_heads
         self.kv_groups = kv_groups
         self.head_dim = head_dim
-        self.group_size = num_heads // kv_groups
-        self.scale = math.sqrt(head_dim)
+        self.attn_dropout = attn_dropout
 
-        # Never use te.Linear here — 3D [B, seq, d] input causes FP8 wgrad
-        # alignment failures (seq_len not divisible by 16 on some backends)
-        self.q_proj = nn.Linear(d_model, num_heads * head_dim)
-        self.kv_proj = nn.Linear(d_model, 2 * kv_groups * head_dim)
-        self.out_proj = nn.Linear(num_heads * head_dim, d_model)
+        q_dim = num_heads * head_dim
+        kv_dim = kv_groups * head_dim
+
+        # Packed [Q | K | V] — one read of x, one GEMM
+        self.qkv_proj = nn.Linear(d_model, q_dim + 2 * kv_dim)
+        self.out_proj = nn.Linear(q_dim, d_model)
 
         # Per-head relative positional bias: [num_heads, num_rel_buckets]
         self.rel_bias = nn.Parameter(torch.zeros(num_heads, num_rel_buckets))
@@ -160,34 +161,43 @@ class GQAAttention(nn.Module):
         B, N, _ = x.shape
         H, G, d = self.num_heads, self.kv_groups, self.head_dim
 
-        q = self.q_proj(x).view(B, N, H, d).transpose(1, 2)       # [B, H, N, d]
+        q_dim = H * d
+        kv_dim = G * d
 
-        kv = self.kv_proj(x).view(B, N, 2, G, d).permute(2, 0, 3, 1, 4)  # [2, B, G, N, d]
-        k, v = kv[0], kv[1]                                        # [B, G, N, d] each
+        qkv = self.qkv_proj(x)                                     # [B, N, Q+K+V]
+        q, k, v = torch.split(qkv, [q_dim, kv_dim, kv_dim], dim=-1)
+
+        q = q.view(B, N, H, d).transpose(1, 2)                     # [B, H, N, d]
+        k = k.view(B, N, G, d).transpose(1, 2)                     # [B, G, N, d]
+        v = v.view(B, N, G, d).transpose(1, 2)                     # [B, G, N, d]
 
         # Expand KV groups: [B, G, N, d] → [B, H, N, d]
-        k = k.repeat_interleave(self.group_size, dim=1)            # [B, H, N, d]
-        v = v.repeat_interleave(self.group_size, dim=1)            # [B, H, N, d]
+        k = k.repeat_interleave(H // G, dim=1)
+        v = v.repeat_interleave(H // G, dim=1)
 
-        # Attention scores
-        attn = (q @ k.transpose(-2, -1)) / self.scale              # [B, H, N, N]
+        # Additive relative positional bias [1, H, N, N]
+        attn_bias = self.rel_bias[:, rel_indices].unsqueeze(0)
 
-        # Add D4-invariant relative positional bias
-        bias = self.rel_bias[:, rel_indices]                        # [H, N, N]
-        attn = attn + bias.unsqueeze(0)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_bias,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )                                                           # [B, H, N, d]
 
-        attn = F.softmax(attn, dim=-1)
-        out = (attn @ v).transpose(1, 2).contiguous().view(B, N, H * d)
+        out = out.transpose(1, 2).contiguous().view(B, N, H * d)
         return self.out_proj(out)
 
 
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block with GQA."""
 
-    def __init__(self, d_model, num_heads, kv_groups, mlp_ratio, num_rel_buckets, head_dim=32):
+    def __init__(self, d_model, num_heads, kv_groups, mlp_ratio, num_rel_buckets, head_dim=32,
+                 attn_dropout=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = GQAAttention(d_model, num_heads, kv_groups, num_rel_buckets, head_dim)
+        self.attn = GQAAttention(d_model, num_heads, kv_groups, num_rel_buckets, head_dim,
+                                 attn_dropout)
         self.norm2 = nn.LayerNorm(d_model)
         mlp_hidden = d_model * mlp_ratio
         # nn.Linear for sequence layers — runs in BF16 via torch autocast.
@@ -241,7 +251,7 @@ class GoViT(nn.Module):
         # Transformer blocks (nn.Linear only — BF16 via torch autocast)
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, num_heads, kv_groups, mlp_ratio,
-                             num_rel_buckets, head_dim)
+                             num_rel_buckets, head_dim, attn_dropout=0.0)
             for _ in range(depth)
         ])
         self.final_norm = nn.LayerNorm(d_model)
@@ -265,7 +275,7 @@ class GoViT(nn.Module):
         hw = n * n
 
         # Reshape [B, C, H, W] → [B, H*W, C] and project
-        x = x.view(B, x.size(1), hw).permute(0, 2, 1)             # [B, hw, C_in]
+        x = x.flatten(2).transpose(1, 2)                           # [B, hw, C_in]
         x = self.token_proj(x)                                      # [B, hw, d_model]
 
         # Add factorized position embedding
