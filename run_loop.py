@@ -898,8 +898,9 @@ def cmd_train(args):
                 "--output", str(eval_dir),
             ]
 
-            result = subprocess.run(eval_cmd, capture_output=True, text=True)
-            eval_output = result.stdout + result.stderr
+            result = subprocess.run(eval_cmd, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True)
+            eval_output = result.stdout
             print(eval_output, end="")
             eval_result = result.returncode
             ev_time = int(time.time() - t0)
