@@ -39,28 +39,16 @@ GoGame AsyncBot::game() const {
 
 int AsyncBot::gen_move(Stone color, int num_simulations,
                        float temperature, bool add_noise) {
-    // Stop any background search before running a synchronous one on
-    // the same tree.  Auto-resume if analyze was active on entry.
-    // Stop FIRST, then save — callback_ is only safe to read after the
-    // callback thread has been joined.
-    bool was_analyzing = analyzing_.load(std::memory_order_acquire);
-    AnalysisCallback saved_cb;
-    int saved_interval = 0;
-    int saved_pv = 0;
-    if (was_analyzing) {
-        stop_analyze_internal();
-        saved_cb = callback_;
-        saved_interval = callback_interval_ms_;
-        saved_pv = callback_pv_moves_;
-    }
+    // KataGo pattern: stopAndWait before touching the tree.  Caller is
+    // responsible for restarting pondering/analyze after gen_move returns.
+    stop_analyze_internal();
 
     // Copy the game so MCTS can safely reference it from search threads.
     GoGame game_copy;
     {
         std::lock_guard<std::mutex> lock(game_mutex_);
         game_copy = game_.copy();
-        // Caller asserts the color matches the current player.
-        (void)color;
+        (void)color;  // Caller asserts the color matches the current player.
     }
 
     std::vector<float> policy;
@@ -78,26 +66,15 @@ int AsyncBot::gen_move(Stone color, int num_simulations,
     }
     mcts_->make_move(action);
 
-    if (was_analyzing)
-        start_analyze(std::move(saved_cb), saved_interval, saved_pv);
-
     return action;
 }
 
 // ── External move (human, opponent) ─────────────────────────
 
 void AsyncBot::play_move(Stone color, int action) {
-    // Stop FIRST, then save — see gen_move() comment.
-    bool was_analyzing = analyzing_.load(std::memory_order_acquire);
-    AnalysisCallback saved_cb;
-    int saved_interval = 0;
-    int saved_pv = 0;
-    if (was_analyzing) {
-        stop_analyze_internal();
-        saved_cb = callback_;
-        saved_interval = callback_interval_ms_;
-        saved_pv = callback_pv_moves_;
-    }
+    // KataGo pattern: stopAndWait before touching the tree.  Caller is
+    // responsible for restarting pondering/analyze after play_move returns.
+    stop_analyze_internal();
 
     {
         std::lock_guard<std::mutex> lock(game_mutex_);
@@ -112,9 +89,6 @@ void AsyncBot::play_move(Stone color, int action) {
     // the next search rebuilds from scratch.
     int tree_action = (action == PASS_MOVE) ? (config_.action_size() - 1) : action;
     mcts_->make_move(tree_action);
-
-    if (was_analyzing)
-        start_analyze(std::move(saved_cb), saved_interval, saved_pv);
 }
 
 // ── Async analyze ───────────────────────────────────────────

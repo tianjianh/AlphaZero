@@ -66,14 +66,15 @@ public:
     GoGame game() const;
 
     // ── Synchronous move selection (AI move) ────────────────
-    // Runs a blocking MCTS search, picks an action, advances game+tree.
-    // Returns the action that was played.  Temperature 0 → greedy.
+    // Stops any background analyze, runs a blocking MCTS search, picks
+    // an action, advances game + tree.  Returns the played action.
+    // Caller is responsible for restarting analyze afterwards if wanted.
     int gen_move(Stone color, int num_simulations = -1,
                  float temperature = 0.0f, bool add_noise = false);
 
     // ── Play an externally-chosen move (human / opponent) ───
-    // Stops any background search, advances game + tree.  If analyze
-    // mode was active, it auto-resumes on the new position.
+    // Stops any background analyze, advances game + tree.  Caller is
+    // responsible for restarting analyze afterwards if wanted.
     void play_move(Stone color, int action);
 
     // ── Async analysis ──────────────────────────────────────
