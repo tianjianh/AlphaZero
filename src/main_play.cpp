@@ -412,12 +412,15 @@ int main(int argc, char* argv[]) {
         std::string input_buf;
         std::string status_msg;
         std::string ai_info;
+
+        // Persistent user preference for analysis mode.  Toggled by 'a'.
+        // Analysis mode = "callback is set + pondering runs during
+        // idle time".  Reporting (the callback) keeps firing across
+        // both human and AI turns; the worker auto-restarts ponder
+        // at the top of each loop iteration whenever the bot is idle.
         bool analysis_on = false;
 
         // Shared state between the bot's callback thread and the UI thread.
-        // The bot calls `analyze_callback` every 500ms from its callback
-        // thread; the UI thread reads `latest_info` each frame to format
-        // the status line.
         std::mutex ai_info_mutex;
         MCTS::AnalysisInfo latest_info;
         bool have_info = false;
@@ -428,9 +431,20 @@ int main(int argc, char* argv[]) {
             have_info = (info.total_visits > 0);
         };
 
-        // Helper: stop any running analysis
-        auto stop_analysis = [&]() {
-            if (bot) bot->stop_analyze();
+        // Helper: enable analysis mode (set callback + start ponder).
+        auto enable_analysis = [&]() {
+            if (!bot) return;
+            bot->set_callback(analyze_callback, /*interval_ms=*/500, pvs);
+            bot->start_ponder();   // background search; callback fires via worker
+            analysis_on = true;
+        };
+
+        // Helper: disable analysis mode (stop + clear callback).
+        auto disable_analysis = [&]() {
+            if (bot) {
+                bot->stop();
+                bot->clear_callback();
+            }
             analysis_on = false;
             {
                 std::lock_guard<std::mutex> lock(ai_info_mutex);
@@ -439,16 +453,16 @@ int main(int argc, char* argv[]) {
             ai_info.clear();
         };
 
-        // Helper: start background analysis (runs via AsyncBot)
-        auto start_analysis = [&]() {
-            if (!bot) return;
-            bot->start_analyze(analyze_callback, /*interval_ms=*/500, pvs);
-            analysis_on = true;
+        // Helper: ensure background ponder is running if user wants
+        // analysis.  Called at the top of the loop on every iteration.
+        // Safe no-op if the bot is already searching.
+        auto maintain_ponder = [&]() {
+            if (analysis_on && bot && !bot->is_searching()) {
+                bot->start_ponder();
+            }
         };
 
         // Helper: refresh ai_info from the most recent callback snapshot.
-        // Called from the UI thread — uses the UI's local `game` for
-        // action-to-string formatting (safe, no cross-thread game reads).
         auto poll_analysis = [&]() {
             if (!analysis_on) return;
             MCTS::AnalysisInfo info;
@@ -477,7 +491,14 @@ int main(int argc, char* argv[]) {
         };
 
         while (true) {
-            // Set getch timeout: 500ms during analysis, blocking otherwise
+            // Ensure ponder is running if analysis is toggled on.  The bot
+            // may be idle because gen_move/play_move just finished or
+            // because analysis was just toggled on — restart it here so
+            // the callback keeps firing.
+            maintain_ponder();
+
+            // Set getch timeout: 500ms during analysis (so we can poll
+            // the latest callback snapshot and redraw), blocking otherwise.
             timeout(analysis_on ? 500 : -1);
 
             if (analysis_on) poll_analysis();
@@ -487,7 +508,7 @@ int main(int argc, char* argv[]) {
                        status_msg, ai_info, input_buf);
 
             if (game.game_over) {
-                stop_analysis();
+                disable_analysis();
                 auto [bs, ws] = game.score();
                 char buf[128];
                 snprintf(buf, sizeof(buf), "Game over  B:%.1f  W:%.1f  [r]restart [q]quit", bs, ws);
@@ -503,12 +524,14 @@ int main(int argc, char* argv[]) {
             }
 
             if (!is_human_turn()) {
-                // AI turn
-                stop_analysis();
+                // AI turn.  gen_move stops any running ponder internally
+                // and runs GENMOVE search through the same worker — the
+                // callback keeps firing during the search so the user
+                // sees live updates of the AI's thinking.
                 status_msg = "AI thinking...";
                 draw_board(stdscr, game, config, -1, -1, false,
                            last_r, last_c, human_color, use_random,
-                           status_msg, "", "");
+                           status_msg, ai_info, "");
 
                 int action;
                 if (use_random) {
@@ -518,8 +541,6 @@ int main(int argc, char* argv[]) {
                     else
                         game.play(action);
                 } else {
-                    // gen_move plays the move internally (bot's game + tree).
-                    // Refresh our local UI copy afterwards.
                     action = bot->gen_move(game.current_player, -1, 0.0f, false);
                     game = bot->game();
                 }
@@ -542,7 +563,7 @@ int main(int argc, char* argv[]) {
             if (key == ERR) continue;  // timeout during analysis polling
             status_msg.clear();
 
-            if (key == 'q' || key == 'Q') { stop_analysis(); keep_playing = false; break; }
+            if (key == 'q' || key == 'Q') { disable_analysis(); keep_playing = false; break; }
 
             // Refresh screen
             if (key == 'r') {
@@ -552,17 +573,15 @@ int main(int argc, char* argv[]) {
 
             // Toggle analysis
             if (key == 'a') {
-                if (analysis_on) stop_analysis();
-                else start_analysis();
+                if (analysis_on) disable_analysis();
+                else             enable_analysis();
                 continue;
             }
 
             // Helper: play a human move through the bot (advances game+tree).
-            // Returns true on success, false if the bot rejected the move
-            // (caller already validated legality via game.is_legal, so this
-            // is defensive).
+            // bot->play_move stops ponder internally (if running); the top
+            // of the next loop iteration auto-restarts it via maintain_ponder.
             auto play_human_move = [&](int action) -> bool {
-                stop_analysis();
                 if (bot) {
                     if (!bot->play_move(game.current_player, action))
                         return false;
@@ -638,7 +657,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        stop_analysis();
+        disable_analysis();
     }
 
     endwin();

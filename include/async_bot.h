@@ -17,36 +17,50 @@ namespace minigo {
 // ================================================================
 // AsyncBot — KataGo-style wrapper around MCTS + GoGame
 //
-// Owns:
-//   - one MCTS instance (persistent tree across moves)
-//   - one GoGame instance (authoritative game state)
-//   - optional background search thread (pondering / analyze)
-//   - optional callback thread (periodic AnalysisInfo snapshots)
+// Architecture: one persistent worker thread runs `worker_loop()` for
+// the bot's lifetime, idle-waiting on a condvar between searches.  All
+// search modes (GENMOVE, PONDER) go through the same worker.  When a
+// callback is configured, the worker spawns a transient callback
+// thread per search that polls `get_analysis()` at a fixed interval
+// and invokes the user callback; the callback thread is joined at
+// the end of each search.
 //
-// Lifecycle patterns:
+// API separates three orthogonal concerns:
 //
-//   Synchronous gen_move (eval, selfplay, AI-move in play):
-//     int action = bot.gen_move(color, sims, temperature, add_noise);
-//     // tree is re-rooted to `action` automatically; game is advanced.
+//   1. Callback reporting (persistent, mode-independent):
+//      set_callback(cb, interval_ms, max_pv)
+//      clear_callback()
 //
-//   Playing a move from an external source (human, opponent):
-//     bot.play_move(color, action);
-//     // stops any background search, advances game + tree, optionally
-//     // resumes analyze mode if it was active.
+//   2. Synchronous operations (caller blocks until done):
+//      gen_move(color, ...)    — AI picks and plays a move
+//      play_move(color, act)   — commit a human/opponent move
 //
-//   Live analysis with periodic callbacks (play UI, web backend):
-//     bot.start_analyze([](const MCTS::AnalysisInfo& info) {
-//         // called on a background thread every interval_ms
-//     }, /*interval_ms=*/500);
-//     // ... elsewhere ...
-//     bot.stop_analyze();
+//   3. Asynchronous operations (caller returns immediately):
+//      start_ponder()                  — background search, no sim cap
+//      start_analyze(cb, ...)          — set_callback + start_ponder
+//      stop()                          — stop async search, wait idle
 //
-// Thread safety: AsyncBot is a single-writer design.  State-mutating
-// methods (gen_move, play_move, start_analyze, stop_analyze, reset)
-// must be called from a single "control" thread.  The background
-// search and callback threads are owned by AsyncBot and never call
-// public methods on it.  get_analysis() and game() are read-only and
-// safe to call from any thread.
+// Typical usage for "game with live analysis" (AI vs human):
+//
+//   bot->set_callback(on_analysis_update, 500, 10);
+//   while (game in progress) {
+//       if (analysis_wanted && !bot->is_searching())
+//           bot->start_ponder();        // callback fires during ponder
+//
+//       if (human_turn) {
+//           bot->play_move(color, action);  // stops ponder, advances
+//       } else {
+//           bot->gen_move(color);            // stops ponder, runs
+//                                            // GENMOVE search (callback
+//                                            // still fires during it),
+//                                            // advances game + tree
+//       }
+//   }
+//
+// Thread safety: single-writer contract.  gen_move / play_move /
+// start_ponder / start_analyze / stop / set_callback / clear_callback /
+// reset must all be called from one "control" thread.  get_analysis()
+// and game() are read-only and safe from any thread.
 // ================================================================
 class AsyncBot {
 public:
@@ -56,66 +70,66 @@ public:
     AsyncBot(const AsyncBot&)            = delete;
     AsyncBot& operator=(const AsyncBot&) = delete;
 
-    // ── Game state ──────────────────────────────────────────
-    // Start a new game from the given position (or default-constructed).
-    // Stops any background search and clears the tree.
-    void reset(const GoGame& initial_game);
-    void reset();  // board_size/komi from config
+    using AnalysisCallback = std::function<void(const MCTS::AnalysisInfo&)>;
 
-    // Snapshot of the current game state (thread-safe copy).
+    // ── Callback configuration ──────────────────────────────
+    // The callback is persistent and applies to every subsequent
+    // search (GENMOVE or PONDER).  Setting while a search is
+    // running is safe; the current search keeps its snapshotted
+    // callback, the next search picks up the new one.
+    void set_callback(AnalysisCallback cb, int interval_ms = 500,
+                      int max_pv_moves = 10);
+    void clear_callback();
+
+    // ── Game state ──────────────────────────────────────────
+    // Start a new game from the given position (default: empty board
+    // with configured komi).  Stops any running search and clears tree.
+    void reset(const GoGame& initial_game);
+    void reset();
+
+    // Thread-safe snapshot of the authoritative game state.
     GoGame game() const;
 
-    // ── Synchronous move selection (AI move) ────────────────
-    // Stops any background analyze, runs a blocking MCTS search, picks
-    // an action, advances game + tree.  Returns the played action.
-    // Throws std::runtime_error if `color` doesn't match the current
-    // player (fail-fast on caller bug).  Pass EMPTY to skip the check.
-    // Caller is responsible for restarting analyze afterwards if wanted.
+    // ── Synchronous gen_move (AI move) ──────────────────────
+    // Stops any running async search, runs a blocking GENMOVE search
+    // through the worker thread, picks an action, advances game + tree.
+    // Returns the played action.  Throws if color doesn't match the
+    // current player (pass EMPTY to skip the check).
     int gen_move(Stone color, int num_simulations = -1,
                  float temperature = 0.0f, bool add_noise = false);
 
-    // ── Play an externally-chosen move (human / opponent) ───
-    // Stops any background analyze, advances game + tree.  Validates
-    // color against the current player and action legality; returns
-    // false on mismatch or illegal move (game + tree unchanged).
-    // Returns true on success.  Pass color=EMPTY to skip the color check.
-    // Caller is responsible for restarting analyze afterwards if wanted.
+    // ── External move (human / opponent) ────────────────────
+    // Stops any running async search.  Validates color + legality;
+    // returns false if either check fails (game + tree unchanged).
+    // Returns true on success.  Pass color=EMPTY to skip color check.
     bool play_move(Stone color, int action);
 
-    // ── Async analysis ──────────────────────────────────────
-    using AnalysisCallback = std::function<void(const MCTS::AnalysisInfo&)>;
+    // ── Async background search ─────────────────────────────
+    // Submits a PONDER request to the worker and returns immediately.
+    // If a callback is configured, it fires every interval_ms until
+    // stop() is called.  No sim cap — runs until stop().
+    void start_ponder();
 
-    // Start a background search + a periodic callback that fires
-    // every interval_ms with the current live analysis.  Returns
-    // immediately.  No-op if already analyzing.
-    void start_analyze(AnalysisCallback callback, int interval_ms = 500,
+    // Convenience: set_callback(cb, ...) + start_ponder().
+    void start_analyze(AnalysisCallback cb, int interval_ms = 500,
                        int max_pv_moves = 10);
 
-    // Stop background search and callback thread.  Blocks until both
-    // threads have joined.  No-op if not analyzing.
-    void stop_analyze();
+    // Stop any async search (ponder/analyze).  Blocks until the
+    // worker has returned to idle state.  Safe no-op if idle.
+    void stop();
 
-    bool is_analyzing() const { return analyzing_.load(std::memory_order_acquire); }
-
-    // ── One-shot analysis snapshot ──────────────────────────
-    // Returns the current tree state (locks tree_mutex_ briefly).
+    // ── Queries ─────────────────────────────────────────────
     MCTS::AnalysisInfo get_analysis(int max_moves = 5) const;
+    bool is_searching() const;
 
-    // Direct access to the underlying MCTS (for niche needs).
+    // Direct access to the underlying MCTS (niche use).
     MCTS* mcts() { return mcts_.get(); }
 
 private:
-    // Run search on the game copy.  Returns when search completes
-    // naturally (sim count reached) or should_stop_ is set.
-    void search_loop_worker();
+    enum class Mode { IDLE, GENMOVE, PONDER, SHUTDOWN };
 
-    // Wakes every callback_interval_ms_, calls callback_ with a
-    // fresh analysis snapshot, loops until analyzing_ becomes false.
-    void callback_loop_worker();
-
-    // Internal stop: joins both threads without taking game_mutex_.
-    // Caller must NOT hold game_mutex_.
-    void stop_analyze_internal();
+    void worker_loop();
+    void stop_locked(std::unique_lock<std::mutex>& lock);  // control_mutex_ must be held
 
     BatchEvaluator* evaluator_;
     Config          config_;
@@ -125,17 +139,25 @@ private:
 
     std::unique_ptr<MCTS>    mcts_;
 
-    // ── Background search + callback threads ───────────────
-    std::thread              search_thread_;
-    std::thread              callback_thread_;
-    std::atomic<bool>        analyzing_{false};
+    // ── Worker coordination (all protected by control_mutex_) ──
+    mutable std::mutex       control_mutex_;
+    std::condition_variable  worker_cv_;   // worker waits on this
+    std::condition_variable  done_cv_;     // callers wait on this
+    Mode                     pending_mode_ = Mode::IDLE;
+    Mode                     current_mode_ = Mode::IDLE;
 
-    // Callback wakeup coordination
-    std::mutex               callback_mutex_;
-    std::condition_variable  callback_cv_;
-    AnalysisCallback         callback_;
-    int                      callback_interval_ms_ = 500;
-    int                      callback_pv_moves_    = 10;
+    // Request parameters
+    int   gen_move_sims_  = -1;
+    float gen_move_temp_  = 0.0f;
+    bool  gen_move_noise_ = false;
+    int   gen_move_result_ = -1;
+
+    AnalysisCallback callback_;
+    int              callback_interval_ms_ = 500;
+    int              callback_pv_moves_    = 10;
+
+    // Persistent worker (lifetime = lifetime of AsyncBot)
+    std::thread      worker_thread_;
 };
 
 }  // namespace minigo
