@@ -360,29 +360,42 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
 
     action_size_ = config_.action_size();
     int action_size = action_size_;
-    root_ = std::make_unique<MCTSNode>();
 
-    // ── Evaluate root ────────────────────────────────────────────
+    // ── Build new root tree in a local (outside any lock) ───────
+    // GPU evaluation takes ms, so we do it without holding tree_mutex_,
+    // then atomically swap into root_ once the new tree is ready.
+    auto new_root = std::make_unique<MCTSNode>();
+
     std::vector<float> state_enc;
     game.encode(state_enc);
     auto root_results = evaluator_->evaluate({ state_enc });
     auto& root_out = root_results[0];
-    root_nn_score_ = root_out.score;
+    float new_root_nn_score = root_out.score;
 
     std::vector<float> legal;
     game.get_legal_moves(legal);
     mask_policy(root_out.policy, legal, action_size);
-    expand(root_.get(), root_out.policy, legal);
-    root_->state.store(NODE_EXPANDED, std::memory_order_release);
-    root_->visit_count.store(1, std::memory_order_relaxed);
+    expand(new_root.get(), root_out.policy, legal);
+    new_root->state.store(NODE_EXPANDED, std::memory_order_release);
+    new_root->visit_count.store(1, std::memory_order_relaxed);
     float root_utility = root_out.value;
     if (config_.score_weight != 0.0f) {
         float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
         root_utility += config_.score_weight * root_score_utility;
     }
     if (!std::isfinite(root_utility)) root_utility = 0.0f;
-    root_->add_value(root_utility);
-    if (add_noise) add_dirichlet_noise(root_.get(), action_size);
+    new_root->add_value(root_utility);
+    if (add_noise) add_dirichlet_noise(new_root.get(), action_size);
+
+    // ── Swap in the new tree (old tree destroyed after lock release) ──
+    std::unique_ptr<MCTSNode> old_root;
+    {
+        std::lock_guard<std::mutex> lock(tree_mutex_);
+        old_root = std::move(root_);
+        root_ = std::move(new_root);
+        root_nn_score_ = new_root_nn_score;
+    }
+    // old_root destroyed here, outside the lock
 
     // ── Run search (KataGo pattern: N threads, each VLP=1) ─────
     int nthreads = std::max(1, config_.num_search_threads);
@@ -449,6 +462,12 @@ int MCTS::get_action(GoGame& game, std::vector<float>& policy,
 // ================================================================
 
 MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
+    // Hold tree_mutex_ so that search() cannot reassign root_ (which
+    // would destroy the tree we're walking).  Search threads still
+    // mutate visit_count/value/prior concurrently — reads use atomics
+    // or tolerate racy scalar reads.
+    std::lock_guard<std::mutex> lock(tree_mutex_);
+
     AnalysisInfo info;
     info.root_score = root_nn_score_;
 

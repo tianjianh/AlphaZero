@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <vector>
 
@@ -129,7 +130,10 @@ private:
     Config          config_;
     std::mt19937    rng_;
 
-    // Live tree state (persists between search() and get_analysis())
+    // Live tree state (persists between search() and get_analysis()).
+    // tree_mutex_ protects concurrent access from get_analysis() while
+    // search() is rebuilding the root at the start of a new search.
+    mutable std::mutex        tree_mutex_;
     std::unique_ptr<MCTSNode> root_;
     float root_nn_score_ = 0.0f;
     int   action_size_   = 0;

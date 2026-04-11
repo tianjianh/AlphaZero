@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <algorithm>
@@ -43,6 +44,12 @@ struct CUDADeviceState {
     int          device_id = -1;
     cudaStream_t stream    = nullptr;
     bool         use_fp16  = false;  // SM >= 7.0 for WMMA tensor cores
+    // Serializes predict_batch on a single GPU. Two server threads on
+    // the same GPU share `stream`, and cudaStreamBeginCapture() is a
+    // stream-wide state change — concurrent kernel launches from another
+    // thread during capture would either be pulled into the wrong graph
+    // or fail with "stream already in capture mode". Take turns instead.
+    std::mutex   predict_mutex;
 };
 
 // ================================================================
@@ -1003,6 +1010,10 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
 
     auto& I = *impl_;
     CUDA_CHECK(cudaSetDevice(I.dev.device_id));
+
+    // Serialize against other handles on the same GPU — graph capture
+    // on the shared stream must be exclusive.
+    std::lock_guard<std::mutex> predict_lock(I.dev.predict_mutex);
 
     int N = (int)states.size();
     int H = I.board_size, W = I.board_size, HW = H * W;
