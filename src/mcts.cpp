@@ -354,46 +354,67 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 // ================================================================
 
 void MCTS::search(GoGame& game, std::vector<float>& visits,
-                  int num_simulations, bool add_noise) {
+                  int num_simulations, bool add_noise, bool reuse_tree) {
     if (num_simulations < 0) num_simulations = config_.num_simulations;
     should_stop_.store(false, std::memory_order_relaxed);
 
     action_size_ = config_.action_size();
     int action_size = action_size_;
 
+    // ── Decide whether to reuse the existing root ───────────────
+    bool can_reuse = false;
+    if (reuse_tree) {
+        std::lock_guard<std::mutex> lock(tree_mutex_);
+        can_reuse = (root_ && root_->state.load(std::memory_order_acquire) == NODE_EXPANDED);
+    }
+
     // ── Build new root tree in a local (outside any lock) ───────
     // GPU evaluation takes ms, so we do it without holding tree_mutex_,
     // then atomically swap into root_ once the new tree is ready.
-    auto new_root = std::make_unique<MCTSNode>();
+    std::unique_ptr<MCTSNode> new_root;
+    float new_root_nn_score = 0.0f;
 
-    std::vector<float> state_enc;
-    game.encode(state_enc);
-    auto root_results = evaluator_->evaluate({ state_enc });
-    auto& root_out = root_results[0];
-    float new_root_nn_score = root_out.score;
+    if (!can_reuse) {
+        new_root = std::make_unique<MCTSNode>();
 
-    std::vector<float> legal;
-    game.get_legal_moves(legal);
-    mask_policy(root_out.policy, legal, action_size);
-    expand(new_root.get(), root_out.policy, legal);
-    new_root->state.store(NODE_EXPANDED, std::memory_order_release);
-    new_root->visit_count.store(1, std::memory_order_relaxed);
-    float root_utility = root_out.value;
-    if (config_.score_weight != 0.0f) {
-        float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
-        root_utility += config_.score_weight * root_score_utility;
+        std::vector<float> state_enc;
+        game.encode(state_enc);
+        auto root_results = evaluator_->evaluate({ state_enc });
+        auto& root_out = root_results[0];
+        new_root_nn_score = root_out.score;
+
+        std::vector<float> legal;
+        game.get_legal_moves(legal);
+        mask_policy(root_out.policy, legal, action_size);
+        expand(new_root.get(), root_out.policy, legal);
+        new_root->state.store(NODE_EXPANDED, std::memory_order_release);
+        new_root->visit_count.store(1, std::memory_order_relaxed);
+        float root_utility = root_out.value;
+        if (config_.score_weight != 0.0f) {
+            float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
+            root_utility += config_.score_weight * root_score_utility;
+        }
+        if (!std::isfinite(root_utility)) root_utility = 0.0f;
+        new_root->add_value(root_utility);
     }
-    if (!std::isfinite(root_utility)) root_utility = 0.0f;
-    new_root->add_value(root_utility);
-    if (add_noise) add_dirichlet_noise(new_root.get(), action_size);
 
-    // ── Swap in the new tree (old tree destroyed after lock release) ──
+    // ── Swap in new root / add noise (brief critical section) ────
     std::unique_ptr<MCTSNode> old_root;
     {
         std::lock_guard<std::mutex> lock(tree_mutex_);
-        old_root = std::move(root_);
-        root_ = std::move(new_root);
-        root_nn_score_ = new_root_nn_score;
+        if (!can_reuse) {
+            old_root = std::move(root_);
+            root_ = std::move(new_root);
+            root_nn_score_ = new_root_nn_score;
+            root_noise_added_ = false;
+        }
+        // Add Dirichlet noise at the root once per position.  After
+        // make_move() the flag is cleared, so the next search that
+        // requests noise will refresh it on the promoted subtree.
+        if (add_noise && !root_noise_added_) {
+            add_dirichlet_noise(root_.get(), action_size);
+            root_noise_added_ = true;
+        }
     }
     // old_root destroyed here, outside the lock
 
@@ -422,13 +443,56 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
             visits[a] = (float)root_->children[a]->visit_count.load(std::memory_order_relaxed);
 }
 
+// ================================================================
+// Tree reuse: re-root to the child for `action`, discard siblings.
+// Caller must hold no MCTS locks.  Safe against concurrent
+// get_analysis() via tree_mutex_.  The old tree is destroyed
+// outside the lock so deep tree deallocation does not block readers.
+// ================================================================
+void MCTS::make_move(int action) {
+    std::unique_ptr<MCTSNode> old_root;
+    {
+        std::lock_guard<std::mutex> lock(tree_mutex_);
+        if (!root_) return;
+
+        if (action < 0 || action >= (int)root_->children.size()
+            || !root_->children[action]) {
+            // Unexplored branch — drop the whole tree.
+            old_root = std::move(root_);
+            root_noise_added_ = false;
+            return;  // old_root destroyed after lock release
+        }
+
+        auto new_root = std::move(root_->children[action]);
+        new_root->parent = nullptr;
+        // Any virtual loss left over from an interrupted search is stale.
+        new_root->virtual_loss_count.store(0, std::memory_order_relaxed);
+
+        old_root = std::move(root_);        // release old root
+        root_    = std::move(new_root);     // install promoted subtree
+        root_noise_added_ = false;          // noise must be re-added on next call
+        // root_nn_score_ is stale now — refreshed on next fresh search.
+    }
+    // old_root destroyed here, outside the lock
+}
+
+void MCTS::reset_tree() {
+    std::unique_ptr<MCTSNode> old_root;
+    {
+        std::lock_guard<std::mutex> lock(tree_mutex_);
+        old_root = std::move(root_);
+        root_nn_score_ = 0.0f;
+        root_noise_added_ = false;
+    }
+}
+
 int MCTS::get_action(GoGame& game, std::vector<float>& policy,
                      float temperature, int num_simulations,
-                     bool add_noise) {
+                     bool add_noise, bool reuse_tree) {
     int action_size = config_.action_size();
 
     std::vector<float> visits;
-    search(game, visits, num_simulations, add_noise);
+    search(game, visits, num_simulations, add_noise, reuse_tree);
 
     if (temperature == 0.0f) {
         int best = (int)(std::max_element(visits.begin(), visits.end())
@@ -572,8 +636,12 @@ static std::vector<TrainingRecord> self_play_game_impl(
         float temp = (game.move_count < config.temperature_threshold)
                      ? 1.0f : 0.0f;
 
+        // reuse_tree=true — previous iteration called make_move() so the
+        // root is already positioned at the current game state.  Dirichlet
+        // noise is refreshed each move because make_move() clears the flag.
         std::vector<float> pi;
-        int action = mcts.get_action(game, pi, temp, -1, true);
+        int action = mcts.get_action(game, pi, temp, -1, /*add_noise=*/true,
+                                      /*reuse_tree=*/true);
 
         Step step;
         game.encode(step.state);
@@ -585,6 +653,8 @@ static std::vector<TrainingRecord> self_play_game_impl(
             game.play(PASS_MOVE);
         else
             game.play(action);
+
+        mcts.make_move(action);
     }
 
     while (!game.game_over) game.play(PASS_MOVE);

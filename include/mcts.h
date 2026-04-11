@@ -113,12 +113,25 @@ public:
     AnalysisInfo get_analysis(int max_moves = 5) const;
 
     // ── Search ──────────────────────────────────────────────
+    // search() builds a fresh root unless reuse_tree=true AND root_ is
+    // already expanded (e.g. after a previous search + make_move()).
     void search(GoGame& game, std::vector<float>& visits,
-                int num_simulations = -1, bool add_noise = true);
+                int num_simulations = -1, bool add_noise = true,
+                bool reuse_tree = false);
 
     int get_action(GoGame& game, std::vector<float>& policy,
                    float temperature = 1.0f, int num_simulations = -1,
-                   bool add_noise = true);
+                   bool add_noise = true, bool reuse_tree = false);
+
+    // ── Tree reuse (KataGo pattern) ─────────────────────────
+    // Re-root the tree to the child at `action` after that move was played.
+    // The chosen subtree is preserved; siblings are discarded outside the
+    // tree_mutex_ lock.  If the child doesn't exist (unexplored branch),
+    // the tree is cleared and the next search() will build a fresh root.
+    void make_move(int action);
+
+    // Clear the tree completely (e.g. new game, SGF load).
+    void reset_tree();
 
     // ── Lifecycle (KataGo pattern) ──────────────────────────
     // Request early stop of a running search. Safe to call from any thread.
@@ -135,8 +148,11 @@ private:
     // search() is rebuilding the root at the start of a new search.
     mutable std::mutex        tree_mutex_;
     std::unique_ptr<MCTSNode> root_;
-    float root_nn_score_ = 0.0f;
-    int   action_size_   = 0;
+    float root_nn_score_    = 0.0f;
+    int   action_size_      = 0;
+    bool  root_noise_added_ = false;  // set by search() when Dirichlet noise
+                                      // is injected; reset by make_move() and
+                                      // when a fresh root is built
 
     // Stop flag — checked by search threads, set by request_stop()
     std::atomic<bool> should_stop_{false};

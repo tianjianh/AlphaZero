@@ -222,6 +222,7 @@ set(CORE_SOURCES
     src/compute_context.cpp
     src/nn_evaluator.cpp
     src/mcts.cpp
+    src/async_bot.cpp
 )
 
 if(HAS_EIGEN)

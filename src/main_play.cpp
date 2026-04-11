@@ -1,6 +1,7 @@
 #include "config.h"
 #include "game.h"
 #include "mcts.h"
+#include "async_bot.h"
 #include "loaded_model.h"
 #include "compute_context.h"
 #include "nn_evaluator.h"
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
@@ -324,7 +326,7 @@ int main(int argc, char* argv[]) {
     std::shared_ptr<LoadedModel> model;
     std::shared_ptr<ComputeContext> context;
     std::shared_ptr<NNEvaluator> evaluator;
-    std::unique_ptr<MCTS> mcts;
+    std::unique_ptr<AsyncBot> bot;
 
     if (!use_random) {
         try {
@@ -342,7 +344,7 @@ int main(int argc, char* argv[]) {
             config.num_search_threads = search_threads;
             evaluator = std::make_shared<NNEvaluator>(
                 model, context, device_ids, config.max_batch_size);
-            mcts = std::make_unique<MCTS>(evaluator.get(), config);
+            bot = std::make_unique<AsyncBot>(evaluator.get(), config);
         } catch (const std::exception& e) {
             fprintf(stderr, "Error: %s\nUse --random for random bot.\n", e.what());
             return 1;
@@ -402,6 +404,8 @@ int main(int argc, char* argv[]) {
             human_color = WHITE;
 
         GoGame game(config.board_size, config.komi);
+        if (bot) bot->reset(game);
+
         int cursor_r = n / 2, cursor_c = n / 2;
         bool cursor_active = false;
         int last_r = -1, last_c = -1;
@@ -409,36 +413,50 @@ int main(int argc, char* argv[]) {
         std::string status_msg;
         std::string ai_info;
         bool analysis_on = false;
-        std::thread analysis_thread;
+
+        // Shared state between the bot's callback thread and the UI thread.
+        // The bot calls `analyze_callback` every 500ms from its callback
+        // thread; the UI thread reads `latest_info` each frame to format
+        // the status line.
+        std::mutex ai_info_mutex;
+        MCTS::AnalysisInfo latest_info;
+        bool have_info = false;
+
+        auto analyze_callback = [&](const MCTS::AnalysisInfo& info) {
+            std::lock_guard<std::mutex> lock(ai_info_mutex);
+            latest_info = info;
+            have_info = (info.total_visits > 0);
+        };
 
         // Helper: stop any running analysis
         auto stop_analysis = [&]() {
-            if (analysis_on && mcts) {
-                mcts->request_stop();
-                if (analysis_thread.joinable())
-                    analysis_thread.join();
-                analysis_on = false;
+            if (bot) bot->stop_analyze();
+            analysis_on = false;
+            {
+                std::lock_guard<std::mutex> lock(ai_info_mutex);
+                have_info = false;
             }
             ai_info.clear();
         };
 
-        // Helper: start background analysis
+        // Helper: start background analysis (runs via AsyncBot)
         auto start_analysis = [&]() {
-            if (!mcts) return;
-            stop_analysis();
+            if (!bot) return;
+            bot->start_analyze(analyze_callback, /*interval_ms=*/500, pvs);
             analysis_on = true;
-            // Launch search in background (large sim count, interruptible)
-            analysis_thread = std::thread([&]() {
-                std::vector<float> visits;
-                mcts->search(game, visits, 1000000, false);
-            });
         };
 
-        // Helper: poll analysis and update ai_info string
+        // Helper: refresh ai_info from the most recent callback snapshot.
+        // Called from the UI thread — uses the UI's local `game` for
+        // action-to-string formatting (safe, no cross-thread game reads).
         auto poll_analysis = [&]() {
-            if (!analysis_on || !mcts) return;
-            auto info = mcts->get_analysis(pvs);
-            if (info.total_visits == 0) return;
+            if (!analysis_on) return;
+            MCTS::AnalysisInfo info;
+            {
+                std::lock_guard<std::mutex> lock(ai_info_mutex);
+                if (!have_info) return;
+                info = latest_info;
+            }
             char buf[256];
             float wr = (info.root_utility + 1.0f) / 2.0f * 100.0f;
             snprintf(buf, sizeof(buf), "WR %.1f%%  Score %+.1f  N=%d",
@@ -495,18 +513,22 @@ int main(int argc, char* argv[]) {
                 int action;
                 if (use_random) {
                     action = random_legal_move(game);
+                    if (action == config.action_size() - 1)
+                        game.play(PASS_MOVE);
+                    else
+                        game.play(action);
                 } else {
-                    std::vector<float> pi;
-                    action = mcts->get_action(game, pi, 0.0f, -1, false);
+                    // gen_move plays the move internally (bot's game + tree).
+                    // Refresh our local UI copy afterwards.
+                    action = bot->gen_move(game.current_player, -1, 0.0f, false);
+                    game = bot->game();
                 }
 
                 if (action == config.action_size() - 1) {
-                    game.play(PASS_MOVE);
                     last_r = last_c = -1;
                     status_msg = "AI plays: PASS";
                 } else {
                     int r = action / n, c = action % n;
-                    game.play(action);
                     last_r = r; last_c = c;
                     char buf[32];
                     snprintf(buf, sizeof(buf), "AI plays: %s", game.action_to_str(action).c_str());
@@ -535,6 +557,17 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
+            // Helper: play a human move through the bot (advances game+tree).
+            auto play_human_move = [&](int action) {
+                stop_analysis();
+                if (bot) {
+                    bot->play_move(game.current_player, action);
+                    game = bot->game();
+                } else {
+                    game.play(action == (config.action_size() - 1) ? PASS_MOVE : action);
+                }
+            };
+
             // Movement (arrows + WASD, but not 'a' which is analysis toggle)
             if (key == KEY_UP    || key == 'w' || key == 'W') { cursor_r = std::max(0, cursor_r - 1); input_buf.clear(); cursor_active = true; }
             else if (key == KEY_DOWN  || key == 's' || key == 'S') { cursor_r = std::min(n-1, cursor_r + 1); input_buf.clear(); cursor_active = true; }
@@ -552,8 +585,7 @@ int main(int argc, char* argv[]) {
                 if (r >= 0) {
                     int action = r * n + c;
                     if (game.is_legal(action)) {
-                        stop_analysis();
-                        game.play(action);
+                        play_human_move(action);
                         last_r = r; last_c = c;
                         input_buf.clear();
                         cursor_active = false;
@@ -565,8 +597,7 @@ int main(int argc, char* argv[]) {
 
             // Pass
             else if (key == 'p' || key == 'P') {
-                stop_analysis();
-                game.play(PASS_MOVE);
+                play_human_move(config.action_size() - 1);
                 last_r = last_c = -1;
                 input_buf.clear();
             }
@@ -580,13 +611,12 @@ int main(int argc, char* argv[]) {
                 if (try_parse_coord(input_buf, n, r, c)) {
                     int action = r * n + c;
                     if (game.is_legal(action)) {
-                        stop_analysis();
                         cursor_r = r; cursor_c = c; cursor_active = true;
                         draw_board(stdscr, game, config, cursor_r, cursor_c, true,
                                    last_r, last_c, human_color, use_random,
                                    status_msg, ai_info, input_buf);
                         napms(120);
-                        game.play(action);
+                        play_human_move(action);
                         last_r = r; last_c = c;
                         input_buf.clear();
                         cursor_active = false;

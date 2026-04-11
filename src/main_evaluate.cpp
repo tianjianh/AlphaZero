@@ -53,9 +53,12 @@ static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
         bool current_is_black = (game.current_player == BLACK);
         MCTS& mcts = (current_is_black == eval1_is_black) ? mcts1 : mcts2;
 
-        // Evaluation: temperature 0, no Dirichlet noise
+        // Evaluation: temperature 0, no Dirichlet noise.
+        // reuse_tree=true — the active MCTS's tree was advanced via
+        // make_move() in the previous iteration.
         std::vector<float> policy;
-        int action = mcts.get_action(game, policy, 0.0f, -1, false);
+        int action = mcts.get_action(game, policy, 0.0f, -1, false,
+                                      /*reuse_tree=*/true);
 
         rec.moves.push_back(action == action_size - 1 ? PASS_MOVE : action);
 
@@ -63,6 +66,11 @@ static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
             game.play(PASS_MOVE);
         else
             game.play(action);
+
+        // Advance BOTH MCTS trees — each player's tree needs to track
+        // the opponent's move too so its next search can reuse the subtree.
+        mcts1.make_move(action);
+        mcts2.make_move(action);
     }
 
     while (!game.game_over) game.play(PASS_MOVE);
