@@ -599,6 +599,11 @@ Now both `gen_move` and `play_move` unconditionally call
   output for GTP `kata-analyze`.  MiniGo returns `AnalysisInfo` as a
   C++ struct; a JSON serializer would be a one-screen function when
   we need it.
-- **Tree reuse across games** — neither reuses across distinct games.
-  Each new game starts fresh.  KataGo uses this for match play and
-  selfplay, where successive games are independent.
+Note: tree reuse is strictly *within* a single game, move-to-move.
+Neither KataGo nor MiniGo reuses across distinct games, and there's
+no reason to — Dirichlet root noise makes every training game diverge
+after a few plies, so the shared prefix is shallow, and forcing
+every game to start from a cached opening tree would hurt training
+diversity.  Cross-game tree reuse only makes sense for repeated
+evaluation from the same position (e.g. an opening book) and isn't
+used in any selfplay loop we're aware of.
