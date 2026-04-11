@@ -297,17 +297,108 @@ for movement.
 
 **Modes**: (B)lack vs AI, (W)hite vs AI, (H)uman vs Human.
 
-**Live analysis**: Press `a` during your turn to toggle MCTS analysis. The search
-runs in a background thread; the UI polls the tree every 500ms (KataGo pattern)
-and shows the top moves with win rate and visit counts:
+#### Hotkeys
+
+| Key | Action |
+|---|---|
+| Arrows / WASD | Move cursor |
+| Enter / Space | Place stone at cursor |
+| Typed coord (e.g. `D4`) | Jump cursor + place stone |
+| `p` (lowercase) | Pass |
+| `a` | Toggle analysis HUD (live evaluation display) |
+| `P` (Shift+P) | Toggle pondering (background search) |
+| `r` | Restart game / refresh screen |
+| `q` | Quit |
+
+#### Pondering and analysis (two independent toggles)
+
+The play binary exposes two orthogonal user preferences:
+
+- **P — Pondering**: a background MCTS search runs while the engine is
+  otherwise idle (your think time during AI-vs-human, or any time during
+  human-vs-human).
+- **A — Analysis**: a 500ms callback fires and the HUD displays the tree's
+  live evaluation — win rate, score, top moves with visit counts.
+
+**Coupling rule**: A requires P.  You can't display the analysis of a tree
+that isn't being searched, so turning A on auto-enables P, and turning P off
+auto-clears A.  Three reachable states:
+
+| State | P | A | Meaning |
+|---|---|---|---|
+| **off** | ❌ | ❌ | Bot idle; no background search, no HUD |
+| **ponder** | ✅ | ❌ | Silent background search; engine thinks without HUD clutter |
+| **analyze** | ✅ | ✅ | Background search + live HUD (numbers update every 500ms) |
+
+**State transitions**:
+
+| From | press `a` → | press `P` → |
+|---|---|---|
+| off | analyze (A on, P auto-on) | ponder (P on) |
+| ponder | analyze (A on, P stays on) | off (P off) |
+| analyze | ponder (A off, P stays on) | off (P off, A auto-off) |
+
+**Usefulness per game mode**:
+
+| Game Mode | off | ponder | analyze |
+|---|---|---|---|
+| **Human vs AI** | Engine only thinks on its own turn (classic Go GUI behavior) | Tournament-style: engine also searches during your turn, no HUD clutter | Engine thinks both turns + live HUD shows what it's computing, including **during the AI's own move** |
+| **Human vs Human** | Pure manual play, no engine | *Wasted compute* — search runs but nothing is displayed | Live evaluation of the current position (study mode) |
+
+Notes:
+
+- In human-vs-AI, **ponder** alone (P only) is genuinely useful: the engine
+  exploits your idle time to search ahead, and its next move comes out faster.
+- In human-vs-human, **ponder** alone is technically valid but pointless
+  (nobody sees the tree).  You'll typically go `off` → `analyze` directly.
+- **analyze** shows live updates through BOTH pondering and the AI's move
+  selection — `gen_move` runs through the same AsyncBot worker thread as
+  `ponder`, so the callback fires throughout.  You literally see what the
+  AI is thinking while it thinks.
+
+**Example HUD output** (analyze state, HvAI, mid-game):
 ```
 WR 65.0%  Score +5.3  N=1234
 | D5   65.0% n=523
 | E3   22.1% n=234
 | C6   12.4% n=128
 ```
-Press `a` again or make a move to stop analysis. `--pvs K` sets the number of
-top moves shown (default 5).
+The number of top moves shown is set by `--pvs K` (default 5).
+
+When pondering without analysis (P only, A off), the panel shows a
+placeholder: `[pondering — press a for HUD]`.
+
+#### Tree preservation guarantees
+
+The MCTS tree is a persistent object inside the `AsyncBot` and **is preserved
+across most state changes**:
+
+- **Toggling `a` or `P`**: tree is preserved.  The current search is stopped
+  briefly to reconfigure the callback; the next search reuses the existing
+  root via `reuse_tree=true`.
+- **Making a move** (human via `play_move`, AI via `gen_move`): the tree is
+  **re-rooted** to the chosen move's child.  The chosen subtree is preserved;
+  unexplored siblings are discarded.  Still "tree reuse" in the sense that
+  no NN re-evaluation of the new root is needed.
+- **Toggling off → on**: tree persists across the off state.  `stop()` stops
+  the search thread but doesn't touch the tree.  Re-enabling picks up where
+  it left off.
+
+The tree is **destroyed and rebuilt from scratch** only in these cases:
+
+- **Starting a new game** (`r` for restart, or selecting a new mode): explicit
+  `reset_tree()`.
+- **Game over → restart**: same as above.
+- **Playing a move into an unexplored branch**: if you play a move that the
+  previous search never visited (so `root_->children[action]` is null),
+  `make_move` drops the tree.  Rare in practice — it can only happen if you
+  make a move immediately after enabling ponder, before the first playout
+  has even completed.
+- **Worker exception**: if the background search throws (e.g. a backend
+  failure), the worker logs and exits the iteration.  Tree state is retained
+  but may be partially incomplete; the next search rebuilds from what's left.
+
+Everything else — toggles, moves, temporary off-states — preserves the tree.
 
 ### Benchmark
 
@@ -400,10 +491,69 @@ threads descend and submit leaves for batch N+1.  Steady-state batch size
 total_search_threads = min(games, threads) × search_threads
 ```
 
-### Analysis Polling API (KataGo pattern)
+### AsyncBot — persistent worker + tree reuse (KataGo pattern)
 
-`MCTS::get_analysis(max_moves)` reads the live search tree via atomics — safe
-to call from any thread while search is running, no locks needed.  Returns:
+The `AsyncBot` class (`include/async_bot.h`) wraps `MCTS + GoGame` and runs
+all searches on **one persistent worker thread** that idle-waits on a
+condvar between requests — matching KataGo's `internalSearchThreadLoop`
+design.  A single `worker_loop()` handles all search modes (GENMOVE for
+AI moves, PONDER for background search), so there's only one state
+machine to reason about.
+
+**Public API** (single-writer contract):
+
+```cpp
+// Callback configuration (persistent; applies to any subsequent search)
+void set_callback(AnalysisCallback cb, int interval_ms, int max_pv);
+void clear_callback();
+
+// Synchronous operations (block until done)
+int  gen_move(Stone color, int sims, float temp, bool noise);
+bool play_move(Stone color, int action);
+
+// Asynchronous operations (return immediately)
+void start_ponder();                         // background search, no cb
+void start_analyze(cb, interval_ms, max_pv); // set_callback + start_ponder
+void stop();                                  // interrupt, wait for idle
+
+// Queries (safe from any thread)
+MCTS::AnalysisInfo get_analysis(int max_moves);
+bool is_searching() const;
+```
+
+**Internals**: `pending_mode_` / `current_mode_` ∈ `{IDLE, GENMOVE,
+PONDER, SHUTDOWN}` protected by `control_mutex_`.  Callers submit a
+request by setting `pending_mode_` and notifying `worker_cv_`, then wait
+on `done_cv_` for `current_mode_` to return to IDLE.  The worker spawns
+a transient callback thread per iteration when a callback is configured,
+joins it at the end of the iteration, then loops back to wait.
+
+**Tree reuse**: the `MCTS` instance owns one persistent `root_` that
+survives across `search()` calls.  `MCTS::make_move(action)` re-roots
+the tree to the played child (preserving its subtree, discarding
+siblings outside the lock).  Every search call passes `reuse_tree=true`
+so subsequent searches accumulate visits rather than rebuilding.  See
+`COMPARISON_WITH_KATAGO.md` §13 for the point-by-point comparison with
+KataGo's `Search::makeMove` + `Search::beginSearch`.
+
+**Live analysis flow** (used by the play UI):
+
+1. `bot->set_callback(cb, 500, 10)` — register a callback that pushes
+   an `AnalysisInfo` snapshot to a mutex-protected UI struct every 500ms.
+2. `bot->start_ponder()` — spawns a GENMOVE or PONDER search via the
+   worker; the worker spawns a callback thread for the duration.
+3. UI thread reads the latest snapshot each frame under the same mutex
+   and redraws.
+4. On human move: `bot->play_move(color, action)` internally stops the
+   ponder (worker's search returns via `request_stop`), advances game +
+   tree, returns.  UI loop restarts ponder at the top of the next
+   iteration via `maintain_bot_state`.
+5. On AI move: `bot->gen_move(color)` runs a GENMOVE search through the
+   same worker — the callback thread fires throughout, so the user sees
+   the AI's search tree evolve live.
+
+`MCTS::get_analysis(max_moves)` itself is a simple reader — it holds
+`tree_mutex_` briefly, walks `root_->children`, and returns:
 
 ```cpp
 struct AnalysisInfo {
@@ -414,19 +564,10 @@ struct AnalysisInfo {
 };
 ```
 
-Each `MoveInfo` contains: action, visits, prior (policy), utility (Q-value).
-
-**Live analysis** in the play UI uses this: a background thread runs
-`search()` with a large sim count, while the main thread polls
-`get_analysis()` every 500ms and redraws the display.  `request_stop()`
-sets an atomic flag that search threads check each playout, enabling
-clean early termination when the user makes a move.
-
-The tree persists as an `MCTS` member (`root_`) between `search()` and
-`get_analysis()` calls.  It is only replaced when the next `search()` starts.
-No separate reporter thread — the main thread handles both polling and input
-sequentially, avoiding the tree-lifetime race that KataGo's independent
-reporter thread must coordinate around.
+Each `MoveInfo` contains: action, visits, prior (policy), utility
+(Q-value).  Visit counts are atomic; priors are stable after the root
+is expanded; `nn_score` is stored per-node so re-rooted trees carry
+their own correct score without needing re-evaluation.
 
 ### KataGo-style NNEvaluator
 
@@ -764,6 +905,7 @@ minigo-cpp/
 │   ├── compute_context.h       # ComputeContext + ComputeHandle base classes
 │   ├── batch_evaluator.h       # BatchEvaluator interface + NNResultBuf
 │   ├── nn_evaluator.h          # KataGo-style batching server (N server threads)
+│   ├── async_bot.h             # Persistent worker wrapper (ponder + analyze)
 │   ├── eigen_compute.h         # Eigen CPU backend (context + handle)
 │   ├── opencl_compute.h        # OpenCL GPU backend (context + handle)
 │   ├── cuda_compute.h          # CUDA GPU backend (context + handle)
@@ -782,8 +924,9 @@ minigo-cpp/
 │   ├── tensorrt_compute.cpp    # TensorRT context + handle (ONNX→engine)
 │   ├── metal_compute.mm        # Metal/MPSGraph context + handle (Obj-C++)
 │   ├── nn_evaluator.cpp        # NNEvaluator N server threads (KataGo pattern)
-│   ├── mcts.cpp                # Multi-threaded MCTS + data augmentation
-│   ├── main_play.cpp           # Human vs AI
+│   ├── mcts.cpp                # Multi-threaded MCTS + tree reuse (make_move)
+│   ├── async_bot.cpp           # Persistent worker thread + callback reporting
+│   ├── main_play.cpp           # Human vs AI (uses AsyncBot for ponder/analyze)
 │   ├── main_selfplay.cpp       # Multi-threaded data generation
 │   ├── main_evaluate.cpp       # Model vs model evaluation matches
 │   └── main_benchmark.cpp      # Performance tests
@@ -849,9 +992,14 @@ python run_loop.py status             Show training progress
   --score-scale F        Score atan compression scale (default: 10.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
+  --pvs K                Top K moves shown in analysis HUD (default: 5)
   --random               Use random bot (no model needed)
   --board N              Board size (for --random mode)
 ```
+
+In-game hotkeys: `a` analysis HUD, `P` (shift+p) pondering,
+`p` pass, `r` restart, `q` quit.  See the Play section above for
+the full state machine.
 
 ### evaluate
 
