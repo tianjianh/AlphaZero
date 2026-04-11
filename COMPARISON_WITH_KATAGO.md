@@ -607,3 +607,72 @@ every game to start from a cached opening tree would hurt training
 diversity.  Cross-game tree reuse only makes sense for repeated
 evaluation from the same position (e.g. an opening book) and isn't
 used in any selfplay loop we're aware of.
+
+### Play mode UX: ponder and analysis as independent toggles
+
+The interactive `play` binary exposes two independent flags:
+
+- **P (pondering)**: background MCTS search runs during idle time
+  (either the human's turn in AI-vs-human, or any turn in
+  human-vs-human — though "idle" is less meaningful there)
+- **A (analysis)**: a 500ms callback fires and the HUD shows the
+  tree's current evaluation (win rate, score, top moves)
+
+**Coupling rule**: A requires P.  You can't display an analysis of a
+tree that isn't being searched.  This means three reachable states,
+not four:
+
+| State | P | A | Meaning |
+|---|---|---|---|
+| **off** | ❌ | ❌ | Bot is idle; no search running, no HUD |
+| **ponder** | ✅ | ❌ | Silent background search; no HUD clutter |
+| **analyze** | ✅ | ✅ | Background search + live HUD updates |
+
+The fourth "A on, P off" state is forbidden — turning off P auto-clears
+A, and turning on A auto-sets P.
+
+**Hotkeys**:
+
+| Key | Action |
+|---|---|
+| `a` | Toggle A (analysis HUD).  Auto-enables P if needed. |
+| `P` (shift+p) | Toggle P (pondering).  Turning off auto-clears A. |
+| `p` (lowercase) | Pass (unchanged) |
+
+**State transitions**:
+
+| From | Press `a` → | Press `P` → |
+|---|---|---|
+| off | analyze (A on, P auto-on) | ponder (P on) |
+| ponder | analyze (A on, P stays on) | off (P off) |
+| analyze | ponder (A off, P stays on) | off (P off, A auto-off) |
+
+**Usefulness per game mode**:
+
+| Game Mode | off | ponder | analyze | Recommended default |
+|---|---|---|---|---|
+| **Human vs AI** (you play black or white) | Engine only thinks on its own turn — classic behavior | Tournament-style: engine also thinks during your turn, no HUD | Engine thinks always + live HUD shows what it's computing | `off` (classic) or `analyze` (study mode) |
+| **Human vs Human** (two humans at one board) | Pure manual play, no engine | *Valid but pointless* — search runs but user sees nothing | Engine shows live eval of the current position for both players | `off` (casual) or `analyze` (study mode) |
+
+Observations:
+
+- In human-vs-AI, **ponder** (P only) is genuinely useful on its own:
+  the engine exploits your think time to search ahead, without
+  cluttering the screen with numbers.
+- In human-vs-human, **ponder** alone is technically valid but
+  wasted compute — nobody benefits from a tree that isn't displayed.
+  You'll typically either be in **off** or **analyze**; the **ponder**
+  state is just a transient thing you pass through.
+- **analyze** has slightly different semantics in the two modes:
+  in HvAI it shows what the AI is thinking during its own turn
+  (because `gen_move` runs through the same worker as `ponder` and
+  fires the same callback); in HvH it just shows the tree's
+  evaluation of the current position.
+
+The state machine is implemented in `main_play.cpp`'s
+`toggle_ponder` / `toggle_analysis` / `apply_bot_state` helpers.
+`AsyncBot` itself exposes the primitives (`set_callback` /
+`clear_callback` / `start_ponder` / `stop`), and a convenience
+`start_analyze` wrapper that combines `set_callback + start_ponder`
+in one call.  Any caller (future web UI, Python bindings) can
+register its own callback and drive the same three states.

@@ -236,7 +236,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
 
     // Help at bottom
     int help_y = std::max(oy + n + 1, (int)(panel_y + 2));
-    const char* help = "Arrows: move  Enter: place  P: pass  A: analysis  R: refresh  Q: quit";
+    const char* help = "arrows:move  enter:place  p:pass  a:analyze  P:ponder  r:refresh  q:quit";
     wattron(win, COLOR_PAIR(CP_LABEL));
     mvwaddnstr(win, std::min(help_y, h - 1), 2, help, w - 4);
     wattroff(win, COLOR_PAIR(CP_LABEL));
@@ -413,12 +413,19 @@ int main(int argc, char* argv[]) {
         std::string status_msg;
         std::string ai_info;
 
-        // Persistent user preference for analysis mode.  Toggled by 'a'.
-        // Analysis mode = "callback is set + pondering runs during
-        // idle time".  Reporting (the callback) keeps firing across
-        // both human and AI turns; the worker auto-restarts ponder
-        // at the top of each loop iteration whenever the bot is idle.
-        bool analysis_on = false;
+        // Two independent user preferences with a coupling rule:
+        //   P (pondering_wanted): background MCTS search runs during idle time
+        //   A (analysis_wanted):  callback fires + HUD displays live eval
+        //
+        // Coupling: A requires P.  Turning A on auto-turns P on; turning P
+        // off auto-turns A off.  Turning A off leaves P as-is (silent ponder
+        // remains a valid state).
+        //
+        // Reachable states: {off, ponder, analyze}.  Hotkeys 'a' and 'P'
+        // (uppercase) cycle between them — see toggle_analysis / toggle_ponder
+        // below.
+        bool pondering_wanted = false;
+        bool analysis_wanted  = false;
 
         // Shared state between the bot's callback thread and the UI thread.
         std::mutex ai_info_mutex;
@@ -431,44 +438,97 @@ int main(int argc, char* argv[]) {
             have_info = (info.total_visits > 0);
         };
 
-        // Helper: enable analysis mode (set callback + start ponder).
-        auto enable_analysis = [&]() {
+        // Apply the two flags to the bot.  Stops any running search,
+        // reconfigures the callback, then restarts ponder if wanted.
+        // Called whenever the user toggles a flag.
+        auto apply_bot_state = [&]() {
             if (!bot) return;
-            bot->set_callback(analyze_callback, /*interval_ms=*/500, pvs);
-            bot->start_ponder();   // background search; callback fires via worker
-            analysis_on = true;
-        };
 
-        // Helper: disable analysis mode (stop + clear callback).
-        auto disable_analysis = [&]() {
-            if (bot) {
-                bot->stop();
+            // Stop the current search so the new callback config takes
+            // effect on the next search (the worker snapshots callback_
+            // when picking up a request).
+            bot->stop();
+
+            if (analysis_wanted) {
+                bot->set_callback(analyze_callback, /*interval_ms=*/500, pvs);
+            } else {
                 bot->clear_callback();
-            }
-            analysis_on = false;
-            {
                 std::lock_guard<std::mutex> lock(ai_info_mutex);
                 have_info = false;
+                ai_info.clear();
             }
-            ai_info.clear();
-        };
 
-        // Helper: ensure background ponder is running if user wants
-        // analysis.  Called at the top of the loop on every iteration.
-        // Safe no-op if the bot is already searching.
-        auto maintain_ponder = [&]() {
-            if (analysis_on && bot && !bot->is_searching()) {
+            if (pondering_wanted) {
                 bot->start_ponder();
             }
         };
 
-        // Helper: refresh ai_info from the most recent callback snapshot.
-        auto poll_analysis = [&]() {
-            if (!analysis_on) return;
+        // Toggle ponder: off ↔ on.  If turning off and analysis was on,
+        // also turn off analysis (coupling: A requires P).
+        auto toggle_ponder = [&]() {
+            if (pondering_wanted) {
+                pondering_wanted = false;
+                analysis_wanted  = false;   // A requires P — no orphaned HUD
+            } else {
+                pondering_wanted = true;
+            }
+            apply_bot_state();
+        };
+
+        // Toggle analysis: off ↔ on.  If turning on and ponder was off,
+        // also turn on ponder (coupling: A requires P).
+        auto toggle_analysis = [&]() {
+            if (analysis_wanted) {
+                analysis_wanted = false;
+                // pondering_wanted stays as-is — user may want silent ponder
+            } else {
+                analysis_wanted  = true;
+                pondering_wanted = true;    // A requires P — auto-enable search
+            }
+            apply_bot_state();
+        };
+
+        // Disable both (used at game-over / quit cleanup).
+        auto disable_all = [&]() {
+            pondering_wanted = false;
+            analysis_wanted  = false;
+            apply_bot_state();
+        };
+
+        // Helper: check if current player is human
+        auto is_human_turn = [&]() {
+            return human_vs_human || game.current_player == human_color;
+        };
+
+        // Ensure the bot's running state matches the user flags.  Called at
+        // the top of the game loop on each iteration.  After gen_move or
+        // play_move, the bot is idle; if the user wants ponder, restart it.
+        // Only starts ponder during human idle time — on AI turn, gen_move
+        // handles its own search through the same worker.
+        auto maintain_bot_state = [&]() {
+            if (!bot) return;
+            if (!is_human_turn()) return;   // AI turn: gen_move drives search
+            if (pondering_wanted && !bot->is_searching()) {
+                bot->start_ponder();
+            }
+        };
+
+        // Refresh ai_info for display.  Shows:
+        //   analyze mode (P+A): live HUD from latest callback snapshot
+        //   ponder mode (P only): "[pondering]" placeholder
+        //   off: cleared
+        auto refresh_ai_info = [&]() {
+            if (!analysis_wanted) {
+                ai_info = pondering_wanted ? "[pondering — press a for HUD]" : "";
+                return;
+            }
             MCTS::AnalysisInfo info;
             {
                 std::lock_guard<std::mutex> lock(ai_info_mutex);
-                if (!have_info) return;
+                if (!have_info) {
+                    ai_info = "[analyzing — waiting for first result]";
+                    return;
+                }
                 info = latest_info;
             }
             char buf[256];
@@ -485,30 +545,25 @@ int main(int argc, char* argv[]) {
             }
         };
 
-        // Helper: check if current player is human
-        auto is_human_turn = [&]() {
-            return human_vs_human || game.current_player == human_color;
-        };
-
         while (true) {
             // Ensure ponder is running if analysis is toggled on.  The bot
             // may be idle because gen_move/play_move just finished or
             // because analysis was just toggled on — restart it here so
             // the callback keeps firing.
-            maintain_ponder();
+            maintain_bot_state();
 
-            // Set getch timeout: 500ms during analysis (so we can poll
+            // Set getch timeout: 500ms while HUD is active (so we can poll
             // the latest callback snapshot and redraw), blocking otherwise.
-            timeout(analysis_on ? 500 : -1);
+            timeout(analysis_wanted ? 500 : -1);
 
-            if (analysis_on) poll_analysis();
+            refresh_ai_info();
 
             draw_board(stdscr, game, config, cursor_r, cursor_c, cursor_active,
                        last_r, last_c, human_color, use_random,
                        status_msg, ai_info, input_buf);
 
             if (game.game_over) {
-                disable_analysis();
+                disable_all();
                 auto [bs, ws] = game.score();
                 char buf[128];
                 snprintf(buf, sizeof(buf), "Game over  B:%.1f  W:%.1f  [r]restart [q]quit", bs, ws);
@@ -563,7 +618,7 @@ int main(int argc, char* argv[]) {
             if (key == ERR) continue;  // timeout during analysis polling
             status_msg.clear();
 
-            if (key == 'q' || key == 'Q') { disable_analysis(); keep_playing = false; break; }
+            if (key == 'q' || key == 'Q') { disable_all(); keep_playing = false; break; }
 
             // Refresh screen
             if (key == 'r') {
@@ -571,16 +626,23 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // Toggle analysis
+            // Toggle analysis HUD ('a').  A requires P — turning A on also
+            // turns on pondering; turning A off leaves pondering as-is.
             if (key == 'a') {
-                if (analysis_on) disable_analysis();
-                else             enable_analysis();
+                toggle_analysis();
+                continue;
+            }
+
+            // Toggle pondering ('P' uppercase — lowercase 'p' is PASS).
+            // Turning P off auto-turns A off (no orphaned HUD).
+            if (key == 'P') {
+                toggle_ponder();
                 continue;
             }
 
             // Helper: play a human move through the bot (advances game+tree).
             // bot->play_move stops ponder internally (if running); the top
-            // of the next loop iteration auto-restarts it via maintain_ponder.
+            // of the next loop iteration auto-restarts it via maintain_bot_state.
             auto play_human_move = [&](int action) -> bool {
                 if (bot) {
                     if (!bot->play_move(game.current_player, action))
@@ -619,8 +681,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Pass
-            else if (key == 'p' || key == 'P') {
+            // Pass (lowercase 'p' only; uppercase 'P' is ponder toggle)
+            else if (key == 'p') {
                 play_human_move(config.action_size() - 1);
                 last_r = last_c = -1;
                 input_buf.clear();
@@ -657,7 +719,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        disable_analysis();
+        disable_all();
     }
 
     endwin();
