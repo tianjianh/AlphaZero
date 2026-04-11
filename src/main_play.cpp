@@ -558,14 +558,19 @@ int main(int argc, char* argv[]) {
             }
 
             // Helper: play a human move through the bot (advances game+tree).
-            auto play_human_move = [&](int action) {
+            // Returns true on success, false if the bot rejected the move
+            // (caller already validated legality via game.is_legal, so this
+            // is defensive).
+            auto play_human_move = [&](int action) -> bool {
                 stop_analysis();
                 if (bot) {
-                    bot->play_move(game.current_player, action);
+                    if (!bot->play_move(game.current_player, action))
+                        return false;
                     game = bot->game();
                 } else {
                     game.play(action == (config.action_size() - 1) ? PASS_MOVE : action);
                 }
+                return true;
             };
 
             // Movement (arrows + WASD, but not 'a' which is analysis toggle)

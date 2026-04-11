@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iostream>
+#include <stdexcept>
 
 namespace minigo {
 
@@ -44,11 +46,16 @@ int AsyncBot::gen_move(Stone color, int num_simulations,
     stop_analyze_internal();
 
     // Copy the game so MCTS can safely reference it from search threads.
+    // Validate color matches the authoritative current player — fail
+    // fast on caller bugs rather than silently producing a wrong move.
     GoGame game_copy;
     {
         std::lock_guard<std::mutex> lock(game_mutex_);
+        if (color != EMPTY && color != game_.current_player) {
+            throw std::runtime_error(
+                "AsyncBot::gen_move: color does not match current player");
+        }
         game_copy = game_.copy();
-        (void)color;  // Caller asserts the color matches the current player.
     }
 
     std::vector<float> policy;
@@ -71,24 +78,35 @@ int AsyncBot::gen_move(Stone color, int num_simulations,
 
 // ── External move (human, opponent) ─────────────────────────
 
-void AsyncBot::play_move(Stone color, int action) {
+bool AsyncBot::play_move(Stone color, int action) {
     // KataGo pattern: stopAndWait before touching the tree.  Caller is
     // responsible for restarting pondering/analyze after play_move returns.
     stop_analyze_internal();
 
+    // Normalize both action representations to a single game-layer action.
+    const int pass_action = config_.action_size() - 1;
+    int game_action = (action == pass_action || action == PASS_MOVE)
+                      ? PASS_MOVE : action;
+    int tree_action = (action == PASS_MOVE) ? pass_action : action;
+
     {
         std::lock_guard<std::mutex> lock(game_mutex_);
-        (void)color;  // caller asserts correct color
-        if (action == config_.action_size() - 1 || action == PASS_MOVE)
-            game_.play(PASS_MOVE);
-        else
-            game_.play(action);
+        // Validate color against the authoritative current player.
+        if (color != EMPTY && color != game_.current_player) {
+            return false;  // wrong turn — don't corrupt game state
+        }
+        // Validate legality at the CURRENT position (catches stale frontends
+        // and out-of-range actions).  game_.is_legal accepts PASS_MOVE.
+        if (!game_.is_legal(game_action)) {
+            return false;
+        }
+        game_.play(game_action);
     }
     // Tree reuse: promote the played child.  If the child doesn't
     // exist (tree wasn't deep enough) make_move drops the tree and
     // the next search rebuilds from scratch.
-    int tree_action = (action == PASS_MOVE) ? (config_.action_size() - 1) : action;
     mcts_->make_move(tree_action);
+    return true;
 }
 
 // ── Async analyze ───────────────────────────────────────────
@@ -97,6 +115,12 @@ void AsyncBot::start_analyze(AnalysisCallback callback, int interval_ms,
                              int max_pv_moves) {
     if (analyzing_.load(std::memory_order_acquire)) return;
     if (!callback) return;
+
+    // Collect any dead-but-joinable threads from a previous search that
+    // exited via exception.  std::thread::operator= on a joinable thread
+    // would call std::terminate, so we must reap first.
+    if (search_thread_.joinable())   search_thread_.join();
+    if (callback_thread_.joinable()) callback_thread_.join();
 
     callback_           = std::move(callback);
     callback_interval_ms_ = std::max(50, interval_ms);
@@ -112,8 +136,10 @@ void AsyncBot::stop_analyze() {
 }
 
 void AsyncBot::stop_analyze_internal() {
-    if (!analyzing_.load(std::memory_order_acquire)) return;
-
+    // Always flip the flag and join whatever threads are joinable.  This
+    // handles both the normal stop path AND the case where search_loop_worker
+    // exited via exception and left analyzing_ flipped to false on its own —
+    // the threads are dead-but-joinable and we must collect them.
     analyzing_.store(false, std::memory_order_release);
     mcts_->request_stop();  // wake the search threads
 
@@ -150,8 +176,23 @@ void AsyncBot::search_loop_worker() {
     try {
         mcts_->search(game_copy, visits, kBigSims,
                        /*add_noise=*/false, /*reuse_tree=*/true);
+    } catch (const std::exception& e) {
+        // Background thread must not crash the host.  Clear analyzing_
+        // and wake the callback thread so it exits promptly — otherwise
+        // is_analyzing() lies and start_analyze() becomes a no-op.
+        std::cerr << "AsyncBot: background search failed: " << e.what() << "\n";
+        analyzing_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+        }
+        callback_cv_.notify_all();
     } catch (...) {
-        // Swallow — background thread must not crash the host.
+        std::cerr << "AsyncBot: background search failed (unknown exception)\n";
+        analyzing_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+        }
+        callback_cv_.notify_all();
     }
 }
 

@@ -68,14 +68,19 @@ public:
     // ── Synchronous move selection (AI move) ────────────────
     // Stops any background analyze, runs a blocking MCTS search, picks
     // an action, advances game + tree.  Returns the played action.
+    // Throws std::runtime_error if `color` doesn't match the current
+    // player (fail-fast on caller bug).  Pass EMPTY to skip the check.
     // Caller is responsible for restarting analyze afterwards if wanted.
     int gen_move(Stone color, int num_simulations = -1,
                  float temperature = 0.0f, bool add_noise = false);
 
     // ── Play an externally-chosen move (human / opponent) ───
-    // Stops any background analyze, advances game + tree.  Caller is
-    // responsible for restarting analyze afterwards if wanted.
-    void play_move(Stone color, int action);
+    // Stops any background analyze, advances game + tree.  Validates
+    // color against the current player and action legality; returns
+    // false on mismatch or illegal move (game + tree unchanged).
+    // Returns true on success.  Pass color=EMPTY to skip the color check.
+    // Caller is responsible for restarting analyze afterwards if wanted.
+    bool play_move(Stone color, int action);
 
     // ── Async analysis ──────────────────────────────────────
     using AnalysisCallback = std::function<void(const MCTS::AnalysisInfo&)>;
