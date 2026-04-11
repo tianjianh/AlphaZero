@@ -398,7 +398,14 @@ The tree is **destroyed and rebuilt from scratch** only in these cases:
   failure), the worker logs and exits the iteration.  Tree state is retained
   but may be partially incomplete; the next search rebuilds from what's left.
 
-Everything else — toggles, moves, temporary off-states — preserves the tree.
+Toggles never rebuild the tree — not even if you hit `a` within microseconds
+of `P`, catching the worker mid-NN-eval.  The root NN evaluation inside
+`search()` is a synchronous call to `evaluator_->evaluate(...)` that cannot
+be interrupted by `request_stop()`; it runs to completion and installs the
+fresh root *before* the playout phase checks the stop flag.  By the time
+the interrupted search returns, `root_` is already EXPANDED, and the next
+search reuses it.  The only thing lost is the handful of playouts that
+would have run after the stop was raised.
 
 ### Benchmark
 
@@ -527,6 +534,16 @@ request by setting `pending_mode_` and notifying `worker_cv_`, then wait
 on `done_cv_` for `current_mode_` to return to IDLE.  The worker spawns
 a transient callback thread per iteration when a callback is configured,
 joins it at the end of the iteration, then loops back to wait.
+
+**Stop-flag ownership**: `MCTS::should_stop_` is set by `request_stop()`
+(called from `stop_locked()`) and checked inside the playout loop.
+Critically, it is **NOT** cleared inside `MCTS::search()` — the clear
+happens in `AsyncBot::worker_loop` via `mcts_->reset_stop_flag()`
+*inside* the same critical section as the `current_mode_` transition.
+This avoids a race where a stop signal raised after the worker released
+the lock but before it entered `search()` would be silently overwritten
+by search()'s own clear.  Non-AsyncBot callers (selfplay, eval,
+benchmark) never set the flag, so leaving it default-false is safe.
 
 **Tree reuse**: the `MCTS` instance owns one persistent `root_` that
 survives across `search()` calls.  `MCTS::make_move(action)` re-roots

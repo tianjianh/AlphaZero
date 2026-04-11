@@ -463,10 +463,11 @@ section compares how KataGo structures them and where MiniGo differs.
 | **Virtual-loss cleanup in `makeMove`** | Not touched — relies on `stopAndWait()` having joined all playout threads first | Defensively zero `virtual_loss_count` on the promoted root; relies on same stopAndWait invariant |
 | **`makeMove` return type** | `bool` — false if the move is illegal at the current game state | `void` — caller is expected to have validated legality |
 | **Tree-reuse default** | Implicit: `beginSearch` keeps `rootNode` if non-null, allocates fresh only when null | Explicit: `search(..., reuse_tree)` parameter; default `false` for safety (fresh build unless caller opts in) |
-| **Persistent search thread** | Yes — one `std::thread` runs `internalSearchThreadLoop()` forever, waking on a condvar when asked to search | No — spawn a fresh `std::thread` per `start_analyze()` call, join on `stop_analyze()` |
-| **Callback thread** | Per-search: transient `callbackLoopThread` launched inside `internalSearchThreadLoop` when analyze mode is on; waits on `callbackLoopWaitingForSearchBegun` before firing, joined at end of each search | Same: transient `callback_thread_` spawned in `start_analyze`, joined in `stop_analyze`; wakes on `callback_cv_.wait_for(interval_ms)` |
+| **Persistent search thread** | Yes — one `std::thread` runs `internalSearchThreadLoop()` forever, waking on a condvar when asked to search | Yes (since commit 8569f30) — one `worker_thread_` runs `AsyncBot::worker_loop` for the bot's lifetime, idle-waiting on `worker_cv_` between requests.  Matches KataGo's design. |
+| **Callback thread** | Per-search: transient `callbackLoopThread` launched inside `internalSearchThreadLoop` when analyze mode is on; waits on `callbackLoopWaitingForSearchBegun` before firing, joined at end of each search | Same: transient callback thread spawned inside `worker_loop` when a callback is configured, joined at the end of each iteration; wakes on a local `condition_variable::wait_for(interval_ms)` |
 | **Search-start handshake** | `searchBegun` lambda is passed into `Search::runWholeSearch`, invoked once the search is initialized; callback thread waits on it via `callbackLoopWaitingForSearchBegun` | None — callback thread just polls `mcts_->get_analysis()` which returns an empty `AnalysisInfo` until the search has expanded the root |
-| **Stop protocol** | `shouldStopNow` atomic flag polled by search threads; `controlMutex` + `userWaitingForStop` condvar for `stopAndWait()` to block caller | `MCTS::request_stop()` sets an atomic; search threads check at the top of each playout; `stop_analyze()` sets `analyzing_=false`, notifies `callback_cv_`, joins both threads |
+| **Stop protocol** | `shouldStopNow` atomic flag polled by search threads; `controlMutex` + `userWaitingForStop` condvar for `stopAndWait()` to block caller | `MCTS::should_stop_` atomic polled by search threads; `control_mutex_` + `done_cv_` condvar for `AsyncBot::stop_locked()` to block caller.  Mode transitions via `pending_mode_`/`current_mode_` pair under the same lock. |
+| **Stop-flag clearing** | Cleared by KataGo's own search lifecycle code (inside `runWholeSearch` setup, atomically with the thread-ready handshake) | Cleared explicitly by `AsyncBot::worker_loop` via `mcts_->reset_stop_flag()` **inside the same critical section** as the `current_mode_` transition — NOT inside `MCTS::search()` itself.  See the "Stop-flag race" note below for why the naive "clear at start of search()" approach is broken. |
 | **`makeMove` / `playMove` auto-resume** | No — caller calls `ponder()` or `analyzeAsync()` again if they want it | No (after cleanup) — `gen_move`/`play_move` call `stop_analyze_internal()` unconditionally; caller restarts if wanted (earlier revision had auto-resume, removed in commit a57b09d to match KataGo) |
 | **Where analysis score is stored** | Retrieved on demand from the current `rootNode`'s NN outputs during `getAnalysisJson`/`getAnalysisData` | `MCTSNode::nn_score` field, set during `expand()` before the `NODE_EXPANDED` release store; `get_analysis()` reads `root_->nn_score` |
 | **Why per-node score** | N/A — KataGo always has fresh NN output pointers on the current root | Without per-node storage, a single `root_nn_score_` member went stale after `make_move()` promoted an unreevaluated child; storing on the node itself means promoted subtrees carry their own correct score |
@@ -475,28 +476,83 @@ section compares how KataGo structures them and where MiniGo differs.
 
 ### Detailed explanation of key differences
 
-#### Persistent vs per-call search thread
+#### Persistent worker thread (matches KataGo)
 
-KataGo spawns **one** search thread at `AsyncBot` construction.  That
-thread runs `internalSearchThreadLoop()` forever, blocking on a condvar
-between searches.  When a client calls `genMove()` / `ponder()` /
-`analyzeAsync()`, the main thread flips `isRunning = true`, wakes the
-condvar, and the search thread picks up the request.  When the search
-finishes it clears `isRunning`, notifies `userWaitingForStop`, and goes
-back to waiting.
+Both KataGo and MiniGo's `AsyncBot` spawn **one** worker thread at
+construction that runs a `while (true)` loop, idle-waiting on a
+condvar between search requests.  When a client calls `gen_move()` /
+`start_ponder()` / `start_analyze()`, the control thread sets
+`pending_mode_` and notifies `worker_cv_`; the worker wakes,
+transitions `current_mode_`, runs the search, and notifies `done_cv_`
+on completion before looping back to wait.
 
-MiniGo's `AsyncBot` instead spawns a fresh `std::thread` inside
-`start_analyze()` and joins it inside `stop_analyze()`.  Every async
-session pays thread-creation cost (a few hundred µs on Linux) and every
-stop pays the join cost.  For an interactive `play` binary that toggles
-analyze a handful of times per game, this is invisible.  For a busy
-analysis engine servicing hundreds of requests per second (e.g. a JSON
-analysis backend) it would become meaningful; at that point we'd
-convert to the persistent pattern.
+Both engines spawn a **transient callback thread per search iteration**
+when a callback is configured, joined at the end of that iteration.
+MiniGo's callback thread uses a local `condition_variable::wait_for`
+so it wakes promptly on shutdown rather than waiting a full interval.
 
-Correctness is the same either way — the persistent thread just avoids
-the per-session setup/teardown overhead.  We chose the simpler pattern
-because our current consumer is the interactive `play` binary.
+MiniGo originally (before commit 8569f30) used a per-call `std::thread`
+that was spawned in `start_analyze` and joined in `stop_analyze`.  That
+was simpler but made exception handling and state transitions brittle
+(see "Stop-flag race" below for an example of the kind of subtlety that
+the persistent-worker design handles more cleanly).
+
+#### Stop-flag race (and how we fix it)
+
+The stop flag (`MCTS::should_stop_`) is an atomic set by
+`request_stop()` and polled by search threads at the top of each
+playout.  The subtle question is: **who clears it, and when?**
+
+KataGo: the stop flag is cleared as part of the search startup
+inside the worker's control flow, under KataGo's `controlMutex`,
+atomically with the `isRunning = true` transition.
+
+MiniGo (initially): `MCTS::search()` cleared the flag as its first
+statement.  This created a race window in the persistent worker:
+
+```
+worker:   takes control_mutex_
+worker:   current_mode_ = PONDER; pending_mode_ = IDLE
+worker:   releases control_mutex_          ← race window OPENS
+worker:   (prepare game_copy, callback thread...)
+worker:   enters mcts_->search()
+search:   clears should_stop_                ← race window CLOSES
+search:   runs playout loop
+```
+
+If `stop_locked()` ran during the race window, it would acquire
+`control_mutex_`, see `current_mode_ == PONDER`, call `request_stop()`
+which sets `should_stop_ = true`, and wait on `done_cv_`.  But the
+worker then enters `search()` and clears `should_stop_ = false`,
+losing the stop signal.  `search()` runs to completion (a billion
+sims for PONDER → effectively forever), and `stop_locked()` blocks
+indefinitely.
+
+The window is narrow (a few instructions between lock release and
+the first line of `search()`), so it's practically unreachable for
+human-timescale interactions, but it's a real correctness bug —
+easily reachable by a scripted test harness that hammers toggles.
+
+**Fix (commit ccc98f2)**: move the clear OUT of `MCTS::search()` and
+INTO `AsyncBot::worker_loop`, placed inside the same critical section
+as the `current_mode_` transition via the new `mcts_->reset_stop_flag()`
+method.  After this, any `stop_locked()` that takes `control_mutex_`
+after the worker releases it can only set `should_stop_ = true`
+*after* it has already been cleared — the clear can never overwrite
+a subsequent stop signal, because the clear happens while the worker
+still holds the lock.
+
+Non-`AsyncBot` callers (`self_play_game_impl`, `main_evaluate`,
+`main_selfplay`, `main_benchmark`) never call `request_stop()`, so
+`should_stop_` is default-initialized to `false` and stays false for
+them — removing the clear from `search()` is a no-op for those paths.
+
+This fix illustrates the general principle: in a persistent-worker
+model, any state that needs to be "reset before each new request"
+must be reset inside the same critical section that picks up the
+request, not inside the work function itself.  Otherwise the reset
+races against signals sent after the pickup but before the work
+begins.
 
 #### Explicit `reuse_tree` flag vs implicit reuse
 
