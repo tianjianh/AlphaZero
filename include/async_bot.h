@@ -41,8 +41,12 @@ namespace minigo {
 //     // ... elsewhere ...
 //     bot.stop_analyze();
 //
-// Thread safety: all public methods are safe to call from any thread.
-// Background threads only exist while analyze is running.
+// Thread safety: AsyncBot is a single-writer design.  State-mutating
+// methods (gen_move, play_move, start_analyze, stop_analyze, reset)
+// must be called from a single "control" thread.  The background
+// search and callback threads are owned by AsyncBot and never call
+// public methods on it.  get_analysis() and game() are read-only and
+// safe to call from any thread.
 // ================================================================
 class AsyncBot {
 public:

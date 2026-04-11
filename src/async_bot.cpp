@@ -41,15 +41,17 @@ int AsyncBot::gen_move(Stone color, int num_simulations,
                        float temperature, bool add_noise) {
     // Stop any background search before running a synchronous one on
     // the same tree.  Auto-resume if analyze was active on entry.
+    // Stop FIRST, then save — callback_ is only safe to read after the
+    // callback thread has been joined.
     bool was_analyzing = analyzing_.load(std::memory_order_acquire);
     AnalysisCallback saved_cb;
     int saved_interval = 0;
     int saved_pv = 0;
     if (was_analyzing) {
+        stop_analyze_internal();
         saved_cb = callback_;
         saved_interval = callback_interval_ms_;
         saved_pv = callback_pv_moves_;
-        stop_analyze_internal();
     }
 
     // Copy the game so MCTS can safely reference it from search threads.
@@ -85,15 +87,16 @@ int AsyncBot::gen_move(Stone color, int num_simulations,
 // ── External move (human, opponent) ─────────────────────────
 
 void AsyncBot::play_move(Stone color, int action) {
+    // Stop FIRST, then save — see gen_move() comment.
     bool was_analyzing = analyzing_.load(std::memory_order_acquire);
     AnalysisCallback saved_cb;
     int saved_interval = 0;
     int saved_pv = 0;
     if (was_analyzing) {
+        stop_analyze_internal();
         saved_cb = callback_;
         saved_interval = callback_interval_ms_;
         saved_pv = callback_pv_moves_;
-        stop_analyze_internal();
     }
 
     {

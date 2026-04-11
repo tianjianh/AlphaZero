@@ -27,6 +27,10 @@ struct MCTSNode {
     MCTSNode* parent = nullptr;
     int action = -1;
     float prior = 0.0f;
+    float nn_score = 0.0f;   // NN score output at this position (set once
+                             // during expand, then read by get_analysis;
+                             // benign data race — 32-bit aligned float
+                             // writes are atomic on target platforms)
 
     std::atomic<int> visit_count{0};
     std::atomic<int> virtual_loss_count{0};
@@ -148,7 +152,6 @@ private:
     // search() is rebuilding the root at the start of a new search.
     mutable std::mutex        tree_mutex_;
     std::unique_ptr<MCTSNode> root_;
-    float root_nn_score_    = 0.0f;
     int   action_size_      = 0;
     bool  root_noise_added_ = false;  // set by search() when Dirichlet noise
                                       // is injected; reset by make_move() and

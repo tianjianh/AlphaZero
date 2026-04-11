@@ -233,6 +233,9 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         game_copy_ptr->get_legal_moves(legal);
         mask_policy(result.policy, legal, action_size);
         expand(node, result.policy, legal);
+        node->nn_score = result.score;  // set BEFORE the release store
+                                        // so readers that see EXPANDED
+                                        // also see a valid score
         node->state.store(NODE_EXPANDED, std::memory_order_release);
 
         // Blend value + score for utility (KataGo-style atan compression)
@@ -335,6 +338,7 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
             mask_policy(res.policy, leaf.legal, action_size);
             if (leaf.leaf->children.empty())
                 expand(leaf.leaf, res.policy, leaf.legal);
+            leaf.leaf->nn_score = res.score;
             leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
 
             float utility = res.value;
@@ -387,6 +391,7 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
         game.get_legal_moves(legal);
         mask_policy(root_out.policy, legal, action_size);
         expand(new_root.get(), root_out.policy, legal);
+        new_root->nn_score = new_root_nn_score;
         new_root->state.store(NODE_EXPANDED, std::memory_order_release);
         new_root->visit_count.store(1, std::memory_order_relaxed);
         float root_utility = root_out.value;
@@ -405,7 +410,6 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
         if (!can_reuse) {
             old_root = std::move(root_);
             root_ = std::move(new_root);
-            root_nn_score_ = new_root_nn_score;
             root_noise_added_ = false;
         }
         // Add Dirichlet noise at the root once per position.  After
@@ -471,7 +475,8 @@ void MCTS::make_move(int action) {
         old_root = std::move(root_);        // release old root
         root_    = std::move(new_root);     // install promoted subtree
         root_noise_added_ = false;          // noise must be re-added on next call
-        // root_nn_score_ is stale now — refreshed on next fresh search.
+        // The promoted node carries its own nn_score, so no member
+        // variable needs updating — get_analysis() reads root_->nn_score.
     }
     // old_root destroyed here, outside the lock
 }
@@ -481,7 +486,6 @@ void MCTS::reset_tree() {
     {
         std::lock_guard<std::mutex> lock(tree_mutex_);
         old_root = std::move(root_);
-        root_nn_score_ = 0.0f;
         root_noise_added_ = false;
     }
 }
@@ -533,9 +537,14 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
     std::lock_guard<std::mutex> lock(tree_mutex_);
 
     AnalysisInfo info;
-    info.root_score = root_nn_score_;
-
-    if (!root_) return info;
+    if (!root_) {
+        info.root_score = 0.0f;
+        return info;
+    }
+    // Read the promoted node's own NN score — survives make_move() so
+    // the analysis HUD always shows the score for the current position,
+    // not some ancestor's stale value.
+    info.root_score = root_->nn_score;
 
     int vc = root_->visit_count.load(std::memory_order_relaxed);
     info.total_visits = vc;
