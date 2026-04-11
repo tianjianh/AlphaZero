@@ -443,3 +443,162 @@ Sources:
 - [KataGo nneval.h](https://github.com/lightvector/KataGo/blob/master/cpp/neuralnet/nneval.h)
 - [KataGo searchnode.h](https://github.com/lightvector/KataGo/blob/master/cpp/search/searchnode.h)
 - [KataGo threadsafequeue.h](https://github.com/lightvector/KataGo/blob/master/cpp/core/threadsafequeue.h)
+
+## 13. Tree Reuse and Async Bot Wrapper
+
+Tree reuse (preserving the MCTS tree across moves instead of rebuilding
+from scratch each move) and a dedicated wrapper for async pondering +
+live analysis are two orthogonal features that cooperate closely.  This
+section compares how KataGo structures them and where MiniGo differs.
+
+| Aspect | KataGo | MiniGo C++ |
+|---|---|---|
+| **Core classes** | `Search` (tree + playout loop) + `AsyncBot` (async control) | `MCTS` (tree + playout loop) + `AsyncBot` (async control) |
+| **Tree-reuse primitive** | `Search::makeMove(loc, pla)` | `MCTS::make_move(action)` |
+| **Clear primitive** | `Search::clearSearch()` | `MCTS::reset_tree()` |
+| **Re-root mechanism** | `rootNode = new SearchNode(*child, ...)` (copy-construct, then sweep-and-delete the rest of the old tree via `applyRecursivelyAnyOrderMulithreaded` + `deleteAllOldOrAllNewTableNodesAndSubtreeValueBiasMulithreaded`) | `root_ = std::move(root_->children[action])`; `old_root = std::move(root_)`; destroy `old_root` outside `tree_mutex_` |
+| **Why copy vs move** | Nodes live in a transposition `SearchNodeTable`; moving would leave dangling table entries | No transposition table — nodes are plain `std::unique_ptr<MCTSNode>`; move transfers ownership cleanly |
+| **Sibling subtree deletion** | Happens inside `makeMove` via mark-sweep helpers | Happens when `old_root`'s destructor runs outside `tree_mutex_` (so deep dealloc doesn't block `get_analysis()`) |
+| **Illegal-child filtering on reuse** | Yes — `beginSearch` filters children that are newly illegal (pattern bonus / playout-doubling advantage changes) and recomputes root stats | No — our rules are static, positions are fully determined by board+ko history, legality of previously-expanded children never changes |
+| **Virtual-loss cleanup in `makeMove`** | Not touched — relies on `stopAndWait()` having joined all playout threads first | Defensively zero `virtual_loss_count` on the promoted root; relies on same stopAndWait invariant |
+| **`makeMove` return type** | `bool` — false if the move is illegal at the current game state | `void` — caller is expected to have validated legality |
+| **Tree-reuse default** | Implicit: `beginSearch` keeps `rootNode` if non-null, allocates fresh only when null | Explicit: `search(..., reuse_tree)` parameter; default `false` for safety (fresh build unless caller opts in) |
+| **Persistent search thread** | Yes — one `std::thread` runs `internalSearchThreadLoop()` forever, waking on a condvar when asked to search | No — spawn a fresh `std::thread` per `start_analyze()` call, join on `stop_analyze()` |
+| **Callback thread** | Per-search: transient `callbackLoopThread` launched inside `internalSearchThreadLoop` when analyze mode is on; waits on `callbackLoopWaitingForSearchBegun` before firing, joined at end of each search | Same: transient `callback_thread_` spawned in `start_analyze`, joined in `stop_analyze`; wakes on `callback_cv_.wait_for(interval_ms)` |
+| **Search-start handshake** | `searchBegun` lambda is passed into `Search::runWholeSearch`, invoked once the search is initialized; callback thread waits on it via `callbackLoopWaitingForSearchBegun` | None — callback thread just polls `mcts_->get_analysis()` which returns an empty `AnalysisInfo` until the search has expanded the root |
+| **Stop protocol** | `shouldStopNow` atomic flag polled by search threads; `controlMutex` + `userWaitingForStop` condvar for `stopAndWait()` to block caller | `MCTS::request_stop()` sets an atomic; search threads check at the top of each playout; `stop_analyze()` sets `analyzing_=false`, notifies `callback_cv_`, joins both threads |
+| **`makeMove` / `playMove` auto-resume** | No — caller calls `ponder()` or `analyzeAsync()` again if they want it | No (after cleanup) — `gen_move`/`play_move` call `stop_analyze_internal()` unconditionally; caller restarts if wanted (earlier revision had auto-resume, removed in commit a57b09d to match KataGo) |
+| **Where analysis score is stored** | Retrieved on demand from the current `rootNode`'s NN outputs during `getAnalysisJson`/`getAnalysisData` | `MCTSNode::nn_score` field, set during `expand()` before the `NODE_EXPANDED` release store; `get_analysis()` reads `root_->nn_score` |
+| **Why per-node score** | N/A — KataGo always has fresh NN output pointers on the current root | Without per-node storage, a single `root_nn_score_` member went stale after `make_move()` promoted an unreevaluated child; storing on the node itself means promoted subtrees carry their own correct score |
+| **Dirichlet noise semantics** | Applied at selection time, not persistently written to priors; no "already added" flag | Written into child priors during `add_dirichlet_noise()`; a `root_noise_added_` flag on MCTS prevents double-noise within a position, cleared by `make_move()` so the next search freshens it |
+| **Noise correctness on reuse** | Free — selection-time computation always uses the current noise | Works because: promoted children's priors were set during their own expansion (clean NN output, never noised — only the OLD root's children had noise added); next search with `add_noise=true` noises these clean priors fresh |
+
+### Detailed explanation of key differences
+
+#### Persistent vs per-call search thread
+
+KataGo spawns **one** search thread at `AsyncBot` construction.  That
+thread runs `internalSearchThreadLoop()` forever, blocking on a condvar
+between searches.  When a client calls `genMove()` / `ponder()` /
+`analyzeAsync()`, the main thread flips `isRunning = true`, wakes the
+condvar, and the search thread picks up the request.  When the search
+finishes it clears `isRunning`, notifies `userWaitingForStop`, and goes
+back to waiting.
+
+MiniGo's `AsyncBot` instead spawns a fresh `std::thread` inside
+`start_analyze()` and joins it inside `stop_analyze()`.  Every async
+session pays thread-creation cost (a few hundred µs on Linux) and every
+stop pays the join cost.  For an interactive `play` binary that toggles
+analyze a handful of times per game, this is invisible.  For a busy
+analysis engine servicing hundreds of requests per second (e.g. a JSON
+analysis backend) it would become meaningful; at that point we'd
+convert to the persistent pattern.
+
+Correctness is the same either way — the persistent thread just avoids
+the per-session setup/teardown overhead.  We chose the simpler pattern
+because our current consumer is the interactive `play` binary.
+
+#### Explicit `reuse_tree` flag vs implicit reuse
+
+KataGo's `Search::beginSearch` checks `if (rootNode != NULL)` and
+preserves the existing tree unconditionally — reuse is the default.  A
+caller who wants to rebuild must explicitly call `clearSearch()` first.
+
+MiniGo's `MCTS::search` takes a `bool reuse_tree` parameter that
+defaults to `false`.  Callers that want reuse must opt in.  This is
+slightly more verbose at the call site but makes the contract explicit:
+`main_benchmark.cpp` (a one-shot microbenchmark) keeps its zero-config
+fresh-build behavior without touching the call, while `main_evaluate`,
+`main_selfplay`, and `AsyncBot` pass `reuse_tree=true` after a
+`make_move()` to signal "I've advanced the tree, reuse it".
+
+The tradeoff: KataGo's implicit reuse is less code at the call site but
+relies on every caller knowing to call `clearSearch()` at game
+boundaries.  Our explicit flag means new callers that don't know about
+tree reuse get safe fresh-build behavior by default.  It's a
+defensive-programming bias — both are correct.
+
+#### Defensive virtual-loss zero in `make_move`
+
+KataGo doesn't touch virtual losses inside `Search::makeMove`.  It
+relies on the invariant that `AsyncBot::makeMove` always calls
+`stopAndWait()` first, which joins all playout threads; once joined,
+any virtual loss they incremented has already been reverted (the
+playout loop's invariant is that vloss is either fully applied and
+later reverted in backprop, or reverted immediately on collision).
+
+MiniGo's `MCTS::make_move` defensively zeros `virtual_loss_count` on
+the promoted root.  It's a no-op in the normal path (the invariant
+holds) but cheap insurance if an interrupted search somehow left a
+stale increment.  Not a bug in either codebase — just different
+risk tolerance.
+
+#### Where the root NN score lives
+
+An easy-to-miss bug in MiniGo's first cut of tree reuse: `MCTS` had a
+`float root_nn_score_` member set only when `search()` built a fresh
+root.  After `make_move()` promoted a child, that member was stale —
+the promoted node represented a different position than the one whose
+score was originally stored.  `get_analysis()` then returned the wrong
+score in the `play` binary's analysis HUD.
+
+KataGo dodges this by always having the current root's `NNOutput*`
+pointers directly on `rootNode`; whatever is "the root" right now owns
+its own NN outputs, and `getAnalysisData()` reads from there.
+
+Fix in MiniGo: add a `float nn_score` field directly on `MCTSNode`,
+written during `expand()` **before** the release store on `state`.
+The write is inside the acquire-release synchronization established by
+`NODE_EXPANDED`, so any reader that sees `state == EXPANDED` also sees
+the correct `nn_score`.  For the root specifically, `get_analysis()`
+holds `tree_mutex_` and the fresh-build swap releases it with the new
+root already fully populated, so the lock's acquire-release pair also
+synchronizes the field.  Promoted children carry their own correct
+score because `nn_score` was set when they were first expanded and
+never modified after.
+
+#### No auto-resume of analyze in `make_move` / `play_move`
+
+KataGo's `AsyncBot::makeMove` is three lines: `stopAndWait();` then
+delegate to `Search::makeMove()`.  It does not remember whether
+pondering was active before the move and does not restart it.  The
+caller is expected to call `ponder()` or `analyzeAsync()` again
+whenever it wants the engine thinking.
+
+MiniGo's first cut tried to be clever: `gen_move` / `play_move` saved
+the callback and interval before `stop_analyze_internal()`, then
+restarted analyze after the tree advance.  This was convenient in
+theory but:
+
+1. The only caller is `main_play`, which explicitly stops analysis
+   *before* every move anyway, so the save/restore code never fired.
+2. It required reading `callback_` before joining the callback thread,
+   which is technically UB per strict C++ (concurrent const reads of
+   a `std::function` target are only safe if no writes happen, and
+   strict reading of the standard treats each invocation as an access).
+3. It made the public API contract fuzzier (when does analyze auto-
+   resume?  what if the user changed the callback between calls?).
+
+Commit `a57b09d` dropped the auto-resume, matching KataGo exactly.
+Now both `gen_move` and `play_move` unconditionally call
+`stop_analyze_internal()` and leave restart to the caller.
+
+#### What MiniGo still lacks from KataGo
+
+- **Ponder mode** — KataGo's `AsyncBot::ponder()` searches on the
+  opponent's position during the opponent's think time, preserving
+  the tree across the opponent's move via `makeMove`.  MiniGo's
+  `AsyncBot` only has `start_analyze()` which is equivalent to
+  pondering with callbacks; a no-callback `start_ponder()` would be
+  trivial to add but no current caller needs it.
+- **Time control** — KataGo's search is integrated with a `TimeControl`
+  that caps sim budget based on remaining game clock.  MiniGo uses a
+  fixed sim count per move.  Not relevant for training; would be
+  needed for a tournament-strength interactive engine.
+- **`Search::getAnalysisJson`** — KataGo produces full JSON analysis
+  output for GTP `kata-analyze`.  MiniGo returns `AnalysisInfo` as a
+  C++ struct; a JSON serializer would be a one-screen function when
+  we need it.
+- **Tree reuse across games** — neither reuses across distinct games.
+  Each new game starts fresh.  KataGo uses this for match play and
+  selfplay, where successive games are independent.
