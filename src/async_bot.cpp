@@ -253,6 +253,14 @@ void AsyncBot::worker_loop() {
             req_callback = callback_;
             req_interval = callback_interval_ms_;
             req_pv       = callback_pv_moves_;
+
+            // Clear the stop flag atomically with the mode transition.
+            // This eliminates the race where a stop_locked() call could
+            // set should_stop_ AFTER we release control_mutex_ but BEFORE
+            // we entered MCTS::search() and had search() clear it.
+            // Any stop() issued after we release the lock below will
+            // re-set the flag cleanly, and search() will see it.
+            mcts_->reset_stop_flag();
         }
 
         // ── Snapshot game state for the search ──

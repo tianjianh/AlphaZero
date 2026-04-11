@@ -360,7 +360,14 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 void MCTS::search(GoGame& game, std::vector<float>& visits,
                   int num_simulations, bool add_noise, bool reuse_tree) {
     if (num_simulations < 0) num_simulations = config_.num_simulations;
-    should_stop_.store(false, std::memory_order_relaxed);
+    // NOTE: should_stop_ is NOT cleared here.  Clearing it inside
+    // search() creates a race window where a stop signal raised after
+    // the controller transitioned state but before search() was entered
+    // would be lost.  The caller is responsible for clearing the flag
+    // (e.g., AsyncBot::worker_loop does it under control_mutex_,
+    // atomically with the mode transition).  Non-AsyncBot callers
+    // (selfplay, eval, benchmark) never call request_stop, so the
+    // flag is default-false and stays false for them.
 
     action_size_ = config_.action_size();
     int action_size = action_size_;

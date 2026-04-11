@@ -142,6 +142,13 @@ public:
     // The search threads will exit at their next check point.
     void request_stop() { should_stop_.store(true, std::memory_order_relaxed); }
 
+    // Clear the stop flag.  Call from the controller thread BEFORE a
+    // new search, under whatever synchronization the controller uses
+    // to serialize stop/start.  search() itself does NOT clear the
+    // flag — doing so inside search() would create a window where a
+    // prior stop signal could be lost (see AsyncBot::worker_loop).
+    void reset_stop_flag() { should_stop_.store(false, std::memory_order_relaxed); }
+
 private:
     BatchEvaluator* evaluator_;
     Config          config_;
