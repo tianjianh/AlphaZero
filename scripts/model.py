@@ -42,6 +42,12 @@ class SEModule(nn.Module):
         hidden = max(8, channels // reduction)
         self.fc1 = nn.Linear(channels, hidden)
         self.fc2 = nn.Linear(hidden, channels)
+        # Zero-init fc2 so the gate starts at sigmoid(0) = 0.5 everywhere
+        # (constant, not random-per-channel).  Standard SE-ResNet trick: the
+        # block behaves as a stable scaled residual at init, then learns its
+        # own per-channel gates from there.
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x):
         s = x.mean(dim=[2, 3])
@@ -91,6 +97,11 @@ class GPoolResBlock(nn.Module):
         self.pool_fc = nn.Linear(2 * pool_channels, channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
+        # Zero-init the injection so the block starts as a plain residual
+        # (pool_fc output ≡ 0 → no bias added).  The network can then learn
+        # to use global info without destabilising early training.
+        nn.init.zeros_(self.pool_fc.weight)
+        nn.init.zeros_(self.pool_fc.bias)
 
     def forward(self, x):
         residual = x
@@ -104,24 +115,30 @@ class GPoolResBlock(nn.Module):
 
 
 class GPoolHead(nn.Module):
-    """1x1 conv → global-pool (mean+max) → MLP → out.
+    """1x1 conv → global-pool (mean+max+std) → MLP → out.
 
     KataGo-style value/score head.  Replaces AlphaZero's 1x1-to-1-channel +
     flattened-FC design, which collapses all channel information into a
     single feature map before the FC.  Keeping multiple channels and pooling
-    them spatially preserves much richer features for the final MLP.
+    them spatially preserves much richer features for the final MLP; adding
+    std on top of mean+max captures per-channel spatial variance, which
+    helps value/score calibration.
     """
 
     def __init__(self, trunk_channels, head_channels, mlp_hidden, out_features, use_fp8=False):
         super().__init__()
         self.conv = nn.Conv2d(trunk_channels, head_channels, 1, bias=False)
         self.bn = nn.BatchNorm2d(head_channels)
-        self.fc1 = _linear(2 * head_channels, mlp_hidden, use_fp8=use_fp8)
+        self.fc1 = _linear(3 * head_channels, mlp_hidden, use_fp8=use_fp8)
         self.fc2 = _linear(mlp_hidden, out_features, use_fp8=use_fp8)
 
     def forward(self, x):
         h = F.relu(self.bn(self.conv(x)))
-        pooled = torch.cat([h.mean(dim=[2, 3]), h.amax(dim=[2, 3])], dim=1)
+        pooled = torch.cat([
+            h.mean(dim=[2, 3]),
+            h.amax(dim=[2, 3]),
+            h.std(dim=[2, 3]),
+        ], dim=1)
         return self.fc2(F.relu(self.fc1(pooled)))
 
 
