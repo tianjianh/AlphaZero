@@ -438,6 +438,21 @@ OpenCLComputeHandle::OpenCLComputeHandle(OpenCLDeviceState& dev,
                                          int max_batch_size)
     : dev_(dev)
 {
+    // TODO(resnet_v2): the new KataGo-style ResNet (alternating SE + GPool
+    // residual blocks, global-pool value/score heads) is not yet supported
+    // by the OpenCL backend.  To re-enable it, add OpenCL kernels for:
+    //   - SEModule (global avg pool + small FC + sigmoid + broadcast mul)
+    //   - GPoolResBlock (parallel conv_main + conv_pool, mean+max pool,
+    //     FC producing per-channel additive bias for conv_main)
+    //   - GPoolHead (1x1 conv + mean+max pool + 2-layer FC)
+    // and teach loaded_model.cpp to populate per-block weight slots.
+    // Until then, use the TensorRT backend.
+    (void)dev; (void)model; (void)max_batch_size;
+    throw std::runtime_error(
+        "OpenCL backend currently disabled: the KataGo-style ResNet "
+        "(SE + GPool blocks + global-pool heads) requires TensorRT.  "
+        "TODO: add OpenCL kernels for the new blocks.");
+
     board_size     = model->board_size;
     input_channels = model->input_channels;
     num_filters    = model->num_filters;

@@ -2,10 +2,12 @@
 MiniGo AlphaZero — Neural Network (PyTorch)
 
 Two architectures:
-  - AlphaZeroNet: triple-headed ResNet (policy + value + score)
-  - GoViT: triple-headed Vision Transformer with D4-invariant positional encoding
+  - AlphaZeroNet: KataGo-style ResNet (alternating SE + GPool residual blocks,
+                  global-pooled value/score heads)
+  - GoViT: Vision Transformer with GQA and directional positional encoding
 
-Shared between training and weight export.
+Both are triple-headed (policy + value + score).  Shared between training
+and weight export.
 """
 
 import math
@@ -32,68 +34,150 @@ def _linear(in_f, out_f, bias=True, use_fp8=False):
     return nn.Linear(in_f, out_f, bias=bias)
 
 
-class ResBlock(nn.Module):
-    def __init__(self, num_filters):
+class SEModule(nn.Module):
+    """Squeeze-and-Excitation: global-avg-pool → MLP → sigmoid → per-channel rescale."""
+
+    def __init__(self, channels, reduction=16):
         super().__init__()
-        self.conv1 = nn.Conv2d(num_filters, num_filters, 3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(num_filters)
-        self.conv2 = nn.Conv2d(num_filters, num_filters, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(num_filters)
+        hidden = max(8, channels // reduction)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.fc2 = nn.Linear(hidden, channels)
+
+    def forward(self, x):
+        s = x.mean(dim=[2, 3])
+        s = F.relu(self.fc1(s))
+        s = torch.sigmoid(self.fc2(s))
+        return x * s.unsqueeze(-1).unsqueeze(-1)
+
+
+class ResBlockSE(nn.Module):
+    """3x3 residual block with SE channel attention at the end."""
+
+    def __init__(self, channels, se_reduction=16):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.se = SEModule(channels, reduction=se_reduction)
 
     def forward(self, x):
         residual = x
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
+        out = self.se(out)
         return F.relu(out + residual)
 
 
+class GPoolResBlock(nn.Module):
+    """KataGo-style global pooling residual block.
+
+    A parallel 'pool' branch alongside the main 3x3 conv is globally pooled
+    (mean+max) and projected by a small FC to per-channel additive biases on
+    the main branch.  Gives the block a direct path for global board state
+    into local features — stacked 3x3 convs alone have only a limited
+    *effective* receptive field even when the *theoretical* one is huge.
+    """
+
+    def __init__(self, channels, pool_channels=None):
+        super().__init__()
+        if pool_channels is None:
+            pool_channels = max(16, channels // 4)
+        self.pool_channels = pool_channels
+        self.conv_main = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn_main = nn.BatchNorm2d(channels)
+        self.conv_pool = nn.Conv2d(channels, pool_channels, 3, padding=1, bias=False)
+        self.bn_pool = nn.BatchNorm2d(pool_channels)
+        self.pool_fc = nn.Linear(2 * pool_channels, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        main = self.bn_main(self.conv_main(x))
+        pool = F.relu(self.bn_pool(self.conv_pool(x)))
+        pool_vec = torch.cat([pool.mean(dim=[2, 3]), pool.amax(dim=[2, 3])], dim=1)
+        bias = self.pool_fc(pool_vec)
+        main = F.relu(main + bias.unsqueeze(-1).unsqueeze(-1))
+        out = self.bn2(self.conv2(main))
+        return F.relu(out + residual)
+
+
+class GPoolHead(nn.Module):
+    """1x1 conv → global-pool (mean+max) → MLP → out.
+
+    KataGo-style value/score head.  Replaces AlphaZero's 1x1-to-1-channel +
+    flattened-FC design, which collapses all channel information into a
+    single feature map before the FC.  Keeping multiple channels and pooling
+    them spatially preserves much richer features for the final MLP.
+    """
+
+    def __init__(self, trunk_channels, head_channels, mlp_hidden, out_features, use_fp8=False):
+        super().__init__()
+        self.conv = nn.Conv2d(trunk_channels, head_channels, 1, bias=False)
+        self.bn = nn.BatchNorm2d(head_channels)
+        self.fc1 = _linear(2 * head_channels, mlp_hidden, use_fp8=use_fp8)
+        self.fc2 = _linear(mlp_hidden, out_features, use_fp8=use_fp8)
+
+    def forward(self, x):
+        h = F.relu(self.bn(self.conv(x)))
+        pooled = torch.cat([h.mean(dim=[2, 3]), h.amax(dim=[2, 3])], dim=1)
+        return self.fc2(F.relu(self.fc1(pooled)))
+
+
 class AlphaZeroNet(nn.Module):
+    """KataGo-style ResNet: alternating SE and GPool residual blocks.
+
+    Block 0 is SE, block 1 is GPool, and so on — with N blocks, ceil(N/2)
+    are SE and floor(N/2) are GPool.  They alternate rather than stacking
+    SE-on-top-of-GPool per block because both mechanisms provide
+    channel-wise global conditioning; doubling up per block is redundant,
+    while alternating gives every block some form of global awareness.
+
+    Heads: policy uses the classic 1x1 → 2ch → FC + pass design; value
+    and score use GPoolHead for global-aware output.
+    """
+
     def __init__(self, board_size=9, input_channels=17, num_filters=64, num_res_blocks=5,
                  use_fp8=False):
         super().__init__()
         self.board_size = board_size
         action_size = board_size * board_size + 1
+        hw = board_size * board_size
 
         self.input_conv = nn.Conv2d(input_channels, num_filters, 3, padding=1, bias=False)
         self.input_bn = nn.BatchNorm2d(num_filters)
-        self.res_blocks = nn.ModuleList(
-            [ResBlock(num_filters) for _ in range(num_res_blocks)]
-        )
+
+        self.trunk = nn.ModuleList()
+        for i in range(num_res_blocks):
+            if i % 2 == 0:
+                self.trunk.append(ResBlockSE(num_filters))
+            else:
+                self.trunk.append(GPoolResBlock(num_filters))
 
         self.policy_conv = nn.Conv2d(num_filters, 2, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = _linear(2 * board_size * board_size, action_size, use_fp8=use_fp8)
+        self.policy_fc = _linear(2 * hw, action_size, use_fp8=use_fp8)
 
-        self.value_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = _linear(board_size * board_size, 64, use_fp8=use_fp8)
-        self.value_fc2 = _linear(64, 1, use_fp8=use_fp8)
-
-        num_bins = board_size * board_size * 2 + 1
-        self.score_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
-        self.score_bn = nn.BatchNorm2d(1)
-        self.score_fc1 = _linear(board_size * board_size, 64, use_fp8=use_fp8)
-        self.score_fc2 = _linear(64, num_bins, use_fp8=use_fp8)
+        head_ch = 32
+        mlp_hidden = max(64, num_filters)
+        self.value_head = GPoolHead(num_filters, head_ch, mlp_hidden,
+                                    out_features=1, use_fp8=use_fp8)
+        num_bins = hw * 2 + 1
+        self.score_head = GPoolHead(num_filters, head_ch, mlp_hidden,
+                                    out_features=num_bins, use_fp8=use_fp8)
 
     def forward(self, x):
         out = F.relu(self.input_bn(self.input_conv(x)))
-        for block in self.res_blocks:
+        for block in self.trunk:
             out = block(out)
 
         p = F.relu(self.policy_bn(self.policy_conv(out)))
         p = p.view(p.size(0), -1)
         p = self.policy_fc(p)
 
-        v = F.relu(self.value_bn(self.value_conv(out)))
-        v = v.view(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        v = torch.tanh(self.value_fc2(v))
-
-        s = F.relu(self.score_bn(self.score_conv(out)))
-        s = s.view(s.size(0), -1)
-        s = F.relu(self.score_fc1(s))
-        s = self.score_fc2(s)
-
+        v = torch.tanh(self.value_head(out))
+        s = self.score_head(out)
         return p, v, s
 
     def predict(self, state_tensor, device="cpu"):

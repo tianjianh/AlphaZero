@@ -943,6 +943,22 @@ struct CUDAComputeHandle::Impl {
 CUDAComputeHandle::CUDAComputeHandle(CUDADeviceState& dev,
                                      const LoadedModel* model,
                                      int max_batch_size) {
+    // TODO(resnet_v2): the new KataGo-style ResNet (alternating SE + GPool
+    // residual blocks, global-pool value/score heads) is not yet supported
+    // by the CUDA backend.  To re-enable it, add hand-written kernels for:
+    //   - SEModule (row reduction for global avg pool, small FC, sigmoid,
+    //     broadcast multiply)
+    //   - GPoolResBlock (parallel conv_main + conv_pool, mean+max reduction,
+    //     FC → additive bias broadcast into the main branch)
+    //   - GPoolHead (1x1 conv, mean+max reduction, 2-layer FC)
+    // and teach loaded_model.cpp to populate per-block weight slots.
+    // Until then, use the TensorRT backend.
+    (void)dev; (void)model; (void)max_batch_size;
+    throw std::runtime_error(
+        "CUDA backend currently disabled: the KataGo-style ResNet "
+        "(SE + GPool blocks + global-pool heads) requires TensorRT.  "
+        "TODO: add CUDA kernels for the new blocks.");
+
     CUDA_CHECK(cudaSetDevice(dev.device_id));
     impl_ = new Impl(dev);
     auto& I = *impl_;

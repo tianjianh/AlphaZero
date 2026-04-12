@@ -157,11 +157,14 @@ The training pipeline uses two commands: `init` (choose network, generate
 training plan) and `train` (run or resume training).
 
 ```bash
-# 1. Initialize — pick a preset or custom architecture
-python run_loop.py init small                # 9x9 ResNet 64f/5b,  100 iters
-python run_loop.py init small --arch vit     # 9x9 ViT d192/8L/6h
-python run_loop.py init large                # 9x9 ResNet 128f/10b, 200 iters
-python run_loop.py init quick                # 5x5 ResNet 32f/3b,  5 iters (test)
+# 1. Initialize — pick a preset or custom architecture.  Training plan and
+# default model size are both set by the preset, but you can override either
+# with --filters/--blocks (or --d-model/--depth) to decouple them.
+python run_loop.py init small                # 9x9 ResNet 64f/5b,   48 iters (~24M  sim-games)
+python run_loop.py init small --arch vit     # 9x9 ViT  d192/8L,    48 iters
+python run_loop.py init large                # 9x9 ResNet 128f/10b, 72 iters (~47M  sim-games, 2x small)
+python run_loop.py init xlarge               # 9x9 ResNet 128f/10b, 200 iters (~670M sim-games, deep run)
+python run_loop.py init quick                # 5x5 ResNet 32f/3b,   5 iters (test)
 python run_loop.py init quick --arch vit     # 5x5 ViT (test)
 
 # 2. Train — GPUs are auto-detected, just run:
@@ -192,15 +195,17 @@ Each iteration runs three phases:
 
 The pipeline is controlled by a **training plan** (`training/plan.json` file)
 generated during `init`.  The plan defines staged training with escalating
-parameters:
+parameters.  Example (ResNet, `large` preset — 72 iters, ~47M sim-games):
 
 ```
-  Stage             Iters   Games   Sims  Epoch      LR   Gate
-  ────────────────────────────────────────────────────────────
-  Warm up           1-5     500    400     10    2e-3    off
-  Explore           6-25   1500    600     15    1e-3   100g
-  Strengthen       26-60   2500    600     15    5e-4   100g
-  Polish           61-100  3000    800     20    1e-4   100g
+  Stage               Iters    Games  Sims  Epoch      LR   Gate
+  ──────────────────────────────────────────────────────────────
+  Bootstrap           1-4       400   200     3    1.2e-3   off
+  Warm up             5-8       600   300     3      9e-4   off
+  Early gated         9-14      900   400     3      6e-4   100g
+  Consolidate        15-24     1100   450     4    4.5e-4   200g
+  Steady improve     25-40     1300   550     5      3e-4   200g
+  Overnight extend   41-72     1400   600     5      2e-4   200g
 ```
 
 Each stage defines: selfplay games per iteration, MCTS simulations per move,
@@ -208,7 +213,16 @@ training epochs, learning rate, and evaluation games for gating.  Early stages
 use fewer sims and no gating for fast exploration; later stages increase data
 quality and enable gating to ensure only stronger models are promoted.
 
-The plan is a plain text file — edit it to customize the schedule.
+The three main presets are different training schedules — all three work
+with any model size (override with `--filters`/`--blocks`):
+
+| Plan     | Iters | Sim-games | vs small | Default model |
+|----------|------:|----------:|---------:|---------------|
+| `small`  |    48 |    ~24M   |     1.0× | 64f/5b        |
+| `large`  |    72 |    ~47M   |     2.0× | 128f/10b      |
+| `xlarge` |   200 |   ~670M   |    28.4× | 128f/10b      |
+
+The plan is a JSON file — edit it to customize the schedule.
 
 #### Model version management
 
@@ -826,10 +840,22 @@ with 8 prefetch workers, keeping GPU utilization high with minimal memory.
 
 Two architectures (`scripts/model.py`), selected with `--arch`:
 
-**ResNet** (default): AlphaZero-style dual-conv residual blocks.
+**ResNet** (default): KataGo-style trunk with alternating residual blocks —
+block 0 is an SE-attention block (3x3 → 3x3 → squeeze-excitation → residual),
+block 1 is a global-pooling block (parallel 3x3 main + 3x3 pool branches,
+where the pool branch is globally mean+max pooled and projected to per-channel
+biases that are added into the main branch before the second 3x3), and so on.
+Value and score heads use global-pooled heads (1x1 conv → small channel count
+→ mean+max pool → MLP) instead of the classic AlphaZero 1x1-to-1-channel +
+flattened-FC design, which collapses all channel information before the FC.
 **ViT**: Vision Transformer with one token per intersection, GQA, and
 directional positional encoding (factorized row/col embedding + signed
 relative bias for full spatial and directional awareness).
+
+**Backend support for the new ResNet is currently TensorRT-only.**  The
+Eigen/CUDA/OpenCL/Metal backends still contain the old AlphaZero-ResNet
+forward pass but throw at handle creation until hand-written kernels for
+SE/GPool blocks and global-pool heads are added (see `TODO.md`).
 
 Both share the same triple-headed output:
 

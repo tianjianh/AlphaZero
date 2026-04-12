@@ -1,9 +1,19 @@
 """
 MiniGo AlphaZero — Training Pipeline
 
+Training plans (decoupled from model size — override with --filters/--blocks
+or --d-model/--depth to train any model with any plan):
+
+  small   48 iters,  ~24M  sim-games  (default model: 64f/5b)
+  large   72 iters,  ~47M  sim-games  (default model: 128f/10b)   2x small
+  xlarge  200 iters, ~670M sim-games  (default model: 128f/10b)   deep run
+  quick   5 iters    (5x5, 32f/3b — sanity check)
+
 Usage:
-  python run_loop.py init small                     # 9x9, 64f/5b, ~100 iters
-  python run_loop.py init large                     # 9x9, 128f/10b, ~200 iters
+  python run_loop.py init small                     # 9x9, 64f/5b, 48-iter plan
+  python run_loop.py init large                     # 9x9, 128f/10b, 72-iter plan
+  python run_loop.py init xlarge                    # 9x9, 128f/10b, 200-iter plan
+  python run_loop.py init small --filters 128 --blocks 10   # large model, small plan
   python run_loop.py init quick                     # 5x5, 32f/3b, 5 iters (test)
   python run_loop.py init --board 9 --filters 96 --blocks 8   # custom arch
 
@@ -191,11 +201,13 @@ _EXPLORE = [
     # Overnight:     moderate exploitation
     (0.1,   0.2,     8,      1.1,    12,   0.20),
 ]
-# Large preset uses wider windows for later stages
-_EXPLORE_LARGE = list(_EXPLORE)
-_EXPLORE_LARGE[3] = (0.1, 0.5, 8, 1.25, 15, 0.22)
-_EXPLORE_LARGE[4] = (0.15, 0.5, 10, 1.1, 12, 0.20)
-_EXPLORE_LARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
+# xlarge preset uses wider sliding windows and stronger score weighting in
+# later stages — appropriate for 200-iter deep training runs, not for the
+# default 72-iter "large" plan which reuses the small-plan exploration.
+_EXPLORE_XLARGE = list(_EXPLORE)
+_EXPLORE_XLARGE[3] = (0.1, 0.5, 8, 1.25, 15, 0.22)
+_EXPLORE_XLARGE[4] = (0.15, 0.5, 10, 1.1, 12, 0.20)
+_EXPLORE_XLARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
 
 
 def generate_stages(preset, board, filters, blocks, arch="resnet"):
@@ -210,6 +222,9 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
     else:
         lrs = ["1.2e-3", "9e-4", "6e-4", "4.5e-4", "3e-4", "2e-4"]
 
+    # ── small: 48 iters, ~23.6M sim-games ────────────────────────
+    # Fast turnaround.  Stages escalate from high-exploration bootstrap
+    # to an exploitative overnight phase.
     if preset == "small":
         if vit:
             #        score_wt swl    win  cpuct temp  eps
@@ -237,8 +252,48 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
             _stage("Steady improve", 23, 32,  1200, 500, ep[4], lrs[4], 200, *ex[4]),
             _stage("Overnight extend",33,48,  1400, 500, ep[5], lrs[5], 200, *ex[5]),
         ]
+
+    # ── large: 72 iters, ~46.5M sim-games (~2x small) ───────────
+    # Same 6-stage structure as small; early stages unchanged, mid stages
+    # slightly richer, overnight is 2x longer with +20% sims to give the
+    # model a deeper polish phase without the cost of xlarge.  This is
+    # *independent* of model size — use it with either 64f/5b or 128f/10b.
     if preset == "large":
-        ex = _EXPLORE_LARGE
+        if vit:
+            # TODO: tune VIT large separately.  For now, mirror the ResNet
+            # iter schedule with VIT's own game/sim/exploration params
+            # (VIT uses more sims per game than ResNet at the same stage).
+            return [
+                _stage("Bootstrap",       1,  4,  500, 256, 3, lrs[0], 0,
+                       0.0,  0.05, 3,  2.0,  20, 0.30),
+                _stage("Warm up",         5,  8,  700, 384, 3, lrs[1], 0,
+                       0.0,  0.05, 4,  1.75, 18, 0.28),
+                _stage("Early gated",     9, 14, 1000, 512, 4, lrs[2], 120,
+                       0.02, 0.08, 4,  1.5,  15, 0.25),
+                _stage("Consolidate",    15, 24, 1300, 576, 5, lrs[3], 200,
+                       0.03, 0.10, 6,  1.4,  14, 0.23),
+                _stage("Steady improve", 25, 40, 1500, 700, 5, lrs[4], 240,
+                       0.05, 0.12, 8,  1.25, 12, 0.20),
+                _stage("Overnight extend",41, 72, 1700, 800, 5, lrs[5], 240,
+                       0.08, 0.15, 8,  1.1,  10, 0.18),
+            ]
+        ex = _EXPLORE
+        ep = [3, 3, 3, 4, 5, 5]
+        return [
+            _stage("Bootstrap",       1,   4,   400, 200, ep[0], lrs[0], 0,   *ex[0]),
+            _stage("Warm up",         5,   8,   600, 300, ep[1], lrs[1], 0,   *ex[1]),
+            _stage("Early gated",     9,  14,   900, 400, ep[2], lrs[2], 100, *ex[2]),
+            _stage("Consolidate",    15,  24,  1100, 450, ep[3], lrs[3], 200, *ex[3]),
+            _stage("Steady improve", 25,  40,  1300, 550, ep[4], lrs[4], 200, *ex[4]),
+            _stage("Overnight extend",41, 72,  1400, 600, ep[5], lrs[5], 200, *ex[5]),
+        ]
+
+    # ── xlarge: 200 iters, ~670M sim-games (~28x small) ─────────
+    # Deep training, equivalent to multi-day runs.  Wider sliding windows
+    # (via _EXPLORE_XLARGE) and higher late-stage sims give more stable
+    # polish at the cost of enormous wall-clock time.
+    if preset == "xlarge":
+        ex = _EXPLORE_XLARGE
         vit_e = [3, 3, 4, 5, 6, 6] if vit else [3, 3, 3, 4, 5, 5]
         return [
             _stage("Bootstrap",        1,   6,  800, 300, vit_e[0], lrs[0], 0,   *ex[0]),
@@ -281,7 +336,7 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
 
     if preset == "quick":
         batch_size = 64; window = 3; eval_threshold = 0.5; temp_threshold = 8
-    elif preset == "large":
+    elif preset == "xlarge":
         window = 10
 
     if board >= 13:
@@ -989,8 +1044,14 @@ def main():
 
     # ── init ──
     p_init = sub.add_parser("init", help="Initialize training (clears previous state)")
-    p_init.add_argument("preset", nargs="?", choices=["quick", "small", "large"],
-                        help="Preset: quick (5x5 test), small (9x9), large (9x9 deep)")
+    p_init.add_argument("preset", nargs="?", choices=["quick", "small", "large", "xlarge"],
+                        help="Training plan: quick (5x5 test), small (48 iters, "
+                             "~24M sim-games), large (72 iters, ~47M sim-games, "
+                             "2x small), xlarge (200 iters, ~670M sim-games, deep run). "
+                             "The preset also picks a default model size "
+                             "(small=64f/5b, large/xlarge=128f/10b) — override "
+                             "with --filters/--blocks to decouple model size "
+                             "from training schedule.")
     p_init.add_argument("--arch", default="resnet", choices=["resnet", "vit"],
                         help="Model architecture (default: resnet)")
     p_init.add_argument("--board", type=int, default=None)
@@ -1024,10 +1085,12 @@ def main():
     args = parser.parse_args()
 
     if args.command == "init":
-        # Resolve preset defaults
+        # Resolve preset defaults.  The preset selects a training plan
+        # *and* default model size, but the user can override --filters /
+        # --blocks (or --d-model / --depth) to decouple the two.
         if args.preset == "quick":
             args.board = args.board or 5; args.filters = args.filters or 32; args.blocks = args.blocks or 3
-        elif args.preset == "large":
+        elif args.preset == "large" or args.preset == "xlarge":
             args.board = args.board or 9; args.filters = args.filters or 128; args.blocks = args.blocks or 10
         elif args.preset == "small":
             args.board = args.board or 9; args.filters = args.filters or 64; args.blocks = args.blocks or 5

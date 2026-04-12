@@ -66,14 +66,33 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         }
 
     } else {
-        // ResNet model
+        // ResNet model — only the new KataGo-style layout (alternating SE +
+        // GPool blocks + global-pool heads) is supported.  The legacy
+        // AlphaZero layout (`res_blocks.*` plain blocks + flat FC heads)
+        // has been replaced wholesale; old .onnx files must be retrained.
+        bool is_new_resnet = tm.count("trunk.0.conv2.weight") > 0;
+        bool is_legacy_resnet = tm.count("res_blocks.0.conv1.weight") > 0;
+        if (!is_new_resnet) {
+            if (is_legacy_resnet) {
+                throw std::runtime_error(
+                    "Legacy AlphaZero ResNet format detected (res_blocks.*). "
+                    "This architecture has been replaced with a KataGo-style ResNet "
+                    "(alternating SE + GPool residual blocks, global-pool value/score heads). "
+                    "Please retrain from scratch using the new architecture.");
+            }
+            throw std::runtime_error(
+                "Unknown model format: no `token_proj.weight` (ViT) and no "
+                "`trunk.0.conv2.weight` (new ResNet).  Is this an ONNX file "
+                "from minigo-cpp?");
+        }
+
         model->model_type = "resnet";
         auto& iw = get("input_conv.weight");
         model->input_channels = (int)iw.dims[1];
         model->num_filters    = (int)iw.dims[0];
 
         model->num_res_blocks = 0;
-        while (tm.count("res_blocks." + std::to_string(model->num_res_blocks) + ".conv1.weight"))
+        while (tm.count("trunk." + std::to_string(model->num_res_blocks) + ".conv2.weight"))
             model->num_res_blocks++;
 
         auto& pfw = get("policy_fc.weight");
@@ -117,50 +136,25 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         g.bias = get(prefix + ".bias").get_floats();
     };
 
-    // ── Load all weights ─────────────────────────────────────────
-    // ViT models use TensorRT (ONNX graph directly) — no CPU weight loading needed
+    // ── Metadata-only load ───────────────────────────────────────
+    // Both ViT and the new KataGo-style ResNet use TensorRT (which parses
+    // the ONNX graph directly and owns its own weight upload).  The per-op
+    // helpers load_conv/load_bn/load_fc are kept for the TODO re-enable of
+    // Eigen/CUDA/OpenCL/Metal after those backends gain SE + GPool kernels.
+    (void)load_conv; (void)load_bn; (void)load_fc;
+
     if (is_vit) {
         std::cout << "Model loaded: type=vit board=" << model->board_size
                   << " d_model=" << model->num_filters
                   << " depth=" << model->vit_depth
                   << " heads=" << model->vit_heads
                   << " kv_groups=" << model->vit_kv_groups << "\n";
-        return model;
+    } else {
+        std::cout << "Model loaded: type=resnet board=" << model->board_size
+                  << " filters=" << model->num_filters
+                  << " blocks=" << model->num_res_blocks
+                  << " channels=" << model->input_channels << "\n";
     }
-
-    load_conv(model->input_conv, "input_conv.weight");
-    load_bn  (model->input_conv, "input_bn");
-
-    model->res_conv1.resize(model->num_res_blocks);
-    model->res_conv2.resize(model->num_res_blocks);
-    for (int i = 0; i < model->num_res_blocks; i++) {
-        std::string pfx = "res_blocks." + std::to_string(i);
-        load_conv(model->res_conv1[i], pfx + ".conv1.weight");
-        load_bn  (model->res_conv1[i], pfx + ".bn1");
-        load_conv(model->res_conv2[i], pfx + ".conv2.weight");
-        load_bn  (model->res_conv2[i], pfx + ".bn2");
-    }
-
-    load_conv(model->policy_conv, "policy_conv.weight");
-    load_bn  (model->policy_conv, "policy_bn");
-    load_conv(model->value_conv,  "value_conv.weight");
-    load_bn  (model->value_conv,  "value_bn");
-
-    load_fc(model->policy_fc, "policy_fc");
-    load_fc(model->value_fc1, "value_fc1");
-    load_fc(model->value_fc2, "value_fc2");
-
-    // Score head (always present)
-    load_conv(model->score_conv, "score_conv.weight");
-    load_bn  (model->score_conv, "score_bn");
-    load_fc(model->score_fc1, "score_fc1");
-    load_fc(model->score_fc2, "score_fc2");
-
-    std::cout << "Model loaded: type=resnet board=" << model->board_size
-              << " filters=" << model->num_filters
-              << " blocks=" << model->num_res_blocks
-              << " channels=" << model->input_channels << "\n";
-
     return model;
 }
 

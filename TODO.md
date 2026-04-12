@@ -104,3 +104,41 @@ This works but wastes FP8 potential — the transformer blocks are >99% of compu
 - `bca5e9e` — FP8 padding implementation + nested BF16 autocast (padding reverted in cb24be1)
 - `cb24be1` — Reverted padding, restricted te.Linear to post-pooling only
 - `32bc9fa` — Removed FP8 from TensorRT auto-detection (BF16 default on SM 8+)
+
+
+## Non-TensorRT backends for the new KataGo-style ResNet
+
+**Status**: Stubbed — throws at handle creation.
+
+The ResNet architecture was replaced with a KataGo-style design (alternating
+SE + GPool residual blocks, global-pool value/score heads; see
+`scripts/model.py` for the PyTorch definition).  TensorRT parses the new
+ONNX graph directly and works out of the box.  The Eigen/CUDA/OpenCL/Metal
+backends still contain their old AlphaZero-ResNet forward passes but
+throw at `ComputeHandle` construction with a "TODO: add kernels" message.
+
+To re-enable a backend, add forward-pass support for:
+
+- **`SEModule`** — global avg pool over spatial dims → FC(C→C/r) → ReLU →
+  FC(C/r→C) → sigmoid → per-channel broadcast multiply.
+- **`GPoolResBlock`** — two parallel 3x3 convs from the same input: a "main"
+  conv (C→C) and a "pool" conv (C→Cp).  The pool branch is globally mean+max
+  pooled to [B, 2*Cp], projected by FC(2Cp→C), and the resulting [B, C]
+  vector is added as a per-channel bias to the main branch before the
+  second 3x3 conv.  Then residual add + ReLU as usual.
+- **`GPoolHead`** — 1x1 conv (C→head_ch) → BN → ReLU → global mean+max pool →
+  FC(2*head_ch→mlp_hidden) → ReLU → FC(mlp_hidden→out_features).
+
+Blocks alternate in the trunk: block 0 SE, block 1 GPool, block 2 SE, ...
+
+And teach `loaded_model.cpp` to populate per-block weight slots for the
+new layout.  The old per-op `load_conv` / `load_bn` / `load_fc` helpers are
+kept in place (currently `(void)`-cast to silence unused warnings) for
+exactly this re-enable path.
+
+See the stubs in:
+
+- `src/eigen_compute.cpp` (`EigenComputeHandle` constructor)
+- `src/cuda_compute.cu` (`CUDAComputeHandle` constructor)
+- `src/opencl_compute.cpp` (`OpenCLComputeHandle` constructor)
+- `src/metal_compute.mm` (`MetalComputeHandle` constructor)

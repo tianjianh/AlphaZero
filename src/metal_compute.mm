@@ -109,6 +109,21 @@ struct MetalComputeHandle::Impl {
 
 MetalComputeHandle::MetalComputeHandle(MetalComputeContext::Impl* ctx_impl,
                                          const LoadedModel* model) {
+    // TODO(resnet_v2): the new KataGo-style ResNet (alternating SE + GPool
+    // residual blocks, global-pool value/score heads) is not yet supported
+    // by the Metal/MPSGraph backend.  To re-enable it, build the graph for:
+    //   - SEModule (global avg pool + small FC + sigmoid + broadcast mul)
+    //   - GPoolResBlock (parallel conv_main + conv_pool, mean+max pool,
+    //     FC producing per-channel additive bias for conv_main)
+    //   - GPoolHead (1x1 conv + mean+max pool + 2-layer FC)
+    // and teach loaded_model.cpp to populate per-block weight slots.
+    // Until then, use the TensorRT backend.
+    (void)ctx_impl; (void)model;
+    throw std::runtime_error(
+        "Metal backend currently disabled: the KataGo-style ResNet "
+        "(SE + GPool blocks + global-pool heads) requires TensorRT.  "
+        "TODO: add MPSGraph construction for the new blocks.");
+
     impl_ = new Impl();
     impl_->ctx = ctx_impl;
     impl_->board_size = model->board_size;

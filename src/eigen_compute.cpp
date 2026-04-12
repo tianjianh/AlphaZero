@@ -31,6 +31,20 @@ static Eigen::VectorXf to_vector(const std::vector<float>& data) {
 }
 
 EigenComputeHandle::EigenComputeHandle(const LoadedModel* model) {
+    // TODO(resnet_v2): the new KataGo-style ResNet (alternating SE + GPool
+    // residual blocks, global-pool value/score heads) is not yet supported
+    // by the Eigen backend.  To re-enable it, add forward passes for:
+    //   - SEModule (global avg pool → FC → sigmoid → broadcast multiply)
+    //   - GPoolResBlock (parallel 3x3 main + 3x3 pool branches, global
+    //     mean+max pool on the pool branch, FC → broadcast additive bias
+    //     into the main branch before conv2)
+    //   - GPoolHead (1x1 conv → global mean+max pool → 2-layer MLP)
+    // and load the corresponding weights from LoadedModel.  Until then,
+    // use the TensorRT backend.
+    throw std::runtime_error(
+        "Eigen backend currently disabled: the KataGo-style ResNet "
+        "(SE + GPool blocks + global-pool heads) and ViT models both "
+        "require TensorRT.  TODO: add Eigen kernels for the new blocks.");
     if (model->model_type == "vit")
         throw std::runtime_error("Eigen backend does not support ViT models. Use TensorRT.");
     board_size     = model->board_size;
