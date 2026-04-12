@@ -175,15 +175,26 @@ def build_data_window(window_size, end_iter):
 
 def _stage(name, start, end, games, sims, epochs, lr, eval_games,
            score_weight, score_weight_loss, window_size,
-           c_puct, temp_threshold, dirichlet_epsilon):
-    """Build a stage dict with all per-stage overrides."""
-    return {"name": name, "start": start, "end": end,
-            "games": games, "sims": sims, "epochs": epochs, "lr": lr,
-            "eval_games": eval_games,
-            "score_weight": score_weight, "score_weight_loss": score_weight_loss,
-            "window_size": window_size,
-            "c_puct": c_puct, "temp_threshold": temp_threshold,
-            "dirichlet_epsilon": dirichlet_epsilon}
+           c_puct, temp_threshold, dirichlet_epsilon,
+           eval_threshold=None):
+    """Build a stage dict with all per-stage overrides.
+
+    Any key present here *and* in the top-level plan `training`/`mcts`
+    dicts is merged via `get_stage_config()` before each iteration.
+    `eval_threshold` is optional — only added to the stage dict when
+    explicitly set, so stages that want the top-level default can just
+    leave it off.
+    """
+    d = {"name": name, "start": start, "end": end,
+         "games": games, "sims": sims, "epochs": epochs, "lr": lr,
+         "eval_games": eval_games,
+         "score_weight": score_weight, "score_weight_loss": score_weight_loss,
+         "window_size": window_size,
+         "c_puct": c_puct, "temp_threshold": temp_threshold,
+         "dirichlet_epsilon": dirichlet_epsilon}
+    if eval_threshold is not None:
+        d["eval_threshold"] = eval_threshold
+    return d
 
 # Per-stage exploration schedule (explore→exploit as model strengthens)
 #                    score_wt  sw_loss  window  c_puct  temp  dir_eps
@@ -202,12 +213,27 @@ _EXPLORE = [
     (0.1,   0.2,     8,      1.1,    12,   0.20),
 ]
 # xlarge preset uses wider sliding windows and stronger score weighting in
-# later stages — appropriate for 200-iter deep training runs, not for the
-# default 72-iter "large" plan which reuses the small-plan exploration.
+# later stages — appropriate for 200-iter deep training runs.
 _EXPLORE_XLARGE = list(_EXPLORE)
 _EXPLORE_XLARGE[3] = (0.1, 0.5, 8, 1.25, 15, 0.22)
 _EXPLORE_XLARGE[4] = (0.15, 0.5, 10, 1.1, 12, 0.20)
 _EXPLORE_XLARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
+
+# large preset (72 iters, ~2x small) — tuned separately from small:
+# wider early windows, escalating eval gating, slightly more exploration in
+# late stages (keep c_puct higher than small's overnight), and a lower
+# score CE loss weight to prevent the score head from dominating gradients.
+_EXPLORE_LARGE = [
+    # score_wt  swl    window  c_puct  temp  dir_eps
+    (0.0,      0.05,   4,      2.0,    20,   0.30),  # 0 Bootstrap
+    (0.0,      0.05,   4,      1.75,   18,   0.28),  # 1 Warm up
+    (0.02,     0.1,    6,      1.5,    15,   0.25),  # 2 Early gated
+    (0.02,     0.1,    6,      1.5,    15,   0.25),  # 3 Consolidate
+    (0.05,     0.12,   8,      1.3,    12,   0.22),  # 4 Steady
+    (0.08,     0.15,   8,      1.25,   12,   0.20),  # 5 Overnight
+]
+# Progressive eval gating: weak candidates pass easily early, strict late.
+_EVAL_TH_LARGE = [None, None, 0.53, 0.54, 0.55, 0.55]
 
 
 def generate_stages(preset, board, filters, blocks, arch="resnet"):
@@ -277,15 +303,16 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
                 _stage("Overnight extend",41, 72, 1700, 800, 5, lrs[5], 240,
                        0.08, 0.15, 8,  1.1,  10, 0.18),
             ]
-        ex = _EXPLORE
+        ex = _EXPLORE_LARGE
+        et = _EVAL_TH_LARGE
         ep = [3, 3, 3, 4, 5, 5]
         return [
-            _stage("Bootstrap",       1,   4,   400, 200, ep[0], lrs[0], 0,   *ex[0]),
-            _stage("Warm up",         5,   8,   600, 300, ep[1], lrs[1], 0,   *ex[1]),
-            _stage("Early gated",     9,  14,   900, 400, ep[2], lrs[2], 100, *ex[2]),
-            _stage("Consolidate",    15,  24,  1100, 450, ep[3], lrs[3], 200, *ex[3]),
-            _stage("Steady improve", 25,  40,  1300, 550, ep[4], lrs[4], 200, *ex[4]),
-            _stage("Overnight extend",41, 72,  1400, 600, ep[5], lrs[5], 200, *ex[5]),
+            _stage("Bootstrap",       1,   4,   400, 200, ep[0], lrs[0], 0,   *ex[0], eval_threshold=et[0]),
+            _stage("Warm up",         5,   8,   600, 300, ep[1], lrs[1], 0,   *ex[1], eval_threshold=et[1]),
+            _stage("Early gated",     9,  14,   900, 400, ep[2], lrs[2], 100, *ex[2], eval_threshold=et[2]),
+            _stage("Consolidate",    15,  24,  1100, 450, ep[3], lrs[3], 200, *ex[3], eval_threshold=et[3]),
+            _stage("Steady improve", 25,  40,  1300, 550, ep[4], lrs[4], 200, *ex[4], eval_threshold=et[4]),
+            _stage("Overnight extend",41, 72,  1400, 600, ep[5], lrs[5], 200, *ex[5], eval_threshold=et[5]),
         ]
 
     # ── xlarge: 200 iters, ~670M sim-games (~28x small) ─────────
@@ -360,7 +387,7 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "eval_threshold": eval_threshold,
             "policy_weight": 1.0,
             "value_weight": 1.0,
-            "score_weight_loss": 0.15 if arch == "vit" else 0.5,
+            "score_weight_loss": 0.15 if arch == "vit" else 0.1,
             "fp8": False,
         },
         "mcts": {
