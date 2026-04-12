@@ -54,46 +54,55 @@ void GoGame::neighbors(int r, int c, Pos* nbrs, int& count) const {
     if (c < board_size - 1) nbrs[count++] = {r, c + 1};
 }
 
-void GoGame::get_group(int r, int c, std::vector<Pos>& group, int& liberties) const {
-    get_group_on(board, r, c, group, liberties);
+int GoGame::get_group(int r, int c, Pos* out_group, int& liberties) const {
+    return get_group_on(board, r, c, out_group, liberties);
 }
 
-void GoGame::get_group_on(const Stone brd[][MAX_BOARD], int r, int c,
-                           std::vector<Pos>& group, int& liberties) const {
+int GoGame::get_group_on(const Stone brd[][MAX_BOARD], int r, int c,
+                          Pos* out_group, int& liberties) const {
     Stone color = brd[r][c];
-    if (color == EMPTY) { group.clear(); liberties = 0; return; }
+    if (color == EMPTY) { liberties = 0; return 0; }
 
-    group.clear();
+    int n = board_size;
+    int group_size = 0;
     liberties = 0;
 
-    // BFS with visited array
-    bool visited[MAX_BOARD][MAX_BOARD] = {};
-    bool liberty_visited[MAX_BOARD][MAX_BOARD] = {};
-    std::vector<Pos> stack;
-    stack.push_back({r, c});
-    visited[r][c] = true;
+    // Stack-based BFS with fixed-size scratch — no heap allocation in
+    // the hot path.  visited[]/lib_seen[] are 361-byte stack arrays
+    // that the compiler zero-inits as a single short memset.
+    bool visited[MAX_BOARD * MAX_BOARD] = {};
+    bool lib_seen[MAX_BOARD * MAX_BOARD] = {};
+    Pos  stack_buf[MAX_BOARD * MAX_BOARD];
+    int  top = 0;
 
-    while (!stack.empty()) {
-        Pos p = stack.back(); stack.pop_back();
-        group.push_back(p);
+    stack_buf[top++] = {r, c};
+    visited[r * MAX_BOARD + c] = true;
 
-        Pos nbrs[4]; int cnt;
-        neighbors(p.r, p.c, nbrs, cnt);
-        for (int i = 0; i < cnt; i++) {
-            int nr = nbrs[i].r, nc = nbrs[i].c;
-            if (brd[nr][nc] == EMPTY && !liberty_visited[nr][nc]) {
-                liberty_visited[nr][nc] = true;
-                liberties++;
-            } else if (brd[nr][nc] == color && !visited[nr][nc]) {
-                visited[nr][nc] = true;
-                stack.push_back({nr, nc});
-            }
+    auto visit = [&](int nr, int nc) {
+        int idx = nr * MAX_BOARD + nc;
+        Stone s = brd[nr][nc];
+        if (s == EMPTY) {
+            if (!lib_seen[idx]) { lib_seen[idx] = true; liberties++; }
+        } else if (s == color && !visited[idx]) {
+            visited[idx] = true;
+            stack_buf[top++] = {nr, nc};
         }
+    };
+
+    while (top > 0) {
+        Pos p = stack_buf[--top];
+        out_group[group_size++] = p;
+        int pr = p.r, pc = p.c;
+        if (pr > 0)         visit(pr - 1, pc);
+        if (pr < n - 1)     visit(pr + 1, pc);
+        if (pc > 0)         visit(pr,     pc - 1);
+        if (pc < n - 1)     visit(pr,     pc + 1);
     }
+    return group_size;
 }
 
-void GoGame::remove_group(const std::vector<Pos>& group) {
-    for (auto& p : group) board[p.r][p.c] = EMPTY;
+void GoGame::remove_group(const Pos* group, int n) {
+    for (int i = 0; i < n; i++) board[group[i].r][group[i].c] = EMPTY;
 }
 
 bool GoGame::is_legal(int action) const {
@@ -117,47 +126,49 @@ bool GoGame::is_legal(int action) const {
     //   captured in the previous move, which requires all liberties
     //   filled (no empty neighbours at capture time).  Contradiction.
     //
-    // Applies to the vast majority of moves: any interior/border position
-    // with at least one open neighbour.  Eliminates the board-clone + BFS
-    // for ~80–90% of is_legal() calls.
-    Pos nbrs[4]; int cnt;
-    neighbors(r, c, nbrs, cnt);
-    for (int i = 0; i < cnt; i++) {
-        if (board[nbrs[i].r][nbrs[i].c] == EMPTY)
-            return true;   // legal — no suicide, no ko possible
-    }
+    // Applies to the vast majority of moves; eliminates board-clone +
+    // BFS for ~80-90% of is_legal() calls.  Inlined as four explicit
+    // boundary-checked loads — no Pos struct, no function call.
+    if ((r > 0     && board[r - 1][c] == EMPTY) ||
+        (r < n - 1 && board[r + 1][c] == EMPTY) ||
+        (c > 0     && board[r][c - 1] == EMPTY) ||
+        (c < n - 1 && board[r][c + 1] == EMPTY))
+        return true;
 
-    // ── Slow path: all neighbours are occupied ────────────────────────
-    // (happens only in dense/endgame positions; also covers rare eye-fills
-    //  and snapbacks that need the full capture+ko simulation)
+    return is_legal_at_slow(r, c);
+}
+
+bool GoGame::is_legal_at_slow(int r, int c) const {
+    // All four neighbours of (r,c) are non-empty (caller guarantees the
+    // fast-path miss).  This handles eye-fills, snapbacks, and ko — the
+    // rare case that needs a full capture+ko simulation.
+    int n = board_size;
     Stone test[MAX_BOARD][MAX_BOARD];
     std::memcpy(test, board, sizeof(board));
     test[r][c] = current_player;
+    Stone opp = opponent(current_player);
 
-    // Simulate captures of opponent groups
-    for (int i = 0; i < cnt; i++) {
-        int nr = nbrs[i].r, nc = nbrs[i].c;
-        if (test[nr][nc] == opponent(current_player)) {
-            std::vector<Pos> grp; int libs;
-            get_group_on(test, nr, nc, grp, libs);
-            if (libs == 0)
-                for (auto& p : grp) test[p.r][p.c] = EMPTY;
-        }
-    }
+    auto try_capture = [&](int nr, int nc) {
+        if (test[nr][nc] != opp) return;
+        Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
+        int gsize = get_group_on(test, nr, nc, grp, libs);
+        if (libs == 0)
+            for (int i = 0; i < gsize; i++) test[grp[i].r][grp[i].c] = EMPTY;
+    };
 
-    // Check suicide
-    std::vector<Pos> own_grp; int own_libs;
+    if (r > 0)     try_capture(r - 1, c);
+    if (r < n - 1) try_capture(r + 1, c);
+    if (c > 0)     try_capture(r, c - 1);
+    if (c < n - 1) try_capture(r, c + 1);
+
+    // Suicide check
+    Pos own_grp[MAX_BOARD * MAX_BOARD]; int own_libs;
     get_group_on(test, r, c, own_grp, own_libs);
     if (own_libs == 0) return false;
 
-    // Check ko
-    if (has_prev_board) {
-        bool same = true;
-        for (int rr = 0; rr < n && same; rr++)
-            for (int cc = 0; cc < n && same; cc++)
-                if (test[rr][cc] != prev_board[rr][cc]) same = false;
-        if (same) return false;
-    }
+    // Ko check via single memcmp instead of nested r,c loop.
+    if (has_prev_board && std::memcmp(test, prev_board, sizeof(board)) == 0)
+        return false;
 
     return true;
 }
@@ -166,10 +177,24 @@ void GoGame::get_legal_moves(std::vector<float>& legal) const {
     int n = board_size;
     int action_size = n * n + 1;
     legal.assign(action_size, 0.0f);
-    for (int i = 0; i < n * n; i++) {
-        if (is_legal(i)) legal[i] = 1.0f;
-    }
     legal[n * n] = 1.0f;  // pass always legal
+    if (game_over) return;
+
+    // Inline the fast path here — avoids 81 function calls per move and
+    // the per-call game_over / pass / bounds rechecks.  is_legal() above
+    // remains the canonical entry point for external callers.
+    for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++) {
+            if (board[r][c] != EMPTY) continue;
+            bool fast =
+                (r > 0     && board[r - 1][c] == EMPTY) ||
+                (r < n - 1 && board[r + 1][c] == EMPTY) ||
+                (c > 0     && board[r][c - 1] == EMPTY) ||
+                (c < n - 1 && board[r][c + 1] == EMPTY);
+            if (fast || is_legal_at_slow(r, c))
+                legal[r * n + c] = 1.0f;
+        }
+    }
 }
 
 void GoGame::play(int action) {
@@ -191,18 +216,20 @@ void GoGame::play(int action) {
         consecutive_passes = 0;
         int r = action / n, c = action % n;
         board[r][c] = current_player;
+        Stone opp = opponent(current_player);
 
-        // Remove captured groups
-        Pos nbrs[4]; int cnt;
-        neighbors(r, c, nbrs, cnt);
-        for (int i = 0; i < cnt; i++) {
-            int nr = nbrs[i].r, nc = nbrs[i].c;
-            if (board[nr][nc] == opponent(current_player)) {
-                std::vector<Pos> grp; int libs;
-                get_group(nr, nc, grp, libs);
-                if (libs == 0) remove_group(grp);
-            }
-        }
+        // Remove captured groups — inline neighbor enumeration with
+        // stack-array group buffer (no heap allocation in the hot path).
+        auto try_capture = [&](int nr, int nc) {
+            if (board[nr][nc] != opp) return;
+            Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
+            int gsize = get_group(nr, nc, grp, libs);
+            if (libs == 0) remove_group(grp, gsize);
+        };
+        if (r > 0)     try_capture(r - 1, c);
+        if (r < n - 1) try_capture(r + 1, c);
+        if (c > 0)     try_capture(r, c - 1);
+        if (c < n - 1) try_capture(r, c + 1);
     }
 
     last_move = action;
@@ -212,13 +239,16 @@ void GoGame::play(int action) {
 }
 
 void GoGame::update_history() {
-    // Write into the next ring slot (overwrites oldest if full)
+    // Write into the next ring slot (overwrites oldest if full).  Drop
+    // the prior snap.fill(0) — every used position is overwritten just
+    // below, and snap[n*n .. MAX_BOARD*MAX_BOARD) is never read.  Each
+    // row is a 1-byte-stride memcpy of `n` bytes; the compiler folds
+    // small-n memcpys to register loads/stores.
     int write_idx = (ring_head_ + ring_size_) % RING_CAP;
     auto& snap = ring_buf_[write_idx];
-    snap.fill(0);
-    for (int r = 0; r < board_size; r++)
-        for (int c = 0; c < board_size; c++)
-            snap[r * board_size + c] = static_cast<int8_t>(board[r][c]);
+    int n = board_size;
+    for (int r = 0; r < n; r++)
+        std::memcpy(&snap[r * n], &board[r][0], (size_t)n);
 
     if (ring_size_ < history_length) {
         ring_size_++;                             // ring not full yet
@@ -309,7 +339,7 @@ std::pair<float, float> GoGame::score() const {
 }
 
 void GoGame::score_game() {
-    // Atari cleanup: repeatedly capture groups with 1 liberty.
+    // Atari cleanup: repeatedly capture groups with ≤1 liberty.
     // Early-stage models often pass with dead stones still on the board.
     // Under Chinese rules the game should be played out; this automates it.
     bool changed = true;
@@ -318,16 +348,10 @@ void GoGame::score_game() {
         for (int r = 0; r < board_size; r++) {
             for (int c = 0; c < board_size; c++) {
                 if (board[r][c] == EMPTY) continue;
-                std::vector<Pos> grp; int libs;
-                get_group(r, c, grp, libs);
-                if (libs == 0) {
-                    // Already captured (shouldn't happen, but safety)
-                    remove_group(grp);
-                    changed = true;
-                } else if (libs == 1) {
-                    // Dead group in atari — the opponent could capture
-                    // in one move. Remove it as if played out.
-                    remove_group(grp);
+                Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
+                int gsize = get_group(r, c, grp, libs);
+                if (libs <= 1) {
+                    remove_group(grp, gsize);
                     changed = true;
                 }
             }

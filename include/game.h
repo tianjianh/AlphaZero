@@ -63,11 +63,16 @@ private:
     int ring_size_ = 0;   // number of valid entries (0 … history_length)
 
     struct Pos { int r, c; };
+    // Stack-based group helpers — out_group is a caller-supplied buffer
+    // sized for the worst case (`MAX_BOARD * MAX_BOARD`).  Avoids the
+    // per-call heap allocation that std::vector<Pos> incurred in the
+    // hot is_legal/play/score loops.
+    int  get_group(int r, int c, Pos* out_group, int& liberties) const;
+    int  get_group_on(const Stone brd[][MAX_BOARD], int r, int c,
+                      Pos* out_group, int& liberties) const;
+    void remove_group(const Pos* group, int n);
     void neighbors(int r, int c, Pos* nbrs, int& count) const;
-    void get_group(int r, int c, std::vector<Pos>& group, int& liberties) const;
-    void get_group_on(const Stone brd[][MAX_BOARD], int r, int c,
-                      std::vector<Pos>& group, int& liberties) const;
-    void remove_group(const std::vector<Pos>& group);
+    bool is_legal_at_slow(int r, int c) const;
     void update_history();
     void score_game();
 };

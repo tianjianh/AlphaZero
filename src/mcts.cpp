@@ -11,14 +11,35 @@
 namespace minigo {
 
 MCTSNode* MCTSNode::select_child(float c_puct) {
+    // Hoist the parent terms (visit_count + virtual_loss + sqrt) out of
+    // the per-child loop — they don't change while we iterate, and
+    // ucb_score() was re-reading them per child via 2 atomic loads + a
+    // sqrt.  For a 82-child root that's 164 atomic ops + 82 sqrts saved
+    // per descent step.  The math here mirrors ucb_score() exactly.
+    int parent_total =
+        visit_count.load(std::memory_order_relaxed) +
+        virtual_loss_count.load(std::memory_order_relaxed);
+    float sqrt_pt = std::sqrt((float)parent_total);
+
     MCTSNode* best = nullptr;
     float best_score = -1e9f;
-    for (auto& child : children) {
+    for (auto& child_ptr : children) {
+        MCTSNode* child = child_ptr.get();
         if (!child) continue;
-        float score = child->ucb_score(c_puct);
+
+        int vc  = child->visit_count.load(std::memory_order_relaxed);
+        int vlc = child->virtual_loss_count.load(std::memory_order_relaxed);
+        int self_total = vc + vlc;
+
+        float q = 0.0f;
+        if (self_total != 0)
+            q = -(child->total_value() + (float)vlc) / (float)self_total;
+
+        float u = c_puct * child->prior * sqrt_pt / (1.0f + (float)self_total);
+        float score = q + u;
         if (score > best_score) {
             best_score = score;
-            best = child.get();
+            best = child;
         }
     }
     return best;
