@@ -1,4 +1,24 @@
 cmake_minimum_required(VERSION 3.16)
+
+# ── Optional: use clang instead of the default compiler ─────
+# Enable with `cmake .. -DMINIGO_USE_CLANG=ON` on a fresh build
+# directory.  Must be handled *before* project() so CMake picks up
+# the choice during its compiler-detection step.  Switching from one
+# compiler to another after a build exists requires clearing the
+# cache (`rm -rf build/*` or use a new build directory).
+#
+# This only selects C/C++.  The CUDA backend still uses nvcc; nvcc's
+# host compiler is controlled by CMAKE_CUDA_HOST_COMPILER if needed.
+if(MINIGO_USE_CLANG)
+  find_program(_MINIGO_CLANG_C   clang)
+  find_program(_MINIGO_CLANG_CXX clang++)
+  if(NOT _MINIGO_CLANG_C OR NOT _MINIGO_CLANG_CXX)
+    message(FATAL_ERROR "MINIGO_USE_CLANG=ON but clang/clang++ not found in PATH")
+  endif()
+  set(CMAKE_C_COMPILER   "${_MINIGO_CLANG_C}"   CACHE FILEPATH "C compiler"   FORCE)
+  set(CMAKE_CXX_COMPILER "${_MINIGO_CLANG_CXX}" CACHE FILEPATH "C++ compiler" FORCE)
+endif()
+
 project(MiniGo LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)

@@ -136,6 +136,16 @@ cmake .. -DMINIGO_BACKEND=eigen    # CPU only (no GPU)
 > cmake .. -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++
 > ```
 
+Compile with clang instead of gcc:
+```bash
+cmake .. -DMINIGO_USE_CLANG=ON      # resolves clang/clang++ from PATH
+```
+Must be passed on a **fresh build directory** — CMake caches the compiler
+after the first configure, so switching gcc ↔ clang on an existing build
+requires `rm -rf build/*` (or a new build dir).  Only selects C/C++;
+nvcc's host compiler for `.cu` files is controlled separately via
+`CMAKE_CUDA_HOST_COMPILER`.
+
 CUDA and TensorRT share the same `CMAKE_CUDA_ARCHITECTURES` default:
 Turing/Ampere/Ada SASS + Hopper PTX (forward-compat with Blackwell and beyond).
 Note: this flag only affects `.cu` files (CUDA backend); TensorRT has no `.cu`
