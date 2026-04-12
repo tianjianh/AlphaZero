@@ -820,20 +820,87 @@ model 2's `NNEvaluator` is constructed.  This adds ~1-2s to eval startup but
 eliminates the race.  Runtime inference is fully parallel (both models' server
 threads use independent per-thread streams).
 
-### GPU Memory: Weight Sharing
+### Context vs Handle vs Stream
 
-| Backend | Weights on GPU | Sharing |
-|---|---|---|
-| **TensorRT** | 1 copy per GPU (baked into `ICudaEngine`) | Shared across all handles — engine is immutable, handles get their own `IExecutionContext` + I/O buffers |
-| **CUDA+CUTLASS** | 1 copy per handle (FP16 upload) | No sharing — each handle owns its weight buffers |
-| **OpenCL** | 1 copy per handle (`cl_mem` upload) | No sharing — each handle creates own buffers |
-| **Metal** | 1 copy per handle (embedded in `MPSGraph`) | No sharing — weights are graph constants |
+Three levels of resource ownership, from long-lived shared infrastructure
+down to per-thread mutable state:
+
+**Context** — one per unique GPU, lives for the lifetime of the process.
+Created on the main thread.  Holds resources that are expensive to create
+once and immutable (or read-only) during inference:
+
+| Backend | Context holds |
+|---|---|
+| **TensorRT** | `IRuntime*`, `ICudaEngine*` (built/deserialized once, immutable) |
+| **CUDA** | Device ID, precision flag (FP16 or FP32) |
+| **OpenCL** | `cl_context`, `cl_program` (compiled kernels) |
+| **Metal** | `MTLDevice`, `MTLCommandQueue` |
+
+**Handle** — one per server thread, created ON that thread.  Holds mutable
+per-inference state that must not be shared between threads:
+
+| Backend | Handle holds |
+|---|---|
+| **TensorRT** | `IExecutionContext*`, device I/O buffers (`d_input`, `d_policy`, ...) |
+| **CUDA** | Weight copies (FP16), workspace buffers, CUDA graph cache |
+| **OpenCL** | `cl_kernel` objects, weight buffers, workspace buffers |
+| **Metal** | `MPSGraph` with baked-in weights and tensors |
+
+**Stream** — one per server thread (via `cudaStreamPerThread` for TRT/CUDA).
+An ordered queue of GPU operations.  The server thread submits memcpy →
+inference → readback to its stream, then syncs.  Streams on the same GPU
+can run in parallel — the GPU hardware scheduler interleaves their kernels.
+
+```
+Process
+├── ComputeContext (GPU 0)
+│   ├── TRT engine (shared, immutable, weights baked in)
+│   ├── Handle #0 (thread 0)  ← exec_ctx + buffers + cudaStreamPerThread[0]
+│   └── Handle #1 (thread 1)  ← exec_ctx + buffers + cudaStreamPerThread[1]
+│
+└── ComputeContext (GPU 1)
+    ├── TRT engine (shared, immutable, weights baked in)
+    ├── Handle #2 (thread 2)  ← exec_ctx + buffers + cudaStreamPerThread[2]
+    └── Handle #3 (thread 3)  ← exec_ctx + buffers + cudaStreamPerThread[3]
+```
+
+The context is the shared read-only infrastructure.  The handle is the
+per-thread mutable workspace.  The stream is the per-thread GPU command
+queue.  Nothing is shared between threads during inference — handles and
+streams are fully independent.
+
+### Where Weights Live
+
+Weights flow from CPU → GPU differently in each backend:
+
+```
+                    TensorRT          CUDA/OpenCL        Metal           Eigen
+                    ─────────         ───────────        ─────           ─────
+LoadedModel (CPU)   [weights]         [weights]          [weights]       [weights]
+                       │                 │ │                │ │             │
+                       ▼                 │ │                │ │             │
+Context (GPU)       ICudaEngine          │ │                │ │             │
+                    [weights ×1]         │ │                │ │             │
+                       │                 │ │                │ │             │
+              ┌────────┤                 │ │                │ │             │
+              ▼        ▼                 ▼ ▼                ▼ ▼             ▼
+Handle 0    ExecCtx  ExecCtx         [wt copy] [wt copy]  MPSGraph MPSGraph  (ref)
+Handle 1    + bufs   + bufs          + bufs    + bufs     [weights] [weights] (ref)
+```
+
+| Backend | Weights on GPU | Sharing | Memory per GPU (128f/10b, 4 threads) |
+|---|---|---|---|
+| **TensorRT** | 1 copy per GPU (baked into `ICudaEngine`) | Shared — engine is immutable, handles get own `IExecutionContext` + I/O buffers | **~6 MB** |
+| **CUDA+CUTLASS** | 1 copy per handle (FP16 upload) | None — each handle owns its weight buffers | ~24 MB |
+| **OpenCL** | 1 copy per handle (`cl_mem` upload) | None — each handle creates own buffers | ~24 MB |
+| **Metal** | 1 copy per handle (embedded in `MPSGraph`) | None — weights are graph constants | ~24 MB |
+| **Eigen** | CPU only (in `LoadedModel`) | Shared by pointer — no GPU copies | 0 |
 
 TensorRT is the most memory-efficient because the compiled engine separates
-immutable weights (shared) from mutable execution state (per-thread).  For our
-small model (~800KB weights), the duplication in other backends is negligible.
-For larger models (128f/10b = ~6MB), 4 server threads on 1 GPU would use
-24MB with CUDA vs 6MB with TensorRT.
+immutable weights (shared) from mutable execution state (per-thread).  For
+the current 128f/10b model (~6MB weights), 4 server threads on 1 GPU use
+24MB with CUDA vs 6MB with TensorRT.  For larger models this gap grows
+proportionally.
 
 ## Performance
 
