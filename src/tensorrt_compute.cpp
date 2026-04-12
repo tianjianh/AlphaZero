@@ -60,7 +60,6 @@ static TRTLogger& get_trt_logger() {
 // ================================================================
 struct TRTDeviceState {
     int          device_id = -1;
-    cudaStream_t stream    = nullptr;
 
     // Engine is built lazily on first create_handle() for this device.
     // Protected by build_mutex so only the first thread builds it.
@@ -68,20 +67,19 @@ struct TRTDeviceState {
     nvinfer1::ICudaEngine*                  engine  = nullptr;
     nvinfer1::IRuntime*                     runtime = nullptr;
 
-    // Serialize predict_batch on a single GPU.  Two server threads on
-    // the same GPU share `stream` and may share TRT-internal host-side
-    // state (workspace planning, memory pools) that isn't fully safe
-    // for concurrent enqueueV3 from different execution contexts.
-    // This matches the CUDA backend's predict_mutex — same rationale
-    // applied to a different backend.
-    std::mutex                              predict_mutex;
-
     // Cached tensor names + sizes (populated after engine build)
     std::string input_name;
     std::string policy_name;
     std::string value_name;
     std::string score_name;
     std::string precision;   // "FP8", "FP16", or "FP32"
+
+    // NOTE: no shared cudaStream_t.  Each ComputeHandle uses
+    // cudaStreamPerThread — CUDA's built-in per-thread implicit stream
+    // (matching KataGo's trtbackend.cpp pattern).  Two server threads
+    // on the same GPU get independent streams automatically, allowing
+    // the GPU hardware scheduler to interleave their inference work
+    // with zero host-side contention.  No predict_mutex needed.
 };
 
 // ================================================================
@@ -345,7 +343,7 @@ static void init_device(TRTDeviceState& ds, int device_id) {
               << " (SM " << prop.major << "." << prop.minor
               << ", " << ds.precision << ")\n";
 
-    CUDA_CHECK(cudaStreamCreate(&ds.stream));
+    // No stream created here — each ComputeHandle uses cudaStreamPerThread.
 
     ds.runtime = nvinfer1::createInferRuntime(get_trt_logger());
     if (!ds.runtime)
@@ -368,7 +366,7 @@ TensorRTComputeContext::~TensorRTComputeContext() {
             cudaSetDevice(ds.device_id);
             if (ds.engine)  delete ds.engine;
             if (ds.runtime) delete ds.runtime;
-            if (ds.stream)  cudaStreamDestroy(ds.stream);
+            // No stream to destroy — handles use cudaStreamPerThread.
         }
         delete impl_;
     }
@@ -416,11 +414,13 @@ struct TensorRTComputeHandle::Impl {
 
     ~Impl() {
         cudaSetDevice(dev.device_id);
-        // Drain any in-flight work on the shared stream before freeing
-        // device buffers.  If a prior predict_batch threw mid-inference
-        // without reaching cudaStreamSynchronize, the stream may still
-        // have pending ops that reference d_input / d_policy / etc.
-        if (dev.stream) cudaStreamSynchronize(dev.stream);
+        // Drain this thread's implicit stream before freeing device
+        // buffers.  If a prior predict_batch threw mid-inference, the
+        // stream may still have pending ops referencing d_input etc.
+        // NOTE: the handle destructor runs on the same server thread
+        // that created the handle (local variable in server_loop), so
+        // cudaStreamPerThread refers to this thread's own stream.
+        cudaStreamSynchronize(cudaStreamPerThread);
         if (exec_ctx) delete exec_ctx;
         if (d_input)  cudaFree(d_input);
         if (d_policy) cudaFree(d_policy);
@@ -552,11 +552,9 @@ TensorRTComputeHandle::predict_batch(
     auto& I = *impl_;
     CUDA_CHECK(cudaSetDevice(I.dev.device_id));
 
-    // Serialize against other handles on the same GPU.  Two server
-    // threads sharing dev.stream may trigger TRT-internal host-side
-    // races in workspace planning or memory pool management during
-    // concurrent enqueueV3 calls — even from different exec_ctxs.
-    std::lock_guard<std::mutex> predict_lock(I.dev.predict_mutex);
+    // Each server thread uses cudaStreamPerThread — its own implicit
+    // CUDA stream.  No mutex needed; two threads on the same GPU
+    // submit to independent streams and the GPU interleaves them.
 
     int N = (int)states.size();
     int H = I.board_size, W = I.board_size;
@@ -571,7 +569,7 @@ TensorRTComputeHandle::predict_batch(
         flat_input.insert(flat_input.end(), s.begin(), s.end());
 
     CUDA_CHECK(cudaMemcpyAsync(I.d_input, flat_input.data(),
-        input_floats * sizeof(float), cudaMemcpyHostToDevice, I.dev.stream));
+        input_floats * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
 
     // Set dynamic input shape for this batch
     nvinfer1::Dims4 input_dims(N, I.input_channels, H, W);
@@ -589,7 +587,7 @@ TensorRTComputeHandle::predict_batch(
         throw std::runtime_error("TensorRT: setTensorAddress(score) failed");
 
     // Run inference
-    if (!I.exec_ctx->enqueueV3(I.dev.stream))
+    if (!I.exec_ctx->enqueueV3(cudaStreamPerThread))
         throw std::runtime_error("TensorRT: enqueueV3 failed");
 
     // Read back results
@@ -597,15 +595,15 @@ TensorRTComputeHandle::predict_batch(
     std::vector<float> val_flat((size_t)N);
 
     CUDA_CHECK(cudaMemcpyAsync(pol_flat.data(), I.d_policy,
-        pol_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+        pol_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.d_value,
-        val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+        val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
     std::vector<float> scr_flat((size_t)N);
     CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
-        scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+        scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
-    CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     // Pack results — TRT outputs are row-major [N, action_size] and [N, 1]
     std::vector<TensorRTComputeHandle::Result> results(N);
