@@ -724,16 +724,60 @@ backend-agnostic.
 | | **TensorRT** | **CUDA** | **OpenCL** | **Metal** |
 |---|---|---|---|---|
 | **Context created** | Main thread | Main thread | Main thread | Main thread |
-| **Context holds** | Stream + runtime per GPU | Stream per GPU | Context + queue + **compiled kernels** per GPU | MTLDevice + command queue |
+| **Context holds** | Runtime per GPU (no shared stream) | Device ID + precision per GPU (no shared stream) | Context + queue + **compiled kernels** per GPU | MTLDevice + command queue |
 | **Handle created** | Server thread | Server thread | Server thread | Server thread |
 | **Handles** | 4 (1 per thread) | 4 (1 per thread) | 4 (1 per thread) | 4 (1 per thread) |
+| **CUDA stream** | Per-thread via `cudaStreamPerThread` | Per-thread via `cudaStreamPerThread` | N/A (OpenCL queue) | N/A (Metal queue) |
 | **Engine/kernel build** | 1st server thread per GPU, mutex-guarded, cached to disk | N/A (hand-written kernels) | Main thread (1 `clBuildProgram` per GPU) | Server thread (1 MPSGraph per handle) |
 | **Weight copies on GPU** | 1 per GPU (inside TRT engine, shared by handles) | 2 per GPU (each handle uploads own FP16 copy) | 2 per GPU (each handle uploads own copy) | 4 total (embedded in MPSGraph) |
-| **Per-handle state** | Execution context + I/O buffers | Weights + workspace buffers | Kernel handles + weights + workspace | MPSGraph with embedded weights |
+| **Per-handle state** | Execution context + I/O buffers | Weights + workspace + CUDA graph cache | Kernel handles + weights + workspace | MPSGraph with embedded weights |
+
+#### Per-thread CUDA streams (KataGo pattern)
+
+Both the **TensorRT** and **CUDA** backends use `cudaStreamPerThread` — CUDA's
+built-in per-thread implicit stream.  Each server thread automatically gets its
+own independent CUDA stream with no explicit creation or destruction.
+
+This means two server threads on the same GPU (e.g. `--nn-device-ids 0,0`)
+submit inference work to **separate streams**.  The GPU hardware scheduler
+interleaves their kernels with zero host-side contention — no shared stream,
+no mutex around `predict_batch`.
+
+Why this matters:
+- **TensorRT**: `enqueueV3()` configures internal workspace and launches
+  kernels.  With a shared stream, two concurrent `enqueueV3` calls from
+  different execution contexts could race on TRT's host-side memory pool
+  management, corrupting heap metadata (the root cause of the sporadic
+  `malloc_consolidate` crash at process exit on multi-GPU systems).
+- **CUDA**: `cudaStreamBeginCapture()` puts a stream into capture mode.
+  If two threads shared a stream, one thread's kernel launches during
+  another thread's capture would be pulled into the wrong CUDA graph.
+
+With per-thread streams, each thread's capture, launch, and sync are
+completely isolated.  No shared mutable state during inference.
+
+The **OpenCL** backend has a shared `cl_command_queue` per device but is
+currently disabled (the KataGo-style ResNet requires SE/GPool kernels not
+yet implemented in OpenCL).  When re-enabled, it should follow the same
+pattern: one queue per handle, not per device.
+
+The **Metal** backend shares one `MTLCommandQueue` per device.  Apple
+explicitly guarantees thread safety for Metal command queue submission,
+so no additional synchronization is needed.
+
+Each handle destructor calls `cudaStreamSynchronize(cudaStreamPerThread)`
+before freeing device buffers, ensuring any in-flight async work from a
+prior `predict_batch` (that may have thrown before reaching its own sync)
+is drained before `cudaFree`.
+
+#### Engine Build Serialization
 
 TensorRT engine build is serialized per cache path (mutex) to prevent concurrent
 writes to the same cache file.  With identical GPUs, only **1 build** occurs across
 all 4 threads — the remaining 3 load from cache or reuse `dev.engine` in memory.
+
+The cache filename includes the TensorRT version (`trt10.8.0_...`) so upgrading
+TRT automatically invalidates stale cached engines.
 
 ### Handle Initialization Timeline
 
@@ -741,20 +785,28 @@ all 4 threads — the remaining 3 load from cache or reuse `dev.engine` in memor
 
 ```
 Main thread:  LoadedModel::load()  →  create_compute_context({0,0,1,1})
-              │                        │→ DeviceState[GPU0]: runtime, stream
-              │                        │→ DeviceState[GPU1]: runtime, stream
+              │                        │→ DeviceState[GPU0]: runtime (no stream)
+              │                        │→ DeviceState[GPU1]: runtime (no stream)
               └→ NNEvaluator(model, ctx, {0,0,1,1}) → spawns 4 threads, returns
 
-Thread 0 (GPU0): ──lock dev[0].mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #0
-Thread 1 (GPU0): ──lock dev[0].mutex── WAIT ─────────────────→ engine exists → create ExecCtx #1
-Thread 2 (GPU1): ──lock dev[1].mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #2
-Thread 3 (GPU1): ──lock dev[1].mutex── WAIT ─────────────────→ engine exists → create ExecCtx #3
+Thread 0 (GPU0): ──lock build_mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #0
+Thread 1 (GPU0): ──lock build_mutex── WAIT ────────────────→ engine exists → create ExecCtx #1
+Thread 2 (GPU1): ──lock build_mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #2
+Thread 3 (GPU1): ──lock build_mutex── WAIT ────────────────→ engine exists → create ExecCtx #3
                   ↑ parallel (different GPUs)      ↑ serialized (same GPU)
+
+Runtime inference (after all handles are ready):
+Thread 0: predict_batch on cudaStreamPerThread[0]  ← independent stream
+Thread 1: predict_batch on cudaStreamPerThread[1]  ← independent stream
+Thread 2: predict_batch on cudaStreamPerThread[2]  ← independent stream
+Thread 3: predict_batch on cudaStreamPerThread[3]  ← independent stream
+           ↑ fully parallel, no shared state during inference
 ```
 
 Threads on different GPUs run in parallel.  Threads on the same GPU are serialized
-by `dev.build_mutex` — the first thread deserializes the engine, subsequent threads
-find `dev.engine` already set and skip to creating their own `IExecutionContext`.
+only during **engine build** by `dev.build_mutex` — the first thread deserializes the
+engine, subsequent threads find `dev.engine` already set and skip to creating their
+own `IExecutionContext`.  After build, all threads run inference fully in parallel.
 
 **Evaluation** (2 models, 2 GPUs, 4 server threads each):
 
@@ -765,8 +817,8 @@ driver-level race (SIGSEGV ~70% of the time).
 
 Fix: `eval1->wait_ready()` blocks until all of model 1's handles are created before
 model 2's `NNEvaluator` is constructed.  This adds ~1-2s to eval startup but
-eliminates the race.  Runtime game play is fully parallel (both models' server
-threads process batches concurrently — different `IExecutionContext`, no conflict).
+eliminates the race.  Runtime inference is fully parallel (both models' server
+threads use independent per-thread streams).
 
 ### GPU Memory: Weight Sharing
 

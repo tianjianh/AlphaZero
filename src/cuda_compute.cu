@@ -42,14 +42,13 @@ namespace minigo {
 // ================================================================
 struct CUDADeviceState {
     int          device_id = -1;
-    cudaStream_t stream    = nullptr;
     bool         use_fp16  = false;  // SM >= 7.0 for WMMA tensor cores
-    // Serializes predict_batch on a single GPU. Two server threads on
-    // the same GPU share `stream`, and cudaStreamBeginCapture() is a
-    // stream-wide state change — concurrent kernel launches from another
-    // thread during capture would either be pulled into the wrong graph
-    // or fail with "stream already in capture mode". Take turns instead.
-    std::mutex   predict_mutex;
+    // NOTE: no shared cudaStream_t or predict_mutex.  Each ComputeHandle
+    // uses cudaStreamPerThread — CUDA's built-in per-thread implicit
+    // stream (matching KataGo's pattern and the TRT backend).  Two server
+    // threads on the same GPU get independent streams automatically,
+    // so graph capture and kernel launches on one thread's stream never
+    // interfere with another thread's.
 };
 
 // ================================================================
@@ -577,7 +576,7 @@ static void init_device(CUDADeviceState& ds, int device_id) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
     ds.use_fp16 = (prop.major >= 7);  // WMMA requires Volta+
 
-    CUDA_CHECK(cudaStreamCreate(&ds.stream));
+    // No stream created here — each ComputeHandle uses cudaStreamPerThread.
     const char* prec = ds.use_fp16 ? "FP16+WMMA" : "FP32";
     std::cout << "CUDA device " << device_id << ": " << prop.name
               << " (SM " << prop.major << "." << prop.minor << ", " << prec << ")\n";
@@ -594,9 +593,7 @@ CUDAComputeContext::CUDAComputeContext(const std::vector<int>& device_ids) {
 
 CUDAComputeContext::~CUDAComputeContext() {
     if (impl_) {
-        for (auto& [id, ds] : impl_->devices) {
-            if (ds.stream) { cudaSetDevice(ds.device_id); cudaStreamDestroy(ds.stream); }
-        }
+        // No streams to destroy — handles use cudaStreamPerThread.
         delete impl_;
     }
 }
@@ -681,8 +678,8 @@ struct CUDAComputeHandle::Impl {
             float* tmp; CUDA_CHECK(cudaMalloc(&tmp, n * sizeof(float)));
             CUDA_CHECK(cudaMemcpy(tmp, data.data(), n * sizeof(float), cudaMemcpyHostToDevice));
             half* buf; CUDA_CHECK(cudaMalloc(&buf, n * sizeof(half)));
-            convert_fp32_to_fp16<<<((int)n + 255) / 256, 256, 0, dev.stream>>>(tmp, buf, (int)n);
-            CUDA_CHECK(cudaStreamSynchronize(dev.stream));
+            convert_fp32_to_fp16<<<((int)n + 255) / 256, 256, 0, cudaStreamPerThread>>>(tmp, buf, (int)n);
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
             cudaFree(tmp);
             return buf;
         } else {
@@ -767,10 +764,10 @@ struct CUDAComputeHandle::Impl {
         size_t input_floats = (size_t)N * input_channels * HW;
         int thr = 256, blk = (int)((input_floats + thr - 1) / thr);
         if (use_fp16)
-            transpose_nchw_fp32_to_fp16<<<blk, thr, 0, dev.stream>>>(
+            transpose_nchw_fp32_to_fp16<<<blk, thr, 0, cudaStreamPerThread>>>(
                 buf_flat_in, (half*)buf_input, N, input_channels, HW);
         else
-            transpose_nchw_fp32<<<blk, thr, 0, dev.stream>>>(
+            transpose_nchw_fp32<<<blk, thr, 0, cudaStreamPerThread>>>(
                 buf_flat_in, (float*)buf_input, N, input_channels, HW);
 
         // Input conv
@@ -792,11 +789,11 @@ struct CUDAComputeHandle::Impl {
             int M = policy_fc_gpu.out_features, K = policy_fc_gpu.in_features;
             int smem = use_fp16 ? K * (int)sizeof(half) : K * (int)sizeof(float);
             if (use_fp16)
-                fc_bias_softmax_fp16_to_fp32<<<N, 32, smem, dev.stream>>>(
+                fc_bias_softmax_fp16_to_fp32<<<N, 32, smem, cudaStreamPerThread>>>(
                     (const half*)policy_fc_gpu.weight, (const half*)buf_pol_out, buf_pol_feat,
                     policy_fc_gpu.bias, M, N, K);
             else
-                fc_bias_softmax_fp32<<<N, 32, smem, dev.stream>>>(
+                fc_bias_softmax_fp32<<<N, 32, smem, cudaStreamPerThread>>>(
                     (const float*)policy_fc_gpu.weight, (const float*)buf_pol_out, buf_pol_feat,
                     policy_fc_gpu.bias, M, N, K);
         }
@@ -807,11 +804,11 @@ struct CUDAComputeHandle::Impl {
         {
             int K = value_fc2_gpu.in_features;
             if (use_fp16)
-                fc_bias_tanh_fp16_to_fp32<<<N, 32, 0, dev.stream>>>(
+                fc_bias_tanh_fp16_to_fp32<<<N, 32, 0, cudaStreamPerThread>>>(
                     (const half*)value_fc2_gpu.weight, (const half*)buf_val_feat, buf_val_out,
                     value_fc2_gpu.bias, N, K);
             else
-                fc_bias_tanh_fp32<<<N, 32, 0, dev.stream>>>(
+                fc_bias_tanh_fp32<<<N, 32, 0, cudaStreamPerThread>>>(
                     (const float*)value_fc2_gpu.weight, (const float*)buf_val_feat, buf_val_out,
                     value_fc2_gpu.bias, N, K);
         }
@@ -822,10 +819,10 @@ struct CUDAComputeHandle::Impl {
         run_fc(buf_scr_feat, buf_scr_bins, score_fc2_gpu, N, false);
         {
             if (use_fp16)
-                score_softmax_ev_fp16<<<N, 32, 0, dev.stream>>>(
+                score_softmax_ev_fp16<<<N, 32, 0, cudaStreamPerThread>>>(
                     (const half*)buf_scr_bins, buf_scr_out, bin_values_gpu, N, num_score_bins);
             else
-                score_softmax_ev_fp32<<<N, 32, 0, dev.stream>>>(
+                score_softmax_ev_fp32<<<N, 32, 0, cudaStreamPerThread>>>(
                     (const float*)buf_scr_bins, buf_scr_out, bin_values_gpu, N, num_score_bins);
         }
     }
@@ -835,9 +832,9 @@ struct CUDAComputeHandle::Impl {
         if (graph_exec) { cudaGraphExecDestroy(graph_exec); graph_exec = nullptr; }
         if (graph) { cudaGraphDestroy(graph); graph = nullptr; }
 
-        CUDA_CHECK(cudaStreamBeginCapture(dev.stream, cudaStreamCaptureModeGlobal));
+        CUDA_CHECK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeGlobal));
         launch_compute(N);
-        CUDA_CHECK(cudaStreamEndCapture(dev.stream, &graph));
+        CUDA_CHECK(cudaStreamEndCapture(cudaStreamPerThread, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
         graph_batch = N;
     }
@@ -852,7 +849,7 @@ struct CUDAComputeHandle::Impl {
 
         // Im2col: [C_in, NHW] → [K, NHW]
         int total_im2col = K * NHW;
-        im2col_3x3_fp16<<<(total_im2col + 255) / 256, 256, 0, dev.stream>>>(
+        im2col_3x3_fp16<<<(total_im2col + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             in, buf_im2col, C_in, NHW, H, W);
 
         // CUTLASS GEMM: C[C_out, NHW] = A[C_out, K] × B[K, NHW]
@@ -875,7 +872,7 @@ struct CUDAComputeHandle::Impl {
         size_t ws_size = CutlassGemm::get_workspace_size(args);
         void* ws = nullptr;
         if (ws_size > 0) CUDA_CHECK(cudaMalloc(&ws, ws_size));
-        status = gemm_op(args, ws, dev.stream);
+        status = gemm_op(args, ws, cudaStreamPerThread);
         if (ws) cudaFree(ws);
         if (status != cutlass::Status::kSuccess)
             throw std::runtime_error("CUTLASS GEMM launch failed");
@@ -883,7 +880,7 @@ struct CUDAComputeHandle::Impl {
 
         // BN + optional residual + ReLU
         int total = C_out * NHW;
-        bn_relu_fp16<<<(total + 255) / 256, 256, 0, dev.stream>>>(
+        bn_relu_fp16<<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             out, conv.bn_scale, conv.bn_bias,
             (mode == 2 && residual) ? residual : nullptr,
             C_out, NHW, mode);
@@ -898,7 +895,7 @@ struct CUDAComputeHandle::Impl {
                                 N, H, W, mode);
         } else {
             int total = conv.c_out * NHW;
-            conv3x3_bn_fp32<<<(total + 255) / 256, 256, 0, dev.stream>>>(
+            conv3x3_bn_fp32<<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                 (const float*)conv.weight, (const float*)in, (float*)out,
                 conv.bn_scale, conv.bn_bias,
                 (mode == 2 && residual) ? (const float*)residual : (const float*)out,
@@ -911,11 +908,11 @@ struct CUDAComputeHandle::Impl {
         int total = N * HW;
         if (use_fp16) {
             int smem = conv.c_out * conv.c_in * (int)sizeof(half) + 2 * conv.c_out * (int)sizeof(float);
-            conv1x1_bn_relu_reshape_fp16<<<(total + 255) / 256, 256, smem, dev.stream>>>(
+            conv1x1_bn_relu_reshape_fp16<<<(total + 255) / 256, 256, smem, cudaStreamPerThread>>>(
                 (const half*)in, (half*)out, (const half*)conv.weight, conv.bn_scale, conv.bn_bias,
                 conv.c_in, conv.c_out, N, HW);
         } else {
-            conv1x1_bn_relu_reshape_fp32<<<(total + 255) / 256, 256, 0, dev.stream>>>(
+            conv1x1_bn_relu_reshape_fp32<<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                 (const float*)in, (float*)out, (const float*)conv.weight, conv.bn_scale, conv.bn_bias,
                 conv.c_in, conv.c_out, N, HW);
         }
@@ -927,10 +924,10 @@ struct CUDAComputeHandle::Impl {
         dim3 block(32, FC_WARPS_PER_BLOCK);
         dim3 grid(M, (N + FC_WARPS_PER_BLOCK - 1) / FC_WARPS_PER_BLOCK);
         if (use_fp16)
-            fc_bias_relu_fp16<<<grid, block, 0, dev.stream>>>(
+            fc_bias_relu_fp16<<<grid, block, 0, cudaStreamPerThread>>>(
                 (const half*)fc.weight, (const half*)in, (half*)out, fc.bias, M, N, K, relu ? 1 : 0);
         else
-            fc_bias_relu_fp32<<<grid, block, 0, dev.stream>>>(
+            fc_bias_relu_fp32<<<grid, block, 0, cudaStreamPerThread>>>(
                 (const float*)fc.weight, (const float*)in, (float*)out, fc.bias, M, N, K, relu ? 1 : 0);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -1003,6 +1000,8 @@ CUDAComputeHandle::CUDAComputeHandle(CUDADeviceState& dev,
 CUDAComputeHandle::~CUDAComputeHandle() {
     if (impl_) {
         cudaSetDevice(impl_->dev.device_id);
+        // Drain this thread's stream before freeing device resources.
+        cudaStreamSynchronize(cudaStreamPerThread);
         impl_->free_workspace();
         impl_->free_conv(impl_->input_conv_gpu);
         for (auto& c : impl_->res_conv1_gpu) impl_->free_conv(c);
@@ -1027,9 +1026,9 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     auto& I = *impl_;
     CUDA_CHECK(cudaSetDevice(I.dev.device_id));
 
-    // Serialize against other handles on the same GPU — graph capture
-    // on the shared stream must be exclusive.
-    std::lock_guard<std::mutex> predict_lock(I.dev.predict_mutex);
+    // Each server thread uses cudaStreamPerThread — its own implicit
+    // CUDA stream.  No mutex needed; graph capture on one thread's
+    // stream doesn't affect another thread's stream.
 
     int N = (int)states.size();
     int H = I.board_size, W = I.board_size, HW = H * W;
@@ -1048,11 +1047,11 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
 
     // Upload input (not part of graph — source address changes)
     CUDA_CHECK(cudaMemcpyAsync(I.buf_flat_in, I.host_input.data(),
-        input_floats * sizeof(float), cudaMemcpyHostToDevice, I.dev.stream));
+        input_floats * sizeof(float), cudaMemcpyHostToDevice, I.cudaStreamPerThread));
 
     // Execute compute pipeline via CUDA graph (or capture on first call / batch change)
     I.ensure_graph(N);
-    CUDA_CHECK(cudaGraphLaunch(I.graph_exec, I.dev.stream));
+    CUDA_CHECK(cudaGraphLaunch(I.graph_exec, I.cudaStreamPerThread));
 
     // Read back results into pre-allocated host buffers
     I.host_pol.resize((size_t)action_size * N);
@@ -1060,13 +1059,13 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     I.host_scr.resize(N);
 
     CUDA_CHECK(cudaMemcpyAsync(I.host_pol.data(), I.buf_pol_feat,
-        I.host_pol.size() * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+        I.host_pol.size() * sizeof(float), cudaMemcpyDeviceToHost, I.cudaStreamPerThread));
     CUDA_CHECK(cudaMemcpyAsync(I.host_val.data(), I.buf_val_out,
-        N * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+        N * sizeof(float), cudaMemcpyDeviceToHost, I.cudaStreamPerThread));
     CUDA_CHECK(cudaMemcpyAsync(I.host_scr.data(), I.buf_scr_out,
-        N * sizeof(float), cudaMemcpyDeviceToHost, I.dev.stream));
+        N * sizeof(float), cudaMemcpyDeviceToHost, I.cudaStreamPerThread));
 
-    CUDA_CHECK(cudaStreamSynchronize(I.dev.stream));
+    CUDA_CHECK(cudaStreamSynchronize(I.cudaStreamPerThread));
 
     // Pack results
     std::vector<CUDAComputeHandle::Result> results(N);
