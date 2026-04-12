@@ -68,6 +68,14 @@ struct TRTDeviceState {
     nvinfer1::ICudaEngine*                  engine  = nullptr;
     nvinfer1::IRuntime*                     runtime = nullptr;
 
+    // Serialize predict_batch on a single GPU.  Two server threads on
+    // the same GPU share `stream` and may share TRT-internal host-side
+    // state (workspace planning, memory pools) that isn't fully safe
+    // for concurrent enqueueV3 from different execution contexts.
+    // This matches the CUDA backend's predict_mutex — same rationale
+    // applied to a different backend.
+    std::mutex                              predict_mutex;
+
     // Cached tensor names + sizes (populated after engine build)
     std::string input_name;
     std::string policy_name;
@@ -408,6 +416,11 @@ struct TensorRTComputeHandle::Impl {
 
     ~Impl() {
         cudaSetDevice(dev.device_id);
+        // Drain any in-flight work on the shared stream before freeing
+        // device buffers.  If a prior predict_batch threw mid-inference
+        // without reaching cudaStreamSynchronize, the stream may still
+        // have pending ops that reference d_input / d_policy / etc.
+        if (dev.stream) cudaStreamSynchronize(dev.stream);
         if (exec_ctx) delete exec_ctx;
         if (d_input)  cudaFree(d_input);
         if (d_policy) cudaFree(d_policy);
@@ -538,6 +551,12 @@ TensorRTComputeHandle::predict_batch(
 
     auto& I = *impl_;
     CUDA_CHECK(cudaSetDevice(I.dev.device_id));
+
+    // Serialize against other handles on the same GPU.  Two server
+    // threads sharing dev.stream may trigger TRT-internal host-side
+    // races in workspace planning or memory pool management during
+    // concurrent enqueueV3 calls — even from different exec_ctxs.
+    std::lock_guard<std::mutex> predict_lock(I.dev.predict_mutex);
 
     int N = (int)states.size();
     int H = I.board_size, W = I.board_size;
