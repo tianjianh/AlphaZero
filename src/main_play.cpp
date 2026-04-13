@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <future>
 #include <locale.h>
 #include <curses.h>
 
@@ -454,7 +455,7 @@ int main(int argc, char* argv[]) {
             bot->stop();
 
             if (analysis_wanted) {
-                bot->set_callback(analyze_callback, /*interval_ms=*/500, pvs);
+                bot->set_callback(analyze_callback, /*interval_ms=*/100, pvs);
             } else {
                 bot->clear_callback();
                 std::lock_guard<std::mutex> lock(ai_info_mutex);
@@ -558,7 +559,7 @@ int main(int argc, char* argv[]) {
 
             // Set getch timeout: 500ms while HUD is active (so we can poll
             // the latest callback snapshot and redraw), blocking otherwise.
-            timeout(analysis_wanted ? 500 : -1);
+            timeout(analysis_wanted ? 100 : -1);
 
             refresh_ai_info();
 
@@ -583,24 +584,33 @@ int main(int argc, char* argv[]) {
             }
 
             if (!is_human_turn()) {
-                // AI turn.  gen_move stops any running ponder internally
-                // and runs GENMOVE search through the same worker — the
-                // callback keeps firing during the search so the user
-                // sees live updates of the AI's thinking.
+                // AI turn.
                 status_msg = "AI thinking...";
-                draw_board(stdscr, game, config, -1, -1, false,
-                           last_r, last_c, human_color, use_random,
-                           status_msg, ai_info, "");
 
                 int action;
                 if (use_random) {
+                    draw_board(stdscr, game, config, -1, -1, false,
+                               last_r, last_c, human_color, use_random,
+                               status_msg, ai_info, "");
                     action = random_legal_move(game);
                     if (action == config.action_size() - 1)
                         game.play(PASS_MOVE);
                     else
                         game.play(action);
                 } else {
-                    action = bot->gen_move(game.current_player, -1, 0.0f, false);
+                    // Run gen_move async so the main thread can redraw
+                    // live search stats from the analysis callback.
+                    auto future = std::async(std::launch::async, [&]() {
+                        return bot->gen_move(game.current_player, -1, 0.0f, false);
+                    });
+                    while (future.wait_for(std::chrono::milliseconds(100))
+                           != std::future_status::ready) {
+                        refresh_ai_info();
+                        draw_board(stdscr, game, config, -1, -1, false,
+                                   last_r, last_c, human_color, use_random,
+                                   status_msg, ai_info, "");
+                    }
+                    action = future.get();
                     game = bot->game();
                 }
 
@@ -637,9 +647,9 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            // Toggle pondering ('P' uppercase — lowercase 'p' is PASS).
+            // Toggle pondering (p/P).
             // Turning P off auto-turns A off (no orphaned HUD).
-            if (key == 'P') {
+            if (key == 'p' || key == 'P') {
                 toggle_ponder();
                 continue;
             }
@@ -685,8 +695,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Pass (lowercase 'p' only; uppercase 'P' is ponder toggle)
-            else if (key == 'p') {
+            // Pass (Ctrl-P)
+            else if (key == 16) {
                 play_human_move(config.action_size() - 1);
                 last_r = last_c = -1;
                 input_buf.clear();
