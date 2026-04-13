@@ -14,7 +14,6 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <locale.h>
 #include <curses.h>
 
@@ -294,6 +293,7 @@ int main(int argc, char* argv[]) {
     int  board_override     = -1;
     int  search_threads     = 16;
     int  nn_server_threads  = 1;
+    int  pvs                = 5;
     std::string nn_device_ids_str = "0";
 
     for (int i = 1; i < argc; i++) {
@@ -309,15 +309,30 @@ int main(int argc, char* argv[]) {
         else if (arg == "--c-puct"            && i+1<argc) config.c_puct   = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
+        else if (arg == "--pvs"              && i+1<argc) pvs             = std::stoi(argv[++i]);
         else if (arg == "--random") use_random = true;
-        else if (arg == "--help") {
+        else if (arg == "--help" || arg == "-h") {
             printf("Usage: play [options]\n"
-                   "  --model PATH      Model file\n"
-                   "  --board N         Board size (--random mode)\n"
-                   "  --sims N          MCTS simulations\n"
-                   "  --random          Random bot\n"
-                   "  --help            This help\n");
+                   "  --model PATH           Model file (default: models/best.onnx)\n"
+                   "  --board N              Board size (--random mode)\n"
+                   "  --sims N               MCTS simulations (default: 800)\n"
+                   "  --search-threads N     MCTS search threads (default: 16)\n"
+                   "  --max-batch N          Max GPU batch size (default: 256)\n"
+                   "  --komi F               Komi value (default: 6.5)\n"
+                   "  --score-weight F       Score utility weight (default: 0.0)\n"
+                   "  --score-scale F        Score atan compression scale (default: 10.0)\n"
+                   "  --c-puct F             UCB exploration constant (default: 1.5)\n"
+                   "  --nn-server-threads N  NN server threads (default: 1)\n"
+                   "  --nn-device-ids IDS    Comma-separated GPU indices (default: \"0\")\n"
+                   "  --pvs N                Top K moves to show in analysis (default: 5)\n"
+                   "  --random               Random bot (no model needed)\n"
+                   "  --help                 This help\n");
             return 0;
+        }
+        else {
+            fprintf(stderr, "Error: unrecognized option '%s'\n"
+                            "Try 'play --help' for usage.\n", argv[i]);
+            return 1;
         }
     }
 
@@ -344,6 +359,9 @@ int main(int argc, char* argv[]) {
             config.num_search_threads = search_threads;
             evaluator = std::make_shared<NNEvaluator>(
                 model, context, device_ids, config.max_batch_size);
+            printf("Waiting for GPU engines ...\n");
+            fflush(stdout);
+            evaluator->wait_ready();
             bot = std::make_unique<AsyncBot>(evaluator.get(), config);
         } catch (const std::exception& e) {
             fprintf(stderr, "Error: %s\nUse --random for random bot.\n", e.what());
@@ -356,18 +374,9 @@ int main(int argc, char* argv[]) {
 
     int n = config.board_size;
 
-    // ── Redirect stdout/stderr to log file before curses ────
-    // Model/GPU init already printed. Redirect remaining output
-    // (TensorRT engine build, NNEvaluator threads) to a log file
-    // so it doesn't corrupt the curses display.
-    FILE* log_fp = fopen("play.log", "w");
-    if (log_fp) {
-        dup2(fileno(log_fp), STDOUT_FILENO);
-        dup2(fileno(log_fp), STDERR_FILENO);
-        fclose(log_fp);
-    }
-
     // ── ncurses init ────────────────────────────────────────
+    // No stdout redirect — background threads (TRT engine build)
+    // may print to the terminal.  Press 'r' or Ctrl-L to redraw.
     setlocale(LC_ALL, "");
     initscr();
     init_colors();
@@ -377,11 +386,6 @@ int main(int argc, char* argv[]) {
     curs_set(0);
 
     bool keep_playing = true;
-
-    // Analysis parameters
-    int pvs = 5;  // top K moves to show
-    for (int i = 1; i < argc; i++)
-        if (std::string(argv[i]) == "--pvs" && i+1 < argc) pvs = std::stoi(argv[++i]);
 
     while (keep_playing) {
         // Choose mode
@@ -620,8 +624,8 @@ int main(int argc, char* argv[]) {
 
             if (key == 'q' || key == 'Q') { disable_all(); keep_playing = false; break; }
 
-            // Refresh screen
-            if (key == 'r') {
+            // Refresh screen (r or Ctrl-L)
+            if (key == 'r' || key == 12) {
                 clearok(stdscr, TRUE);
                 continue;
             }

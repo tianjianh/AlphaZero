@@ -107,14 +107,23 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
 // Whichever GPU finishes first picks up the next batch — self-balancing.
 void NNEvaluator::server_loop(int thread_id, int gpu_id) {
     // Create ComputeHandle ON this thread — uploads weights to GPU
-    auto handle = context_->create_handle(model_.get(), gpu_id, max_batch_size_);
+    std::unique_ptr<ComputeHandle> handle;
+    try {
+        handle = context_->create_handle(model_.get(), gpu_id, max_batch_size_);
+    } catch (const std::exception& e) {
+        std::cerr << "NNEvaluator thread " << thread_id
+                  << " (gpu " << gpu_id << "): " << e.what() << "\n";
+    }
 
-    // Signal that this thread's handle is ready
+    // Signal that this thread's handle is ready (even on failure, so
+    // wait_ready() doesn't block forever).
     {
         std::lock_guard<std::mutex> lock(ready_mutex_);
         handles_ready_++;
     }
     ready_cv_.notify_all();
+
+    if (!handle) return;  // failed — exit thread
 
     std::vector<NNResultBuf*> batch;
     batch.reserve(max_batch_size_);

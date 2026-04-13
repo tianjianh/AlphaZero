@@ -158,7 +158,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--komi"              && i+1<argc) komi              = std::stof(argv[++i]);
         else if (arg == "--score-weight"      && i+1<argc) score_weight      = std::stof(argv[++i]);
         else if (arg == "--score-scale"       && i+1<argc) score_scale        = std::stof(argv[++i]);
-        else if (arg == "--help") {
+        else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "Usage: evaluate [options]\n"
                 << "\n"
@@ -183,6 +183,11 @@ int main(int argc, char* argv[]) {
                 << "  --nn-server-threads N   NN server threads per model (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated GPU indices (default: \"0\")\n";
             return 0;
+        }
+        else {
+            std::cerr << "Error: unrecognized option '" << arg << "'\n"
+                      << "Try 'evaluate --help' for usage.\n";
+            return 1;
         }
     }
 

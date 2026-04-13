@@ -339,25 +339,13 @@ std::pair<float, float> GoGame::score() const {
 }
 
 void GoGame::score_game() {
-    // Atari cleanup: repeatedly capture groups with ≤1 liberty.
-    // Early-stage models often pass with dead stones still on the board.
-    // Under Chinese rules the game should be played out; this automates it.
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int r = 0; r < board_size; r++) {
-            for (int c = 0; c < board_size; c++) {
-                if (board[r][c] == EMPTY) continue;
-                Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
-                int gsize = get_group(r, c, grp, libs);
-                if (libs <= 1) {
-                    remove_group(grp, gsize);
-                    changed = true;
-                }
-            }
-        }
-    }
-
+    // Tromp-Taylor scoring: score the final position as-is after two
+    // passes.  No heuristic dead-stone removal — under Chinese rules the
+    // game is played to completion, so any stones still on the board are
+    // alive.  For training this provides the correct signal: the network
+    // learns to capture dead stones before passing rather than relying on
+    // a post-game cleanup (which was also order-dependent and broke semeai
+    // / seki positions).
     auto [b, w] = score();
     final_black_score = b - w;
     if (b > w) winner = BLACK;

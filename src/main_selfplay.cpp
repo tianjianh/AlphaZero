@@ -71,7 +71,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--score-scale"      && i+1<argc) config.score_scale = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads  = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str  = argv[++i];
-        else if (arg == "--help") {
+        else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "Usage: selfplay [options]\n"
                 << "  --model PATH            Model file (default: models/best.onnx)\n"
@@ -91,6 +91,11 @@ int main(int argc, char* argv[]) {
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
+        }
+        else {
+            std::cerr << "Error: unrecognized option '" << arg << "'\n"
+                      << "Try 'selfplay --help' for usage.\n";
+            return 1;
         }
     }
 
