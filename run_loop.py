@@ -223,14 +223,19 @@ _EXPLORE_XLARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
 # wider early windows, escalating eval gating, slightly more exploration in
 # late stages (keep c_puct higher than small's overnight), and a lower
 # score CE loss weight to prevent the score head from dominating gradients.
+#
+# Late-stage windows are wider than small (10/12 vs 8/8) to prevent data
+# homogeneity when the best model is stuck for several iterations — all
+# selfplay data from the same policy makes the optimizer overfit and
+# produce dramatically worse candidates (3-22% win rates observed in v1).
 _EXPLORE_LARGE = [
     # score_wt  swl    window  c_puct  temp  dir_eps
     (0.0,      0.05,   4,      2.0,    20,   0.30),  # 0 Bootstrap
     (0.0,      0.05,   4,      1.75,   18,   0.28),  # 1 Warm up
     (0.02,     0.1,    6,      1.5,    15,   0.25),  # 2 Early gated
     (0.02,     0.1,    6,      1.5,    15,   0.25),  # 3 Consolidate
-    (0.05,     0.12,   8,      1.3,    12,   0.22),  # 4 Steady
-    (0.08,     0.15,   8,      1.25,   12,   0.20),  # 5 Overnight
+    (0.05,     0.12,  10,      1.3,    12,   0.22),  # 4 Steady — window 8→10
+    (0.08,     0.15,  12,      1.25,   12,   0.20),  # 5 Overnight — window 8→12
 ]
 # Progressive eval gating: weak candidates pass easily early, strict late.
 _EVAL_TH_LARGE = [None, None, 0.53, 0.54, 0.55, 0.55]
@@ -287,32 +292,42 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
     if preset == "large":
         if vit:
             # TODO: tune VIT large separately.  For now, mirror the ResNet
-            # iter schedule with VIT's own game/sim/exploration params
-            # (VIT uses more sims per game than ResNet at the same stage).
+            # iter schedule with VIT's own game/sim/exploration params.
+            # Same late-stage fixes as ResNet: wider windows, lower LR,
+            # fewer overnight epochs.
+            lrs_v = list(lrs)
+            lrs_v[4] = "2e-4"
+            lrs_v[5] = "1e-4"
             return [
-                _stage("Bootstrap",       1,  4,  500, 256, 3, lrs[0], 0,
+                _stage("Bootstrap",       1,  4,  500, 256, 3, lrs_v[0], 0,
                        0.0,  0.05, 3,  2.0,  20, 0.30),
-                _stage("Warm up",         5,  8,  700, 384, 3, lrs[1], 0,
+                _stage("Warm up",         5,  8,  700, 384, 3, lrs_v[1], 0,
                        0.0,  0.05, 4,  1.75, 18, 0.28),
-                _stage("Early gated",     9, 14, 1000, 512, 4, lrs[2], 120,
+                _stage("Early gated",     9, 14, 1000, 512, 4, lrs_v[2], 120,
                        0.02, 0.08, 4,  1.5,  15, 0.25),
-                _stage("Consolidate",    15, 24, 1300, 576, 5, lrs[3], 200,
+                _stage("Consolidate",    15, 24, 1300, 576, 5, lrs_v[3], 200,
                        0.03, 0.10, 6,  1.4,  14, 0.23),
-                _stage("Steady improve", 25, 40, 1500, 700, 5, lrs[4], 240,
-                       0.05, 0.12, 8,  1.25, 12, 0.20),
-                _stage("Overnight extend",41, 72, 1700, 800, 5, lrs[5], 240,
-                       0.08, 0.15, 8,  1.1,  10, 0.18),
+                _stage("Steady improve", 25, 40, 1500, 700, 5, lrs_v[4], 240,
+                       0.05, 0.12, 10, 1.25, 12, 0.20),
+                _stage("Overnight extend",41, 72, 1700, 800, 3, lrs_v[5], 240,
+                       0.08, 0.15, 12, 1.1,  10, 0.18),
             ]
         ex = _EXPLORE_LARGE
         et = _EVAL_TH_LARGE
-        ep = [3, 3, 3, 4, 5, 5]
+        ep = [3, 3, 3, 4, 5, 3]
+        # LR decays further in late stages to avoid overshooting near
+        # the plateau (observed: candidates with 3-22% win rates when
+        # LR was too high on homogeneous selfplay data).
+        lrs_l = list(lrs)
+        lrs_l[4] = "2e-4"   # Steady:    3e-4 → 2e-4
+        lrs_l[5] = "1e-4"   # Overnight: 2e-4 → 1e-4
         return [
-            _stage("Bootstrap",       1,   4,   400, 200, ep[0], lrs[0], 0,   *ex[0], eval_threshold=et[0]),
-            _stage("Warm up",         5,   8,   600, 300, ep[1], lrs[1], 0,   *ex[1], eval_threshold=et[1]),
-            _stage("Early gated",     9,  14,   900, 400, ep[2], lrs[2], 100, *ex[2], eval_threshold=et[2]),
-            _stage("Consolidate",    15,  24,  1100, 450, ep[3], lrs[3], 200, *ex[3], eval_threshold=et[3]),
-            _stage("Steady improve", 25,  40,  1300, 550, ep[4], lrs[4], 200, *ex[4], eval_threshold=et[4]),
-            _stage("Overnight extend",41, 72,  1400, 600, ep[5], lrs[5], 200, *ex[5], eval_threshold=et[5]),
+            _stage("Bootstrap",       1,   4,   400, 200, ep[0], lrs_l[0], 0,   *ex[0], eval_threshold=et[0]),
+            _stage("Warm up",         5,   8,   600, 300, ep[1], lrs_l[1], 0,   *ex[1], eval_threshold=et[1]),
+            _stage("Early gated",     9,  14,   900, 400, ep[2], lrs_l[2], 100, *ex[2], eval_threshold=et[2]),
+            _stage("Consolidate",    15,  24,  1100, 450, ep[3], lrs_l[3], 200, *ex[3], eval_threshold=et[3]),
+            _stage("Steady improve", 25,  40,  1300, 550, ep[4], lrs_l[4], 200, *ex[4], eval_threshold=et[4]),
+            _stage("Overnight extend",41, 72,  1400, 600, ep[5], lrs_l[5], 200, *ex[5], eval_threshold=et[5]),
         ]
 
     # ── xlarge: 200 iters, ~670M sim-games (~28x small) ─────────
