@@ -234,8 +234,8 @@ _EXPLORE_LARGE = [
     (0.0,      0.05,   4,      1.75,   18,   0.28),  # 1 Warm up
     (0.02,     0.1,    6,      1.5,    15,   0.25),  # 2 Early gated
     (0.02,     0.1,    6,      1.5,    15,   0.25),  # 3 Consolidate
-    (0.05,     0.12,  10,      1.3,    12,   0.22),  # 4 Steady — window 8→10
-    (0.08,     0.15,  12,      1.25,   12,   0.20),  # 5 Overnight — window 8→12
+    (0.10,     0.15,  10,      1.3,    12,   0.22),  # 4 Steady — sw 0.05→0.10, swl 0.12→0.15
+    (0.15,     0.20,  12,      1.25,   12,   0.20),  # 5 Overnight — sw 0.08→0.15, swl 0.15→0.20
 ]
 # Progressive eval gating: weak candidates pass easily early, strict late.
 _EVAL_TH_LARGE = [None, None, 0.53, 0.54, 0.55, 0.55]
