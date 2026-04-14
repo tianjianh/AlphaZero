@@ -138,6 +138,7 @@ int main(int argc, char* argv[]) {
     int max_batch_size     = 256;
     float c_puct           = -1.0f;  // -1 = use default
     float komi             = -1.0f;  // -1 = use default
+    float win_loss_weight  = -1.0f;  // -1 = use default
     float score_weight     = -1.0f;  // -1 = use default
     float score_scale      = -1.0f;  // -1 = use default
 
@@ -156,6 +157,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--output"            && i+1<argc) output_dir        = argv[++i];
         else if (arg == "--c-puct"            && i+1<argc) c_puct            = std::stof(argv[++i]);
         else if (arg == "--komi"              && i+1<argc) komi              = std::stof(argv[++i]);
+        else if (arg == "--win-loss-weight"   && i+1<argc) win_loss_weight   = std::stof(argv[++i]);
         else if (arg == "--score-weight"      && i+1<argc) score_weight      = std::stof(argv[++i]);
         else if (arg == "--score-scale"       && i+1<argc) score_scale        = std::stof(argv[++i]);
         else if (arg == "--help" || arg == "-h") {
@@ -177,6 +179,7 @@ int main(int argc, char* argv[]) {
                 << "  --threshold FLOAT       Win rate to pass (default: 0.55)\n"
                 << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
                 << "  --komi F                Komi value (default: 6.5)\n"
+                << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
                 << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
                 << "  --output DIR            Save game records as SGF files\n"
@@ -230,6 +233,7 @@ int main(int argc, char* argv[]) {
     if (sims > 0) config.num_simulations = sims;
     if (c_puct > 0) config.c_puct = c_puct;
     if (komi >= 0) config.komi = komi;
+    if (win_loss_weight >= 0) config.win_loss_weight = win_loss_weight;
     if (score_weight >= 0) config.score_weight = score_weight;
     if (score_scale >= 0) config.score_scale = score_scale;
 
@@ -269,6 +273,7 @@ int main(int argc, char* argv[]) {
               << "  Games:      " << num_games << "\n"
               << "  Sims:       " << config.num_simulations << "\n"
               << "  c_puct:     " << config.c_puct << "\n"
+              << "  WinLoss wt: " << config.win_loss_weight << "\n"
               << "  Score wt:   " << config.score_weight << "\n"
               << "  Score sc:   " << config.score_scale << "\n"
               << "  Threads:    " << num_threads << "\n"

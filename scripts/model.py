@@ -6,8 +6,16 @@ Two architectures:
                   global-pooled value/score heads)
   - GoViT: Vision Transformer with GQA and directional positional encoding
 
-Both are triple-headed (policy + value + score).  Shared between training
-and weight export.
+Seven-headed architecture (KataGo-style):
+  Inference (exported to ONNX):
+    1. Policy         — move probabilities [B, action_size]
+    2. Value          — W/L/D distribution [B, 3] logits
+    3. ScoreMean      — expected score [B, 1]
+    4. ScoreStdev     — score uncertainty [B, 1] (softplus)
+    5. Ownership      — per-intersection territory [B, board²] (sigmoid)
+  Training-only (NOT exported):
+    6. Score Belief   — score distribution [B, num_bins] logits
+    7. Opponent Policy — opponent's next move [B, action_size]
 """
 
 import math
@@ -151,8 +159,9 @@ class AlphaZeroNet(nn.Module):
     channel-wise global conditioning; doubling up per block is redundant,
     while alternating gives every block some form of global awareness.
 
-    Heads: policy uses the classic 1x1 → 2ch → FC + pass design; value
-    and score use GPoolHead for global-aware output.
+    Heads: policy uses the classic 1x1 → 2ch → FC + pass design; value,
+    scoreMean, scoreStdev, scoreBelief use GPoolHead; ownership is a 1×1
+    conv; opponent policy mirrors the policy head architecture.
     """
 
     def __init__(self, board_size=9, input_channels=17, num_filters=64, num_res_blocks=5,
@@ -172,41 +181,88 @@ class AlphaZeroNet(nn.Module):
             else:
                 self.trunk.append(GPoolResBlock(num_filters))
 
+        # --- Head 1: Policy ---
         self.policy_conv = nn.Conv2d(num_filters, 2, 1, bias=False)
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = _linear(2 * hw, action_size, use_fp8=use_fp8)
 
         head_ch = 32
         mlp_hidden = max(64, num_filters)
-        self.value_head = GPoolHead(num_filters, head_ch, mlp_hidden,
-                                    out_features=1, use_fp8=use_fp8)
-        num_bins = hw * 2 + 1
-        self.score_head = GPoolHead(num_filters, head_ch, mlp_hidden,
-                                    out_features=num_bins, use_fp8=use_fp8)
 
-    def forward(self, x):
+        # --- Head 2: Value (3-class: win/loss/draw) ---
+        self.value_head = GPoolHead(num_filters, head_ch, mlp_hidden,
+                                    out_features=3, use_fp8=use_fp8)
+
+        # --- Head 3: ScoreMean (regression) ---
+        self.score_mean_head = GPoolHead(num_filters, head_ch, mlp_hidden,
+                                         out_features=1, use_fp8=use_fp8)
+
+        # --- Head 4: ScoreStdev (positive via softplus) ---
+        self.score_stdev_head = GPoolHead(num_filters, head_ch, mlp_hidden,
+                                          out_features=1, use_fp8=use_fp8)
+
+        # --- Head 5: Ownership (per-intersection sigmoid) ---
+        self.ownership_conv = nn.Conv2d(num_filters, 1, 1)
+
+        # --- Head 6: Score Belief (training-only, bin classification) ---
+        num_bins = hw * 2 + 1
+        self.score_belief_head = GPoolHead(num_filters, head_ch, mlp_hidden,
+                                           out_features=num_bins, use_fp8=use_fp8)
+
+        # --- Head 7: Opponent Policy (training-only) ---
+        self.opp_policy_conv = nn.Conv2d(num_filters, 2, 1, bias=False)
+        self.opp_policy_bn = nn.BatchNorm2d(2)
+        self.opp_policy_fc = _linear(2 * hw, action_size, use_fp8=use_fp8)
+
+    def _trunk(self, x):
         out = F.relu(self.input_bn(self.input_conv(x)))
         for block in self.trunk:
             out = block(out)
+        return out
 
-        p = F.relu(self.policy_bn(self.policy_conv(out)))
+    def _policy(self, trunk):
+        p = F.relu(self.policy_bn(self.policy_conv(trunk)))
         p = p.view(p.size(0), -1)
-        p = self.policy_fc(p)
+        return self.policy_fc(p)
 
-        v = torch.tanh(self.value_head(out))
-        s = self.score_head(out)
-        return p, v, s
+    def forward(self, x):
+        """All 7 heads — used during training."""
+        trunk = self._trunk(x)
+
+        policy = self._policy(trunk)
+        value = self.value_head(trunk)                         # [B, 3] logits
+        score_mean = self.score_mean_head(trunk)               # [B, 1]
+        score_stdev = F.softplus(self.score_stdev_head(trunk)) # [B, 1]
+        ownership = self.ownership_conv(trunk).view(x.size(0), -1)  # [B, board²]
+        score_belief = self.score_belief_head(trunk)           # [B, num_bins]
+
+        opp = F.relu(self.opp_policy_bn(self.opp_policy_conv(trunk)))
+        opp = opp.view(opp.size(0), -1)
+        opp_policy = self.opp_policy_fc(opp)                   # [B, action_size]
+
+        return policy, value, score_mean, score_stdev, ownership, score_belief, opp_policy
+
+    def forward_inference(self, x):
+        """5 inference heads only — used by predict() and ONNX export."""
+        trunk = self._trunk(x)
+
+        policy = self._policy(trunk)
+        value = self.value_head(trunk)                         # [B, 3] logits
+        score_mean = self.score_mean_head(trunk)               # [B, 1]
+        score_stdev = F.softplus(self.score_stdev_head(trunk)) # [B, 1]
+        ownership = torch.sigmoid(self.ownership_conv(trunk).view(x.size(0), -1))
+
+        return policy, value, score_mean, score_stdev, ownership
 
     def predict(self, state_tensor, device="cpu"):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value, score_logits = self(x)
-            probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-            board_area = self.board_size * self.board_size
-            bins = torch.arange(score_logits.size(1), device=x.device).float() - board_area
-            score = (F.softmax(score_logits, dim=1) * bins).sum(dim=1).item()
-        return probs, value.item(), score
+            policy, value_logits, score_mean, score_stdev, ownership = self.forward_inference(x)
+            probs = F.softmax(policy, dim=1).squeeze(0).cpu().numpy()
+            value = (F.softmax(value_logits, dim=1)[0, 0] - F.softmax(value_logits, dim=1)[0, 1]).item()
+            score = score_mean.item()
+        return probs, value, score
 
 
 # ══════════════════════════════════════════════════════════
@@ -357,61 +413,90 @@ class GoViT(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-        # Policy head: per-token logit + learnable pass logit
+        # --- Head 1: Policy ---
         self.policy_proj = _linear(d_model, 1, use_fp8=use_fp8)
         self.pass_logit = nn.Parameter(torch.zeros(1))
 
-        # Value head: mean pool → MLP → tanh
+        # --- Head 2: Value (3-class: win/loss/draw) ---
         self.value_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
-        self.value_fc2 = _linear(d_model, 1, use_fp8=use_fp8)
+        self.value_fc2 = _linear(d_model, 3, use_fp8=use_fp8)
 
-        # Score head: mean pool → MLP → bin classification
+        # --- Head 3: ScoreMean (regression) ---
+        self.score_mean_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
+        self.score_mean_fc2 = _linear(d_model, 1, use_fp8=use_fp8)
+
+        # --- Head 4: ScoreStdev (positive via softplus) ---
+        self.score_stdev_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
+        self.score_stdev_fc2 = _linear(d_model, 1, use_fp8=use_fp8)
+
+        # --- Head 5: Ownership (per-intersection sigmoid) ---
+        self.ownership_proj = _linear(d_model, 1, use_fp8=use_fp8)
+
+        # --- Head 6: Score Belief (training-only) ---
         num_bins = board_size * board_size * 2 + 1
-        self.score_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
-        self.score_fc2 = _linear(d_model, num_bins, use_fp8=use_fp8)
+        self.score_belief_fc1 = _linear(d_model, d_model, use_fp8=use_fp8)
+        self.score_belief_fc2 = _linear(d_model, num_bins, use_fp8=use_fp8)
 
-    def forward(self, x):
+        # --- Head 7: Opponent Policy (training-only) ---
+        self.opp_policy_proj = _linear(d_model, 1, use_fp8=use_fp8)
+        self.opp_pass_logit = nn.Parameter(torch.zeros(1))
+
+    def _trunk(self, x):
         B = x.size(0)
-        n = self.board_size
-        hw = n * n
-
-        # Reshape [B, C, H, W] → [B, H*W, C] and project
         x = x.flatten(2).transpose(1, 2)                           # [B, hw, C_in]
         x = self.token_proj(x)                                      # [B, hw, d_model]
-
-        # Add factorized position embedding
         x = x + self.row_embed(self.row_ids) + self.col_embed(self.col_ids)
-
-        # Transformer blocks
         for block in self.blocks:
             x = block(x, self.rel_indices)
+        return self.final_norm(x)                                    # [B, hw, d_model]
 
-        x = self.final_norm(x)                                      # [B, hw, d_model]
-
-        # Policy: per-token logit + pass
-        p_board = self.policy_proj(x).squeeze(-1)                   # [B, hw]
+    def _policy(self, trunk):
+        B = trunk.size(0)
+        p_board = self.policy_proj(trunk).squeeze(-1)               # [B, hw]
         p_pass = self.pass_logit.expand(B, 1)                       # [B, 1]
-        p = torch.cat([p_board, p_pass], dim=1)                     # [B, hw+1]
+        return torch.cat([p_board, p_pass], dim=1)                   # [B, hw+1]
 
-        # Value: mean pool → MLP → tanh
-        pooled = x.mean(dim=1)                                      # [B, d_model]
-        v = torch.tanh(self.value_fc2(F.gelu(self.value_fc1(pooled))))
+    def forward(self, x):
+        """All 7 heads — used during training."""
+        B = x.size(0)
+        trunk = self._trunk(x)
+        pooled = trunk.mean(dim=1)                                   # [B, d_model]
 
-        # Score: mean pool → MLP → bin logits
-        s = self.score_fc2(F.gelu(self.score_fc1(pooled)))
+        policy = self._policy(trunk)
+        value = self.value_fc2(F.gelu(self.value_fc1(pooled)))       # [B, 3] logits
+        score_mean = self.score_mean_fc2(F.gelu(self.score_mean_fc1(pooled)))  # [B, 1]
+        score_stdev = F.softplus(self.score_stdev_fc2(F.gelu(self.score_stdev_fc1(pooled))))
+        ownership = self.ownership_proj(trunk).squeeze(-1)           # [B, hw]
+        score_belief = self.score_belief_fc2(F.gelu(self.score_belief_fc1(pooled)))
 
-        return p, v, s
+        opp_board = self.opp_policy_proj(trunk).squeeze(-1)          # [B, hw]
+        opp_pass = self.opp_pass_logit.expand(B, 1)
+        opp_policy = torch.cat([opp_board, opp_pass], dim=1)        # [B, hw+1]
+
+        return policy, value, score_mean, score_stdev, ownership, score_belief, opp_policy
+
+    def forward_inference(self, x):
+        """5 inference heads only — used by predict() and ONNX export."""
+        trunk = self._trunk(x)
+        pooled = trunk.mean(dim=1)
+
+        policy = self._policy(trunk)
+        value = self.value_fc2(F.gelu(self.value_fc1(pooled)))
+        score_mean = self.score_mean_fc2(F.gelu(self.score_mean_fc1(pooled)))
+        score_stdev = F.softplus(self.score_stdev_fc2(F.gelu(self.score_stdev_fc1(pooled))))
+        ownership = torch.sigmoid(self.ownership_proj(trunk).squeeze(-1))
+
+        return policy, value, score_mean, score_stdev, ownership
 
     def predict(self, state_tensor, device="cpu"):
         self.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_tensor).float().unsqueeze(0).to(device)
-            logits, value, score_logits = self(x)
-            probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-            board_area = self.board_size * self.board_size
-            bins = torch.arange(score_logits.size(1), device=x.device).float() - board_area
-            score = (F.softmax(score_logits, dim=1) * bins).sum(dim=1).item()
-        return probs, value.item(), score
+            policy, value_logits, score_mean, score_stdev, ownership = self.forward_inference(x)
+            probs = F.softmax(policy, dim=1).squeeze(0).cpu().numpy()
+            value = (F.softmax(value_logits, dim=1)[0, 0] - F.softmax(value_logits, dim=1)[0, 1]).item()
+            score = score_mean.item()
+        return probs, value, score
 
 
 def convert_te_to_nn(model):

@@ -107,10 +107,32 @@ def decompress(filepath):
 
 
 def read_bin_file(filepath):
-    """Read selfplay .bin file, return list of (state, policy, value, score) records."""
+    """Read selfplay .bin file (V2 with V1 fallback).
+
+    V2: [magic:u16=0x4D47][version:u16=2][count:i32][board_size:i32]
+        per record: ... + [ownership:f32×board²][opponent_action:i32]
+    V1: [count:i32]
+        per record: [state_size:i32][state][policy_size:i32][policy][value:f32][score:f32]
+
+    Returns list of (state, policy, value, score, ownership_or_None, opp_action_or_None).
+    """
     data = decompress(filepath)
     pos = 0
-    n = struct.unpack_from("i", data, pos)[0]; pos += 4
+
+    # Detect V2 by magic header
+    is_v2 = False
+    board_sq = 0
+    if len(data) >= 4:
+        magic = struct.unpack_from("<H", data, 0)[0]
+        if magic == 0x4D47:
+            is_v2 = True
+            _magic, _version, n, board_size = struct.unpack_from("<HHii", data, 0)
+            board_sq = board_size * board_size
+            pos = 12
+        else:
+            n = struct.unpack_from("i", data, pos)[0]
+            pos += 4
+
     records = []
     for _ in range(n):
         ss = struct.unpack_from("i", data, pos)[0]; pos += 4
@@ -119,14 +141,21 @@ def read_bin_file(filepath):
         policy = struct.unpack_from(f"{ps}f", data, pos); pos += ps * 4
         value = struct.unpack_from("f", data, pos)[0]; pos += 4
         score = struct.unpack_from("f", data, pos)[0]; pos += 4
-        records.append((state, policy, value, score))
+        if is_v2:
+            ownership = struct.unpack_from(f"{board_sq}f", data, pos); pos += board_sq * 4
+            opp_action = struct.unpack_from("i", data, pos)[0]; pos += 4
+        else:
+            ownership = None
+            opp_action = None
+        records.append((state, policy, value, score, ownership, opp_action))
     return records
 
 
 def extract_games_from_bin(records, board_size):
     """Group augmented records into games (8 augmentations per position).
 
-    Returns list of games. Each game is a list of (board_state, policy, value, score).
+    Returns list of games. Each game is a list of
+    (board_state, policy, value, score, ownership, opp_action).
     The first augmentation (identity) is used for display.
     """
     # Records come in groups of 8 (dihedral augmentation)
@@ -136,8 +165,7 @@ def extract_games_from_bin(records, board_size):
 
     game = []
     for i in range(0, len(records), 8):
-        state, policy, value, score = records[i]  # identity augmentation
-        game.append((state, policy, value, score))
+        game.append(records[i])  # identity augmentation (full tuple)
 
     return [game]  # one game per .bin file
 
@@ -147,7 +175,9 @@ def replay_game_from_bin(game, board_size):
     hw = board_size * board_size
     moves = []
 
-    for i, (state, policy, value, score) in enumerate(game):
+    for i, rec in enumerate(game):
+        state, policy, value, score = rec[0], rec[1], rec[2], rec[3]
+        ownership = rec[4] if len(rec) > 4 else None
         # State layout: [ch0..ch16] where ch0 = current player's stones,
         # ch1 = opponent's stones (current frame)
         # The color plane (ch16) tells us who is playing: 1.0 = black
@@ -160,10 +190,10 @@ def replay_game_from_bin(game, board_size):
         best_action = max(range(action_size), key=lambda a: policy[a])
 
         if best_action == board_size * board_size:
-            moves.append((current, None, None, policy, value, score))  # pass
+            moves.append((current, None, None, policy, value, score, ownership))
         else:
             r, c = best_action // board_size, best_action % board_size
-            moves.append((current, r, c, policy, value, score))
+            moves.append((current, r, c, policy, value, score, ownership))
 
     return moves
 
@@ -219,6 +249,7 @@ def _get_move_info(moves_data, idx, is_sgf):
         parts = []
         if len(m) > 4: parts.append(f"V={m[4]:+.2f}")
         if len(m) > 5: parts.append(f"S={m[5]:+.1f}")
+        # ownership info is at index 6 if present
         extra = "  " + " ".join(parts) if parts else ""
         return m[0], m[1], m[2], extra
 

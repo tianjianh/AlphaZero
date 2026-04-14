@@ -236,7 +236,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
 
     // Help at bottom
     int help_y = std::max(oy + n + 1, (int)(panel_y + 2));
-    const char* help = "arrows:move  enter:place  p:pass  a:analyze  P:ponder  r:refresh  q:quit";
+    const char* help = "arrows:move  enter:place  p:pass  a:analyze  o:ownership  P:ponder  r:refresh  q:quit";
     wattron(win, COLOR_PAIR(CP_LABEL));
     mvwaddnstr(win, std::min(help_y, h - 1), 2, help, w - 4);
     wattroff(win, COLOR_PAIR(CP_LABEL));
@@ -304,6 +304,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--sims"              && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
         else if (arg == "--search-threads"    && i+1<argc) search_threads  = std::stoi(argv[++i]);
         else if (arg == "--komi"              && i+1<argc) config.komi     = std::stof(argv[++i]);
+        else if (arg == "--win-loss-weight"    && i+1<argc) config.win_loss_weight = std::stof(argv[++i]);
         else if (arg == "--score-weight"      && i+1<argc) config.score_weight = std::stof(argv[++i]);
         else if (arg == "--score-scale"       && i+1<argc) config.score_scale = std::stof(argv[++i]);
         else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
@@ -320,6 +321,7 @@ int main(int argc, char* argv[]) {
                    "  --search-threads N     MCTS search threads (default: 16)\n"
                    "  --max-batch N          Max GPU batch size (default: 256)\n"
                    "  --komi F               Komi value (default: 6.5)\n"
+                   "  --win-loss-weight F    Win/loss utility weight (default: 1.0)\n"
                    "  --score-weight F       Score utility weight (default: 0.0)\n"
                    "  --score-scale F        Score atan compression scale (default: 10.0)\n"
                    "  --c-puct F             UCB exploration constant (default: 1.5)\n"
@@ -431,6 +433,7 @@ int main(int argc, char* argv[]) {
         // below.
         bool pondering_wanted = false;
         bool analysis_wanted  = false;
+        bool show_ownership   = false;
 
         // Shared state between the bot's callback thread and the UI thread.
         std::mutex ai_info_mutex;
@@ -538,8 +541,8 @@ int main(int argc, char* argv[]) {
             }
             char buf[256];
             float wr = (info.root_utility + 1.0f) / 2.0f * 100.0f;
-            snprintf(buf, sizeof(buf), "WR %.1f%%  Score %+.1f  N=%d",
-                     wr, info.root_score, info.total_visits);
+            snprintf(buf, sizeof(buf), "WR %.1f%%  Score %+.1f \xc2\xb1 %.1f  N=%d",
+                     wr, info.root_score, info.root_score_sd, info.total_visits);
             ai_info = buf;
             for (auto& m : info.moves) {
                 std::string ms = (m.action == config.action_size() - 1)
@@ -566,6 +569,35 @@ int main(int argc, char* argv[]) {
             draw_board(stdscr, game, config, cursor_r, cursor_c, cursor_active,
                        last_r, last_c, human_color, use_random,
                        status_msg, ai_info, input_buf);
+
+            // Ownership overlay: draw +/- at empty intersections
+            if (show_ownership) {
+                MCTS::AnalysisInfo info;
+                {
+                    std::lock_guard<std::mutex> lock(ai_info_mutex);
+                    info = latest_info;
+                }
+                int bsz = game.board_size;
+                if ((int)info.root_ownership.size() == bsz * bsz) {
+                    int ox = 5, oy = 3, cell_w = 2;
+                    for (int r = 0; r < bsz; r++) {
+                        for (int c = 0; c < bsz; c++) {
+                            if (game.board[r][c] != EMPTY) continue;
+                            float own = info.root_ownership[r * bsz + c];
+                            if (own > 0.6f) {
+                                wattron(stdscr, COLOR_PAIR(CP_BLACK_STONE));
+                                mvwaddch(stdscr, oy + r, ox + c * cell_w, '+');
+                                wattroff(stdscr, COLOR_PAIR(CP_BLACK_STONE));
+                            } else if (own < 0.4f) {
+                                wattron(stdscr, COLOR_PAIR(CP_WHITE_STONE));
+                                mvwaddch(stdscr, oy + r, ox + c * cell_w, '-');
+                                wattroff(stdscr, COLOR_PAIR(CP_WHITE_STONE));
+                            }
+                        }
+                    }
+                    wrefresh(stdscr);
+                }
+            }
 
             if (game.game_over) {
                 disable_all();
@@ -644,6 +676,12 @@ int main(int argc, char* argv[]) {
             // turns on pondering; turning A off leaves pondering as-is.
             if (key == 'a') {
                 toggle_analysis();
+                continue;
+            }
+
+            // Toggle ownership overlay ('o').
+            if (key == 'o') {
+                show_ownership = !show_ownership;
                 continue;
             }
 

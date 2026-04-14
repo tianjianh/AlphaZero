@@ -28,6 +28,11 @@ public:
     void get_legal_moves(std::vector<float>& legal) const;
     std::pair<float, float> score() const;
 
+    // Per-intersection ownership from current player's perspective.
+    // out[r*board_size+c] = 1.0 if owned by `player`, 0.0 otherwise.
+    // Neutral intersections (dame) = 0.0.  Uses Tromp-Taylor flood-fill.
+    void get_ownership(Stone player, std::vector<float>& out) const;
+
     // Neural network encoding: (input_channels, H, W) flattened row-major
     void encode(std::vector<float>& out) const;
 

@@ -254,13 +254,12 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         game_copy_ptr->get_legal_moves(legal);
         mask_policy(result.policy, legal, action_size);
         expand(node, result.policy, legal);
-        node->nn_score = result.score;  // set BEFORE the release store
-                                        // so readers that see EXPANDED
-                                        // also see a valid score
+        node->nn_score    = result.score;
+        node->nn_score_sd = result.score_sd;
         node->state.store(NODE_EXPANDED, std::memory_order_release);
 
         // Blend value + score for utility (KataGo-style atan compression)
-        float utility = result.value;
+        float utility = config_.win_loss_weight * result.value;
         if (config_.score_weight != 0.0f) {
             float score_utility = atanf(result.score / config_.score_scale) / (float)(M_PI / 2.0);
             utility += config_.score_weight * score_utility;
@@ -359,10 +358,11 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
             mask_policy(res.policy, leaf.legal, action_size);
             if (leaf.leaf->children.empty())
                 expand(leaf.leaf, res.policy, leaf.legal);
-            leaf.leaf->nn_score = res.score;
+            leaf.leaf->nn_score    = res.score;
+            leaf.leaf->nn_score_sd = res.score_sd;
             leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
 
-            float utility = res.value;
+            float utility = config_.win_loss_weight * res.value;
             if (config_.score_weight != 0.0f) {
                 float score_utility = atanf(res.score / config_.score_scale) / (float)(M_PI / 2.0);
                 utility += config_.score_weight * score_utility;
@@ -404,7 +404,7 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     // GPU evaluation takes ms, so we do it without holding tree_mutex_,
     // then atomically swap into root_ once the new tree is ready.
     std::unique_ptr<MCTSNode> new_root;
-    float new_root_nn_score = 0.0f;
+    NNOutput root_nn_output;
 
     if (!can_reuse) {
         new_root = std::make_unique<MCTSNode>();
@@ -412,19 +412,19 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
         std::vector<float> state_enc;
         game.encode(state_enc);
         auto root_results = evaluator_->evaluate({ state_enc });
-        auto& root_out = root_results[0];
-        new_root_nn_score = root_out.score;
+        root_nn_output = std::move(root_results[0]);
 
         std::vector<float> legal;
         game.get_legal_moves(legal);
-        mask_policy(root_out.policy, legal, action_size);
-        expand(new_root.get(), root_out.policy, legal);
-        new_root->nn_score = new_root_nn_score;
+        mask_policy(root_nn_output.policy, legal, action_size);
+        expand(new_root.get(), root_nn_output.policy, legal);
+        new_root->nn_score    = root_nn_output.score;
+        new_root->nn_score_sd = root_nn_output.score_sd;
         new_root->state.store(NODE_EXPANDED, std::memory_order_release);
         new_root->visit_count.store(1, std::memory_order_relaxed);
-        float root_utility = root_out.value;
+        float root_utility = config_.win_loss_weight * root_nn_output.value;
         if (config_.score_weight != 0.0f) {
-            float root_score_utility = atanf(root_out.score / config_.score_scale) / (float)(M_PI / 2.0);
+            float root_score_utility = atanf(root_nn_output.score / config_.score_scale) / (float)(M_PI / 2.0);
             root_utility += config_.score_weight * root_score_utility;
         }
         if (!std::isfinite(root_utility)) root_utility = 0.0f;
@@ -569,10 +569,10 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
         info.root_score = 0.0f;
         return info;
     }
-    // Read the promoted node's own NN score — survives make_move() so
-    // the analysis HUD always shows the score for the current position,
-    // not some ancestor's stale value.
-    info.root_score = root_->nn_score;
+    // Read the promoted node's own NN outputs — survives make_move() so
+    // the analysis HUD always shows data for the current position.
+    info.root_score    = root_->nn_score;
+    info.root_score_sd = root_->nn_score_sd;
 
     int vc = root_->visit_count.load(std::memory_order_relaxed);
     info.total_visits = vc;
@@ -608,6 +608,8 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
 static void augment_sample(const std::vector<float>& state,
                            const std::vector<float>& policy,
                            float value, float score,
+                           const std::vector<float>& ownership,
+                           int opponent_action,
                            int board_size, int input_channels,
                            std::vector<TrainingRecord>& out) {
     int n  = board_size;
@@ -620,6 +622,7 @@ static void augment_sample(const std::vector<float>& state,
             TrainingRecord rec;
             rec.state.resize((size_t)input_channels * hw);
             rec.policy.resize(action_size);
+            rec.ownership.resize(hw);
             rec.value = value;
             rec.score = score;
 
@@ -645,9 +648,20 @@ static void augment_sample(const std::vector<float>& state,
                 for (int c = 0; c < n; c++) {
                     auto [tr, tc] = transform(r, c);
                     rec.policy[tr * n + tc] = policy[r * n + c];
+                    rec.ownership[tr * n + tc] = ownership[r * n + c];
                 }
             }
             rec.policy[hw] = pass_prob;
+
+            // Transform opponent action (board moves only; pass stays as-is)
+            if (opponent_action >= 0 && opponent_action < hw) {
+                int or_ = opponent_action / n, oc = opponent_action % n;
+                auto [tr, tc] = transform(or_, oc);
+                rec.opponent_action = tr * n + tc;
+            } else {
+                rec.opponent_action = opponent_action;  // pass or -1
+            }
+
             out.push_back(std::move(rec));
         }
     }
@@ -664,6 +678,7 @@ static std::vector<TrainingRecord> self_play_game_impl(
         std::vector<float> state;
         std::vector<float> policy;
         Stone player;
+        int action;  // the action taken at this step
     };
     std::vector<Step> trajectory;
 
@@ -684,6 +699,7 @@ static std::vector<TrainingRecord> self_play_game_impl(
         game.encode(step.state);
         step.policy = pi;
         step.player = game.current_player;
+        step.action = action;
         trajectory.push_back(std::move(step));
 
         if (action == action_size - 1)
@@ -700,10 +716,16 @@ static std::vector<TrainingRecord> self_play_game_impl(
     auto [bs, ws] = game.score();
     float black_score = bs - ws;  // raw points, e.g. +12.5
 
+    // Compute ownership from game-end position
+    std::vector<float> black_ownership, white_ownership;
+    game.get_ownership(BLACK, black_ownership);
+    game.get_ownership(WHITE, white_ownership);
+
     std::vector<TrainingRecord> records;
     records.reserve(trajectory.size() * 8);
 
-    for (auto& step : trajectory) {
+    for (size_t i = 0; i < trajectory.size(); i++) {
+        auto& step = trajectory[i];
         float value;
         if      (game.winner == EMPTY)        value =  0.0f;
         else if (game.winner == step.player)  value =  1.0f;
@@ -712,7 +734,17 @@ static std::vector<TrainingRecord> self_play_game_impl(
         // Score from current player's perspective (raw points)
         float score = (step.player == BLACK) ? black_score : -black_score;
 
+        // Ownership from current player's perspective
+        const auto& ownership = (step.player == BLACK) ? black_ownership : white_ownership;
+
+        // Opponent's next action (look-ahead by one step)
+        int opponent_action = -1;
+        if (i + 1 < trajectory.size()) {
+            opponent_action = trajectory[i + 1].action;
+        }
+
         augment_sample(step.state, step.policy, value, score,
+                       ownership, opponent_action,
                        config.board_size, config.input_channels, records);
     }
 

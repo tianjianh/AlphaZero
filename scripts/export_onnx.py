@@ -3,7 +3,13 @@
 Export PyTorch AlphaZero model to ONNX format.
 
 The ONNX model is the universal format used by all C++ inference backends.
-Both the ONNX Runtime backend and the Eigen backend load .onnx files.
+
+Exports 5 inference heads:
+  1. policy_logits [B, action_size]
+  2. value [B, 1]         — P(win) - P(loss) after softmax
+  3. score_mean [B, 1]    — raw regression output
+  4. score_stdev [B, 1]   — softplus output (positive)
+  5. ownership [B, board²] — per-intersection sigmoid
 
 Usage:
   python export_onnx.py --checkpoint ../training/checkpoints/training.pt --output ../models/model.onnx
@@ -15,12 +21,32 @@ import os
 import sys
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import onnx
-from onnx import helper, numpy_helper, TensorProto
+from onnx import numpy_helper
 
 sys.path.insert(0, os.path.dirname(__file__))
 from model import AlphaZeroNet, GoViT, create_model
+
+
+class _InferenceWrapper(nn.Module):
+    """Wrapper that calls forward_inference() and post-processes value logits.
+
+    Value: softmax([B, 3]) → P(win) - P(loss) → [B, 1]
+    All other outputs passed through unchanged.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        policy, value_logits, score_mean, score_stdev, ownership = self.model.forward_inference(x)
+        value_probs = F.softmax(value_logits, dim=1)
+        value = value_probs[:, 0:1] - value_probs[:, 1:2]  # P(win) - P(loss) → [B, 1]
+        return policy, value, score_mean, score_stdev, ownership
 
 
 def _embed_state_dict(onnx_path, model):
@@ -35,7 +61,6 @@ def _embed_state_dict(onnx_path, model):
     sd = model.state_dict()
 
     existing_names = {init.name for init in onnx_model.graph.initializer}
-    # TorchScript exporter may also use param names as node outputs (SSA)
     for node in onnx_model.graph.node:
         existing_names.update(node.output)
 
@@ -48,78 +73,43 @@ def _embed_state_dict(onnx_path, model):
     onnx.save(onnx_model, onnx_path)
 
 
-def _append_postprocessing(onnx_path, board_size):
-    """Append score post-processing to ONNX graph for C++ inference.
-
-    Value already has tanh in the model — no post-processing needed.
-    Score: softmax(logits) @ bin_values → raw points [B, 1]
-    """
-    model = onnx.load(onnx_path)
-    graph = model.graph
-    board_area = board_size * board_size
-    num_bins = board_area * 2 + 1
-
-    # Rename score output to make room for post-processed version
-    for node in graph.node:
-        new_outputs = list(node.output)
-        for i, o in enumerate(new_outputs):
-            if o == "score":
-                new_outputs[i] = "score_logits"
-        del node.output[:]
-        node.output.extend(new_outputs)
-
-    # --- Score: softmax → expected value ---
-    graph.node.append(helper.make_node("Softmax", ["score_logits"], ["score_probs"], axis=1))
-    bin_vals = (np.arange(num_bins, dtype=np.float32) - board_area).reshape(num_bins, 1)
-    bv = numpy_helper.from_array(bin_vals, "score_bin_values")
-    graph.initializer.append(bv)
-    # MatMul: [B, num_bins] @ [num_bins, 1] → [B, 1]
-    graph.node.append(helper.make_node("MatMul", ["score_probs", "score_bin_values"], ["score"]))
-
-    # Update score output shape: [batch, num_bins] → [batch, 1]
-    new_outputs = []
-    for output in graph.output:
-        if output.name == "score":
-            new_outputs.append(
-                helper.make_tensor_value_info("score", TensorProto.FLOAT, ["batch", 1]))
-        else:
-            new_outputs.append(output)
-    del graph.output[:]
-    graph.output.extend(new_outputs)
-
-    onnx.save(model, onnx_path)
-
-
 def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="resnet"):
     """Export a PyTorch model to ONNX format with dynamic batch axis.
 
     The ONNX file contains:
     1. The optimized graph (BN folded into Conv) for ONNX Runtime / TensorRT
     2. All raw state_dict tensors as extra initializers for the Eigen backend
-    3. Post-processing ops: score softmax→expected_value
+    3. Value post-processing: softmax → P(win) - P(loss)
     """
-    # Convert te.Linear → nn.Linear for ONNX compatibility
     from model import convert_te_to_nn
     convert_te_to_nn(model)
 
     model.eval()
+    wrapper = _InferenceWrapper(model)
+    wrapper.eval()
+
     dummy = torch.randn(1, input_channels, board_size, board_size)
 
     # Run once to populate batch norm running stats
     with torch.no_grad():
-        model(dummy)
+        wrapper(dummy)
+
+    board_area = board_size * board_size
+    output_names = ["policy_logits", "value", "score_mean", "score_stdev", "ownership"]
 
     torch.onnx.export(
-        model,
+        wrapper,
         dummy,
         output_path,
         input_names=["state"],
-        output_names=["policy_logits", "value", "score"],
+        output_names=output_names,
         dynamic_axes={
             "state": {0: "batch"},
             "policy_logits": {0: "batch"},
             "value": {0: "batch"},
-            "score": {0: "batch"},
+            "score_mean": {0: "batch"},
+            "score_stdev": {0: "batch"},
+            "ownership": {0: "batch"},
         },
         opset_version=18,
         do_constant_folding=True,
@@ -127,18 +117,20 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="re
         dynamo=False,
     )
 
-    # Append post-processing for C++ inference
-    _append_postprocessing(output_path, board_size)
-
     # Embed full state_dict for Eigen backend
     _embed_state_dict(output_path, model)
 
     file_size = os.path.getsize(output_path)
-    action_size = board_size * board_size + 1
+    action_size = board_area + 1
     print(f"Exported ONNX model to {output_path}")
     print(f"  Size: {file_size / 1024:.1f} KB")
     print(f"  Input: [batch, {input_channels}, {board_size}, {board_size}]")
-    print(f"  Output: policy_logits [batch, {action_size}], value [batch, 1], score [batch, 1]")
+    print(f"  Outputs:")
+    print(f"    policy_logits [batch, {action_size}]")
+    print(f"    value [batch, 1]  (P(win) - P(loss))")
+    print(f"    score_mean [batch, 1]  (raw points)")
+    print(f"    score_stdev [batch, 1]  (uncertainty)")
+    print(f"    ownership [batch, {board_area}]  (per-intersection)")
 
 
 def main():

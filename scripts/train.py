@@ -6,6 +6,12 @@ Reads zstd-compressed self-play data (.bin.zst) and trains the PyTorch model.
 Streams data from disk — one file decompressed at a time, no memory limit.
 Multi-GPU via DistributedDataParallel (launched with torchrun).
 
+Seven-headed training: policy, value (W/L/D), scoreMean, scoreStdev,
+ownership, scoreBelief (soft Gaussian), opponentPolicy.  All loss weights
+are individually configurable via CLI.
+
+Binary format: V2 only (0x4D47 magic header).
+
 Single GPU:   python train.py --data ../training/selfplay --epochs 15
 Multi GPU:    torchrun --nproc_per_node=2 train.py --data ../training/selfplay --epochs 15
 """
@@ -21,6 +27,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -38,8 +45,10 @@ except ImportError:
 
 
 # ═══════════════════════════════════════════════════════════
-# Streaming dataset — decompresses one file at a time
+# Streaming dataset — V2 binary format (0x4D47 magic)
 # ═══════════════════════════════════════════════════════════
+
+_V2_MAGIC = 0x4D47  # 'MG'
 
 def _find_data_files(data_dirs):
     """Find all selfplay data files (.bin.zst, .bin.gz, .bin)."""
@@ -68,47 +77,71 @@ def _decompress(filepath):
 
 
 def _read_header(filepath):
-    """Read the 4-byte record count without decompressing the whole file."""
+    """Read record count from V2 header without full decompression."""
     try:
         if filepath.endswith(".zst"):
             dctx = zstd.ZstdDecompressor()
             with open(filepath, "rb") as f:
                 reader = dctx.stream_reader(f)
-                hdr = reader.read(4)
-                return struct.unpack("i", hdr)[0] if len(hdr) == 4 else 0
+                hdr = reader.read(12)  # magic(2) + version(2) + count(4) + board_size(4)
         else:
-            data = _decompress(filepath)
-            return struct.unpack_from("i", data, 0)[0]
+            with open(filepath, "rb") as f:
+                hdr = f.read(12)
+        if len(hdr) < 12:
+            return 0
+        magic, version, count = struct.unpack_from("<HHi", hdr, 0)
+        if magic != _V2_MAGIC:
+            return 0  # not V2 — skip
+        return count
     except (OSError, struct.error, zstd.ZstdError):
         return 0
 
 
 def _parse_file(data, board_size, input_channels=17):
-    """Parse all records from raw (decompressed) bytes into tensors.
-    Zero-copy bulk parse — no per-record Python loop."""
-    state_floats = input_channels * board_size * board_size
-    policy_floats = board_size * board_size + 1
-    # Record layout: [state_size(i32)] [state(f32×S)] [policy_size(i32)] [policy(f32×P)] [value(f32)] [score(f32)]
-    record_bytes = 4 + state_floats * 4 + 4 + policy_floats * 4 + 4 + 4
+    """Parse all records from V2 binary format into tensors.
 
-    n = struct.unpack_from("i", data, 0)[0]
+    V2 header: [magic:u16][version:u16][count:i32][board_size:i32]
+    Per record: [state_size:i32][state:f32×S][policy_size:i32][policy:f32×P]
+                [value:f32][score:f32][ownership:f32×board²][opponent_action:i32]
+    """
+    if len(data) < 12:
+        return []
+
+    magic, version, n, file_board = struct.unpack_from("<HHii", data, 0)
+    if magic != _V2_MAGIC:
+        raise ValueError(f"Not a V2 data file (magic=0x{magic:04X}, expected 0x4D47). "
+                         "Training requires V2 format — regenerate selfplay data.")
     if n == 0:
         return []
 
-    # View entire payload as float32 array (skip 4-byte file header)
-    payload = np.frombuffer(data, dtype=np.uint8, offset=4, count=n * record_bytes)
+    state_floats = input_channels * board_size * board_size
+    policy_floats = board_size * board_size + 1
+    ownership_floats = board_size * board_size
+
+    # Record layout (V2):
+    # [state_size:i32][state:f32×S][policy_size:i32][policy:f32×P]
+    # [value:f32][score:f32][ownership:f32×B²][opponent_action:i32]
+    record_bytes = (4 + state_floats * 4 + 4 + policy_floats * 4
+                    + 4 + 4 + ownership_floats * 4 + 4)
+
+    header_bytes = 12  # magic(2) + version(2) + count(4) + board_size(4)
+    payload = np.frombuffer(data, dtype=np.uint8, offset=header_bytes, count=n * record_bytes)
     records = payload.reshape(n, record_bytes)
 
     # Byte offsets within each record
-    s_off = 4                                        # skip state_size(i32)
+    s_off = 4
     s_end = s_off + state_floats * 4
-    p_off = s_end + 4                                # skip policy_size(i32)
+    p_off = s_end + 4
     p_end = p_off + policy_floats * 4
     v_off = p_end
     v_end = v_off + 4
     sc_off = v_end
+    sc_end = sc_off + 4
+    own_off = sc_end
+    own_end = own_off + ownership_floats * 4
+    opp_off = own_end
 
-    # Bulk extract via views — no Python per-record loop
+    # Bulk extract
     states = np.ndarray((n, state_floats), dtype=np.float32,
                         buffer=records[:, s_off:s_end].tobytes()
                         ).reshape(n, input_channels, board_size, board_size).copy()
@@ -117,13 +150,19 @@ def _parse_file(data, board_size, input_channels=17):
     values = np.ndarray((n,), dtype=np.float32,
                         buffer=records[:, v_off:v_end].tobytes()).copy()
     scores = np.ndarray((n,), dtype=np.float32,
-                        buffer=records[:, sc_off:sc_off+4].tobytes()).copy()
+                        buffer=records[:, sc_off:sc_end].tobytes()).copy()
+    ownerships = np.ndarray((n, ownership_floats), dtype=np.float32,
+                            buffer=records[:, own_off:own_end].tobytes()).copy()
+    opp_actions = np.ndarray((n,), dtype=np.int32,
+                             buffer=records[:, opp_off:opp_off+4].tobytes()).copy()
 
     return list(zip(
         torch.from_numpy(states),
         torch.from_numpy(policies),
         torch.from_numpy(values),
         torch.from_numpy(scores),
+        torch.from_numpy(ownerships),
+        torch.from_numpy(opp_actions.astype(np.int64)),
     ))
 
 
@@ -196,12 +235,21 @@ def main():
     parser.add_argument("--mlp-ratio", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8,
                         help="DataLoader workers for prefetching (default: 8)")
+    # --- All 7 loss weights ---
     parser.add_argument("--policy-weight", type=float, default=1.0,
-                        help="Loss weight for policy cross-entropy (default: 1.0)")
-    parser.add_argument("--value-weight", type=float, default=1.0,
-                        help="Loss weight for value MSE (default: 1.0)")
-    parser.add_argument("--score-weight-loss", type=float, default=1.0,
-                        help="Loss weight for score cross-entropy (default: 1.0)")
+                        help="Loss weight for policy cross-entropy")
+    parser.add_argument("--value-weight", type=float, default=1.5,
+                        help="Loss weight for value cross-entropy (W/L/D)")
+    parser.add_argument("--score-mean-weight", type=float, default=0.5,
+                        help="Loss weight for score mean MSE")
+    parser.add_argument("--score-stdev-weight", type=float, default=0.5,
+                        help="Loss weight for score stdev MSE")
+    parser.add_argument("--ownership-weight", type=float, default=0.02,
+                        help="Loss weight for ownership BCE (~1.5/board² for 9x9)")
+    parser.add_argument("--score-belief-weight", type=float, default=0.15,
+                        help="Loss weight for score belief CE (soft Gaussian)")
+    parser.add_argument("--opp-policy-weight", type=float, default=0.15,
+                        help="Loss weight for opponent policy CE")
     parser.add_argument("--fp8", action="store_true",
                         help="Use FP8 training via NVIDIA Transformer Engine (Blackwell+)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
@@ -297,7 +345,7 @@ def main():
             try:
                 import transformer_engine.pytorch as te
                 use_te_fp8 = True
-                amp_dtype = torch.bfloat16  # TE handles FP8 internally; BF16 for non-TE ops
+                amp_dtype = torch.bfloat16
                 mprint(f"Mixed precision: FP8 via Transformer Engine (SM {sm[0]}.{sm[1]})")
                 tlog(f"    AMP: FP8 (Transformer Engine)")
             except ImportError:
@@ -341,7 +389,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=False,  # max_batches cap handles DDP sync
+        drop_last=False,
         persistent_workers=args.num_workers > 0,
     )
 
@@ -361,58 +409,99 @@ def main():
         max_batches = t.item()
         mprint(f"DDP sync: {max_batches} batches/epoch")
 
+    # ── Pre-compute score belief bins ──────────────────────
+    board_area = args.board * args.board
+    num_bins = board_area * 2 + 1
+    belief_sigma = 3.0
+    bin_centers = torch.arange(num_bins, dtype=torch.float32, device=device) - board_area
+
     # ── Train ──────────────────────────────────────────────
     mprint(f"\nTraining: {args.epochs} epochs, batch={args.batch_size}, lr={args.lr}")
+    mprint(f"  Weights: policy={args.policy_weight} value={args.value_weight} "
+           f"score_mean={args.score_mean_weight} score_stdev={args.score_stdev_weight} "
+           f"own={args.ownership_weight} belief={args.score_belief_weight} "
+           f"opp={args.opp_policy_weight}")
     mprint("-" * 60)
 
     t_train_start = time.time()
     for epoch in range(1, args.epochs + 1):
         dataset.set_epoch(epoch)
         model.train()
-        total_loss = total_pl = total_vl = total_sl = 0.0
+        total_loss = 0.0
+        total_pl = total_vl = total_sml = total_ssl = 0.0
+        total_ol = total_bl = total_opl = 0.0
         n = 0
         t0 = time.time()
 
-        board_area = args.board * args.board
-        num_bins = board_area * 2 + 1
-
-        for states, policies, values, scores in loader:
+        for states, policies, values, scores, ownerships, opp_actions in loader:
             if max_batches is not None and n >= max_batches:
                 break
 
             states = states.to(device, non_blocking=True)
             policies = policies.to(device, non_blocking=True)
-            values = values.to(device, non_blocking=True).unsqueeze(1)
+            values = values.to(device, non_blocking=True)
             scores = scores.to(device, non_blocking=True)
+            ownerships = ownerships.to(device, non_blocking=True)
+            opp_actions = opp_actions.to(device, non_blocking=True)
+
+            # Value target: {1 → win(0), -1 → loss(1), 0 → draw(2)}
+            value_target = torch.where(values > 0, 0,
+                           torch.where(values < 0, 1, 2)).long()
 
             optimizer.zero_grad()
 
-            # FP8: TE autocast for te.Linear layers + torch autocast for
-            # non-TE ops (LayerNorm, GELU, nn.Linear fallbacks) in BF16.
-            # BF16/FP16: standard torch AMP autocast only.
             if use_te_fp8:
                 te_ctx = te.fp8_autocast(enabled=True)
                 amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
             else:
                 te_ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp)
-                amp_ctx = torch.amp.autocast("cuda", enabled=False)  # no-op
+                amp_ctx = torch.amp.autocast("cuda", enabled=False)
             with te_ctx, amp_ctx:
-                logits, pred_value, pred_score = model(states)
+                (pred_policy, pred_value, pred_score_mean, pred_score_stdev,
+                 pred_ownership, pred_score_belief, pred_opp_policy) = model(states)
 
+                # 1. Policy: soft CE against MCTS visit distribution
                 policy_loss = -torch.sum(
-                    policies * torch.log_softmax(logits, dim=1)
+                    policies * torch.log_softmax(pred_policy, dim=1)
                 ) / states.size(0)
 
-                value_loss = nn.functional.mse_loss(pred_value, values)
+                # 2. Value: 3-class CE (win/loss/draw)
+                value_loss = F.cross_entropy(pred_value, value_target)
 
-                # Score: cross-entropy over bins
-                score_bin = (torch.round(scores) + board_area).long()
-                score_bin = score_bin.clamp(0, num_bins - 1)
-                score_loss = nn.functional.cross_entropy(pred_score, score_bin)
+                # 3. ScoreMean: MSE regression
+                score_mean_loss = F.mse_loss(pred_score_mean.squeeze(1), scores)
 
-                loss = (args.policy_weight * policy_loss +
-                        args.value_weight * value_loss +
-                        args.score_weight_loss * score_loss)
+                # 4. ScoreStdev: MSE against |actual - predicted_mean|
+                with torch.no_grad():
+                    stdev_target = (scores - pred_score_mean.squeeze(1).detach()).abs()
+                score_stdev_loss = F.mse_loss(pred_score_stdev.squeeze(1), stdev_target)
+
+                # 5. Ownership: per-intersection BCE
+                ownership_loss = F.binary_cross_entropy_with_logits(
+                    pred_ownership, ownerships)
+
+                # 6. Score Belief: CE with soft Gaussian target (from score, not stored)
+                score_expanded = scores.unsqueeze(1)  # [B, 1]
+                belief_logits = -0.5 * ((bin_centers.unsqueeze(0) - score_expanded) / belief_sigma) ** 2
+                soft_target = F.softmax(belief_logits, dim=1)
+                score_belief_loss = -(soft_target * F.log_softmax(pred_score_belief, dim=1)).sum(dim=1).mean()
+
+                # 7. Opponent Policy: CE against actual next move (mask -1)
+                opp_mask = opp_actions >= 0
+                if opp_mask.any():
+                    opp_policy_loss = F.cross_entropy(
+                        pred_opp_policy[opp_mask], opp_actions[opp_mask])
+                else:
+                    opp_policy_loss = torch.tensor(0.0, device=device)
+
+                # Total weighted loss
+                loss = (args.policy_weight       * policy_loss
+                      + args.value_weight        * value_loss
+                      + args.score_mean_weight   * score_mean_loss
+                      + args.score_stdev_weight  * score_stdev_loss
+                      + args.ownership_weight    * ownership_loss
+                      + args.score_belief_weight * score_belief_loss
+                      + args.opp_policy_weight   * opp_policy_loss)
 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -425,18 +514,25 @@ def main():
             total_loss += loss.item()
             total_pl += policy_loss.item()
             total_vl += value_loss.item()
-            total_sl += score_loss.item()
+            total_sml += score_mean_loss.item()
+            total_ssl += score_stdev_loss.item()
+            total_ol += ownership_loss.item()
+            total_bl += score_belief_loss.item()
+            total_opl += opp_policy_loss.item()
             n += 1
 
         dt = time.time() - t0
-        avg_loss = total_loss / max(n, 1)
-        avg_pl = total_pl / max(n, 1)
-        avg_vl = total_vl / max(n, 1)
-        avg_sl = total_sl / max(n, 1)
-        mprint(f"  Epoch {epoch:3d}/{args.epochs}  loss={avg_loss:.4f}  "
-               f"policy={avg_pl:.4f}  value={avg_vl:.4f}  score={avg_sl:.4f}  ({dt:.1f}s, {n} batches)")
+        d = max(n, 1)
+        avg = lambda t: t / d
+        mprint(f"  Epoch {epoch:3d}/{args.epochs}  loss={avg(total_loss):.4f}  "
+               f"pol={avg(total_pl):.4f}  val={avg(total_vl):.4f}  "
+               f"smn={avg(total_sml):.4f}  ssd={avg(total_ssl):.4f}  "
+               f"own={avg(total_ol):.4f}  bel={avg(total_bl):.4f}  "
+               f"opp={avg(total_opl):.4f}  ({dt:.1f}s, {n}b)")
         tlog(f"    Epoch {epoch:3d}/{args.epochs}  "
-             f"loss={avg_loss:.4f}  policy={avg_pl:.4f}  value={avg_vl:.4f}  score={avg_sl:.4f}  {dt:.1f}s")
+             f"loss={avg(total_loss):.4f}  pol={avg(total_pl):.4f}  val={avg(total_vl):.4f}  "
+             f"smn={avg(total_sml):.4f}  ssd={avg(total_ssl):.4f}  own={avg(total_ol):.4f}  "
+             f"bel={avg(total_bl):.4f}  opp={avg(total_opl):.4f}  {dt:.1f}s")
 
     train_time = time.time() - t_train_start
     mprint(f"Training complete ({train_time:.1f}s)")

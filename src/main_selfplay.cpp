@@ -17,10 +17,21 @@
 using namespace minigo;
 
 static void write_records(const std::string& path,
-                           const std::vector<TrainingRecord>& records) {
+                           const std::vector<TrainingRecord>& records,
+                           int board_size) {
     std::ofstream out(path, std::ios::binary);
-    int32_t n = (int32_t)records.size();
+
+    // V2 header: [magic:u16][version:u16][count:i32][board_size:i32]
+    uint16_t magic   = 0x4D47;  // 'MG'
+    uint16_t version = 2;
+    int32_t  n       = (int32_t)records.size();
+    int32_t  bs      = board_size;
+    out.write(reinterpret_cast<const char*>(&magic), 2);
+    out.write(reinterpret_cast<const char*>(&version), 2);
     out.write(reinterpret_cast<const char*>(&n), 4);
+    out.write(reinterpret_cast<const char*>(&bs), 4);
+
+    int board_sq = board_size * board_size;
 
     for (auto& rec : records) {
         int32_t ss = (int32_t)rec.state.size();
@@ -31,6 +42,10 @@ static void write_records(const std::string& path,
         out.write(reinterpret_cast<const char*>(rec.policy.data()), ps * sizeof(float));
         out.write(reinterpret_cast<const char*>(&rec.value), sizeof(float));
         out.write(reinterpret_cast<const char*>(&rec.score), sizeof(float));
+        // V2 fields
+        out.write(reinterpret_cast<const char*>(rec.ownership.data()), board_sq * sizeof(float));
+        int32_t opp = rec.opponent_action;
+        out.write(reinterpret_cast<const char*>(&opp), 4);
     }
 }
 
@@ -67,6 +82,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--dirichlet-epsilon" && i+1<argc) config.dirichlet_epsilon = std::stof(argv[++i]);
         else if (arg == "--temp-threshold"    && i+1<argc) config.temperature_threshold = std::stoi(argv[++i]);
         else if (arg == "--komi"             && i+1<argc) config.komi = std::stof(argv[++i]);
+        else if (arg == "--win-loss-weight"   && i+1<argc) config.win_loss_weight = std::stof(argv[++i]);
         else if (arg == "--score-weight"     && i+1<argc) config.score_weight = std::stof(argv[++i]);
         else if (arg == "--score-scale"      && i+1<argc) config.score_scale = std::stof(argv[++i]);
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads  = std::stoi(argv[++i]);
@@ -86,6 +102,7 @@ int main(int argc, char* argv[]) {
                 << "  --dirichlet-epsilon F   Root noise weight (default: 0.25)\n"
                 << "  --temp-threshold N      Moves of stochastic play (default: 15)\n"
                 << "  --komi F                Komi value (default: 6.5)\n"
+                << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
                 << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
@@ -177,7 +194,7 @@ int main(int argc, char* argv[]) {
 
             std::string filename = output_dir + "/game_" +
                                    std::to_string(game_id) + ".bin";
-            write_records(filename, records);
+            write_records(filename, records, config.board_size);
 
             {
                 std::lock_guard<std::mutex> lock(print_mutex);

@@ -174,30 +174,31 @@ def build_data_window(window_size, end_iter):
 # ══════════════════════════════════════════════════════════
 
 def _stage(name, start, end, games, sims, epochs, lr, eval_games,
-           score_weight, score_weight_loss, window_size,
+           score_weight, score_mean_weight, window_size,
            c_puct, temp_threshold, dirichlet_epsilon,
-           eval_threshold=None):
+           eval_threshold=None, **extra_weights):
     """Build a stage dict with all per-stage overrides.
 
     Any key present here *and* in the top-level plan `training`/`mcts`
     dicts is merged via `get_stage_config()` before each iteration.
     `eval_threshold` is optional — only added to the stage dict when
     explicitly set, so stages that want the top-level default can just
-    leave it off.
+    leave it off.  Extra loss weight overrides can be passed via kwargs.
     """
     d = {"name": name, "start": start, "end": end,
          "games": games, "sims": sims, "epochs": epochs, "lr": lr,
          "eval_games": eval_games,
-         "score_weight": score_weight, "score_weight_loss": score_weight_loss,
+         "score_weight": score_weight, "score_mean_weight": score_mean_weight,
          "window_size": window_size,
          "c_puct": c_puct, "temp_threshold": temp_threshold,
          "dirichlet_epsilon": dirichlet_epsilon}
     if eval_threshold is not None:
         d["eval_threshold"] = eval_threshold
+    d.update(extra_weights)
     return d
 
 # Per-stage exploration schedule (explore→exploit as model strengthens)
-#                    score_wt  sw_loss  window  c_puct  temp  dir_eps
+#                    score_wt  smn_wt  window  c_puct  temp  dir_eps
 _EXPLORE = [
     # Bootstrap:     aggressive explore — network is random
     (0.0,   0.05,    3,      2.0,    20,   0.30),
@@ -229,7 +230,7 @@ _EXPLORE_XLARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
 # selfplay data from the same policy makes the optimizer overfit and
 # produce dramatically worse candidates (3-22% win rates observed in v1).
 _EXPLORE_LARGE = [
-    # score_wt  swl    window  c_puct  temp  dir_eps
+    # score_wt  smn_wt  window  c_puct  temp  dir_eps
     (0.0,      0.05,   4,      2.0,    20,   0.30),  # 0 Bootstrap
     (0.0,      0.05,   4,      1.75,   18,   0.28),  # 1 Warm up
     (0.02,     0.1,    6,      1.5,    15,   0.25),  # 2 Early gated
@@ -401,8 +402,12 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "window_size": window,
             "eval_threshold": eval_threshold,
             "policy_weight": 1.0,
-            "value_weight": 1.0,
-            "score_weight_loss": 0.15 if arch == "vit" else 0.1,
+            "value_weight": 1.5,
+            "score_mean_weight": 0.15 if arch == "vit" else 0.1,
+            "score_stdev_weight": 0.5,
+            "ownership_weight": 0.02,
+            "score_belief_weight": 0.15,
+            "opp_policy_weight": 0.15,
             "fp8": False,
         },
         "mcts": {
@@ -411,6 +416,7 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "dirichlet_alpha": dirichlet_alpha,
             "dirichlet_epsilon": 0.25,
             "temp_threshold": temp_threshold,
+            "win_loss_weight": 1.0,
             "score_weight": score_weight,
             "score_scale": 10.0,
         },
@@ -481,6 +487,7 @@ def run_selfplay(iter_data, model, games, sims, hw, mc):
         "--dirichlet-epsilon", str(mc["dirichlet_epsilon"]),
         "--temp-threshold", str(mc["temp_threshold"]),
         "--komi", str(mc["komi"]),
+        "--win-loss-weight", str(mc["win_loss_weight"]),
         "--score-weight", str(mc["score_weight"]),
         "--score-scale", str(mc["score_scale"]),
     ]
@@ -645,7 +652,7 @@ Komi:         {mc['komi']}
 MCTS:         c_puct={mc['c_puct']}  dirichlet_alpha={mc['dirichlet_alpha']}  dirichlet_eps={mc['dirichlet_epsilon']}  temp_threshold={mc['temp_threshold']}
 Score weight: {mc['score_weight']}
 Score scale:  {mc['score_scale']}
-Loss weights: policy={t['policy_weight']} value={t['value_weight']} score={t['score_weight_loss']}
+Loss weights: policy={t['policy_weight']} value={t['value_weight']} score={t['score_mean_weight']}
 Eval gate:    {t['eval_threshold']} win rate threshold
 
 Training Plan:
@@ -812,7 +819,7 @@ def cmd_train(args):
     print(f"  Score weight:     {mc['score_weight']}")
     print(f"  Score scale:      {mc['score_scale']}")
     print(f"  Loss weights:     policy={t['policy_weight']} "
-          f"value={t['value_weight']} score={t['score_weight_loss']}")
+          f"value={t['value_weight']} score={t['score_mean_weight']}")
     print("============================================")
     print()
 
@@ -831,7 +838,7 @@ def cmd_train(args):
     tlog(f"  Score weight:     {mc['score_weight']}")
     tlog(f"  Score scale:      {mc['score_scale']}")
     tlog(f"  Loss weights:     policy={t['policy_weight']} "
-         f"value={t['value_weight']} score={t['score_weight_loss']}")
+         f"value={t['value_weight']} score={t['score_mean_weight']}")
     tlog("  Hardware:")
     tlog(f"    Threads:          {hw['threads']}")
     tlog(f"    Search threads:   {hw['search_threads']}")
@@ -933,7 +940,11 @@ def cmd_train(args):
                 "--log-file", str(TRAIN_LOG),
                 "--policy-weight", str(st["policy_weight"]),
                 "--value-weight", str(st["value_weight"]),
-                "--score-weight-loss", str(st["score_weight_loss"]),
+                "--score-mean-weight", str(st["score_mean_weight"]),
+                "--score-stdev-weight", str(st["score_stdev_weight"]),
+                "--ownership-weight", str(st["ownership_weight"]),
+                "--score-belief-weight", str(st["score_belief_weight"]),
+                "--opp-policy-weight", str(st["opp_policy_weight"]),
             ] + (["--fp8"] if st.get("fp8", False) else [])
             if arch == "vit":
                 train_args += [
@@ -989,6 +1000,7 @@ def cmd_train(args):
                 "--sims", str(stage["sims"]),
                 "--c-puct", str(smc["c_puct"]),
                 "--komi", str(smc["komi"]),
+                "--win-loss-weight", str(smc["win_loss_weight"]),
                 "--score-weight", str(smc["score_weight"]),
                 "--threshold", str(st["eval_threshold"]),
                 "--score-scale", str(smc["score_scale"]),

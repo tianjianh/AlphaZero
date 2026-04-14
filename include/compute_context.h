@@ -16,11 +16,13 @@ namespace minigo {
 //
 // Destroyed when the server thread exits.
 // ================================================================
-// ── NN output: policy + value + score ────────────────────────
+// ── NN output: policy + value + score + ownership ────────────
 struct NNOutput {
     std::vector<float> policy;
-    float value = 0.0f;
-    float score = 0.0f;  // normalized score estimate [-1, 1]
+    float value    = 0.0f;   // P(win) - P(loss), post-processed in ONNX
+    float score    = 0.0f;   // scoreMean (raw points)
+    float score_sd = 0.0f;   // scoreStdev (uncertainty in points)
+    std::vector<float> ownership;  // [board²] per-intersection ownership (sigmoid)
 };
 
 class ComputeHandle {

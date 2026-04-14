@@ -338,6 +338,62 @@ std::pair<float, float> GoGame::score() const {
     return {black_area, white_area + komi};
 }
 
+void GoGame::get_ownership(Stone player, std::vector<float>& out) const {
+    int n = board_size;
+    out.assign(n * n, 0.0f);
+
+    // Reuse the same flood-fill logic as score()
+    bool visited[MAX_BOARD][MAX_BOARD] = {};
+    for (int r = 0; r < n; r++) {
+        for (int c = 0; c < n; c++) {
+            // Stones: owner is the stone's color
+            if (board[r][c] == player) {
+                out[r * n + c] = 1.0f;
+            } else if (board[r][c] != EMPTY) {
+                out[r * n + c] = 0.0f;
+            } else if (!visited[r][c]) {
+                // Flood-fill empty region
+                std::vector<Pos> region;
+                bool touches_black = false, touches_white = false;
+                std::vector<Pos> stack;
+                stack.push_back({r, c});
+                visited[r][c] = true;
+
+                while (!stack.empty()) {
+                    Pos p = stack.back(); stack.pop_back();
+                    region.push_back(p);
+
+                    Pos nbrs[4]; int cnt;
+                    neighbors(p.r, p.c, nbrs, cnt);
+                    for (int i = 0; i < cnt; i++) {
+                        int nr = nbrs[i].r, nc = nbrs[i].c;
+                        if (board[nr][nc] == EMPTY && !visited[nr][nc]) {
+                            visited[nr][nc] = true;
+                            stack.push_back({nr, nc});
+                        } else if (board[nr][nc] == BLACK) {
+                            touches_black = true;
+                        } else if (board[nr][nc] == WHITE) {
+                            touches_white = true;
+                        }
+                    }
+                }
+
+                // Assign territory: only if surrounded by one color
+                bool owned_by_player = false;
+                if (player == BLACK && touches_black && !touches_white)
+                    owned_by_player = true;
+                if (player == WHITE && touches_white && !touches_black)
+                    owned_by_player = true;
+
+                if (owned_by_player) {
+                    for (auto& p : region)
+                        out[p.r * n + p.c] = 1.0f;
+                }
+            }
+        }
+    }
+}
+
 void GoGame::score_game() {
     // Tromp-Taylor scoring: score the final position as-is after two
     // passes.  No heuristic dead-stone removal — under Chinese rules the

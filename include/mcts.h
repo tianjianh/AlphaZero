@@ -31,6 +31,7 @@ struct MCTSNode {
                              // during expand, then read by get_analysis;
                              // benign data race — 32-bit aligned float
                              // writes are atomic on target platforms)
+    float nn_score_sd = 0.0f;  // NN score stdev (uncertainty)
 
     std::atomic<int> visit_count{0};
     std::atomic<int> virtual_loss_count{0};
@@ -111,7 +112,9 @@ public:
         std::vector<MoveInfo> moves;   // top moves, sorted by visits desc
         int   total_visits = 0;
         float root_utility = 0.0f;    // mean Q at root
-        float root_score   = 0.0f;    // NN raw score estimate (points, komi incl.)
+        float root_score   = 0.0f;    // NN raw score estimate (points)
+        float root_score_sd = 0.0f;   // NN score stdev (uncertainty)
+        std::vector<float> root_ownership;  // [board²] NN ownership at root
     };
 
     AnalysisInfo get_analysis(int max_moves = 5) const;
@@ -199,7 +202,9 @@ struct TrainingRecord {
     std::vector<float> state;
     std::vector<float> policy;
     float value;
-    float score;  // normalized score from current player's perspective [-1, 1]
+    float score;                       // points, current player's perspective
+    std::vector<float> ownership;      // [board²] — 1.0 = current player owns
+    int   opponent_action;             // opponent's next move (-1 if last move)
 };
 
 std::vector<TrainingRecord> self_play_game(

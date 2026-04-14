@@ -71,8 +71,10 @@ struct TRTDeviceState {
     std::string input_name;
     std::string policy_name;
     std::string value_name;
-    std::string score_name;
-    std::string precision;   // "FP8", "FP16", or "FP32"
+    std::string score_name;       // "score_mean"
+    std::string score_sd_name;    // "score_stdev"
+    std::string ownership_name;   // "ownership"
+    std::string precision;        // "FP8", "FP16", or "FP32"
 
     // NOTE: no shared cudaStream_t.  Each ComputeHandle uses
     // cudaStreamPerThread — CUDA's built-in per-thread implicit stream
@@ -399,16 +401,20 @@ struct TensorRTComputeHandle::Impl {
     int max_batch_size = 0;
 
     // I/O device buffers (256-byte aligned as required by TRT 10)
-    float* d_input   = nullptr;   // [max_batch, C, H, W]
-    float* d_policy  = nullptr;   // [max_batch, action_size]
-    float* d_value   = nullptr;   // [max_batch, 1]
-    float* d_score   = nullptr;   // [max_batch, 1]  (optional)
+    float* d_input     = nullptr;   // [max_batch, C, H, W]
+    float* d_policy    = nullptr;   // [max_batch, action_size]
+    float* d_value     = nullptr;   // [max_batch, 1]
+    float* d_score     = nullptr;   // [max_batch, 1]
+    float* d_score_sd  = nullptr;   // [max_batch, 1]
+    float* d_ownership = nullptr;   // [max_batch, board²]
 
     // Tensor names from engine
     std::string input_name;
     std::string policy_name;
     std::string value_name;
     std::string score_name;
+    std::string score_sd_name;
+    std::string ownership_name;
 
     Impl(TRTDeviceState& d) : dev(d) {}
 
@@ -421,11 +427,13 @@ struct TensorRTComputeHandle::Impl {
         // that created the handle (local variable in server_loop), so
         // cudaStreamPerThread refers to this thread's own stream.
         cudaStreamSynchronize(cudaStreamPerThread);
-        if (exec_ctx) delete exec_ctx;
-        if (d_input)  cudaFree(d_input);
-        if (d_policy) cudaFree(d_policy);
-        if (d_value)  cudaFree(d_value);
-        if (d_score)  cudaFree(d_score);
+        if (exec_ctx)   delete exec_ctx;
+        if (d_input)     cudaFree(d_input);
+        if (d_policy)    cudaFree(d_policy);
+        if (d_value)     cudaFree(d_value);
+        if (d_score)     cudaFree(d_score);
+        if (d_score_sd)  cudaFree(d_score_sd);
+        if (d_ownership) cudaFree(d_ownership);
     }
 };
 
@@ -442,7 +450,7 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
         if (!dev.engine) {
             dev.engine = build_or_load_engine(dev, model, max_batch_size);
 
-            // Discover I/O tensor names
+            // Discover I/O tensor names by matching ONNX export names
             int nb = dev.engine->getNbIOTensors();
             for (int i = 0; i < nb; i++) {
                 const char* name = dev.engine->getIOTensorName(i);
@@ -450,18 +458,23 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
                 if (mode == nvinfer1::TensorIOMode::kINPUT) {
                     dev.input_name = name;
                 } else {
-                    // Check for explicitly-named score head first
                     std::string sname(name);
-                    if (sname == "score") {
+                    if (sname == "policy_logits")
+                        dev.policy_name = name;
+                    else if (sname == "value")
+                        dev.value_name = name;
+                    else if (sname == "score_mean" || sname == "score")
                         dev.score_name = name;
-                    } else {
-                        // Identify policy vs value by shape:
-                        // policy is [N, action_size], value is [N, 1]
+                    else if (sname == "score_stdev")
+                        dev.score_sd_name = name;
+                    else if (sname == "ownership")
+                        dev.ownership_name = name;
+                    else {
+                        // Fallback: identify by shape for unknown names
                         auto dims = dev.engine->getTensorShape(name);
-                        // Last dim > 1 → policy, else value
                         if (dims.nbDims >= 2 && dims.d[dims.nbDims - 1] > 1)
                             dev.policy_name = name;
-                        else
+                        else if (dev.value_name.empty())
                             dev.value_name = name;
                     }
                 }
@@ -488,7 +501,9 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
             std::cout << "TensorRT I/O: input=\"" << dev.input_name
                       << "\" policy=\"" << dev.policy_name
                       << "\" value=\"" << dev.value_name
-                      << "\" score=\"" << dev.score_name << "\"\n";
+                      << "\" score=\"" << dev.score_name
+                      << "\" score_sd=\"" << dev.score_sd_name
+                      << "\" ownership=\"" << dev.ownership_name << "\"\n";
         }
     }
 
@@ -498,10 +513,12 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     I.board_size     = model->board_size;
     I.input_channels = model->input_channels;
     I.max_batch_size = max_batch_size;
-    I.input_name     = dev.input_name;
-    I.policy_name    = dev.policy_name;
-    I.value_name     = dev.value_name;
-    I.score_name     = dev.score_name;
+    I.input_name      = dev.input_name;
+    I.policy_name     = dev.policy_name;
+    I.value_name      = dev.value_name;
+    I.score_name      = dev.score_name;
+    I.score_sd_name   = dev.score_sd_name;
+    I.ownership_name  = dev.ownership_name;
 
     // Create per-thread execution context
     I.exec_ctx = dev.engine->createExecutionContext();
@@ -519,7 +536,9 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     CUDA_CHECK(cudaMalloc(&I.d_input,  input_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_policy, policy_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_value,  value_bytes));
-    CUDA_CHECK(cudaMalloc(&I.d_score, (size_t)max_batch_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&I.d_score,     (size_t)max_batch_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&I.d_score_sd,  (size_t)max_batch_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&I.d_ownership, (size_t)max_batch_size * HW * sizeof(float)));
 
     std::cout << "TensorRT handle ready (" << I.dev.precision << "): board=" << I.board_size;
     if (model->model_type == "vit")
@@ -583,8 +602,18 @@ TensorRTComputeHandle::predict_batch(
         throw std::runtime_error("TensorRT: setTensorAddress(policy) failed");
     if (!I.exec_ctx->setTensorAddress(I.value_name.c_str(),  I.d_value))
         throw std::runtime_error("TensorRT: setTensorAddress(value) failed");
-    if (!I.exec_ctx->setTensorAddress(I.score_name.c_str(), I.d_score))
-        throw std::runtime_error("TensorRT: setTensorAddress(score) failed");
+    if (!I.score_name.empty()) {
+        if (!I.exec_ctx->setTensorAddress(I.score_name.c_str(), I.d_score))
+            throw std::runtime_error("TensorRT: setTensorAddress(score_mean) failed");
+    }
+    if (!I.score_sd_name.empty()) {
+        if (!I.exec_ctx->setTensorAddress(I.score_sd_name.c_str(), I.d_score_sd))
+            throw std::runtime_error("TensorRT: setTensorAddress(score_stdev) failed");
+    }
+    if (!I.ownership_name.empty()) {
+        if (!I.exec_ctx->setTensorAddress(I.ownership_name.c_str(), I.d_ownership))
+            throw std::runtime_error("TensorRT: setTensorAddress(ownership) failed");
+    }
 
     // Run inference
     if (!I.exec_ctx->enqueueV3(cudaStreamPerThread))
@@ -593,26 +622,37 @@ TensorRTComputeHandle::predict_batch(
     // Read back results
     std::vector<float> pol_flat((size_t)N * action_size);
     std::vector<float> val_flat((size_t)N);
+    std::vector<float> scr_flat((size_t)N);
+    std::vector<float> scr_sd_flat((size_t)N);
+    std::vector<float> own_flat((size_t)N * HW);
 
     CUDA_CHECK(cudaMemcpyAsync(pol_flat.data(), I.d_policy,
         pol_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.d_value,
         val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
-    std::vector<float> scr_flat((size_t)N);
-    CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
-        scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    if (!I.score_name.empty())
+        CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
+            scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    if (!I.score_sd_name.empty())
+        CUDA_CHECK(cudaMemcpyAsync(scr_sd_flat.data(), I.d_score_sd,
+            scr_sd_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    if (!I.ownership_name.empty())
+        CUDA_CHECK(cudaMemcpyAsync(own_flat.data(), I.d_ownership,
+            own_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     // Pack results — TRT outputs are row-major [N, action_size] and [N, 1]
     std::vector<TensorRTComputeHandle::Result> results(N);
     for (int n = 0; n < N; n++) {
-        std::vector<float> pol(pol_flat.begin() + n * action_size,
-                               pol_flat.begin() + (n + 1) * action_size);
-        results[n].policy = std::move(pol);
-        results[n].value  = val_flat[n];
-        results[n].score  = scr_flat[n];
+        results[n].policy.assign(pol_flat.begin() + n * action_size,
+                                 pol_flat.begin() + (n + 1) * action_size);
+        results[n].value    = val_flat[n];
+        results[n].score    = scr_flat[n];
+        results[n].score_sd = scr_sd_flat[n];
+        results[n].ownership.assign(own_flat.begin() + n * HW,
+                                    own_flat.begin() + (n + 1) * HW);
     }
     return results;
 }

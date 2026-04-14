@@ -3,7 +3,9 @@
 Miniature AlphaZero Go engine modelled on KataGo's architecture:
 multi-threaded MCTS with per-leaf blocking evaluation + a KataGo-style
 `NNEvaluator` server that batches leaf evaluations into one GPU call.
-Triple-headed neural network: **policy** (move probabilities) + **value** (win/loss) + **score** (point margin estimation, like KataGo's score head).
+KataGo-style 7-headed neural network with 5 inference heads (policy,
+value W/L/D, scoreMean, scoreStdev, ownership) and 2 training-only
+auxiliary heads (score belief, opponent policy).
 Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple Silicon).
 
 **Inference backends** (compile-time selectable):
@@ -20,6 +22,51 @@ a `ComputeHandle` on its assigned GPU.  All threads drain from a single shared q
 Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching KataGo's pattern.
 
 **Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency)
+
+### Neural network architecture
+
+KataGo-style 7-headed design.  Two architectures (ResNet, ViT) share the
+same head structure.  5 heads are exported to ONNX for inference; 2 are
+training-only auxiliaries that shape the trunk's internal representations.
+
+**Inference heads (in ONNX):**
+
+| Head | Shape | Purpose |
+|------|-------|---------|
+| Policy | `[B, action_size]` | Move probability distribution (soft CE against MCTS visits) |
+| Value | `[B, 3]` → `[B, 1]` | W/L/D logits → P(win)-P(loss) via softmax (post-processed in ONNX) |
+| ScoreMean | `[B, 1]` | Expected final score in points (MSE regression) |
+| ScoreStdev | `[B, 1]` | Score uncertainty (softplus, MSE against `|actual-predicted|`) |
+| Ownership | `[B, board²]` | Per-intersection territory probability (sigmoid, BCE) |
+
+**Training-only heads (in .pt checkpoint, stripped from ONNX):**
+
+| Head | Shape | Purpose |
+|------|-------|---------|
+| Score Belief | `[B, num_bins]` | Score distribution (soft Gaussian target, CE) |
+| Opponent Policy | `[B, action_size]` | Opponent's next move prediction (CE) |
+
+**MCTS utility formula:**
+```
+utility = win_loss_weight × (P(win) - P(loss))
+        + score_weight × atan(scoreMean / score_scale) / (π/2)
+```
+
+All loss weights and MCTS utility weights are individually configurable
+via CLI arguments, `plan.json` defaults, and per-stage overrides.
+
+### Selfplay data format
+
+Binary V2 format with ownership and opponent action:
+```
+Header: [magic: 0x4D47] [version: 2] [count: i32] [board_size: i32]
+Per record:
+  [state_size: i32] [state: f32×S]
+  [policy_size: i32] [policy: f32×P]
+  [value: f32] [score: f32]
+  [ownership: f32×board²]
+  [opponent_action: i32]
+```
 
 ## Prerequisites
 
@@ -223,6 +270,12 @@ training epochs, learning rate, and evaluation games for gating.  Early stages
 use fewer sims and no gating for fast exploration; later stages increase data
 quality and enable gating to ensure only stronger models are promoted.
 
+Per-stage overrides also control all **loss weights** (7 training head
+weights) and **MCTS utility weights** (`win_loss_weight`, `score_weight`,
+`score_scale`).  These escalate across stages — e.g. `score_weight` starts
+at 0 (ignore score during bootstrap) and increases to 0.1+ in late stages
+once the score head is reliable.
+
 The three main presets are different training schedules — all three work
 with any model size (override with `--filters`/`--blocks`):
 
@@ -330,6 +383,7 @@ for movement.
 | Typed coord (e.g. `D4`) | Jump cursor + place stone |
 | `p` (lowercase) | Pass |
 | `a` | Toggle analysis HUD (live evaluation display) |
+| `o` | Toggle ownership overlay (+/- territory markers on the board) |
 | `P` (Shift+P) | Toggle pondering (background search) |
 | `r` | Restart game / refresh screen |
 | `q` | Quit |
@@ -382,11 +436,14 @@ Notes:
 
 **Example HUD output** (analyze state, HvAI, mid-game):
 ```
-WR 65.0%  Score +5.3  N=1234
+WR 65.0%  Score +5.3 +/- 2.1  N=1234
 | D5   65.0% n=523
 | E3   22.1% n=234
 | C6   12.4% n=128
 ```
+
+The score shows the expected point margin ± standard deviation from the
+neural network's scoreMean and scoreStdev heads.
 The number of top moves shown is set by `--pvs K` (default 5).
 
 When pondering without analysis (P only, A off), the panel shows a
