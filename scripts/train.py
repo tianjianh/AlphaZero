@@ -250,6 +250,10 @@ def main():
                         help="Loss weight for score belief CE (soft Gaussian)")
     parser.add_argument("--opp-policy-weight", type=float, default=0.15,
                         help="Loss weight for opponent policy CE")
+    parser.add_argument("--score-scale", type=float, default=20.0,
+                        help="Score loss normalization: divide scoreMean/Stdev "
+                             "MSE targets by this (points). Default 20 ≈ 2σ "
+                             "of game scores for 9x9.")
     parser.add_argument("--fp8", action="store_true",
                         help="Use FP8 training via NVIDIA Transformer Engine (Blackwell+)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
@@ -468,13 +472,17 @@ def main():
                 # 2. Value: 3-class CE (win/loss/draw)
                 value_loss = F.cross_entropy(pred_value, value_target)
 
-                # 3. ScoreMean: MSE regression
-                score_mean_loss = F.mse_loss(pred_score_mean.squeeze(1), scores)
+                # 3. ScoreMean: MSE regression, scaled to keep loss O(1)
+                # MSE is in points² so we divide by score_scale² (KataGo approach).
+                # Equivalent to normalizing inputs but better for AMP precision.
+                sc_scale_sq = args.score_scale * args.score_scale
+                score_mean_loss = F.mse_loss(pred_score_mean.squeeze(1), scores) / sc_scale_sq
 
-                # 4. ScoreStdev: MSE against |actual - predicted_mean|
+                # 4. ScoreStdev: MSE against |actual - predicted_mean| (scaled)
                 with torch.no_grad():
                     stdev_target = (scores - pred_score_mean.squeeze(1).detach()).abs()
-                score_stdev_loss = F.mse_loss(pred_score_stdev.squeeze(1), stdev_target)
+                score_stdev_loss = F.mse_loss(pred_score_stdev.squeeze(1),
+                                              stdev_target) / sc_scale_sq
 
                 # 5. Ownership: per-intersection BCE
                 ownership_loss = F.binary_cross_entropy_with_logits(

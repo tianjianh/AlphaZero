@@ -418,7 +418,10 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "temp_threshold": temp_threshold,
             "win_loss_weight": 1.0,
             "score_weight": score_weight,
-            "score_scale": 10.0,
+            "score_scale": 20.0,  # shared: MCTS utility atan compression
+                                  # AND training loss normalization (points²).
+                                  # ≈ 2σ of final scores for 9x9; scale with
+                                  # board size for 13x13/19x19.
         },
         "stages": generate_stages(preset, board, filters, blocks, arch),
     }
@@ -945,6 +948,7 @@ def cmd_train(args):
                 "--ownership-weight", str(st["ownership_weight"]),
                 "--score-belief-weight", str(st["score_belief_weight"]),
                 "--opp-policy-weight", str(st["opp_policy_weight"]),
+                "--score-scale", str(smc["score_scale"]),
             ] + (["--fp8"] if st.get("fp8", False) else [])
             if arch == "vit":
                 train_args += [
