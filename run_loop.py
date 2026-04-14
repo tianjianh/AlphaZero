@@ -198,27 +198,30 @@ def _stage(name, start, end, games, sims, epochs, lr, eval_games,
     return d
 
 # Per-stage exploration schedule (explore→exploit as model strengthens)
-#                    score_wt  smn_wt  window  c_puct  temp  dir_eps
+# smn_wt is applied to raw MSE in points² — keep small (0.001-0.01).
+# Early stages: very small smn_wt to avoid noisy early-score gradients
+# dominating.  Late stages: raise smn_wt so score head sharpens.
+#                    score_wt  smn_wt   window  c_puct  temp  dir_eps
 _EXPLORE = [
     # Bootstrap:     aggressive explore — network is random
-    (0.0,   0.05,    3,      2.0,    20,   0.30),
+    (0.0,    0.002,    3,      2.0,    20,   0.30),
     # Warm up:       still exploring, score head too noisy
-    (0.0,   0.05,    3,      1.75,   18,   0.28),
+    (0.0,    0.002,    3,      1.75,   18,   0.28),
     # Early gated:   tiny score, keep exploring
-    (0.02,  0.1,     4,      1.5,    15,   0.25),
+    (0.02,   0.005,    4,      1.5,    15,   0.25),
     # Consolidate:   still exploring — model needs diverse data
-    (0.02,  0.1,     6,      1.5,    15,   0.25),
+    (0.02,   0.005,    6,      1.5,    15,   0.25),
     # Steady:        start exploiting, score head becoming useful
-    (0.05,  0.15,    8,      1.25,   12,   0.22),
+    (0.05,   0.008,    8,      1.25,   12,   0.22),
     # Overnight:     moderate exploitation
-    (0.1,   0.2,     8,      1.1,    12,   0.20),
+    (0.1,    0.010,    8,      1.1,    12,   0.20),
 ]
 # xlarge preset uses wider sliding windows and stronger score weighting in
 # later stages — appropriate for 200-iter deep training runs.
 _EXPLORE_XLARGE = list(_EXPLORE)
-_EXPLORE_XLARGE[3] = (0.1, 0.5, 8, 1.25, 15, 0.22)
-_EXPLORE_XLARGE[4] = (0.15, 0.5, 10, 1.1, 12, 0.20)
-_EXPLORE_XLARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
+_EXPLORE_XLARGE[3] = (0.1,  0.015, 8,  1.25, 15, 0.22)
+_EXPLORE_XLARGE[4] = (0.15, 0.020, 10, 1.1,  12, 0.20)
+_EXPLORE_XLARGE[5] = (0.15, 0.020, 10, 1.1,  12, 0.20)
 
 # large preset (72 iters, ~2x small) — tuned separately from small:
 # wider early windows, escalating eval gating, slightly more exploration in
@@ -231,12 +234,12 @@ _EXPLORE_XLARGE[5] = (0.15, 0.5, 10, 1.1, 12, 0.20)
 # produce dramatically worse candidates (3-22% win rates observed in v1).
 _EXPLORE_LARGE = [
     # score_wt  smn_wt  window  c_puct  temp  dir_eps
-    (0.0,      0.05,   4,      2.0,    20,   0.30),  # 0 Bootstrap
-    (0.0,      0.05,   4,      1.75,   18,   0.28),  # 1 Warm up
-    (0.02,     0.1,    6,      1.5,    15,   0.25),  # 2 Early gated
-    (0.02,     0.1,    6,      1.5,    15,   0.25),  # 3 Consolidate
-    (0.10,     0.15,  10,      1.3,    12,   0.22),  # 4 Steady — sw 0.05→0.10, swl 0.12→0.15
-    (0.15,     0.20,  12,      1.25,   12,   0.20),  # 5 Overnight — sw 0.08→0.15, swl 0.15→0.20
+    (0.0,      0.002,  4,      2.0,    20,   0.30),  # 0 Bootstrap
+    (0.0,      0.002,  4,      1.75,   18,   0.28),  # 1 Warm up
+    (0.02,     0.005,  6,      1.5,    15,   0.25),  # 2 Early gated
+    (0.02,     0.005,  6,      1.5,    15,   0.25),  # 3 Consolidate
+    (0.10,     0.010, 10,      1.3,    12,   0.22),  # 4 Steady
+    (0.15,     0.015, 12,      1.25,   12,   0.20),  # 5 Overnight
 ]
 # Progressive eval gating: weak candidates pass easily early, strict late.
 _EVAL_TH_LARGE = [None, None, 0.53, 0.54, 0.55, 0.55]
@@ -259,20 +262,20 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
     # to an exploitative overnight phase.
     if preset == "small":
         if vit:
-            #        score_wt swl    win  cpuct temp  eps
+            #        score_wt smn_wt  win  cpuct temp  eps
             return [
                 _stage("Bootstrap",       1,  4,  500, 256, 3, lrs[0], 0,
-                       0.0,  0.05, 3,  2.0,  20, 0.30),
+                       0.0,  0.002, 3,  2.0,  20, 0.30),
                 _stage("Warm up",         5,  8,  700, 384, 3, lrs[1], 0,
-                       0.0,  0.05, 4,  1.75, 18, 0.28),
+                       0.0,  0.002, 4,  1.75, 18, 0.28),
                 _stage("Early gated",     9, 14, 1000, 512, 4, lrs[2], 120,
-                       0.02, 0.08, 4,  1.5,  15, 0.25),
+                       0.02, 0.004, 4,  1.5,  15, 0.25),
                 _stage("Consolidate",    15, 22, 1200, 512, 5, lrs[3], 200,
-                       0.03, 0.10, 6,  1.4,  14, 0.23),
+                       0.03, 0.006, 6,  1.4,  14, 0.23),
                 _stage("Steady improve", 23, 32, 1400, 640, 5, lrs[4], 240,
-                       0.05, 0.12, 8,  1.25, 12, 0.20),
+                       0.05, 0.008, 8,  1.25, 12, 0.20),
                 _stage("Overnight extend",33,48, 1600, 768, 5, lrs[5], 240,
-                       0.08, 0.15, 8,  1.1,  10, 0.18),
+                       0.08, 0.012, 8,  1.1,  10, 0.18),
             ]
         ex = _EXPLORE
         ep = [3, 3, 3, 4, 5, 5]
@@ -301,17 +304,17 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
             lrs_v[5] = "1e-4"
             return [
                 _stage("Bootstrap",       1,  4,  500, 256, 3, lrs_v[0], 0,
-                       0.0,  0.05, 3,  2.0,  20, 0.30),
+                       0.0,  0.002, 3,  2.0,  20, 0.30),
                 _stage("Warm up",         5,  8,  700, 384, 3, lrs_v[1], 0,
-                       0.0,  0.05, 4,  1.75, 18, 0.28),
+                       0.0,  0.002, 4,  1.75, 18, 0.28),
                 _stage("Early gated",     9, 14, 1000, 512, 4, lrs_v[2], 120,
-                       0.02, 0.08, 4,  1.5,  15, 0.25),
+                       0.02, 0.004, 4,  1.5,  15, 0.25),
                 _stage("Consolidate",    15, 24, 1300, 576, 5, lrs_v[3], 200,
-                       0.03, 0.10, 6,  1.4,  14, 0.23),
+                       0.03, 0.006, 6,  1.4,  14, 0.23),
                 _stage("Steady improve", 25, 40, 1500, 700, 5, lrs_v[4], 240,
-                       0.05, 0.12, 10, 1.25, 12, 0.20),
+                       0.05, 0.010, 10, 1.25, 12, 0.20),
                 _stage("Overnight extend",41, 72, 1700, 800, 3, lrs_v[5], 240,
-                       0.08, 0.15, 12, 1.1,  10, 0.18),
+                       0.08, 0.015, 12, 1.1,  10, 0.18),
             ]
         ex = _EXPLORE_LARGE
         et = _EVAL_TH_LARGE
@@ -401,13 +404,17 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "batch_size": batch_size,
             "window_size": window,
             "eval_threshold": eval_threshold,
+            # Weights chosen for balanced weighted contributions mid-training:
+            # policy ~3.0 (dominant), value ~1.0, auxiliaries 0.05–0.5.
+            # scoreMean/Stdev weights are small because raw MSE is in points²
+            # (typical magnitude 20-100).  Matches KataGo's design ratios.
             "policy_weight": 1.0,
             "value_weight": 1.5,
-            "score_mean_weight": 0.15 if arch == "vit" else 0.1,
-            "score_stdev_weight": 0.5,
-            "ownership_weight": 0.02,
-            "score_belief_weight": 0.15,
-            "opp_policy_weight": 0.15,
+            "score_mean_weight": 0.005,
+            "score_stdev_weight": 0.005,
+            "ownership_weight": 1.5,
+            "score_belief_weight": 0.02,
+            "opp_policy_weight": 0.1,
             "fp8": False,
         },
         "mcts": {
@@ -418,10 +425,10 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "temp_threshold": temp_threshold,
             "win_loss_weight": 1.0,
             "score_weight": score_weight,
-            "score_scale": 20.0,  # shared: MCTS utility atan compression
-                                  # AND training loss normalization (points²).
-                                  # ≈ 2σ of final scores for 9x9; scale with
-                                  # board size for 13x13/19x19.
+            "score_scale": 10.0,  # MCTS utility atan compression only.
+                                  # score_utility = atan(score/10)/(π/2).
+                                  # Training loss uses raw points²; weights
+                                  # are small to compensate (KataGo-style).
         },
         "stages": generate_stages(preset, board, filters, blocks, arch),
     }
@@ -948,7 +955,6 @@ def cmd_train(args):
                 "--ownership-weight", str(st["ownership_weight"]),
                 "--score-belief-weight", str(st["score_belief_weight"]),
                 "--opp-policy-weight", str(st["opp_policy_weight"]),
-                "--score-scale", str(smc["score_scale"]),
             ] + (["--fp8"] if st.get("fp8", False) else [])
             if arch == "vit":
                 train_args += [

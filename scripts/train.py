@@ -236,24 +236,29 @@ def main():
     parser.add_argument("--num-workers", type=int, default=8,
                         help="DataLoader workers for prefetching (default: 8)")
     # --- All 7 loss weights ---
+    # Loss weights.  Designed so mid-training weighted contributions are
+    # balanced: policy ~3.0 (dominant), value ~1.0, auxiliaries 0.1-0.5.
+    # scoreMean/Stdev weights are small because their raw MSE is in
+    # points² (typical magnitude 20-100), matching KataGo's approach.
     parser.add_argument("--policy-weight", type=float, default=1.0,
-                        help="Loss weight for policy cross-entropy")
+                        help="Loss weight for policy CE (KataGo: 1.0)")
     parser.add_argument("--value-weight", type=float, default=1.5,
-                        help="Loss weight for value cross-entropy (W/L/D)")
-    parser.add_argument("--score-mean-weight", type=float, default=0.5,
-                        help="Loss weight for score mean MSE")
-    parser.add_argument("--score-stdev-weight", type=float, default=0.5,
-                        help="Loss weight for score stdev MSE")
-    parser.add_argument("--ownership-weight", type=float, default=0.02,
-                        help="Loss weight for ownership BCE (~1.5/board² for 9x9)")
-    parser.add_argument("--score-belief-weight", type=float, default=0.15,
-                        help="Loss weight for score belief CE (soft Gaussian)")
-    parser.add_argument("--opp-policy-weight", type=float, default=0.15,
-                        help="Loss weight for opponent policy CE")
-    parser.add_argument("--score-scale", type=float, default=20.0,
-                        help="Score loss normalization: divide scoreMean/Stdev "
-                             "MSE targets by this (points). Default 20 ≈ 2σ "
-                             "of game scores for 9x9.")
+                        help="Loss weight for value CE W/L/D (KataGo: 1.5)")
+    parser.add_argument("--score-mean-weight", type=float, default=0.005,
+                        help="Loss weight for scoreMean MSE in points² "
+                             "(~25 raw × 0.005 = 0.125 weighted)")
+    parser.add_argument("--score-stdev-weight", type=float, default=0.005,
+                        help="Loss weight for scoreStdev MSE in points² "
+                             "(~12 raw × 0.005 = 0.06 weighted)")
+    parser.add_argument("--ownership-weight", type=float, default=1.5,
+                        help="Loss weight for ownership BCE per-intersection "
+                             "mean (~0.3 × 1.5 = 0.45 weighted; matches KataGo)")
+    parser.add_argument("--score-belief-weight", type=float, default=0.02,
+                        help="Loss weight for score belief CE (soft Gaussian; "
+                             "~3 × 0.02 = 0.06 weighted, matches KataGo)")
+    parser.add_argument("--opp-policy-weight", type=float, default=0.1,
+                        help="Loss weight for opponent policy CE "
+                             "(~3 × 0.1 = 0.3 weighted)")
     parser.add_argument("--fp8", action="store_true",
                         help="Use FP8 training via NVIDIA Transformer Engine (Blackwell+)")
     parser.add_argument("--output-onnx", default="models/model.onnx")
@@ -472,17 +477,14 @@ def main():
                 # 2. Value: 3-class CE (win/loss/draw)
                 value_loss = F.cross_entropy(pred_value, value_target)
 
-                # 3. ScoreMean: MSE regression, scaled to keep loss O(1)
-                # MSE is in points² so we divide by score_scale² (KataGo approach).
-                # Equivalent to normalizing inputs but better for AMP precision.
-                sc_scale_sq = args.score_scale * args.score_scale
-                score_mean_loss = F.mse_loss(pred_score_mean.squeeze(1), scores) / sc_scale_sq
+                # 3. ScoreMean: raw MSE in points² (weight is small to compensate,
+                # matching KataGo — scale absorbed into weight, not the loss).
+                score_mean_loss = F.mse_loss(pred_score_mean.squeeze(1), scores)
 
-                # 4. ScoreStdev: MSE against |actual - predicted_mean| (scaled)
+                # 4. ScoreStdev: raw MSE against |actual - predicted_mean|
                 with torch.no_grad():
                     stdev_target = (scores - pred_score_mean.squeeze(1).detach()).abs()
-                score_stdev_loss = F.mse_loss(pred_score_stdev.squeeze(1),
-                                              stdev_target) / sc_scale_sq
+                score_stdev_loss = F.mse_loss(pred_score_stdev.squeeze(1), stdev_target)
 
                 # 5. Ownership: per-intersection BCE
                 ownership_loss = F.binary_cross_entropy_with_logits(
