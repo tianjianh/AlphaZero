@@ -785,9 +785,28 @@ def cmd_train(args):
     mc = plan["mcts"]
     arch = m["arch"]
 
-    # Apply komi override
+    # Apply CLI overrides to plan defaults.  These modify plan["training"]
+    # and plan["mcts"] dicts in place so that get_stage_config() sees the
+    # override as the base default for all subsequent stages.  Per-stage
+    # overrides in the plan still take precedence over these CLI overrides.
     if args.komi is not None:
         mc["komi"] = args.komi
+
+    # Training loss weight overrides (all 7)
+    for key in ("policy_weight", "value_weight", "score_mean_weight",
+                "score_stdev_weight", "ownership_weight",
+                "score_belief_weight", "opp_policy_weight"):
+        val = getattr(args, key, None)
+        if val is not None:
+            t[key] = val
+            log(f"CLI override: training.{key} = {val}")
+
+    # MCTS utility weight overrides (all 3)
+    for key in ("win_loss_weight", "score_weight", "score_scale"):
+        val = getattr(args, key, None)
+        if val is not None:
+            mc[key] = val
+            log(f"CLI override: mcts.{key} = {val}")
 
     total_iters = get_total_iterations(plan)
     if state["pipeline_iter"] >= total_iters:
@@ -1142,6 +1161,21 @@ def main():
                          help="Max iterations to run this session")
     p_train.add_argument("--komi", type=float, default=None,
                          help="Override komi from training plan")
+
+    # Loss weight CLI overrides (override plan.json training defaults;
+    # per-stage settings in the plan still take precedence over these).
+    p_train.add_argument("--policy-weight", type=float, default=None)
+    p_train.add_argument("--value-weight", type=float, default=None)
+    p_train.add_argument("--score-mean-weight", type=float, default=None)
+    p_train.add_argument("--score-stdev-weight", type=float, default=None)
+    p_train.add_argument("--ownership-weight", type=float, default=None)
+    p_train.add_argument("--score-belief-weight", type=float, default=None)
+    p_train.add_argument("--opp-policy-weight", type=float, default=None)
+
+    # MCTS utility weight CLI overrides
+    p_train.add_argument("--win-loss-weight", type=float, default=None)
+    p_train.add_argument("--score-weight", type=float, default=None)
+    p_train.add_argument("--score-scale", type=float, default=None)
 
     # ── status ──
     sub.add_parser("status", help="Show training progress")
