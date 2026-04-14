@@ -986,18 +986,81 @@ Eigen/CUDA/OpenCL/Metal backends still contain the old AlphaZero-ResNet
 forward pass but throw at handle creation until hand-written kernels for
 SE/GPool blocks and global-pool heads are added (see `TODO.md`).
 
-Both share the same triple-headed output:
+Both architectures share 7 output heads (KataGo-style).  4 drive MCTS at
+inference time and are exported to ONNX; 3 are training-only auxiliaries
+that shape the trunk's internal representations but are never evaluated
+during inference (stripped from the `.onnx` file to save model size and
+compute).
 
-| Head | Model output | ONNX post-processing | Training loss |
-|------|-------------|----------------------|---------------|
-| **Policy** | `[B, 82]` logits | (none — C++ applies softmax) | Cross-entropy with MCTS visit distribution |
-| **Value** | `[B, 1]` tanh → [-1, 1] | (none) | MSE (targets: {-1, 0, 1}) |
-| **Score** | `[B, num_bins]` logits | softmax → expected value (raw points) | Cross-entropy over bins (num_bins = board² × 2 + 1) |
+### Heads used by MCTS (exported to ONNX)
 
-The model's `forward()` returns raw logits (no activations).  The ONNX export
-appends post-processing ops to the graph so C++ inference receives the same
-shapes as before: policy `[B, 82]`, value `[B, 1]` in [-1,1], score `[B, 1]`
-in raw points.  Training applies MSE for value and CE for score.
+| Head | Model output | ONNX output | Training loss |
+|------|-------------|-------------|---------------|
+| **Policy** | `[B, 82]` logits | `policy_logits [B, 82]` | CE with soft MCTS visit distribution |
+| **Value** | `[B, 3]` logits (W/L/D) | `value [B, 1]` = P(win)−P(loss) | CE over {win, loss, draw}, weight 1.5 |
+| **ScoreMean** | `[B, 1]` raw float | `score_mean [B, 1]` (points) | MSE vs actual game score, weight 0.5 |
+| **ScoreStdev** | `[B, 1]` softplus | `score_stdev [B, 1]` (points) | MSE vs |actual−predicted|, weight 0.5 |
+
+The value head predicts a 3-class distribution: P(win), P(loss), P(draw).
+The ONNX export appends `softmax → P(win) − P(loss)` post-processing so
+C++ receives `value [B, 1]` in [-1, +1] as before.  ScoreMean is a direct
+regression of the final score margin (in points, from the current player's
+perspective) — replaces the old 163-bin classification, which suffered from
+hard one-hot targets and stagnant training loss.  ScoreStdev captures the
+model's uncertainty about its score estimate.
+
+### Training-only auxiliary heads (NOT in ONNX)
+
+| Head | Model output | Training loss | Weight |
+|------|-------------|---------------|--------|
+| **Ownership** | `[B, board²]` sigmoid | BCE per intersection | 1.5 / board² |
+| **Score Belief** | `[B, num_bins]` logits | CE with soft Gaussian target (σ≈3) | 0.15 |
+| **Opponent Policy** | `[B, action_size]` logits | CE vs opponent's next move | 0.15 |
+
+**Ownership** is the most impactful auxiliary: it gives every trunk block
+per-intersection territory supervision ("you own D4 but lost E7"), which
+is far richer than the single-scalar game-outcome signal the value head
+provides.  Without it the model struggles to learn endgame territory
+concepts.  The ownership target comes from the game-end board state
+(reusing `GoGame::score()`'s existing flood-fill logic).
+
+**Score Belief** forces the trunk to represent score *uncertainty* — wide
+distributions in sharp tactical positions, narrow peaks in settled endgames.
+The target is a Gaussian centered on the actual game score, not a hard
+one-hot bin.  The resulting features help ScoreMean and Value be more
+accurate even though MCTS never reads the belief distribution itself.
+
+**Opponent Policy** teaches threat-awareness by predicting what the
+opponent plays next (available from the selfplay trajectory).  Lowest-
+impact auxiliary (~10-20 Elo in KataGo ablations) but nearly free.
+
+### MCTS Utility
+
+Each leaf evaluation produces a blended utility that MCTS backpropagates:
+
+```
+utility = winLossWeight × value
+        + scoreWeight   × atan(scoreMean / scoreScale) / (π/2)
+```
+
+- `value = P(win) − P(loss)` from the 3-class value head
+- `scoreMean` is the regression output (points, current player's perspective)
+- `atan` compression maps ±∞ → [-1, +1], preventing extreme scores from
+  dominating the utility
+- `winLossWeight` (default 1.0), `scoreWeight` (default 0.02, ramped up in
+  later training stages), `scoreScale` (default 10.0) are configurable
+
+The score signal teaches MCTS to prefer moves that **win by more points**,
+which prevents aimless play in won positions and teaches the model to close
+out games decisively.  Without it, MCTS treats "win by 1" and "win by 30"
+identically.
+
+### .pt vs .onnx
+
+The PyTorch checkpoint (`.pt`) contains all 7 heads — needed for training
+continuation.  The ONNX file (`.onnx`) contains only the 4 MCTS heads —
+this keeps inference fast and the model file small.  The 3 training-only
+heads add ~55K params to `.pt` but are stripped from `.onnx`.
 
 ### Precision
 
@@ -1023,11 +1086,9 @@ via TensorRT is automatic (no extra config needed).
   ladders, and edge awareness
 - *GQA*: 6 query heads, 2 KV groups (3 queries share each K/V group)
 
-The score head (inspired by KataGo) lets MCTS prefer moves that win by more
-points.  MCTS blends the two signals with KataGo-style atan compression:
-`utility = value + score_weight × atan(score / score_scale) / (π/2)`.
+See the **MCTS Utility** section above for how the score head drives search.
 `score_weight` (default 0.02) and `score_scale` (default 10.0) are
-configurable.  Set `score_weight` to 0 to disable score utility.
+configurable via CLI flags.  Set `score_weight` to 0 to disable score utility.
 
 **Komi** (compensation for white) defaults to **6.5** for 9×9 and is configurable
 via `--komi` in all executables and `PLAN_KOMI` in the training plan.
