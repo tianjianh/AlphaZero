@@ -31,20 +31,49 @@ training-only auxiliaries that shape the trunk's internal representations.
 
 **Inference heads (in ONNX):**
 
-| Head | Shape | Purpose |
-|------|-------|---------|
-| Policy | `[B, action_size]` | Move probability distribution (soft CE against MCTS visits) |
-| Value | `[B, 3]` → `[B, 1]` | W/L/D logits → P(win)-P(loss) via softmax (post-processed in ONNX) |
-| ScoreMean | `[B, 1]` | Expected final score in points (MSE regression) |
-| ScoreStdev | `[B, 1]` | Score uncertainty (softplus, MSE against `|actual-predicted|`) |
-| Ownership | `[B, board²]` | Per-intersection territory probability (sigmoid, BCE) |
+| Head | Shape | Activation | Loss | Target |
+|------|-------|------------|------|--------|
+| Policy | `[B, action_size]` | (logits) | soft CE | MCTS visit distribution |
+| Value | `[B, 3]` → `[B, 1]` | softmax → P(W)-P(L) | CE | one-hot {win=0, loss=1, draw=2} |
+| ScoreMean | `[B, 1]` | none | MSE in points² | actual game score (signed, current player) |
+| ScoreStdev | `[B, 1]` | softplus | MSE in points² | `\|actual − pred_mean.detach()\|` |
+| Ownership | `[B, board²]` | sigmoid | mean BCE | per-intersection {0, 1} from Tromp-Taylor scoring |
 
 **Training-only heads (in .pt checkpoint, stripped from ONNX):**
 
-| Head | Shape | Purpose |
-|------|-------|---------|
-| Score Belief | `[B, num_bins]` | Score distribution (soft Gaussian target, CE) |
-| Opponent Policy | `[B, action_size]` | Opponent's next move prediction (CE) |
+| Head | Shape | Activation | Loss | Target |
+|------|-------|------------|------|--------|
+| Score Belief | `[B, num_bins]` | softmax | soft CE | Gaussian centered on score, σ=3 (computed from score, not stored) |
+| Opponent Policy | `[B, action_size]` | (logits) | CE | next move from trajectory (masked if `-1`) |
+
+**Loss weights and target contributions**
+
+Weights are calibrated so that weighted contributions are balanced at
+mid-training: policy dominates (~3.0), value is a strong secondary
+(~1.0), and auxiliaries each contribute 0.05–0.5.  The overall loss
+sums to ~5.0 with no single auxiliary drowning out another.
+
+| Head | Default weight | Typical raw loss | Weighted | vs policy |
+|------|---------------:|-----------------:|---------:|----------:|
+| Policy | 1.000 | ~3.0 (log 82≈4.4 init) | **3.000** | 1.00 |
+| Value | 1.500 | ~0.7 (log 3≈1.1 init) | **1.050** | 0.35 |
+| Ownership | 1.500 | ~0.30 (mean BCE, log 2≈0.69 init) | **0.450** | 0.15 |
+| Opponent Policy | 0.100 | ~3.0 | **0.300** | 0.10 |
+| ScoreMean | 0.005 | ~25 points² mid-train (MSE) | **0.125** | 0.04 |
+| ScoreStdev | 0.005 | ~12 points² mid-train | **0.060** | 0.02 |
+| Score Belief | 0.020 | ~3 | **0.060** | 0.02 |
+| **Total** | | | **~5.0** | |
+
+**Why scoreMean/Stdev weights are tiny:** their raw MSE is in points²
+(not normalized) — typical magnitudes of 10–100.  KataGo uses the same
+approach (raw huber MSE with ~0.00015 coefficient); small weight
+compensates for large loss magnitude.
+
+**Why ownership weight is 1.5:** `F.binary_cross_entropy_with_logits`
+averages BCE over all intersections, returning ~0.3 mid-training.
+Weight 1.5 lifts the weighted contribution to 0.45, giving ownership
+the same gradient bandwidth as value.  KataGo uses `1.5 / board_area`
+with sum-reduction, which gives the same effective scale.
 
 **MCTS utility formula:**
 ```
@@ -52,8 +81,33 @@ utility = win_loss_weight × (P(win) - P(loss))
         + score_weight × atan(scoreMean / score_scale) / (π/2)
 ```
 
-All loss weights and MCTS utility weights are individually configurable
-via CLI arguments, `plan.json` defaults, and per-stage overrides.
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `win_loss_weight` | 1.0 | multiplier on P(win)-P(loss) term |
+| `score_weight` | 0.0 (bootstrap) → 0.1 (overnight) | how much MCTS values score predictions |
+| `score_scale` | 10.0 | atan compression: 5-point lead → `atan(0.5)/(π/2) ≈ 0.30` utility |
+
+**Configurability**
+
+All 7 loss weights and 3 MCTS weights are individually configurable
+three ways, with this precedence (high → low):
+
+1. **Per-stage override** in `plan.json` stages[]:
+   ```json
+   { "name": "Steady improve", ...,
+     "score_weight": 0.05, "ownership_weight": 2.0,
+     "score_mean_weight": 0.008, "win_loss_weight": 1.2 }
+   ```
+2. **CLI flag** to `run_loop.py train` (overrides plan default but not stage override):
+   ```bash
+   python run_loop.py train --policy-weight 2.0 --ownership-weight 3.0 \
+                            --score-scale 15.0
+   ```
+   Available flags: `--policy-weight`, `--value-weight`,
+   `--score-mean-weight`, `--score-stdev-weight`, `--ownership-weight`,
+   `--score-belief-weight`, `--opp-policy-weight`, `--win-loss-weight`,
+   `--score-weight`, `--score-scale`.
+3. **Plan defaults** in `plan.json` `training` / `mcts` sections.
 
 ### Selfplay data format
 
