@@ -157,7 +157,7 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
             // Return zero-logit policy so mask_policy's softmax produces
             // uniform priors over legal moves instead of crashing on an
             // empty vector.
-            int action_size = model_->board_size * model_->board_size + 1;
+            int action_size = model_->action_size;
             for (auto* buf : batch) {
                 std::lock_guard<std::mutex> lock(buf->mu);
                 buf->policy.assign(action_size, 0.0f);

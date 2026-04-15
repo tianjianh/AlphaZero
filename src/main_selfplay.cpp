@@ -5,6 +5,7 @@
 #include "compute_context.h"
 #include "nn_evaluator.h"
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -18,20 +19,23 @@ using namespace minigo;
 
 static void write_records(const std::string& path,
                            const std::vector<TrainingRecord>& records,
-                           int board_size) {
+                           int board_rows,
+                           int board_cols) {
     std::ofstream out(path, std::ios::binary);
 
-    // V2 header: [magic:u16][version:u16][count:i32][board_size:i32]
+    // V3 header: [magic:u16][version:u16][count:i32][rows:i32][cols:i32]
     uint16_t magic   = 0x4D47;  // 'MG'
-    uint16_t version = 2;
+    uint16_t version = 3;
     int32_t  n       = (int32_t)records.size();
-    int32_t  bs      = board_size;
+    int32_t  rows    = board_rows;
+    int32_t  cols    = board_cols;
     out.write(reinterpret_cast<const char*>(&magic), 2);
     out.write(reinterpret_cast<const char*>(&version), 2);
     out.write(reinterpret_cast<const char*>(&n), 4);
-    out.write(reinterpret_cast<const char*>(&bs), 4);
+    out.write(reinterpret_cast<const char*>(&rows), 4);
+    out.write(reinterpret_cast<const char*>(&cols), 4);
 
-    int board_sq = board_size * board_size;
+    int board_sq = board_rows * board_cols;
 
     for (auto& rec : records) {
         int32_t ss = (int32_t)rec.state.size();
@@ -42,7 +46,7 @@ static void write_records(const std::string& path,
         out.write(reinterpret_cast<const char*>(rec.policy.data()), ps * sizeof(float));
         out.write(reinterpret_cast<const char*>(&rec.value), sizeof(float));
         out.write(reinterpret_cast<const char*>(&rec.score), sizeof(float));
-        // V2 fields
+        // Trailing fields preserved for future targets/analysis.
         out.write(reinterpret_cast<const char*>(rec.ownership.data()), board_sq * sizeof(float));
         int32_t opp = rec.opponent_action;
         out.write(reinterpret_cast<const char*>(&opp), 4);
@@ -81,7 +85,6 @@ int main(int argc, char* argv[]) {
         else if (arg == "--dirichlet-alpha"   && i+1<argc) config.dirichlet_alpha = std::stof(argv[++i]);
         else if (arg == "--dirichlet-epsilon" && i+1<argc) config.dirichlet_epsilon = std::stof(argv[++i]);
         else if (arg == "--temp-threshold"    && i+1<argc) config.temperature_threshold = std::stoi(argv[++i]);
-        else if (arg == "--komi"             && i+1<argc) config.komi = std::stof(argv[++i]);
         else if (arg == "--win-loss-weight"   && i+1<argc) config.win_loss_weight = std::stof(argv[++i]);
         else if (arg == "--score-weight"     && i+1<argc) config.score_weight = std::stof(argv[++i]);
         else if (arg == "--score-scale"      && i+1<argc) config.score_scale = std::stof(argv[++i]);
@@ -98,13 +101,12 @@ int main(int argc, char* argv[]) {
                 << "  --output DIR            Output directory (default: training/selfplay)\n"
                 << "  --sims N                MCTS simulations per move (default: 800)\n"
                 << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
-                << "  --dirichlet-alpha F     Root noise concentration (default: 0.15 for 9x9)\n"
+                << "  --dirichlet-alpha F     Root noise concentration (default: 0.30)\n"
                 << "  --dirichlet-epsilon F   Root noise weight (default: 0.25)\n"
-                << "  --temp-threshold N      Moves of stochastic play (default: 15)\n"
-                << "  --komi F                Komi value (default: 6.5)\n"
+                << "  --temp-threshold N      Moves of stochastic play (default: 18)\n"
                 << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
-                << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
+                << "  --score-scale F         Score utility scale (default: 1000.0)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -131,14 +133,15 @@ int main(int argc, char* argv[]) {
     auto model = LoadedModel::load(model_path);
 
     config.model_type         = model->model_type;
-    config.board_size         = model->board_size;
+    config.board_rows         = model->board_rows;
+    config.board_cols         = model->board_cols;
     config.input_channels     = model->input_channels;
+    config.history_length     = std::max(1, (model->input_channels - 1) / 14);
     config.num_filters        = model->num_filters;
     config.num_res_blocks     = model->num_res_blocks;
     config.vit_depth          = model->vit_depth;
     config.vit_heads          = model->vit_heads;
     config.vit_kv_groups      = model->vit_kv_groups;
-    config.max_moves_per_game = config.board_size * config.board_size * 2;
     config.num_search_threads = search_threads;
 
     // Create compute context (device init — shared across server threads)
@@ -148,10 +151,10 @@ int main(int argc, char* argv[]) {
     auto nn_evaluator = std::make_shared<NNEvaluator>(
         model, context, device_ids, config.max_batch_size);
 
-    std::cout << "MiniGo C++ Self-Play\n"
-              << "  Board:            " << config.board_size << "x" << config.board_size << "\n"
+    std::cout << "MiniXiangqi Self-Play\n"
+              << "  Board:            " << config.board_rows << "x" << config.board_cols << "\n"
               << "  Arch:             " << config.model_type << "\n"
-              << "  Komi:             " << config.komi << "\n";
+              << "  History:          " << config.history_length << "\n";
     if (config.model_type == "vit")
         std::cout << "  d_model:          " << config.num_filters
                   << "  depth=" << config.vit_depth
@@ -190,11 +193,11 @@ int main(int argc, char* argv[]) {
             auto t1 = std::chrono::steady_clock::now();
 
             double secs = std::chrono::duration<double>(t1 - t0).count();
-            int moves   = (int)records.size() / 8;
+            int moves   = (int)records.size() / 2;
 
             std::string filename = output_dir + "/game_" +
                                    std::to_string(game_id) + ".bin";
-            write_records(filename, records, config.board_size);
+            write_records(filename, records, config.board_rows, config.board_cols);
 
             {
                 std::lock_guard<std::mutex> lock(print_mutex);

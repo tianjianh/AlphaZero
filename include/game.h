@@ -3,83 +3,109 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace minigo {
 
-enum Stone : int8_t { EMPTY = 0, BLACK = 1, WHITE = 2 };
+enum Stone : int8_t { EMPTY = 0, RED = 1, BLACK = 2, WHITE = BLACK };
 
-inline Stone opponent(Stone s) { return s == BLACK ? WHITE : BLACK; }
+inline Stone opponent(Stone s) { return s == RED ? BLACK : RED; }
 
-constexpr int MAX_BOARD = 19;
-constexpr int PASS_MOVE = -1;
+constexpr int BOARD_ROWS = 10;
+constexpr int BOARD_COLS = 9;
+constexpr int BOARD_AREA = BOARD_ROWS * BOARD_COLS;
+constexpr int MAX_GAME_MOVES = 512;
 
-class GoGame {
+enum Piece : int8_t {
+    NO_PIECE = 0,
+    RED_KING,
+    RED_ADVISOR,
+    RED_BISHOP,
+    RED_KNIGHT,
+    RED_ROOK,
+    RED_CANNON,
+    RED_PAWN,
+    BLACK_KING,
+    BLACK_ADVISOR,
+    BLACK_BISHOP,
+    BLACK_KNIGHT,
+    BLACK_ROOK,
+    BLACK_CANNON,
+    BLACK_PAWN,
+};
+
+class XiangqiGame {
 public:
-    GoGame(int board_size = 9, float komi = 7.5f, int history_length = 8);
+    explicit XiangqiGame(int history_length = 4);
 
-    // Core interface
     void reset();
-    GoGame copy() const;
+    XiangqiGame copy() const;
     bool is_legal(int action) const;
     void play(int action);
+    void force_draw();
 
-    // Info
     void get_legal_moves(std::vector<float>& legal) const;
     std::pair<float, float> score() const;
-
-    // Per-intersection ownership from current player's perspective.
-    // out[r*board_size+c] = 1.0 if owned by `player`, 0.0 otherwise.
-    // Neutral intersections (dame) = 0.0.  Uses Tromp-Taylor flood-fill.
     void get_ownership(Stone player, std::vector<float>& out) const;
-
-    // Neural network encoding: (input_channels, H, W) flattened row-major
     void encode(std::vector<float>& out) const;
 
-    // Display
     std::string display() const;
     std::string action_to_str(int action) const;
     int str_to_action(const std::string& s) const;
 
-    // State
-    int board_size;
-    float komi;
-    int history_length;
-    Stone current_player;
-    int move_count;
-    int last_move;
-    int consecutive_passes;
-    bool game_over;
-    Stone winner;
-    float final_black_score;   // bs - ws (komi included), set by score_game()
+    static constexpr int rows() { return BOARD_ROWS; }
+    static constexpr int cols() { return BOARD_COLS; }
+    static constexpr int area() { return BOARD_AREA; }
+    static constexpr int action_size() { return BOARD_AREA * BOARD_AREA; }
 
-    Stone board[MAX_BOARD][MAX_BOARD];
+    int board_rows = BOARD_ROWS;
+    int board_cols = BOARD_COLS;
+    int history_length = 4;
+    Stone current_player = RED;
+    int move_count = 0;
+    int last_move = -1;
+    bool game_over = false;
+    Stone winner = EMPTY;
+    float final_black_score = 0.0f;
+
+    int8_t board[BOARD_ROWS][BOARD_COLS] = {};
 
 private:
-    Stone prev_board[MAX_BOARD][MAX_BOARD];
-    bool has_prev_board;
+    static constexpr int PIECE_PLANES = 14;
+    static constexpr int RING_CAP = 16;
 
-    // ── Ring buffer for history boards ────────────────────────────────
-    // Replaces std::vector + erase(begin()) [O(n) memmove every play()].
-    // All slots are inline (no heap allocation) → copy() is a plain memcpy.
-    static constexpr int RING_CAP = 9;  // enough for history_length ≤ 8
-    std::array<std::array<int8_t, MAX_BOARD * MAX_BOARD>, RING_CAP> ring_buf_;
-    int ring_head_ = 0;   // index of oldest valid slot
-    int ring_size_ = 0;   // number of valid entries (0 … history_length)
+    std::array<std::array<int8_t, BOARD_AREA>, RING_CAP> ring_buf_{};
+    int ring_head_ = 0;
+    int ring_size_ = 0;
+    std::array<uint64_t, MAX_GAME_MOVES + 1> position_hashes_{};
+    int position_hash_count_ = 0;
 
-    struct Pos { int r, c; };
-    // Stack-based group helpers — out_group is a caller-supplied buffer
-    // sized for the worst case (`MAX_BOARD * MAX_BOARD`).  Avoids the
-    // per-call heap allocation that std::vector<Pos> incurred in the
-    // hot is_legal/play/score loops.
-    int  get_group(int r, int c, Pos* out_group, int& liberties) const;
-    int  get_group_on(const Stone brd[][MAX_BOARD], int r, int c,
-                      Pos* out_group, int& liberties) const;
-    void remove_group(const Pos* group, int n);
-    void neighbors(int r, int c, Pos* nbrs, int& count) const;
-    bool is_legal_at_slow(int r, int c) const;
+    static bool in_bounds(int r, int c);
+    static bool in_red_palace(int r, int c);
+    static bool in_black_palace(int r, int c);
+    static bool in_palace(Stone side, int r, int c);
+    static bool crossed_river(Stone side, int r);
+    static int piece_type(int8_t piece);
+    static Stone piece_color(int8_t piece);
+    static bool is_side_piece(int8_t piece, Stone side);
+    static char piece_to_char(int8_t piece);
+    static int encode_action(int src, int dst) { return src * BOARD_AREA + dst; }
+    static int sq_index(int r, int c) { return r * BOARD_COLS + c; }
+    static int action_src(int action) { return action / BOARD_AREA; }
+    static int action_dst(int action) { return action % BOARD_AREA; }
+
+    bool is_pseudo_legal(int sr, int sc, int dr, int dc) const;
+    void apply_move_unchecked(int sr, int sc, int dr, int dc, int8_t& captured);
+    void undo_move_unchecked(int sr, int sc, int dr, int dc, int8_t captured);
+    bool is_square_attacked(int r, int c, Stone by) const;
+    bool has_any_legal_move(Stone side) const;
+    bool is_threefold_repetition() const;
+    uint64_t compute_hash() const;
     void update_history();
     void score_game();
 };
+
+using GoGame = XiangqiGame;
 
 }  // namespace minigo

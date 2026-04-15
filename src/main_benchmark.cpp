@@ -7,6 +7,7 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -29,7 +30,6 @@ int main(int argc, char* argv[]) {
     std::string model_path  = "models/best.onnx";
     int  num_games          = 5;
     int  nn_iters           = 1000;
-    int  board_override     = -1;
     int  num_threads        = 1;
     int  search_threads     = 16;
     int  nn_server_threads  = 1;
@@ -38,14 +38,13 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if      (arg == "--model"             && i+1<argc) model_path      = argv[++i];
-        else if (arg == "--board"             && i+1<argc) board_override  = std::stoi(argv[++i]);
         else if (arg == "--sims"              && i+1<argc) config.num_simulations = std::stoi(argv[++i]);
         else if (arg == "--nn-iters"          && i+1<argc) nn_iters        = std::stoi(argv[++i]);
         else if (arg == "--games"             && i+1<argc) num_games       = std::stoi(argv[++i]);
         else if (arg == "--threads"           && i+1<argc) num_threads     = std::stoi(argv[++i]);
         else if (arg == "--search-threads"    && i+1<argc) search_threads  = std::stoi(argv[++i]);
         else if (arg == "--max-batch"         && i+1<argc) config.max_batch_size = std::stoi(argv[++i]);
-        else if (arg == "--komi"              && i+1<argc) config.komi = std::stof(argv[++i]);
+        else if (arg == "--c-puct"            && i+1<argc) config.c_puct = std::stof(argv[++i]);
         else if (arg == "--win-loss-weight"   && i+1<argc) config.win_loss_weight = std::stof(argv[++i]);
         else if (arg == "--score-weight"      && i+1<argc) config.score_weight = std::stof(argv[++i]);
         else if (arg == "--score-scale"       && i+1<argc) config.score_scale = std::stof(argv[++i]);
@@ -54,17 +53,16 @@ int main(int argc, char* argv[]) {
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: benchmark [options]\n"
                       << "  --model PATH            Model file (default: models/best.onnx)\n"
-                      << "  --board N               Board size override\n"
-                      << "  --sims N                MCTS simulations\n"
+                      << "  --sims N                MCTS simulations (default: 800)\n"
                       << "  --nn-iters N            NN inference iterations (default: 1000)\n"
                       << "  --games N               Self-play games (default: 5)\n"
                       << "  --threads N             Self-play worker threads (default: 1)\n"
                       << "  --search-threads N      MCTS search threads per move (default: 16)\n"
                       << "  --max-batch N           Max GPU batch size (default: 256)\n"
-                      << "  --komi F                Komi value (default: 6.5)\n"
+                      << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
                       << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                       << "  --score-weight F        Score utility weight (default: 0.0)\n"
-                      << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
+                      << "  --score-scale F         Score utility scale (default: 1000.0)\n"
                       << "  --nn-server-threads N   NN server threads (default: 1)\n"
                       << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -94,7 +92,9 @@ int main(int argc, char* argv[]) {
         context = std::shared_ptr<ComputeContext>(create_compute_context(device_ids));
         has_model = true;
         config.model_type      = model->model_type;
-        config.board_size      = model->board_size;
+        config.board_rows      = model->board_rows;
+        config.board_cols      = model->board_cols;
+        config.history_length  = std::max(1, (model->input_channels - 1) / 14);
         config.input_channels  = model->input_channels;
         config.num_filters     = model->num_filters;
         config.num_res_blocks  = model->num_res_blocks;
@@ -105,12 +105,9 @@ int main(int argc, char* argv[]) {
         std::cout << "No model loaded — NN/MCTS benchmarks will be skipped.\n";
     }
 
-    if (board_override > 0) config.board_size = board_override;
-    config.max_moves_per_game = config.board_size * config.board_size * 2;
-
-    std::cout << "MiniGo C++ Benchmark\n"
-              << "  Board: " << config.board_size << "x" << config.board_size
-              << "  Komi: " << config.komi
+    std::cout << "MiniXiangqi Benchmark\n"
+              << "  Board: " << config.board_rows << "x" << config.board_cols
+              << "  c_puct: " << config.c_puct
               << "  WinLoss wt: " << config.win_loss_weight
               << "  Score wt: " << config.score_weight
               << "  Score sc: " << config.score_scale;
@@ -125,14 +122,13 @@ int main(int argc, char* argv[]) {
         auto t0 = std::chrono::steady_clock::now();
 
         for (int g = 0; g < 10000; g++) {
-            GoGame game(config.board_size, config.komi);
+            GoGame game(config.history_length);
             while (!game.game_over && game.move_count < config.max_moves_per_game) {
                 std::vector<float> legal;
                 game.get_legal_moves(legal);
                 for (int a = 0; a < (int)legal.size(); a++) {
                     if (legal[a] > 0.0f) {
-                        if (a == config.action_size() - 1) game.play(PASS_MOVE);
-                        else game.play(a);
+                        game.play(a);
                         total_moves++;
                         break;
                     }
@@ -160,7 +156,7 @@ int main(int argc, char* argv[]) {
     {
         std::cout << "2. NN inference, single-thread (" << context->backend_name() << ")...\n";
 
-        GoGame game(config.board_size, config.komi);
+        GoGame game(config.history_length);
         std::vector<float> state;
         game.encode(state);
 
@@ -183,7 +179,7 @@ int main(int argc, char* argv[]) {
     {
         std::cout << "3. Batch NN inference throughput...\n";
 
-        GoGame game(config.board_size, config.komi);
+        GoGame game(config.history_length);
         std::vector<float> state;
         game.encode(state);
 
@@ -215,7 +211,7 @@ int main(int argc, char* argv[]) {
 
         config.num_search_threads = 1;
         MCTS mcts(eval_single.get(), config);
-        GoGame game(config.board_size, config.komi);
+        GoGame game(config.history_length);
 
         auto t0 = std::chrono::steady_clock::now();
         std::vector<float> pi;

@@ -191,10 +191,7 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
                 child->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
                 path.push_back(child);
                 int action = child->action;
-                if (action == action_size - 1)
-                    game_copy_ptr->play(PASS_MOVE);
-                else
-                    game_copy_ptr->play(action);
+                game_copy_ptr->play(action);
                 node = child;
 
             } else if (st == NODE_EXPANDING) {
@@ -313,10 +310,7 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
                 node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
                 leaf.path.push_back(node);
                 int action = node->action;
-                if (action == action_size - 1)
-                    game_copy_ptr->play(PASS_MOVE);
-                else
-                    game_copy_ptr->play(action);
+                game_copy_ptr->play(action);
             }
 
             if (!node) {
@@ -610,60 +604,59 @@ static void augment_sample(const std::vector<float>& state,
                            float value, float score,
                            const std::vector<float>& ownership,
                            int opponent_action,
-                           int board_size, int input_channels,
+                           int board_rows, int board_cols,
+                           int input_channels,
                            std::vector<TrainingRecord>& out) {
-    int n  = board_size;
-    int hw = n * n;
-    int action_size = hw + 1;
-    float pass_prob = policy[hw];
+    int area = board_rows * board_cols;
+    int action_size = area * area;
 
-    for (int rot = 0; rot < 4; rot++) {
-        for (int flip = 0; flip < 2; flip++) {
-            TrainingRecord rec;
-            rec.state.resize((size_t)input_channels * hw);
-            rec.policy.resize(action_size);
-            rec.ownership.resize(hw);
-            rec.value = value;
-            rec.score = score;
+    auto mirror_sq = [&](int sq) {
+        int r = sq / board_cols;
+        int c = sq % board_cols;
+        return r * board_cols + (board_cols - 1 - c);
+    };
 
-            auto transform = [&](int r, int c) -> std::pair<int,int> {
-                int tr = r, tc = c;
-                for (int k = 0; k < rot; k++) {
-                    int tmp = tr; tr = tc; tc = n - 1 - tmp;
-                }
-                if (flip) tc = n - 1 - tc;
-                return {tr, tc};
-            };
+    auto mirror_action = [&](int action) {
+        if (action < 0 || action >= action_size) return action;
+        int src = action / area;
+        int dst = action % area;
+        return mirror_sq(src) * area + mirror_sq(dst);
+    };
 
-            for (int ch = 0; ch < input_channels; ch++) {
-                for (int r = 0; r < n; r++) {
-                    for (int c = 0; c < n; c++) {
-                        auto [tr, tc] = transform(r, c);
-                        rec.state[ch * hw + tr * n + tc] =
-                            state[ch * hw + r * n + c];
-                    }
-                }
-            }
-            for (int r = 0; r < n; r++) {
-                for (int c = 0; c < n; c++) {
-                    auto [tr, tc] = transform(r, c);
-                    rec.policy[tr * n + tc] = policy[r * n + c];
-                    rec.ownership[tr * n + tc] = ownership[r * n + c];
-                }
-            }
-            rec.policy[hw] = pass_prob;
+    for (int flip = 0; flip < 2; ++flip) {
+        TrainingRecord rec;
+        rec.state.resize((size_t)input_channels * area);
+        rec.policy.resize(action_size);
+        rec.ownership.resize(area);
+        rec.value = value;
+        rec.score = score;
+        rec.opponent_action = flip ? mirror_action(opponent_action) : opponent_action;
 
-            // Transform opponent action (board moves only; pass stays as-is)
-            if (opponent_action >= 0 && opponent_action < hw) {
-                int or_ = opponent_action / n, oc = opponent_action % n;
-                auto [tr, tc] = transform(or_, oc);
-                rec.opponent_action = tr * n + tc;
-            } else {
-                rec.opponent_action = opponent_action;  // pass or -1
-            }
-
+        if (!flip) {
+            rec.state = state;
+            rec.policy = policy;
+            rec.ownership = ownership;
             out.push_back(std::move(rec));
+            continue;
         }
+
+        for (int ch = 0; ch < input_channels; ++ch) {
+            for (int r = 0; r < board_rows; ++r) {
+                for (int c = 0; c < board_cols; ++c) {
+                    int src_idx = ch * area + r * board_cols + c;
+                    int dst_idx = ch * area + r * board_cols + (board_cols - 1 - c);
+                    rec.state[dst_idx] = state[src_idx];
+                }
+            }
+        }
+
+        for (int sq = 0; sq < area; ++sq) {
+            rec.ownership[mirror_sq(sq)] = ownership[sq];
+        }
+        for (int action = 0; action < action_size; ++action) {
+            rec.policy[mirror_action(action)] = policy[action];
+        }
+        out.push_back(std::move(rec));
     }
 }
 
@@ -672,7 +665,7 @@ static void augment_sample(const std::vector<float>& state,
 // ================================================================
 static std::vector<TrainingRecord> self_play_game_impl(
         MCTS& mcts, const Config& config) {
-    GoGame game(config.board_size, config.komi);
+    GoGame game(config.history_length);
 
     struct Step {
         std::vector<float> state;
@@ -681,8 +674,6 @@ static std::vector<TrainingRecord> self_play_game_impl(
         int action;  // the action taken at this step
     };
     std::vector<Step> trajectory;
-
-    int action_size = config.action_size();
 
     while (!game.game_over && game.move_count < config.max_moves_per_game) {
         float temp = (game.move_count < config.temperature_threshold)
@@ -702,27 +693,22 @@ static std::vector<TrainingRecord> self_play_game_impl(
         step.action = action;
         trajectory.push_back(std::move(step));
 
-        if (action == action_size - 1)
-            game.play(PASS_MOVE);
-        else
-            game.play(action);
+        game.play(action);
 
         mcts.make_move(action);
     }
 
-    while (!game.game_over) game.play(PASS_MOVE);
+    if (!game.game_over) game.force_draw();
 
-    // Compute score target: raw point difference from BLACK's perspective
-    auto [bs, ws] = game.score();
-    float black_score = bs - ws;  // raw points, e.g. +12.5
+    auto [red_score, black_score_total] = game.score();
+    float black_score = black_score_total - red_score;
 
-    // Compute ownership from game-end position
-    std::vector<float> black_ownership, white_ownership;
+    std::vector<float> black_ownership, red_ownership;
     game.get_ownership(BLACK, black_ownership);
-    game.get_ownership(WHITE, white_ownership);
+    game.get_ownership(RED, red_ownership);
 
     std::vector<TrainingRecord> records;
-    records.reserve(trajectory.size() * 8);
+    records.reserve(trajectory.size() * 2);
 
     for (size_t i = 0; i < trajectory.size(); i++) {
         auto& step = trajectory[i];
@@ -735,7 +721,7 @@ static std::vector<TrainingRecord> self_play_game_impl(
         float score = (step.player == BLACK) ? black_score : -black_score;
 
         // Ownership from current player's perspective
-        const auto& ownership = (step.player == BLACK) ? black_ownership : white_ownership;
+        const auto& ownership = (step.player == BLACK) ? black_ownership : red_ownership;
 
         // Opponent's next action (look-ahead by one step)
         int opponent_action = -1;
@@ -745,7 +731,8 @@ static std::vector<TrainingRecord> self_play_game_impl(
 
         augment_sample(step.state, step.policy, value, score,
                        ownership, opponent_action,
-                       config.board_size, config.input_channels, records);
+                       config.board_rows, config.board_cols,
+                       config.input_channels, records);
     }
 
     return records;

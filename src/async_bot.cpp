@@ -46,7 +46,7 @@ static int pick_action(const std::vector<float>& visits, float temperature) {
 AsyncBot::AsyncBot(BatchEvaluator* evaluator, const Config& config)
     : evaluator_(evaluator),
       config_(config),
-      game_(config.board_size, config.komi),
+      game_(config.history_length),
       mcts_(std::make_unique<MCTS>(evaluator, config)) {
     worker_thread_ = std::thread(&AsyncBot::worker_loop, this);
 }
@@ -91,7 +91,7 @@ void AsyncBot::reset(const GoGame& initial_game) {
 }
 
 void AsyncBot::reset() {
-    reset(GoGame(config_.board_size, config_.komi));
+    reset(GoGame(config_.history_length));
 }
 
 GoGame AsyncBot::game() const {
@@ -141,19 +141,13 @@ bool AsyncBot::play_move(Stone color, int action) {
         stop_locked(lock);
     }
 
-    // Normalize to game-layer and tree-layer action representations.
-    const int pass_action = config_.action_size() - 1;
-    int game_action = (action == pass_action || action == PASS_MOVE)
-                      ? PASS_MOVE : action;
-    int tree_action = (action == PASS_MOVE) ? pass_action : action;
-
     {
         std::lock_guard<std::mutex> gl(game_mutex_);
         if (color != EMPTY && color != game_.current_player) return false;
-        if (!game_.is_legal(game_action))                    return false;
-        game_.play(game_action);
+        if (!game_.is_legal(action))                         return false;
+        game_.play(action);
     }
-    mcts_->make_move(tree_action);
+    mcts_->make_move(action);
     return true;
 }
 
@@ -340,12 +334,8 @@ void AsyncBot::worker_loop() {
         if (mode == Mode::GENMOVE && search_ok && chosen_action >= 0) {
             {
                 std::lock_guard<std::mutex> gl(game_mutex_);
-                int game_action = (chosen_action == config_.action_size() - 1)
-                                  ? PASS_MOVE : chosen_action;
-                // Defensive: should always be legal since MCTS only picks from
-                // legal moves masked by get_legal_moves at root expansion.
-                if (game_.is_legal(game_action)) {
-                    game_.play(game_action);
+                if (game_.is_legal(chosen_action)) {
+                    game_.play(chosen_action);
                 } else {
                     chosen_action = -1;  // caller will see -1 as "failed"
                 }

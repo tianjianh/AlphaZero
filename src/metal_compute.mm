@@ -52,7 +52,7 @@ struct MetalComputeHandle::Impl {
     MPSGraphTensor*     inputTensor = nil;
     MPSGraphTensor*     policyOutput = nil;
     MPSGraphTensor*     valueOutput  = nil;
-    int board_size = 0, input_channels = 0;
+    int board_rows = 0, board_cols = 0, input_channels = 0, action_size = 0;
 
     // Graph construction helpers
     MPSGraphTensor* addConv2d(MPSGraphTensor* input, const std::vector<float>& w,
@@ -109,30 +109,17 @@ struct MetalComputeHandle::Impl {
 
 MetalComputeHandle::MetalComputeHandle(MetalComputeContext::Impl* ctx_impl,
                                          const LoadedModel* model) {
-    // TODO(resnet_v2): the new KataGo-style ResNet (alternating SE + GPool
-    // residual blocks, global-pool value/score heads) is not yet supported
-    // by the Metal/MPSGraph backend.  To re-enable it, build the graph for:
-    //   - SEModule (global avg pool + small FC + sigmoid + broadcast mul)
-    //   - GPoolResBlock (parallel conv_main + conv_pool, mean+max pool,
-    //     FC producing per-channel additive bias for conv_main)
-    //   - GPoolHead (1x1 conv + mean+max pool + 2-layer FC)
-    // and teach loaded_model.cpp to populate per-block weight slots.
-    // Until then, use the TensorRT backend.
-    (void)ctx_impl; (void)model;
-    throw std::runtime_error(
-        "Metal backend currently disabled: the KataGo-style ResNet "
-        "(SE + GPool blocks + global-pool heads) requires TensorRT.  "
-        "TODO: add MPSGraph construction for the new blocks.");
-
     impl_ = new Impl();
     impl_->ctx = ctx_impl;
-    impl_->board_size = model->board_size;
+    impl_->board_rows = model->board_rows;
+    impl_->board_cols = model->board_cols;
     impl_->input_channels = model->input_channels;
+    impl_->action_size = model->action_size;
 
     auto* g = impl_;
     g->graph = [[MPSGraph alloc] init];
 
-    int H = model->board_size, W = model->board_size, HW = H * W;
+    int H = model->board_rows, W = model->board_cols, HW = H * W;
     int nf = model->num_filters;
 
     // Input placeholder [N, C, H, W] FP32 → cast to FP16
@@ -164,10 +151,9 @@ MetalComputeHandle::MetalComputeHandle(MetalComputeContext::Impl* ctx_impl,
         pol = g->addBN(pol, model->policy_conv.bn_scale, model->policy_conv.bn_bias, pc);
         pol = g->addReLU(pol);
         pol = [g->graph reshapeTensor:pol withShape:@[@(-1), @(pc * HW)] name:nil];
-        int as = HW + 1;
+        int as = model->action_size;
         pol = g->addFC(pol, model->policy_fc.weight, model->policy_fc.bias, as, pc * HW);
-        pol = [g->graph castTensor:pol toType:MPSDataTypeFloat32 name:nil];
-        g->policyOutput = [g->graph softMaxWithTensor:pol axis:1 name:nil];
+        g->policyOutput = [g->graph castTensor:pol toType:MPSDataTypeFloat32 name:nil];
     }
 
     // Value head
@@ -200,10 +186,10 @@ MetalComputeHandle::predict_batch(const std::vector<std::vector<float>>& states)
     if (states.empty()) return {};
 
     int N = (int)states.size();
-    int H = impl_->board_size, W = H;
+    int H = impl_->board_rows, W = impl_->board_cols;
     int HW = H * W;
     int C = impl_->input_channels;
-    int action_size = HW + 1;
+    int action_size = impl_->action_size;
 
     size_t input_floats = (size_t)N * C * HW;
     std::vector<float> flat;

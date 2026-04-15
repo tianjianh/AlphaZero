@@ -1,58 +1,39 @@
 #pragma once
 
+#include "game.h"
 #include <string>
 
 namespace minigo {
 
 struct Config {
-    // Board
-    int board_size = 9;
-    float komi = 6.5f;
+    int board_rows = BOARD_ROWS;
+    int board_cols = BOARD_COLS;
+    int history_length = 4;
 
-    // Neural network
-    std::string model_type = "resnet";  // "resnet" or "vit"
-    int num_res_blocks = 5;
-    int num_filters = 64;
-    int input_channels = 17;  // 8 history * 2 + 1 color
-    // ViT-specific (copied from LoadedModel after load)
+    std::string model_type = "xiangqi-resnet";
+    int num_res_blocks = 10;
+    int num_filters = 128;
+    int input_channels = history_length * 14 + 1;
     int vit_depth = 0;
     int vit_heads = 0;
     int vit_kv_groups = 0;
 
-    // MCTS
     int num_simulations = 800;
     float c_puct = 1.5f;
-    float dirichlet_alpha = 0.15f;   // ~10/avg_legal_moves (0.15 for 9x9, 0.03 for 19x19)
-    float dirichlet_epsilon = 0.25f; // blend: 75% network prior + 25% noise
-    int temperature_threshold = 15;  // moves of stochastic play (rest is greedy)
-    float win_loss_weight = 1.0f;    // blend: utility = wlw * value + sw * score_utility
-    float score_weight = 0.0f;       // blend: utility = wlw * value + sw * score_utility
-    float score_scale = 10.0f;       // atan compression: score_utility = atan(score/scale)/(π/2)
+    float dirichlet_alpha = 0.30f;
+    float dirichlet_epsilon = 0.25f;
+    int temperature_threshold = 18;
+    float win_loss_weight = 1.0f;
+    float score_weight = 0.0f;
+    float score_scale = 1000.0f;
 
-    // Self-play
-    int max_moves_per_game = 162;  // board_size^2 * 2
+    int max_moves_per_game = 300;
+    int num_search_threads = 1;
+    int virtual_loss_parallel = 32;
+    int max_batch_size = 256;
 
-    // Multi-threaded MCTS (KataGo pattern)
-    //
-    // Each MCTS::search() spawns num_search_threads internal threads.
-    // Each thread: descend → evaluate_single(block) → expand → backprop → repeat.
-    // Collisions (node being evaluated by another thread): revert vloss, yield, retry.
-    //
-    // Batch size adapts to total concurrent search threads across all games:
-    //   total_threads = min(games, selfplay_threads) × num_search_threads
-    //
-    // Tuning: increase num_search_threads until GPU utilization plateaus.
-    // KataGo recommends 8-32 per position for strong GPUs.
-    int num_search_threads = 1;     // search threads per MCTS::search() call
-    int virtual_loss_parallel = 32; // VLP for single-threaded Eigen fallback
-
-    // NN server batch inference (independent of search thread count)
-    // Server takes min(queue_size, max_batch_size) — just a cap.
-    int max_batch_size = 256;       // max states in one GPU call
-
-    // Derived
-    int action_size() const { return board_size * board_size + 1; }
-    int pass_action() const { return board_size * board_size; }
+    int board_area() const { return board_rows * board_cols; }
+    int action_size() const { return board_area() * board_area(); }
 };
 
 }  // namespace minigo

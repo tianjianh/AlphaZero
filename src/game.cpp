@@ -1,461 +1,530 @@
 #include "game.h"
+
 #include <algorithm>
-#include <cassert>
-#include <cstring>
-#include <sstream>
+#include <array>
 #include <cctype>
+#include <sstream>
+#include <stdexcept>
 
 namespace minigo {
 
-GoGame::GoGame(int board_size, float komi, int history_length)
-    : board_size(board_size), komi(komi), history_length(history_length) {
+namespace {
+
+constexpr std::array<int, 7> kPieceValues = {
+    10000, 110, 110, 300, 600, 350, 70
+};
+
+constexpr int kKnightOffsets[8][4] = {
+    {-2, -1, -1,  0},
+    {-2,  1, -1,  0},
+    {-1, -2,  0, -1},
+    {-1,  2,  0,  1},
+    { 1, -2,  0, -1},
+    { 1,  2,  0,  1},
+    { 2, -1,  1,  0},
+    { 2,  1,  1,  0},
+};
+
+constexpr int kBishopOffsets[4][4] = {
+    {-2, -2, -1, -1},
+    {-2,  2, -1,  1},
+    { 2, -2,  1, -1},
+    { 2,  2,  1,  1},
+};
+
+constexpr int kKingDirs[4][2] = {
+    {-1, 0}, {1, 0}, {0, -1}, {0, 1}
+};
+
+constexpr int kAdvisorDirs[4][2] = {
+    {-1, -1}, {-1, 1}, {1, -1}, {1, 1}
+};
+
+int normalized_rank(int r) {
+    return BOARD_ROWS - 1 - r;
+}
+
+bool parse_square(const std::string& s, size_t pos, int& r, int& c) {
+    if (pos + 1 >= s.size()) return false;
+    char file = static_cast<char>(std::tolower(static_cast<unsigned char>(s[pos])));
+    char rank = s[pos + 1];
+    if (file < 'a' || file >= 'a' + BOARD_COLS) return false;
+    if (rank < '0' || rank > '9') return false;
+    c = file - 'a';
+    r = BOARD_ROWS - 1 - (rank - '0');
+    return XiangqiGame::rows() > r && r >= 0;
+}
+
+}  // namespace
+
+XiangqiGame::XiangqiGame(int history_length_)
+    : history_length(std::max(1, std::min(history_length_, RING_CAP))) {
     reset();
 }
 
-void GoGame::reset() {
-    std::memset(board, 0, sizeof(board));
-    std::memset(prev_board, 0, sizeof(prev_board));
-    has_prev_board = false;
-    current_player = BLACK;
+void XiangqiGame::reset() {
+    for (auto& row : board) {
+        std::fill(std::begin(row), std::end(row), NO_PIECE);
+    }
+
+    const int8_t startup[BOARD_ROWS][BOARD_COLS] = {
+        {BLACK_ROOK, BLACK_KNIGHT, BLACK_BISHOP, BLACK_ADVISOR, BLACK_KING, BLACK_ADVISOR, BLACK_BISHOP, BLACK_KNIGHT, BLACK_ROOK},
+        {NO_PIECE,   NO_PIECE,     NO_PIECE,     NO_PIECE,      NO_PIECE,    NO_PIECE,      NO_PIECE,     NO_PIECE,   NO_PIECE},
+        {NO_PIECE,   BLACK_CANNON, NO_PIECE,     NO_PIECE,      NO_PIECE,    NO_PIECE,      NO_PIECE,     BLACK_CANNON, NO_PIECE},
+        {BLACK_PAWN, NO_PIECE,     BLACK_PAWN,   NO_PIECE,      BLACK_PAWN,  NO_PIECE,      BLACK_PAWN,   NO_PIECE,   BLACK_PAWN},
+        {NO_PIECE,   NO_PIECE,     NO_PIECE,     NO_PIECE,      NO_PIECE,    NO_PIECE,      NO_PIECE,     NO_PIECE,   NO_PIECE},
+        {NO_PIECE,   NO_PIECE,     NO_PIECE,     NO_PIECE,      NO_PIECE,    NO_PIECE,      NO_PIECE,     NO_PIECE,   NO_PIECE},
+        {RED_PAWN,   NO_PIECE,     RED_PAWN,     NO_PIECE,      RED_PAWN,    NO_PIECE,      RED_PAWN,     NO_PIECE,   RED_PAWN},
+        {NO_PIECE,   RED_CANNON,   NO_PIECE,     NO_PIECE,      NO_PIECE,    NO_PIECE,      NO_PIECE,     RED_CANNON, NO_PIECE},
+        {NO_PIECE,   NO_PIECE,     NO_PIECE,     NO_PIECE,      NO_PIECE,    NO_PIECE,      NO_PIECE,     NO_PIECE,   NO_PIECE},
+        {RED_ROOK,   RED_KNIGHT,   RED_BISHOP,   RED_ADVISOR,   RED_KING,    RED_ADVISOR,   RED_BISHOP,   RED_KNIGHT, RED_ROOK},
+    };
+
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            board[r][c] = startup[r][c];
+        }
+    }
+
+    current_player = RED;
     move_count = 0;
-    last_move = -2;  // sentinel: no move yet
-    consecutive_passes = 0;
+    last_move = -1;
     game_over = false;
     winner = EMPTY;
     final_black_score = 0.0f;
     ring_head_ = 0;
     ring_size_ = 0;
+    position_hash_count_ = 0;
     update_history();
+    position_hashes_[position_hash_count_++] = compute_hash();
 }
 
-GoGame GoGame::copy() const {
-    GoGame g(board_size, komi, history_length);
-    std::memcpy(g.board,      board,      sizeof(board));
-    std::memcpy(g.prev_board, prev_board, sizeof(prev_board));
-    g.has_prev_board  = has_prev_board;
-    g.current_player  = current_player;
-    g.move_count      = move_count;
-    g.last_move       = last_move;
-    g.consecutive_passes = consecutive_passes;
-    g.game_over       = game_over;
-    g.winner          = winner;
-    // Ring buffer copy: all inline storage — no heap allocation
-    g.ring_buf_  = ring_buf_;
-    g.ring_head_ = ring_head_;
-    g.ring_size_ = ring_size_;
-    return g;
+XiangqiGame XiangqiGame::copy() const {
+    return *this;
 }
 
-void GoGame::neighbors(int r, int c, Pos* nbrs, int& count) const {
-    count = 0;
-    if (r > 0) nbrs[count++] = {r - 1, c};
-    if (r < board_size - 1) nbrs[count++] = {r + 1, c};
-    if (c > 0) nbrs[count++] = {r, c - 1};
-    if (c < board_size - 1) nbrs[count++] = {r, c + 1};
+bool XiangqiGame::in_bounds(int r, int c) {
+    return r >= 0 && r < BOARD_ROWS && c >= 0 && c < BOARD_COLS;
 }
 
-int GoGame::get_group(int r, int c, Pos* out_group, int& liberties) const {
-    return get_group_on(board, r, c, out_group, liberties);
+bool XiangqiGame::in_red_palace(int r, int c) {
+    return r >= 7 && r <= 9 && c >= 3 && c <= 5;
 }
 
-int GoGame::get_group_on(const Stone brd[][MAX_BOARD], int r, int c,
-                          Pos* out_group, int& liberties) const {
-    Stone color = brd[r][c];
-    if (color == EMPTY) { liberties = 0; return 0; }
+bool XiangqiGame::in_black_palace(int r, int c) {
+    return r >= 0 && r <= 2 && c >= 3 && c <= 5;
+}
 
-    int n = board_size;
-    int group_size = 0;
-    liberties = 0;
+bool XiangqiGame::in_palace(Stone side, int r, int c) {
+    return side == RED ? in_red_palace(r, c) : in_black_palace(r, c);
+}
 
-    // Stack-based BFS with fixed-size scratch — no heap allocation in
-    // the hot path.  visited[]/lib_seen[] are 361-byte stack arrays
-    // that the compiler zero-inits as a single short memset.
-    bool visited[MAX_BOARD * MAX_BOARD] = {};
-    bool lib_seen[MAX_BOARD * MAX_BOARD] = {};
-    Pos  stack_buf[MAX_BOARD * MAX_BOARD];
-    int  top = 0;
+bool XiangqiGame::crossed_river(Stone side, int r) {
+    return side == RED ? r <= 4 : r >= 5;
+}
 
-    stack_buf[top++] = {r, c};
-    visited[r * MAX_BOARD + c] = true;
+int XiangqiGame::piece_type(int8_t piece) {
+    if (piece == NO_PIECE) return -1;
+    if (piece <= RED_PAWN) return piece - RED_KING;
+    return piece - BLACK_KING;
+}
 
-    auto visit = [&](int nr, int nc) {
-        int idx = nr * MAX_BOARD + nc;
-        Stone s = brd[nr][nc];
-        if (s == EMPTY) {
-            if (!lib_seen[idx]) { lib_seen[idx] = true; liberties++; }
-        } else if (s == color && !visited[idx]) {
-            visited[idx] = true;
-            stack_buf[top++] = {nr, nc};
-        }
-    };
+Stone XiangqiGame::piece_color(int8_t piece) {
+    if (piece >= RED_KING && piece <= RED_PAWN) return RED;
+    if (piece >= BLACK_KING && piece <= BLACK_PAWN) return BLACK;
+    return EMPTY;
+}
 
-    while (top > 0) {
-        Pos p = stack_buf[--top];
-        out_group[group_size++] = p;
-        int pr = p.r, pc = p.c;
-        if (pr > 0)         visit(pr - 1, pc);
-        if (pr < n - 1)     visit(pr + 1, pc);
-        if (pc > 0)         visit(pr,     pc - 1);
-        if (pc < n - 1)     visit(pr,     pc + 1);
+bool XiangqiGame::is_side_piece(int8_t piece, Stone side) {
+    return piece_color(piece) == side;
+}
+
+char XiangqiGame::piece_to_char(int8_t piece) {
+    switch (piece) {
+        case RED_KING: return 'K';
+        case RED_ADVISOR: return 'A';
+        case RED_BISHOP: return 'B';
+        case RED_KNIGHT: return 'N';
+        case RED_ROOK: return 'R';
+        case RED_CANNON: return 'C';
+        case RED_PAWN: return 'P';
+        case BLACK_KING: return 'k';
+        case BLACK_ADVISOR: return 'a';
+        case BLACK_BISHOP: return 'b';
+        case BLACK_KNIGHT: return 'n';
+        case BLACK_ROOK: return 'r';
+        case BLACK_CANNON: return 'c';
+        case BLACK_PAWN: return 'p';
+        default: return '.';
     }
-    return group_size;
 }
 
-void GoGame::remove_group(const Pos* group, int n) {
-    for (int i = 0; i < n; i++) board[group[i].r][group[i].c] = EMPTY;
+void XiangqiGame::apply_move_unchecked(int sr, int sc, int dr, int dc, int8_t& captured) {
+    captured = board[dr][dc];
+    board[dr][dc] = board[sr][sc];
+    board[sr][sc] = NO_PIECE;
 }
 
-bool GoGame::is_legal(int action) const {
-    if (game_over) return false;
-    int n = board_size;
+void XiangqiGame::undo_move_unchecked(int sr, int sc, int dr, int dc, int8_t captured) {
+    board[sr][sc] = board[dr][dc];
+    board[dr][dc] = captured;
+}
 
-    if (action == PASS_MOVE || action == n * n) return true;
-
-    int r = action / n, c = action % n;
-    if (r < 0 || r >= n || c < 0 || c >= n) return false;
-    if (board[r][c] != EMPTY) return false;
-
-    // ── Fast path: any empty neighbour → definitely legal ────────────
-    //
-    // • Suicide is impossible: our stone inherits the empty neighbour
-    //   as a liberty, so the group can never have 0 liberties.
-    //
-    // • Ko is impossible: after we play, (r,c) has our stone and the
-    //   adjacent empty cell still empty.  For board == prev_board we
-    //   would need our stone there in prev_board — but our stone was
-    //   captured in the previous move, which requires all liberties
-    //   filled (no empty neighbours at capture time).  Contradiction.
-    //
-    // Applies to the vast majority of moves; eliminates board-clone +
-    // BFS for ~80-90% of is_legal() calls.  Inlined as four explicit
-    // boundary-checked loads — no Pos struct, no function call.
-    if ((r > 0     && board[r - 1][c] == EMPTY) ||
-        (r < n - 1 && board[r + 1][c] == EMPTY) ||
-        (c > 0     && board[r][c - 1] == EMPTY) ||
-        (c < n - 1 && board[r][c + 1] == EMPTY))
+bool XiangqiGame::is_square_attacked(int r, int c, Stone by) const {
+    const int pawn_dir = (by == RED) ? -1 : 1;
+    const int pawn_src_r = r - pawn_dir;
+    if (in_bounds(pawn_src_r, c) && board[pawn_src_r][c] == (by == RED ? RED_PAWN : BLACK_PAWN))
         return true;
+    for (int dc : {-1, 1}) {
+        int pc = c + dc;
+        if (!in_bounds(r, pc)) continue;
+        int8_t piece = board[r][pc];
+        if (piece != (by == RED ? RED_PAWN : BLACK_PAWN)) continue;
+        if (crossed_river(by, r)) return true;
+    }
 
-    return is_legal_at_slow(r, c);
+    for (const auto& off : kKnightOffsets) {
+        int sr = r + off[0];
+        int sc = c + off[1];
+        int leg_r = r + off[2];
+        int leg_c = c + off[3];
+        if (!in_bounds(sr, sc) || !in_bounds(leg_r, leg_c)) continue;
+        if (board[leg_r][leg_c] != NO_PIECE) continue;
+        int8_t piece = board[sr][sc];
+        if (piece == (by == RED ? RED_KNIGHT : BLACK_KNIGHT)) return true;
+    }
+
+    for (const auto& dir : kKingDirs) {
+        int rr = r + dir[0];
+        int cc = c + dir[1];
+        bool seen_screen = false;
+        while (in_bounds(rr, cc)) {
+            int8_t piece = board[rr][cc];
+            if (piece != NO_PIECE) {
+                if (!seen_screen) {
+                    if (piece == (by == RED ? RED_ROOK : BLACK_ROOK)) return true;
+                    if (piece == (by == RED ? RED_KING : BLACK_KING)) return true;
+                    seen_screen = true;
+                } else {
+                    if (piece == (by == RED ? RED_CANNON : BLACK_CANNON)) return true;
+                    break;
+                }
+            }
+            rr += dir[0];
+            cc += dir[1];
+        }
+    }
+
+    return false;
 }
 
-bool GoGame::is_legal_at_slow(int r, int c) const {
-    // All four neighbours of (r,c) are non-empty (caller guarantees the
-    // fast-path miss).  This handles eye-fills, snapbacks, and ko — the
-    // rare case that needs a full capture+ko simulation.
-    int n = board_size;
-    Stone test[MAX_BOARD][MAX_BOARD];
-    std::memcpy(test, board, sizeof(board));
-    test[r][c] = current_player;
-    Stone opp = opponent(current_player);
+bool XiangqiGame::is_pseudo_legal(int sr, int sc, int dr, int dc) const {
+    if (!in_bounds(sr, sc) || !in_bounds(dr, dc)) return false;
+    if (sr == dr && sc == dc) return false;
+    int8_t piece = board[sr][sc];
+    if (!is_side_piece(piece, current_player)) return false;
+    if (is_side_piece(board[dr][dc], current_player)) return false;
 
-    auto try_capture = [&](int nr, int nc) {
-        if (test[nr][nc] != opp) return;
-        Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
-        int gsize = get_group_on(test, nr, nc, grp, libs);
-        if (libs == 0)
-            for (int i = 0; i < gsize; i++) test[grp[i].r][grp[i].c] = EMPTY;
-    };
+    Stone side = current_player;
+    int type = piece_type(piece);
+    int row_delta = dr - sr;
+    int col_delta = dc - sc;
+    int abs_row = std::abs(row_delta);
+    int abs_col = std::abs(col_delta);
 
-    if (r > 0)     try_capture(r - 1, c);
-    if (r < n - 1) try_capture(r + 1, c);
-    if (c > 0)     try_capture(r, c - 1);
-    if (c < n - 1) try_capture(r, c + 1);
-
-    // Suicide check
-    Pos own_grp[MAX_BOARD * MAX_BOARD]; int own_libs;
-    get_group_on(test, r, c, own_grp, own_libs);
-    if (own_libs == 0) return false;
-
-    // Ko check via single memcmp instead of nested r,c loop.
-    if (has_prev_board && std::memcmp(test, prev_board, sizeof(board)) == 0)
-        return false;
-
-    return true;
+    switch (type) {
+        case 0:
+            if (board[dr][dc] == (side == RED ? BLACK_KING : RED_KING) && sc == dc) {
+                int step = (dr > sr) ? 1 : -1;
+                for (int r = sr + step; r != dr; r += step) {
+                    if (board[r][sc] != NO_PIECE) return false;
+                }
+                return true;
+            }
+            return in_palace(side, dr, dc) && abs_row + abs_col == 1;
+        case 1:
+            return in_palace(side, dr, dc) && abs_row == 1 && abs_col == 1;
+        case 2: {
+            if (abs_row != 2 || abs_col != 2) return false;
+            if (side == RED && dr < 5) return false;
+            if (side == BLACK && dr > 4) return false;
+            return board[(sr + dr) / 2][(sc + dc) / 2] == NO_PIECE;
+        }
+        case 3:
+            if (!((abs_row == 2 && abs_col == 1) || (abs_row == 1 && abs_col == 2))) return false;
+            if (abs_row == 2) return board[sr + row_delta / 2][sc] == NO_PIECE;
+            return board[sr][sc + col_delta / 2] == NO_PIECE;
+        case 4:
+        case 5: {
+            if (sr != dr && sc != dc) return false;
+            int step_r = (dr == sr) ? 0 : (dr > sr ? 1 : -1);
+            int step_c = (dc == sc) ? 0 : (dc > sc ? 1 : -1);
+            int blockers = 0;
+            for (int rr = sr + step_r, cc = sc + step_c; rr != dr || cc != dc; rr += step_r, cc += step_c) {
+                if (board[rr][cc] != NO_PIECE) blockers++;
+            }
+            if (type == 4) return blockers == 0;
+            if (board[dr][dc] == NO_PIECE) return blockers == 0;
+            return blockers == 1;
+        }
+        case 6: {
+            int forward = (side == RED) ? -1 : 1;
+            if (row_delta == forward && col_delta == 0) return true;
+            if (!crossed_river(side, sr)) return false;
+            return row_delta == 0 && abs_col == 1;
+        }
+        default:
+            return false;
+    }
 }
 
-void GoGame::get_legal_moves(std::vector<float>& legal) const {
-    int n = board_size;
-    int action_size = n * n + 1;
-    legal.assign(action_size, 0.0f);
-    legal[n * n] = 1.0f;  // pass always legal
+bool XiangqiGame::is_legal(int action) const {
+    if (game_over) return false;
+    if (action < 0 || action >= action_size()) return false;
+    int src = action_src(action);
+    int dst = action_dst(action);
+    int sr = src / BOARD_COLS;
+    int sc = src % BOARD_COLS;
+    int dr = dst / BOARD_COLS;
+    int dc = dst % BOARD_COLS;
+    if (!is_pseudo_legal(sr, sc, dr, dc)) return false;
+
+    XiangqiGame tmp = *this;
+    int8_t captured = NO_PIECE;
+    tmp.apply_move_unchecked(sr, sc, dr, dc, captured);
+    int king_r = -1, king_c = -1;
+    int8_t king_piece = (current_player == RED) ? RED_KING : BLACK_KING;
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            if (tmp.board[r][c] == king_piece) {
+                king_r = r;
+                king_c = c;
+                break;
+            }
+        }
+        if (king_r >= 0) break;
+    }
+    if (king_r < 0) return false;
+    return !tmp.is_square_attacked(king_r, king_c, opponent(current_player));
+}
+
+bool XiangqiGame::has_any_legal_move(Stone side) const {
+    XiangqiGame tmp = *this;
+    tmp.current_player = side;
+    for (int sr = 0; sr < BOARD_ROWS; ++sr) {
+        for (int sc = 0; sc < BOARD_COLS; ++sc) {
+            if (!is_side_piece(tmp.board[sr][sc], side)) continue;
+            int src = sq_index(sr, sc);
+            for (int dr = 0; dr < BOARD_ROWS; ++dr) {
+                for (int dc = 0; dc < BOARD_COLS; ++dc) {
+                    int dst = sq_index(dr, dc);
+                    if (tmp.is_legal(encode_action(src, dst))) return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+uint64_t XiangqiGame::compute_hash() const {
+    uint64_t h = 1469598103934665603ULL;
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            h ^= static_cast<uint64_t>(board[r][c] + 17 * (r * BOARD_COLS + c + 1));
+            h *= 1099511628211ULL;
+        }
+    }
+    h ^= static_cast<uint64_t>(current_player);
+    h *= 1099511628211ULL;
+    return h;
+}
+
+bool XiangqiGame::is_threefold_repetition() const {
+    if (position_hash_count_ < 3) return false;
+    uint64_t current = position_hashes_[position_hash_count_ - 1];
+    int count = 0;
+    for (int i = 0; i < position_hash_count_; ++i) {
+        if (position_hashes_[i] == current) count++;
+    }
+    return count >= 3;
+}
+
+void XiangqiGame::get_legal_moves(std::vector<float>& legal) const {
+    legal.assign(action_size(), 0.0f);
     if (game_over) return;
-
-    // Inline the fast path here — avoids 81 function calls per move and
-    // the per-call game_over / pass / bounds rechecks.  is_legal() above
-    // remains the canonical entry point for external callers.
-    for (int r = 0; r < n; r++) {
-        for (int c = 0; c < n; c++) {
-            if (board[r][c] != EMPTY) continue;
-            bool fast =
-                (r > 0     && board[r - 1][c] == EMPTY) ||
-                (r < n - 1 && board[r + 1][c] == EMPTY) ||
-                (c > 0     && board[r][c - 1] == EMPTY) ||
-                (c < n - 1 && board[r][c + 1] == EMPTY);
-            if (fast || is_legal_at_slow(r, c))
-                legal[r * n + c] = 1.0f;
+    for (int sr = 0; sr < BOARD_ROWS; ++sr) {
+        for (int sc = 0; sc < BOARD_COLS; ++sc) {
+            if (!is_side_piece(board[sr][sc], current_player)) continue;
+            int src = sq_index(sr, sc);
+            for (int dr = 0; dr < BOARD_ROWS; ++dr) {
+                for (int dc = 0; dc < BOARD_COLS; ++dc) {
+                    int action = encode_action(src, sq_index(dr, dc));
+                    if (is_legal(action)) legal[action] = 1.0f;
+                }
+            }
         }
     }
 }
 
-void GoGame::play(int action) {
-    int n = board_size;
-
-    // Normalize pass
-    if (action == n * n) action = PASS_MOVE;
-
-    std::memcpy(prev_board, board, sizeof(board));
-    has_prev_board = true;
-
-    if (action == PASS_MOVE) {
-        consecutive_passes++;
-        if (consecutive_passes >= 2) {
-            game_over = true;
-            score_game();
-        }
-    } else {
-        consecutive_passes = 0;
-        int r = action / n, c = action % n;
-        board[r][c] = current_player;
-        Stone opp = opponent(current_player);
-
-        // Remove captured groups — inline neighbor enumeration with
-        // stack-array group buffer (no heap allocation in the hot path).
-        auto try_capture = [&](int nr, int nc) {
-            if (board[nr][nc] != opp) return;
-            Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
-            int gsize = get_group(nr, nc, grp, libs);
-            if (libs == 0) remove_group(grp, gsize);
-        };
-        if (r > 0)     try_capture(r - 1, c);
-        if (r < n - 1) try_capture(r + 1, c);
-        if (c > 0)     try_capture(r, c - 1);
-        if (c < n - 1) try_capture(r, c + 1);
+void XiangqiGame::play(int action) {
+    if (!is_legal(action)) {
+        throw std::runtime_error("XiangqiGame::play called with illegal action");
     }
+
+    int src = action_src(action);
+    int dst = action_dst(action);
+    int sr = src / BOARD_COLS;
+    int sc = src % BOARD_COLS;
+    int dr = dst / BOARD_COLS;
+    int dc = dst % BOARD_COLS;
+
+    int8_t captured = NO_PIECE;
+    apply_move_unchecked(sr, sc, dr, dc, captured);
 
     last_move = action;
     move_count++;
     current_player = opponent(current_player);
     update_history();
+    if (position_hash_count_ < (int)position_hashes_.size())
+        position_hashes_[position_hash_count_++] = compute_hash();
+
+    if (is_threefold_repetition()) {
+        game_over = true;
+        winner = EMPTY;
+        score_game();
+        return;
+    }
+
+    if (!has_any_legal_move(current_player)) {
+        game_over = true;
+        winner = opponent(current_player);
+        score_game();
+        return;
+    }
+
+    score_game();
 }
 
-void GoGame::update_history() {
-    // Write into the next ring slot (overwrites oldest if full).  Drop
-    // the prior snap.fill(0) — every used position is overwritten just
-    // below, and snap[n*n .. MAX_BOARD*MAX_BOARD) is never read.  Each
-    // row is a 1-byte-stride memcpy of `n` bytes; the compiler folds
-    // small-n memcpys to register loads/stores.
+void XiangqiGame::force_draw() {
+    game_over = true;
+    winner = EMPTY;
+    score_game();
+}
+
+std::pair<float, float> XiangqiGame::score() const {
+    float red_score = 0.0f;
+    float black_score = 0.0f;
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            int8_t piece = board[r][c];
+            if (piece == NO_PIECE) continue;
+            int value = kPieceValues[piece_type(piece)];
+            if (piece_color(piece) == RED) red_score += value;
+            else black_score += value;
+        }
+    }
+    return {red_score, black_score};
+}
+
+void XiangqiGame::get_ownership(Stone player, std::vector<float>& out) const {
+    out.assign(BOARD_AREA, 0.0f);
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            if (piece_color(board[r][c]) == player) {
+                out[sq_index(r, c)] = 1.0f;
+            }
+        }
+    }
+}
+
+void XiangqiGame::update_history() {
     int write_idx = (ring_head_ + ring_size_) % RING_CAP;
     auto& snap = ring_buf_[write_idx];
-    int n = board_size;
-    for (int r = 0; r < n; r++)
-        std::memcpy(&snap[r * n], &board[r][0], (size_t)n);
-
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            snap[sq_index(r, c)] = board[r][c];
+        }
+    }
     if (ring_size_ < history_length) {
-        ring_size_++;                             // ring not full yet
+        ring_size_++;
     } else {
-        ring_head_ = (ring_head_ + 1) % RING_CAP; // evict oldest: O(1)
+        ring_head_ = (ring_head_ + 1) % RING_CAP;
     }
 }
 
-void GoGame::encode(std::vector<float>& out) const {
-    int n = board_size;
-    int nn = n * n;
-    int planes = history_length * 2 + 1;
-    out.assign(planes * nn, 0.0f);
-
-    // History planes: most-recent first (i=0 → most recent snapshot)
-    // ring_buf_[(ring_head_ + ring_size_ - 1 - i) % RING_CAP] gives snapshot i steps back
-    for (int i = 0; i < history_length && i < ring_size_; i++) {
+void XiangqiGame::encode(std::vector<float>& out) const {
+    int planes = history_length * PIECE_PLANES + 1;
+    out.assign((size_t)planes * BOARD_AREA, 0.0f);
+    for (int i = 0; i < history_length && i < ring_size_; ++i) {
         int slot = (ring_head_ + ring_size_ - 1 - i + RING_CAP) % RING_CAP;
         const auto& snap = ring_buf_[slot];
-        int cur_plane = i;
-        int opp_plane = history_length + i;
-        for (int pos = 0; pos < nn; pos++) {
-            Stone s = static_cast<Stone>(snap[pos]);
-            if (s == current_player)
-                out[cur_plane * nn + pos] = 1.0f;
-            else if (s == opponent(current_player))
-                out[opp_plane * nn + pos] = 1.0f;
+        int plane_base = i * PIECE_PLANES;
+        for (int idx = 0; idx < BOARD_AREA; ++idx) {
+            int8_t piece = snap[idx];
+            if (piece == NO_PIECE) continue;
+            Stone side = piece_color(piece);
+            int rel = piece_type(piece) + (side == current_player ? 0 : 7);
+            out[(plane_base + rel) * BOARD_AREA + idx] = 1.0f;
         }
     }
-
-    // Color plane (all-ones for BLACK, all-zeros for WHITE)
-    if (current_player == BLACK) {
-        float* color_plane = out.data() + history_length * 2 * nn;
-        std::fill(color_plane, color_plane + nn, 1.0f);
+    if (current_player == RED) {
+        float* color_plane = out.data() + (planes - 1) * BOARD_AREA;
+        std::fill(color_plane, color_plane + BOARD_AREA, 1.0f);
     }
 }
 
-std::pair<float, float> GoGame::score() const {
-    int n = board_size;
-    float black_area = 0, white_area = 0;
+void XiangqiGame::score_game() {
+    auto [red_score, black_score] = score();
+    final_black_score = black_score - red_score;
+}
 
-    // Count stones
-    for (int r = 0; r < n; r++)
-        for (int c = 0; c < n; c++) {
-            if (board[r][c] == BLACK) black_area++;
-            if (board[r][c] == WHITE) white_area++;
-        }
+std::string XiangqiGame::action_to_str(int action) const {
+    if (action < 0 || action >= action_size()) return "????";
+    int src = action_src(action);
+    int dst = action_dst(action);
+    int sr = src / BOARD_COLS;
+    int sc = src % BOARD_COLS;
+    int dr = dst / BOARD_COLS;
+    int dc = dst % BOARD_COLS;
+    std::string s;
+    s += static_cast<char>('a' + sc);
+    s += static_cast<char>('0' + normalized_rank(sr));
+    s += static_cast<char>('a' + dc);
+    s += static_cast<char>('0' + normalized_rank(dr));
+    return s;
+}
 
-    // Flood-fill empty regions
-    bool visited[MAX_BOARD][MAX_BOARD] = {};
-    for (int r = 0; r < n; r++) {
-        for (int c = 0; c < n; c++) {
-            if (board[r][c] != EMPTY || visited[r][c]) continue;
-
-            std::vector<Pos> region;
-            bool touches_black = false, touches_white = false;
-            std::vector<Pos> stack;
-            stack.push_back({r, c});
-            visited[r][c] = true;
-
-            while (!stack.empty()) {
-                Pos p = stack.back(); stack.pop_back();
-                region.push_back(p);
-
-                Pos nbrs[4]; int cnt;
-                neighbors(p.r, p.c, nbrs, cnt);
-                for (int i = 0; i < cnt; i++) {
-                    int nr = nbrs[i].r, nc = nbrs[i].c;
-                    if (board[nr][nc] == EMPTY && !visited[nr][nc]) {
-                        visited[nr][nc] = true;
-                        stack.push_back({nr, nc});
-                    } else if (board[nr][nc] == BLACK) {
-                        touches_black = true;
-                    } else if (board[nr][nc] == WHITE) {
-                        touches_white = true;
-                    }
-                }
-            }
-
-            if (touches_black && !touches_white)
-                black_area += region.size();
-            else if (touches_white && !touches_black)
-                white_area += region.size();
-        }
+int XiangqiGame::str_to_action(const std::string& s) const {
+    std::string compact;
+    compact.reserve(s.size());
+    for (char ch : s) {
+        if (!std::isspace(static_cast<unsigned char>(ch)) && ch != '-') compact.push_back(ch);
     }
-
-    return {black_area, white_area + komi};
+    int sr, sc, dr, dc;
+    if (!parse_square(compact, 0, sr, sc) || !parse_square(compact, 2, dr, dc))
+        throw std::runtime_error("invalid move string: " + s);
+    return encode_action(sq_index(sr, sc), sq_index(dr, dc));
 }
 
-void GoGame::get_ownership(Stone player, std::vector<float>& out) const {
-    int n = board_size;
-    out.assign(n * n, 0.0f);
-
-    // Reuse the same flood-fill logic as score()
-    bool visited[MAX_BOARD][MAX_BOARD] = {};
-    for (int r = 0; r < n; r++) {
-        for (int c = 0; c < n; c++) {
-            // Stones: owner is the stone's color
-            if (board[r][c] == player) {
-                out[r * n + c] = 1.0f;
-            } else if (board[r][c] != EMPTY) {
-                out[r * n + c] = 0.0f;
-            } else if (!visited[r][c]) {
-                // Flood-fill empty region
-                std::vector<Pos> region;
-                bool touches_black = false, touches_white = false;
-                std::vector<Pos> stack;
-                stack.push_back({r, c});
-                visited[r][c] = true;
-
-                while (!stack.empty()) {
-                    Pos p = stack.back(); stack.pop_back();
-                    region.push_back(p);
-
-                    Pos nbrs[4]; int cnt;
-                    neighbors(p.r, p.c, nbrs, cnt);
-                    for (int i = 0; i < cnt; i++) {
-                        int nr = nbrs[i].r, nc = nbrs[i].c;
-                        if (board[nr][nc] == EMPTY && !visited[nr][nc]) {
-                            visited[nr][nc] = true;
-                            stack.push_back({nr, nc});
-                        } else if (board[nr][nc] == BLACK) {
-                            touches_black = true;
-                        } else if (board[nr][nc] == WHITE) {
-                            touches_white = true;
-                        }
-                    }
-                }
-
-                // Assign territory: only if surrounded by one color
-                bool owned_by_player = false;
-                if (player == BLACK && touches_black && !touches_white)
-                    owned_by_player = true;
-                if (player == WHITE && touches_white && !touches_black)
-                    owned_by_player = true;
-
-                if (owned_by_player) {
-                    for (auto& p : region)
-                        out[p.r * n + p.c] = 1.0f;
-                }
-            }
-        }
-    }
-}
-
-void GoGame::score_game() {
-    // Tromp-Taylor scoring: score the final position as-is after two
-    // passes.  No heuristic dead-stone removal — under Chinese rules the
-    // game is played to completion, so any stones still on the board are
-    // alive.  For training this provides the correct signal: the network
-    // learns to capture dead stones before passing rather than relying on
-    // a post-game cleanup (which was also order-dependent and broke semeai
-    // / seki positions).
-    auto [b, w] = score();
-    final_black_score = b - w;
-    if (b > w) winner = BLACK;
-    else if (w > b) winner = WHITE;
-    else winner = EMPTY;
-}
-
-std::string GoGame::action_to_str(int action) const {
-    int n = board_size;
-    if (action == PASS_MOVE || action == n * n) return "PASS";
-    int r = action / n, c = action % n;
-    const char* cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
-    return std::string(1, cols[c]) + std::to_string(n - r);
-}
-
-int GoGame::str_to_action(const std::string& s) const {
-    if (s == "PASS" || s == "pass") return board_size * board_size;
-    const char* cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
-    char col_char = std::toupper(s[0]);
-    int c = 0;
-    while (cols[c] && cols[c] != col_char) c++;
-    int row_num = std::stoi(s.substr(1));
-    int r = board_size - row_num;
-    return r * board_size + c;
-}
-
-std::string GoGame::display() const {
-    const char* cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
-    const char symbols[] = {'.', 'X', 'O'};
+std::string XiangqiGame::display() const {
     std::ostringstream ss;
-
-    ss << "   ";
-    for (int c = 0; c < board_size; c++) ss << cols[c] << ' ';
-    ss << '\n';
-
-    for (int r = 0; r < board_size; r++) {
-        int row_num = board_size - r;
-        if (row_num < 10) ss << ' ';
-        ss << row_num << ' ';
-        for (int c = 0; c < board_size; c++) {
-            ss << symbols[board[r][c]];
-            if (c < board_size - 1) ss << ' ';
+    ss << "    a b c d e f g h i\n";
+    for (int r = 0; r < BOARD_ROWS; ++r) {
+        ss << ' ' << normalized_rank(r) << "  ";
+        for (int c = 0; c < BOARD_COLS; ++c) {
+            ss << piece_to_char(board[r][c]);
+            if (c + 1 < BOARD_COLS) ss << ' ';
         }
-        ss << ' ';
-        if (row_num < 10) ss << ' ';
-        ss << row_num << '\n';
+        ss << "  " << normalized_rank(r) << '\n';
+        if (r == 4) ss << "    -----------------\n";
     }
-
-    ss << "   ";
-    for (int c = 0; c < board_size; c++) ss << cols[c] << ' ';
-    ss << '\n';
-
-    ss << "Move " << move_count << " | Turn: "
-       << (current_player == BLACK ? "Black(X)" : "White(O)");
+    ss << "    a b c d e f g h i\n";
+    ss << "Move " << move_count + 1 << " | Turn: "
+       << (current_player == RED ? "Red" : "Black");
+    if (game_over) {
+        if (winner == EMPTY) ss << " | Result: draw";
+        else ss << " | Winner: " << (winner == RED ? "Red" : "Black");
+    }
     return ss.str();
 }
 

@@ -1,65 +1,52 @@
 #pragma once
 
-#include <cmath>
 #include <memory>
 #include <string>
-#include <vector>
-#include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 namespace minigo {
 
-// ================================================================
-// LoadedModel — parsed ONNX weights in CPU memory (KataGo pattern)
-//
-// Loaded once on the main thread.  Shared (const) across all
-// NNEvaluator server threads.  Each ComputeHandle uploads these
-// CPU weights to its own GPU buffers.
-//
-// BN parameters are pre-fused: scale[i] = gamma[i] / sqrt(var[i] + eps),
-// bias[i] = beta[i] - gamma[i] * mean[i] / sqrt(var[i] + eps).
-// ================================================================
-
 struct ConvBNWeights {
-    std::vector<float> weight;      // [C_out, C_in*kH*kW] row-major
-    std::vector<float> bn_scale;    // [C_out] pre-fused
-    std::vector<float> bn_bias;     // [C_out] pre-fused
-    int c_out = 0, c_in = 0, k = 0;  // k = kernel size (1 or 3)
+    std::vector<float> weight;
+    std::vector<float> bn_scale;
+    std::vector<float> bn_bias;
+    int c_out = 0;
+    int c_in = 0;
+    int k = 0;
 };
 
 struct FCWeights {
-    std::vector<float> weight;  // [out_features, in_features]
-    std::vector<float> bias;    // [out_features]
-    int out_features = 0, in_features = 0;
+    std::vector<float> weight;
+    std::vector<float> bias;
+    int out_features = 0;
+    int in_features = 0;
 };
 
 class LoadedModel {
 public:
-    // Load and parse an ONNX model file.  Pre-fuses BN parameters.
     static std::shared_ptr<LoadedModel> load(const std::string& model_path);
 
-    // Original ONNX file path (needed by TensorRT backend)
     std::string model_path;
-
-    // Architecture metadata (all inferred from ONNX weights by load())
-    std::string model_type;   // "resnet" or "vit"
-    int board_size = 0;
+    std::string model_type;
+    int board_rows = 10;
+    int board_cols = 9;
     int input_channels = 0;
-    int num_filters = 0;      // ResNet: conv filters; ViT: d_model
-    int num_res_blocks = 0;   // ResNet only
-    int vit_depth = 0;        // ViT: transformer blocks
-    int vit_heads = 0;        // ViT: Q heads
-    int vit_kv_groups = 0;    // ViT: KV groups (GQA)
+    int num_filters = 0;
+    int num_res_blocks = 0;
+    int vit_depth = 0;
+    int vit_heads = 0;
+    int vit_kv_groups = 0;
+    int action_size = 0;
 
-    // Weights (all pre-fused BN, CPU-side)
-    ConvBNWeights              input_conv;
-    std::vector<ConvBNWeights> res_conv1, res_conv2;
-    ConvBNWeights              policy_conv, value_conv;
-    FCWeights                  policy_fc, value_fc1, value_fc2;
-
-    // Score head
-    ConvBNWeights              score_conv;
-    FCWeights                  score_fc1, score_fc2;
+    ConvBNWeights input_conv;
+    std::vector<ConvBNWeights> res_conv1;
+    std::vector<ConvBNWeights> res_conv2;
+    ConvBNWeights policy_conv;
+    ConvBNWeights value_conv;
+    FCWeights policy_fc;
+    FCWeights value_fc1;
+    FCWeights value_fc2;
 };
 
 }  // namespace minigo
