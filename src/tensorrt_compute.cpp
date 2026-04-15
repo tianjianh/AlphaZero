@@ -61,9 +61,22 @@ static TRTLogger& get_trt_logger() {
 struct TRTDeviceState {
     int          device_id = -1;
 
-    // Engine is built lazily on first create_handle() for this device.
-    // Protected by build_mutex so only the first thread builds it.
-    std::mutex                              build_mutex;
+    // Serializes ALL engine-level host-side operations on the same
+    // ICudaEngine: (1) lazy engine build on first create_handle(),
+    // (2) createExecutionContext(), (3) delete exec_ctx.  Per NVIDIA
+    // TRT 10 docs, ICudaEngine lifecycle + context creation/destruction
+    // are NOT thread-safe with respect to one another — even when each
+    // exec_ctx runs on its own per-thread CUDA stream.  The engine
+    // holds an internal list of live execution contexts; concurrent
+    // ~IExecutionContext corrupts that list and the damage only
+    // surfaces when ~ICudaEngine walks the list at process teardown,
+    // manifesting as "double free or corruption (out)" after
+    // "Done! N games".  Only observed with --nn-device-ids 0,0 or
+    // 0,0,1,1 (two+ server threads per GPU).  Matches KataGo's
+    // trtbackend.cpp pattern: one per-engine mutex for lifecycle,
+    // no mutex for inference (enqueueV3, setTensorAddress,
+    // setInputShape — each thread has its own exec_ctx and stream).
+    std::mutex                              engine_mutex;
     nvinfer1::ICudaEngine*                  engine  = nullptr;
     nvinfer1::IRuntime*                     runtime = nullptr;
 
@@ -427,7 +440,17 @@ struct TensorRTComputeHandle::Impl {
         // that created the handle (local variable in server_loop), so
         // cudaStreamPerThread refers to this thread's own stream.
         cudaStreamSynchronize(cudaStreamPerThread);
-        if (exec_ctx)   delete exec_ctx;
+        // delete exec_ctx must be serialized per engine — ~NNEvaluator
+        // notifies all server threads at once, so two threads on the
+        // same GPU race to tear down exec_ctxs that share an engine.
+        // Without this lock the engine's internal context list is
+        // corrupted and ~ICudaEngine later crashes with a "double
+        // free or corruption (out)" after "Done!".  Stream sync above
+        // stays outside the lock (it's per-thread, not per-engine).
+        if (exec_ctx) {
+            std::lock_guard<std::mutex> lock(dev.engine_mutex);
+            delete exec_ctx;
+        }
         if (d_input)     cudaFree(d_input);
         if (d_policy)    cudaFree(d_policy);
         if (d_value)     cudaFree(d_value);
@@ -446,7 +469,7 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
 
     // Build engine if not yet built for this device (thread-safe)
     {
-        std::lock_guard<std::mutex> lock(dev.build_mutex);
+        std::lock_guard<std::mutex> lock(dev.engine_mutex);
         if (!dev.engine) {
             dev.engine = build_or_load_engine(dev, model, max_batch_size);
 
@@ -520,8 +543,12 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     I.score_sd_name   = dev.score_sd_name;
     I.ownership_name  = dev.ownership_name;
 
-    // Create per-thread execution context
-    I.exec_ctx = dev.engine->createExecutionContext();
+    // Create per-thread execution context.  Serialized per engine via
+    // dev.engine_mutex — see TRTDeviceState comment above for why.
+    {
+        std::lock_guard<std::mutex> lock(dev.engine_mutex);
+        I.exec_ctx = dev.engine->createExecutionContext();
+    }
     if (!I.exec_ctx)
         throw std::runtime_error("TensorRT: failed to create execution context");
 

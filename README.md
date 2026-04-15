@@ -867,6 +867,31 @@ Why this matters:
 With per-thread streams, each thread's capture, launch, and sync are
 completely isolated.  No shared mutable state during inference.
 
+#### Per-engine lock for context lifecycle (TensorRT)
+
+Per-thread streams make **inference** lock-free, but they do NOT make
+`IExecutionContext` **lifecycle** operations thread-safe.  Per NVIDIA
+TRT 10 docs, `ICudaEngine::createExecutionContext()` and
+`~IExecutionContext` are not thread-safe with respect to other context
+creation/destruction on the same engine — the engine keeps an internal
+list of live contexts that both operations mutate.
+
+With `--nn-device-ids 0,0,1,1`, two server threads share one engine per
+GPU.  At process exit, `~NNEvaluator` calls `notify_all()` and all four
+threads tear down their handles in parallel → each calls `delete
+exec_ctx` on contexts that point into the same engine → concurrent
+mutation of the internal list corrupts it → the damage only surfaces
+when `~ICudaEngine` walks the list at teardown, manifesting as
+`double free or corruption (out)` after `Done! N games`.
+
+Fix: one `engine_mutex` per `TRTDeviceState` held around (a) engine
+build, (b) `createExecutionContext()`, and (c) `delete exec_ctx`.
+Inference (`enqueueV3`, `setTensorAddress`, `setInputShape`) stays
+unlocked — each thread still owns its own `exec_ctx` and stream, so
+the GPU scheduler interleaves kernels across threads as before.  This
+matches KataGo's `trtbackend.cpp`: one per-engine lock for lifecycle,
+zero locks for inference.
+
 The **OpenCL** backend has a shared `cl_command_queue` per device but is
 currently disabled (the KataGo-style ResNet requires SE/GPool kernels not
 yet implemented in OpenCL).  When re-enabled, it should follow the same
@@ -900,11 +925,11 @@ Main thread:  LoadedModel::load()  →  create_compute_context({0,0,1,1})
               │                        │→ DeviceState[GPU1]: runtime (no stream)
               └→ NNEvaluator(model, ctx, {0,0,1,1}) → spawns 4 threads, returns
 
-Thread 0 (GPU0): ──lock build_mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #0
-Thread 1 (GPU0): ──lock build_mutex── WAIT ────────────────→ engine exists → create ExecCtx #1
-Thread 2 (GPU1): ──lock build_mutex──→ deserialize engine ──→ unlock ──→ create ExecCtx #2
-Thread 3 (GPU1): ──lock build_mutex── WAIT ────────────────→ engine exists → create ExecCtx #3
-                  ↑ parallel (different GPUs)      ↑ serialized (same GPU)
+Thread 0 (GPU0): ──lock engine_mutex──→ deserialize engine ──→ unlock ──→ lock ──→ ExecCtx #0 ──→ unlock
+Thread 1 (GPU0): ──lock engine_mutex── WAIT ─────────────────→ engine exists ─────→ ExecCtx #1 ──→ unlock
+Thread 2 (GPU1): ──lock engine_mutex──→ deserialize engine ──→ unlock ──→ lock ──→ ExecCtx #2 ──→ unlock
+Thread 3 (GPU1): ──lock engine_mutex── WAIT ─────────────────→ engine exists ─────→ ExecCtx #3 ──→ unlock
+                  ↑ parallel (different GPUs)     ↑ serialized (same GPU) — build AND context lifecycle
 
 Runtime inference (after all handles are ready):
 Thread 0: predict_batch on cudaStreamPerThread[0]  ← independent stream
@@ -915,9 +940,11 @@ Thread 3: predict_batch on cudaStreamPerThread[3]  ← independent stream
 ```
 
 Threads on different GPUs run in parallel.  Threads on the same GPU are serialized
-only during **engine build** by `dev.build_mutex` — the first thread deserializes the
-engine, subsequent threads find `dev.engine` already set and skip to creating their
-own `IExecutionContext`.  After build, all threads run inference fully in parallel.
+by `dev.engine_mutex` during three brief points: (1) engine build (first thread
+deserializes, others wait then skip), (2) `createExecutionContext()` at handle
+construction, and (3) `delete exec_ctx` at handle destruction.  After
+construction all threads run inference fully in parallel — `enqueueV3` is lock-free
+because each thread owns its own `IExecutionContext` and `cudaStreamPerThread`.
 
 **Evaluation** (2 models, 2 GPUs, 4 server threads each):
 

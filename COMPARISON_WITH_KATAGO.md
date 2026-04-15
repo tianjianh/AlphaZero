@@ -118,6 +118,8 @@ Side-by-side comparison of implementation details across all major subsystems.
 | **Atomic float** | `std::atomic<double>` (platform support) | CAS loop on `std::atomic<int32_t>` bit pattern |
 | **Per-node lock** | `MutexPool` indexed by hash (for expansion) | Lock-free CAS on state enum |
 | **Stats lock** | `statsLock` mutex for virtual loss writes | Lock-free `fetch_add`/`fetch_sub` |
+| **TRT engine lifecycle lock** | Per-engine mutex around build + ctx create/delete | `TRTDeviceState::engine_mutex` (same scope) |
+| **TRT inference lock** | None — per-thread CUDA stream | None — `cudaStreamPerThread` |
 
 ## 10. Key Design Differences
 
@@ -437,6 +439,36 @@ NNEvaluator destructor:
   6. ComputeContext destructor (later, when shared_ptr refcount → 0):
        - clReleaseProgram, clReleaseCommandQueue, clReleaseContext per GPU
 ```
+
+#### TensorRT lifecycle: per-engine lock (matches KataGo)
+
+TensorRT differs from OpenCL here.  Per NVIDIA TRT 10 docs,
+`ICudaEngine::createExecutionContext()` and `~IExecutionContext` are
+**not thread-safe** with respect to other context creation/destruction
+on the same engine — the engine maintains an internal list of live
+contexts that both operations mutate.  Per-thread CUDA streams make
+**inference** (`enqueueV3`) safe but do NOT cover lifecycle.
+
+With `--nn-device-ids 0,0,1,1` (two server threads per GPU), step 2
+above (`notify_all`) wakes all four threads simultaneously.  Each then
+runs step 4 in parallel — calling `delete exec_ctx` on contexts that
+share an engine.  Concurrent list mutation corrupts engine internals;
+the damage only surfaces when `~ICudaEngine` walks the list at step 6,
+manifesting as `double free or corruption (out)` after `Done! N games`.
+
+**KataGo's `trtbackend.cpp`** uses a single per-engine mutex around
+(a) engine build, (b) `createExecutionContext()`, and (c)
+`delete exec_ctx`, leaving inference lock-free.  **MiniGo matches this
+exactly**: one `engine_mutex` per `TRTDeviceState` covers the same
+three points.  Inference keeps using `cudaStreamPerThread` with no
+mutex so the GPU scheduler can still interleave kernels from different
+threads on the same GPU.
+
+| Lock | KataGo | MiniGo |
+|------|--------|--------|
+| Per-engine lifecycle mutex | `TRTModel::mutex` (held during build, ctx create, ctx delete) | `TRTDeviceState::engine_mutex` (same three points) |
+| Inference | Lock-free, per-thread stream | Lock-free, `cudaStreamPerThread` |
+| Disk cache serialization | Per-cache-path mutex in engine cache | `build_mutexes[cache_path]` static map |
 
 Sources:
 - [KataGo nneval.cpp](https://github.com/lightvector/KataGo/blob/master/cpp/neuralnet/nneval.cpp)
