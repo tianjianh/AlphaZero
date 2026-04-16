@@ -236,26 +236,27 @@ def main():
     parser.add_argument("--num-workers", type=int, default=8,
                         help="DataLoader workers for prefetching (default: 8)")
     # --- All 7 loss weights ---
-    # Loss weights.  Designed so mid-training weighted contributions are
-    # balanced: policy ~3.0 (dominant), value ~1.0, auxiliaries 0.1-0.5.
-    # scoreMean/Stdev weights are small because their raw MSE is in
-    # points² (typical magnitude 20-100), matching KataGo's approach.
+    # Weights calibrated to match KataGo proportions: policy ~55%,
+    # value ~18%, ownership ~10%, score total ~5%, opponent ~9%.
+    # Value must ramp across plan stages (1.5 → 5.0) because raw
+    # value CE drops from ~0.8 (init) to ~0.08 (converged).
     parser.add_argument("--policy-weight", type=float, default=1.0,
-                        help="Loss weight for policy CE (KataGo: 1.0)")
+                        help="Loss weight for policy CE (KataGo: 0.93)")
     parser.add_argument("--value-weight", type=float, default=1.5,
-                        help="Loss weight for value CE W/L/D (KataGo: 1.5)")
-    parser.add_argument("--score-mean-weight", type=float, default=0.005,
-                        help="Loss weight for scoreMean MSE in points² "
-                             "(~25 raw × 0.005 = 0.125 weighted)")
-    parser.add_argument("--score-stdev-weight", type=float, default=0.005,
-                        help="Loss weight for scoreStdev MSE in points² "
-                             "(~12 raw × 0.005 = 0.06 weighted)")
-    parser.add_argument("--ownership-weight", type=float, default=1.5,
+                        help="Loss weight for value CE W/L/D — ramp via plan "
+                             "(KataGo: 1.20; we need higher because raw loss is lower)")
+    parser.add_argument("--score-mean-weight", type=float, default=0.010,
+                        help="Loss weight for scoreMean Huber(δ=12) "
+                             "(KataGo: 0.0015; we use higher to compensate for lacking TD/lead heads)")
+    parser.add_argument("--score-stdev-weight", type=float, default=0.006,
+                        help="Loss weight for scoreStdev Huber(δ=10) "
+                             "(KataGo: 0.001)")
+    parser.add_argument("--ownership-weight", type=float, default=0.85,
                         help="Loss weight for ownership BCE per-intersection "
-                             "mean (~0.3 × 1.5 = 0.45 weighted; matches KataGo)")
-    parser.add_argument("--score-belief-weight", type=float, default=0.02,
-                        help="Loss weight for score belief CE (soft Gaussian; "
-                             "~3 × 0.02 = 0.06 weighted, matches KataGo)")
+                             "mean (~0.27 × 0.85 = 0.23 weighted, ~10%%; KataGo: 1.5)")
+    parser.add_argument("--score-belief-weight", type=float, default=0.035,
+                        help="Loss weight for score belief CE 163-bin "
+                             "(KataGo: 0.04 total for CDF+PDF)")
     parser.add_argument("--opp-policy-weight", type=float, default=0.1,
                         help="Loss weight for opponent policy CE "
                              "(~3 × 0.1 = 0.3 weighted)")
@@ -500,14 +501,17 @@ def main():
                 # 2. Value: 3-class CE (win/loss/draw)
                 value_loss = F.cross_entropy(pred_value, value_target)
 
-                # 3. ScoreMean: raw MSE in points² (weight is small to compensate,
-                # matching KataGo — scale absorbed into weight, not the loss).
-                score_mean_loss = F.mse_loss(pred_score_mean.squeeze(1), scores)
+                # 3. ScoreMean: Huber(δ=12) on raw points (KataGo exact match).
+                # Quadratic for |err|<12, linear beyond — clips gradient on
+                # outlier samples (±20pt errors from noisy self-play) that
+                # would otherwise dominate the MSE gradient and cause the
+                # optimizer to partially ignore the score signal.
+                score_mean_loss = F.huber_loss(pred_score_mean.squeeze(1), scores, delta=12.0)
 
-                # 4. ScoreStdev: raw MSE against |actual - predicted_mean|
+                # 4. ScoreStdev: Huber(δ=10) against |actual - predicted_mean|
                 with torch.no_grad():
                     stdev_target = (scores - pred_score_mean.squeeze(1).detach()).abs()
-                score_stdev_loss = F.mse_loss(pred_score_stdev.squeeze(1), stdev_target)
+                score_stdev_loss = F.huber_loss(pred_score_stdev.squeeze(1), stdev_target, delta=10.0)
 
                 # 5. Ownership: per-intersection BCE
                 ownership_loss = F.binary_cross_entropy_with_logits(

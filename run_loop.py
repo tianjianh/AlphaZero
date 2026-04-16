@@ -405,15 +405,17 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "window_size": window,
             "eval_threshold": eval_threshold,
             # Weights chosen for balanced weighted contributions mid-training:
-            # policy ~3.0 (dominant), value ~1.0, auxiliaries 0.05–0.5.
-            # scoreMean/Stdev weights are small because raw MSE is in points²
-            # (typical magnitude 20-100).  Matches KataGo's design ratios.
+            # Weights calibrated to match KataGo proportions: policy ~55%,
+            # value ~18%, ownership ~10%, score total ~5%, opponent ~9%.
+            # Value ramps across stages (1.5 → 5.0) via per-stage overrides
+            # because raw value CE drops from ~0.8 (init) to ~0.08 (converged).
+            # Score losses use Huber (not MSE) matching KataGo exactly.
             "policy_weight": 1.0,
             "value_weight": 1.5,
-            "score_mean_weight": 0.005,
-            "score_stdev_weight": 0.005,
-            "ownership_weight": 1.5,
-            "score_belief_weight": 0.02,
+            "score_mean_weight": 0.010,
+            "score_stdev_weight": 0.006,
+            "ownership_weight": 0.85,
+            "score_belief_weight": 0.035,
             "opp_policy_weight": 0.1,
             "fp8": False,
         },
@@ -425,10 +427,7 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
             "temp_threshold": temp_threshold,
             "win_loss_weight": 1.0,
             "score_weight": score_weight,
-            "score_scale": 10.0,  # MCTS utility atan compression only.
-                                  # score_utility = atan(score/10)/(π/2).
-                                  # Training loss uses raw points²; weights
-                                  # are small to compensate (KataGo-style).
+            "score_scale": 2.0 * (board ** 2) ** 0.5,  # KataGo: 2*sqrt(boardArea)
         },
         "stages": generate_stages(preset, board, filters, blocks, arch),
     }

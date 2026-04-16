@@ -48,50 +48,52 @@ training-only auxiliaries that shape the trunk's internal representations.
 
 **Loss weights and target contributions**
 
-Weights are calibrated so that policy dominates and auxiliaries each
-contribute a modest fraction.  Table below matches an actual mid-training
-epoch with the late-stage plan weights (policy=1, value=1.5,
-score_mean=0.015, score_stdev=0.005, ownership=1.5, belief=0.02, opp=0.1).
+Weights are calibrated to match KataGo's proportions: policy dominant
+(~55%), value strong secondary (~18%), ownership moderate (~10%),
+score total ~5%, opponent ~9%.  `value_weight` ramps across plan stages
+(1.5 → 5.0) because raw value CE drops from ~0.8 (init) to ~0.08
+(converged) — a fixed weight would make value either dominant at init
+or negligible once converged.  Table shows late-stage (Overnight extend):
 
-| Head | Stage weight | Typical raw loss (mid-train) | Weighted | vs policy |
-|------|---------------:|-----------------:|---------:|----------:|
-| Policy | 1.000 | ~1.3 (log 82 ≈ 4.4 init) | **1.30** | 1.00 |
-| Value | 1.500 | ~0.08 (log 3 ≈ 1.1 init, CE) | **0.12** | 0.09 |
-| Ownership | 1.500 | ~0.27 (mean BCE, log 2 ≈ 0.69 init) | **0.40** | 0.31 |
-| Opponent Policy | 0.100 | ~2.0 | **0.20** | 0.15 |
-| ScoreMean | 0.002 → 0.015 (ramped) | ~10 points² (MSE) | **0.02 → 0.15** | 0.02 → 0.12 |
-| ScoreStdev | 0.005 | ~5 points² (MSE) | **0.025** | 0.02 |
-| Score Belief | 0.020 | ~2.8 | **0.056** | 0.04 |
-| **Total** | | | **~2.2** | |
+| Head | Late weight | Loss function | Raw loss | Weighted | % |
+|------|------------:|---------------|----------|---------:|---:|
+| Policy | 1.0 | soft CE | ~1.3 | **1.27** | 55% |
+| Value | 5.0 (ramped 1.5→5.0) | CE (W/L/D) | ~0.08 | **0.40** | 17% |
+| Ownership | 0.85 | BCE mean | ~0.27 | **0.23** | 10% |
+| Opponent Policy | 0.1 | CE | ~2.0 | **0.20** | 9% |
+| Score Belief | 0.035 | soft CE (163 bins) | ~2.8 | **0.10** | 4% |
+| ScoreMean | 0.015 (ramped 0.004→0.015) | **Huber(δ=12)** | ~5.7 | **0.09** | 4% |
+| ScoreStdev | 0.006 | **Huber(δ=10)** | ~2.6 | **0.02** | 1% |
+| **Total** | | | | **2.30** | |
 
-`plan.json` ramps `score_mean_weight` across stages (`0.002 → 0.005 →
-0.01 → 0.015`) so that the model learns policy/value first, then
-refines the score head once the trunk is reasonable.  `score_stdev_weight`
-stays at `0.005` — larger than KataGo's `0.001` because our stdev
-target is `|actual − pred_mean.detach()|` (MSE in points²) rather than
-KataGo's `stdev-of-belief` (Huber in points).
+`value_weight` ramp: 1.5 (bootstrap) → 1.5 → 2.0 → 3.0 → 4.0 → 5.0.
+This keeps value at ~15-21% of total loss across all training stages,
+matching KataGo's value proportion despite our raw value loss being
+much smaller (0.08 vs KataGo's typical ~0.5 with larger models).
 
-**KataGo comparison (loss functions).**  KataGo's analogous losses are
-different in both shape and coefficient:
+**KataGo comparison (loss functions).**  Score losses now use the same
+Huber formulation as KataGo.  Weights are higher than KataGo's because
+we lack their additional score-related heads (TD score ×3, lead,
+scoring — ~5 extra heads that contribute score gradient through the
+shared trunk):
 
 | | KataGo | MiniGo |
 |---|---|---|
-| Score mean | **Huber(δ=12)** on **points** | **MSE** on **points²** |
-| Score stdev | Huber(δ=10) on points, target from `score_belief` distribution | MSE on points², target `\|actual − pred_mean.detach()\|` |
-| scoreMean weight | `0.0015` | `0.002 → 0.015` (stage ramp) |
-| scoreStdev weight | `0.001` | `0.005` |
+| Score mean | Huber(δ=12) | **Huber(δ=12)** (same) |
+| Score stdev | Huber(δ=10) | **Huber(δ=10)** (same) |
+| Score belief | CDF MSE + PDF CE, weight 0.04 total | soft CE, weight **0.035** |
+| scoreMean weight | `0.0015` | `0.004 → 0.015` (higher to compensate for lacking TD/lead) |
+| scoreStdev weight | `0.001` | `0.006` |
+| Value weight | `1.20` | `1.5 → 5.0` (ramped; higher because our val_raw is 10× smaller) |
+| Ownership weight | `1.5` | `0.85` (lower to give room for value ramp) |
 
-Our weights are ~5–10× larger than KataGo's, but that does NOT mean we
-train score 10× harder: MSE on points² grows quadratically in the
-error (`err=10` → `loss=100`), so the effective gradient magnitude is
-similar.  The raw-loss columns are **not directly comparable** between
-KataGo and MiniGo because of the MSE-vs-Huber choice.
-
-**Why ownership weight is 1.5:** `F.binary_cross_entropy_with_logits`
-averages BCE over all intersections, returning ~0.3 mid-training.
-Weight 1.5 lifts the weighted contribution to 0.45, giving ownership
-the same gradient bandwidth as value.  KataGo uses `1.5 / board_area`
-with sum-reduction, which gives the same effective scale.
+**Why ownership weight is 0.85 (not KataGo's 1.5):**
+`F.binary_cross_entropy_with_logits` averages BCE over all 81
+intersections, returning ~0.27 mid-training.  KataGo uses weight 1.5
+but their value proportion is naturally ~20% from a higher raw value
+loss.  Our raw value loss is tiny (0.08), so we need weight 5.0 on
+value — giving ownership a lower weight (0.85 × 0.27 = 0.23, ~10%)
+keeps the total budget balanced.
 
 **MCTS utility formula:**
 ```
@@ -99,11 +101,16 @@ utility = win_loss_weight × (P(win) - P(loss))
         + score_weight × atan(scoreMean / score_scale) / (π/2)
 ```
 
-| Param | Default | Meaning |
-|-------|---------|---------|
-| `win_loss_weight` | 1.0 | multiplier on P(win)-P(loss) term |
-| `score_weight` | 0.0 (bootstrap) → 0.1 (overnight) | how much MCTS values score predictions |
-| `score_scale` | 10.0 | atan compression: 5-point lead → `atan(0.5)/(π/2) ≈ 0.30` utility |
+| Param | Default | KataGo | Meaning |
+|-------|---------|--------|---------|
+| `win_loss_weight` | 1.0 | 1.0 | multiplier on P(win)-P(loss) term |
+| `score_weight` | 0.0 → 0.30 (ramped) | 0.30 (fixed) | how much MCTS values score predictions |
+| `score_scale` | 18.0 | `2×√boardArea` = 18 for 9×9 | atan compression: 10pt lead → `atan(10/18)/(π/2) ≈ 0.32` |
+
+KataGo additionally integrates score utility over the score distribution
+`(scoreMean, scoreStdev)` so uncertain scores are dampened.  We use a
+point estimate on `scoreMean` — a reasonable approximation once the model
+is trained and stdev is small.  Stdev integration is a future improvement.
 
 **Configurability**
 

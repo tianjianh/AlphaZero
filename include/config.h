@@ -27,7 +27,7 @@ struct Config {
     int temperature_threshold = 15;  // moves of stochastic play (rest is greedy)
     float win_loss_weight = 1.0f;    // blend: utility = wlw * value + sw * score_utility
     float score_weight = 0.0f;       // blend: utility = wlw * value + sw * score_utility
-    float score_scale = 10.0f;       // atan compression: score_utility = atan(score/scale)/(π/2)
+    float score_scale = 18.0f;       // atan compression: 2*sqrt(boardArea) for 9x9 (KataGo formula)
 
     // Self-play
     int max_moves_per_game = 162;  // board_size^2 * 2
