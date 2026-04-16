@@ -94,9 +94,10 @@ void XiangqiGame::reset() {
     final_black_score = 0.0f;
     ring_head_ = 0;
     ring_size_ = 0;
-    position_hash_count_ = 0;
     update_history();
-    position_hashes_[position_hash_count_++] = compute_hash();
+    current_hash_ = compute_hash();
+    move_history_count_ = 1;
+    move_history_[0] = MoveRecord{-1, NO_PIECE, false, current_hash_};
 }
 
 XiangqiGame XiangqiGame::copy() const {
@@ -139,6 +140,21 @@ bool XiangqiGame::is_side_piece(int8_t piece, Stone side) {
     return piece_color(piece) == side;
 }
 
+bool XiangqiGame::find_king(Stone side, int& r, int& c) const {
+    int8_t king_piece = (side == RED) ? RED_KING : BLACK_KING;
+    for (int row = 0; row < BOARD_ROWS; ++row) {
+        for (int col = 0; col < BOARD_COLS; ++col) {
+            if (board[row][col] == king_piece) {
+                r = row;
+                c = col;
+                return true;
+            }
+        }
+    }
+    r = c = -1;
+    return false;
+}
+
 char XiangqiGame::piece_to_char(int8_t piece) {
     switch (piece) {
         case RED_KING: return 'K';
@@ -168,6 +184,13 @@ void XiangqiGame::apply_move_unchecked(int sr, int sc, int dr, int dc, int8_t& c
 void XiangqiGame::undo_move_unchecked(int sr, int sc, int dr, int dc, int8_t captured) {
     board[sr][sc] = board[dr][dc];
     board[dr][dc] = captured;
+}
+
+bool XiangqiGame::is_in_check(Stone side) const {
+    int king_r = -1;
+    int king_c = -1;
+    if (!find_king(side, king_r, king_c)) return false;
+    return is_square_attacked(king_r, king_c, opponent(side));
 }
 
 bool XiangqiGame::is_square_attacked(int r, int c, Stone by) const {
@@ -292,20 +315,7 @@ bool XiangqiGame::is_legal(int action) const {
     XiangqiGame tmp = *this;
     int8_t captured = NO_PIECE;
     tmp.apply_move_unchecked(sr, sc, dr, dc, captured);
-    int king_r = -1, king_c = -1;
-    int8_t king_piece = (current_player == RED) ? RED_KING : BLACK_KING;
-    for (int r = 0; r < BOARD_ROWS; ++r) {
-        for (int c = 0; c < BOARD_COLS; ++c) {
-            if (tmp.board[r][c] == king_piece) {
-                king_r = r;
-                king_c = c;
-                break;
-            }
-        }
-        if (king_r >= 0) break;
-    }
-    if (king_r < 0) return false;
-    return !tmp.is_square_attacked(king_r, king_c, opponent(current_player));
+    return !tmp.is_in_check(current_player);
 }
 
 bool XiangqiGame::has_any_legal_move(Stone side) const {
@@ -339,14 +349,38 @@ uint64_t XiangqiGame::compute_hash() const {
     return h;
 }
 
-bool XiangqiGame::is_threefold_repetition() const {
-    if (position_hash_count_ < 3) return false;
-    uint64_t current = position_hashes_[position_hash_count_ - 1];
-    int count = 0;
-    for (int i = 0; i < position_hash_count_; ++i) {
-        if (position_hashes_[i] == current) count++;
+int XiangqiGame::repetition_status(int n_recur) const {
+    if (n_recur <= 0 || move_history_count_ <= 1) return REPETITION_NONE;
+
+    // Match XQWLight's reversible-history scan: only uncaptured move
+    // sequences participate, and perpetual-check responsibility is tracked
+    // separately for the side to move and the opponent.
+    bool self_side = false;
+    bool self_perpetual_check = true;
+    bool opp_perpetual_check = true;
+
+    for (int idx = move_history_count_ - 1; idx >= 0; --idx) {
+        const auto& rec = move_history_[idx];
+        if (rec.action < 0 || rec.captured != NO_PIECE) break;
+
+        if (self_side) {
+            self_perpetual_check = self_perpetual_check && rec.gave_check;
+            if (rec.pre_move_hash == current_hash_) {
+                n_recur--;
+                if (n_recur == 0) {
+                    int status = REPETITION_DRAW;
+                    if (self_perpetual_check) status |= REPETITION_SELF_PERPETUAL_CHECK;
+                    if (opp_perpetual_check) status |= REPETITION_OPP_PERPETUAL_CHECK;
+                    return status;
+                }
+            }
+        } else {
+            opp_perpetual_check = opp_perpetual_check && rec.gave_check;
+        }
+        self_side = !self_side;
     }
-    return count >= 3;
+
+    return REPETITION_NONE;
 }
 
 void XiangqiGame::get_legal_moves(std::vector<float>& legal) const {
@@ -378,6 +412,7 @@ void XiangqiGame::play(int action) {
     int dr = dst / BOARD_COLS;
     int dc = dst % BOARD_COLS;
 
+    uint64_t pre_move_hash = current_hash_;
     int8_t captured = NO_PIECE;
     apply_move_unchecked(sr, sc, dr, dc, captured);
 
@@ -385,12 +420,25 @@ void XiangqiGame::play(int action) {
     move_count++;
     current_player = opponent(current_player);
     update_history();
-    if (position_hash_count_ < (int)position_hashes_.size())
-        position_hashes_[position_hash_count_++] = compute_hash();
+    current_hash_ = compute_hash();
 
-    if (is_threefold_repetition()) {
+    bool gave_check = is_in_check(current_player);
+    if (move_history_count_ < (int)move_history_.size()) {
+        move_history_[move_history_count_++] = MoveRecord{action, captured, gave_check, pre_move_hash};
+    }
+
+    int rep_status = repetition_status(3);
+    if (rep_status != REPETITION_NONE) {
         game_over = true;
-        winner = EMPTY;
+        bool self_perpetual = (rep_status & REPETITION_SELF_PERPETUAL_CHECK) != 0;
+        bool opp_perpetual = (rep_status & REPETITION_OPP_PERPETUAL_CHECK) != 0;
+        if (self_perpetual == opp_perpetual) {
+            winner = EMPTY;
+        } else if (self_perpetual) {
+            winner = opponent(current_player);
+        } else {
+            winner = current_player;
+        }
         score_game();
         return;
     }

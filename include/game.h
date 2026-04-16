@@ -72,14 +72,26 @@ public:
     int8_t board[BOARD_ROWS][BOARD_COLS] = {};
 
 private:
+    struct MoveRecord {
+        int action = -1;
+        int8_t captured = NO_PIECE;
+        bool gave_check = false;
+        uint64_t pre_move_hash = 0;
+    };
+
     static constexpr int PIECE_PLANES = 14;
     static constexpr int RING_CAP = 16;
+    static constexpr int REPETITION_NONE = 0;
+    static constexpr int REPETITION_DRAW = 1;
+    static constexpr int REPETITION_SELF_PERPETUAL_CHECK = 2;
+    static constexpr int REPETITION_OPP_PERPETUAL_CHECK = 4;
 
     std::array<std::array<int8_t, BOARD_AREA>, RING_CAP> ring_buf_{};
     int ring_head_ = 0;
     int ring_size_ = 0;
-    std::array<uint64_t, MAX_GAME_MOVES + 1> position_hashes_{};
-    int position_hash_count_ = 0;
+    std::array<MoveRecord, MAX_GAME_MOVES + 1> move_history_{};
+    int move_history_count_ = 0;
+    uint64_t current_hash_ = 0;
 
     static bool in_bounds(int r, int c);
     static bool in_red_palace(int r, int c);
@@ -95,12 +107,14 @@ private:
     static int action_src(int action) { return action / BOARD_AREA; }
     static int action_dst(int action) { return action % BOARD_AREA; }
 
+    bool find_king(Stone side, int& r, int& c) const;
     bool is_pseudo_legal(int sr, int sc, int dr, int dc) const;
     void apply_move_unchecked(int sr, int sc, int dr, int dc, int8_t& captured);
     void undo_move_unchecked(int sr, int sc, int dr, int dc, int8_t captured);
+    bool is_in_check(Stone side) const;
     bool is_square_attacked(int r, int c, Stone by) const;
     bool has_any_legal_move(Stone side) const;
-    bool is_threefold_repetition() const;
+    int repetition_status(int n_recur = 1) const;
     uint64_t compute_hash() const;
     void update_history();
     void score_game();

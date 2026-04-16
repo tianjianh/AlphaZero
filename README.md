@@ -257,23 +257,34 @@ The current engine ends the game when:
 
 - the side to move has no legal move
   - winner is the opponent
-- the same position appears three times
-  - currently treated as a draw
+- a repeated position inside the current non-capturing sequence reaches the
+  XQWLight-style adjudication threshold
+  - the perpetual checker loses
+  - if both sides are perpetually checking, the result is a draw
+  - if neither side is perpetually checking, the repeated position is a draw
 - the self-play move limit is reached
   - forced draw
 
-### Important Simplification
+### Repetition And Long-Check
 
-This port does **not** yet implement full Xiangqi long-check / long-chase
-adjudication at the same depth as mature engines such as XQWizard/XQWLight.
+Repetition handling now follows the same core approach used by
+`xqwlight_win32/XQWL06.CPP`:
 
-Current repetition handling is:
+- scan backward only through the current reversible sequence
+  - the scan stops at the root or the most recent capture
+- compare the current side-to-move hash against prior same-side-to-move hashes
+- track whether the current side's repeating moves are all checks
+- track whether the opponent's repeating moves are all checks
 
-- simple repeated-position detection
-- draw on threefold repetition
+When the recurrence threshold is reached, adjudication is:
 
-That is an intentional simplification and should be considered a known gap if
-the goal is tournament-grade Xiangqi rule completeness.
+- current side perpetually checking: current side loses
+- opponent perpetually checking: current side wins
+- both sides perpetually checking: draw
+- repeated position without perpetual checking on either side: draw
+
+This keeps the game result aligned with XQWLight's long-check behavior instead
+of collapsing every repeated position into a simple threefold draw.
 
 ## Feature Encoding
 
@@ -742,7 +753,6 @@ The remaining differences are intentional and tied to tool purpose.
 ## Known Limitations
 
 - the port is documented and validated around **Metal on macOS**
-- repetition handling is simplified to threefold draw
 - the current training loop uses only policy/value supervision even though the
   self-play record still stores extra trailing fields
 - `evaluate --output` writes text records, not a standard Xiangqi notation file
