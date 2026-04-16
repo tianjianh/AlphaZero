@@ -433,6 +433,12 @@ def main():
     mprint("-" * 60)
 
     t_train_start = time.time()
+    # Value-head diagnostic bin edges (KataGo-style calibration tracking).
+    # Phase bins by stone-count proxy for move number (9x9 max ~80 stones).
+    phase_edges = [0, 16, 41, 999]  # early < 16, mid 16-40, late >= 41
+    # Confidence bins on max softmax prob of 3-class value (W/L/D; chance = 1/3)
+    conf_edges = [0.333, 0.50, 0.70, 0.90, 1.0001]
+
     for epoch in range(1, args.epochs + 1):
         dataset.set_epoch(epoch)
         model.train()
@@ -441,6 +447,15 @@ def main():
         total_ol = total_bl = total_opl = 0.0
         n = 0
         t0 = time.time()
+
+        # Value diagnostics: CE bucketed by game phase; calibration curve
+        # (correct count + confidence sum per confidence bin).  Per-epoch
+        # accumulators so the overhead is O(B) per batch, not O(B²).
+        phase_ce_sum  = [0.0, 0.0, 0.0]  # early/mid/late
+        phase_count   = [0,   0,   0]
+        conf_correct  = [0, 0, 0, 0]     # correct predictions per bin
+        conf_sum      = [0.0, 0.0, 0.0, 0.0]  # sum of max-probs per bin
+        conf_count    = [0, 0, 0, 0]
 
         for states, policies, values, scores, ownerships, opp_actions in loader:
             if max_batches is not None and n >= max_batches:
@@ -531,6 +546,33 @@ def main():
             total_opl += opp_policy_loss.item()
             n += 1
 
+            # ── Value-head diagnostics (cheap, no extra fwd pass) ────
+            # Stone count as a proxy for game phase.  Encoding: channels
+            # 0 and 8 are the most-recent current/opponent snapshots, so
+            # their sum across HxW gives total stones on board.  Works
+            # for any history_length the encoder uses.
+            with torch.no_grad():
+                stone_count = (states[:, 0] + states[:, 8]).reshape(states.size(0), -1).sum(dim=1)
+                v_probs = F.softmax(pred_value.float(), dim=1)
+                v_max, v_pred = v_probs.max(dim=1)
+                per_sample_ce = F.cross_entropy(pred_value.float(), value_target, reduction="none")
+                correct = (v_pred == value_target)
+
+                for b, (lo, hi) in enumerate(zip(phase_edges[:-1], phase_edges[1:])):
+                    m = (stone_count >= lo) & (stone_count < hi)
+                    c = m.sum().item()
+                    if c:
+                        phase_count[b]  += c
+                        phase_ce_sum[b] += per_sample_ce[m].sum().item()
+
+                for b, (lo, hi) in enumerate(zip(conf_edges[:-1], conf_edges[1:])):
+                    m = (v_max >= lo) & (v_max < hi)
+                    c = m.sum().item()
+                    if c:
+                        conf_count[b]   += c
+                        conf_sum[b]     += v_max[m].sum().item()
+                        conf_correct[b] += correct[m].sum().item()
+
         dt = time.time() - t0
         d = max(n, 1)
         avg = lambda t: t / d
@@ -543,6 +585,40 @@ def main():
              f"loss={avg(total_loss):.4f}  pol={avg(total_pl):.4f}  val={avg(total_vl):.4f}  "
              f"smn={avg(total_sml):.4f}  ssd={avg(total_ssl):.4f}  own={avg(total_ol):.4f}  "
              f"bel={avg(total_bl):.4f}  opp={avg(total_opl):.4f}  {dt:.1f}s")
+
+        # ── Value diagnostics: phase CE + calibration (ECE) ──────
+        # Tells us whether low val_loss is genuinely well-calibrated
+        # (scenario 1) or dominated by easy late-game positions
+        # (scenario 2) or overconfident (scenario 3).  Bucket CE by
+        # game phase (stone count proxies for move number); bucket
+        # max-softmax-prob by confidence and compare to accuracy.
+        phase_ce = [s / c if c else 0.0
+                    for s, c in zip(phase_ce_sum, phase_count)]
+        phase_tot = sum(phase_count) or 1
+        phase_frac = [c / phase_tot for c in phase_count]
+
+        # Expected Calibration Error:  Σ (|B|/N) × |acc_B − conf_B|
+        ece = 0.0
+        conf_tot = sum(conf_count) or 1
+        calib_parts = []
+        for b in range(len(conf_count)):
+            if conf_count[b]:
+                conf_b = conf_sum[b] / conf_count[b]
+                acc_b  = conf_correct[b] / conf_count[b]
+                ece += (conf_count[b] / conf_tot) * abs(acc_b - conf_b)
+                calib_parts.append(f"{conf_edges[b]:.2f}-{conf_edges[b+1]:.2f}:"
+                                   f"conf={conf_b:.3f}/acc={acc_b:.3f}"
+                                   f"@{conf_count[b]/conf_tot*100:.0f}%")
+            else:
+                calib_parts.append(f"{conf_edges[b]:.2f}-{conf_edges[b+1]:.2f}:-")
+
+        diag_line = (f"      val-diag  "
+                     f"phase CE: early={phase_ce[0]:.3f}({phase_frac[0]*100:.0f}%) "
+                     f"mid={phase_ce[1]:.3f}({phase_frac[1]*100:.0f}%) "
+                     f"late={phase_ce[2]:.3f}({phase_frac[2]*100:.0f}%)  "
+                     f"ECE={ece:.3f}  calib[{' '.join(calib_parts)}]")
+        mprint(diag_line)
+        tlog(diag_line)
 
     train_time = time.time() - t_train_start
     mprint(f"Training complete ({train_time:.1f}s)")
