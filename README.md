@@ -48,26 +48,44 @@ training-only auxiliaries that shape the trunk's internal representations.
 
 **Loss weights and target contributions**
 
-Weights are calibrated so that weighted contributions are balanced at
-mid-training: policy dominates (~3.0), value is a strong secondary
-(~1.0), and auxiliaries each contribute 0.05–0.5.  The overall loss
-sums to ~5.0 with no single auxiliary drowning out another.
+Weights are calibrated so that policy dominates and auxiliaries each
+contribute a modest fraction.  Table below matches an actual mid-training
+epoch with the late-stage plan weights (policy=1, value=1.5,
+score_mean=0.015, score_stdev=0.005, ownership=1.5, belief=0.02, opp=0.1).
 
-| Head | Default weight | Typical raw loss | Weighted | vs policy |
+| Head | Stage weight | Typical raw loss (mid-train) | Weighted | vs policy |
 |------|---------------:|-----------------:|---------:|----------:|
-| Policy | 1.000 | ~3.0 (log 82≈4.4 init) | **3.000** | 1.00 |
-| Value | 1.500 | ~0.7 (log 3≈1.1 init) | **1.050** | 0.35 |
-| Ownership | 1.500 | ~0.30 (mean BCE, log 2≈0.69 init) | **0.450** | 0.15 |
-| Opponent Policy | 0.100 | ~3.0 | **0.300** | 0.10 |
-| ScoreMean | 0.005 | ~25 points² mid-train (MSE) | **0.125** | 0.04 |
-| ScoreStdev | 0.005 | ~12 points² mid-train | **0.060** | 0.02 |
-| Score Belief | 0.020 | ~3 | **0.060** | 0.02 |
-| **Total** | | | **~5.0** | |
+| Policy | 1.000 | ~1.3 (log 82 ≈ 4.4 init) | **1.30** | 1.00 |
+| Value | 1.500 | ~0.08 (log 3 ≈ 1.1 init, CE) | **0.12** | 0.09 |
+| Ownership | 1.500 | ~0.27 (mean BCE, log 2 ≈ 0.69 init) | **0.40** | 0.31 |
+| Opponent Policy | 0.100 | ~2.0 | **0.20** | 0.15 |
+| ScoreMean | 0.002 → 0.015 (ramped) | ~10 points² (MSE) | **0.02 → 0.15** | 0.02 → 0.12 |
+| ScoreStdev | 0.005 | ~5 points² (MSE) | **0.025** | 0.02 |
+| Score Belief | 0.020 | ~2.8 | **0.056** | 0.04 |
+| **Total** | | | **~2.2** | |
 
-**Why scoreMean/Stdev weights are tiny:** their raw MSE is in points²
-(not normalized) — typical magnitudes of 10–100.  KataGo uses the same
-approach (raw huber MSE with ~0.00015 coefficient); small weight
-compensates for large loss magnitude.
+`plan.json` ramps `score_mean_weight` across stages (`0.002 → 0.005 →
+0.01 → 0.015`) so that the model learns policy/value first, then
+refines the score head once the trunk is reasonable.  `score_stdev_weight`
+stays at `0.005` — larger than KataGo's `0.001` because our stdev
+target is `|actual − pred_mean.detach()|` (MSE in points²) rather than
+KataGo's `stdev-of-belief` (Huber in points).
+
+**KataGo comparison (loss functions).**  KataGo's analogous losses are
+different in both shape and coefficient:
+
+| | KataGo | MiniGo |
+|---|---|---|
+| Score mean | **Huber(δ=12)** on **points** | **MSE** on **points²** |
+| Score stdev | Huber(δ=10) on points, target from `score_belief` distribution | MSE on points², target `\|actual − pred_mean.detach()\|` |
+| scoreMean weight | `0.0015` | `0.002 → 0.015` (stage ramp) |
+| scoreStdev weight | `0.001` | `0.005` |
+
+Our weights are ~5–10× larger than KataGo's, but that does NOT mean we
+train score 10× harder: MSE on points² grows quadratically in the
+error (`err=10` → `loss=100`), so the effective gradient magnitude is
+similar.  The raw-loss columns are **not directly comparable** between
+KataGo and MiniGo because of the MSE-vs-Huber choice.
 
 **Why ownership weight is 1.5:** `F.binary_cross_entropy_with_logits`
 averages BCE over all intersections, returning ~0.3 mid-training.
@@ -358,6 +376,86 @@ All training metrics are written to `training/logs/train.log` in real-time:
 per-iteration parameters, per-epoch losses, selfplay timing, evaluation
 win rates, and promotion decisions.  This single file captures the full
 training history for debugging and tuning.
+
+#### Value-head diagnostics (per epoch)
+
+Raw `val` loss alone hides three very different failure modes for the
+value head (W/L/D classifier): genuine good fit, easy-position-dominated
+average (most 9×9 samples are decided endgame positions where any model
+gets CE≈0.02), and overconfident collapse where predicted probabilities
+no longer track empirical accuracy.  Each epoch therefore emits an
+extra `val-diag` line to stdout AND `train.log`:
+
+```
+Epoch 1/3  loss=2.2274  pol=1.2676  val=0.0787  smn=10.8004 ...
+    val-diag  phase CE: early=0.412(16%) mid=0.134(24%) late=0.018(60%)
+              ECE=0.037  calib[0.33-0.50:conf=0.421/acc=0.398@5% ...]
+```
+
+The diagnostic is **value-head-only** — policy, score, and ownership
+heads aren't classifiers with "confidence", so their loss numbers are
+already informative.  Two metrics:
+
+**Phase CE** — value cross-entropy bucketed by game phase, where phase
+is estimated from stone count on the board (channel 0 + channel 8 of
+the encoded state = current-snapshot stones for both colors):
+
+| Bin | Stones | Corresponds to | Healthy CE |
+|---|---|---|---|
+| `early` | 0–15 | Opening; position fluid | 0.3–0.6 |
+| `mid` | 16–40 | Middle game; decisive fights | 0.1–0.3 |
+| `late` | 41+ | Endgame; usually decided | 0.01–0.05 |
+
+The `(XX%)` annotation is the fraction of samples in that bin.  For
+typical 9×9 training (80–130 move games), expect roughly **15/25/60**.
+`late%` near 0 signals games too short to reach endgame (rare after
+iter ~4).
+
+**ECE (Expected Calibration Error)** — measures whether predicted
+confidence tracks empirical accuracy.  Formally: Σ (|B|/N) · |acc−conf|
+across 4 confidence buckets `[0.33,0.5)`, `[0.5,0.7)`, `[0.7,0.9)`,
+`[0.9,1.0]`.  The `calib[...]` field shows per-bucket `conf/acc/@%`
+so you can see *where* miscalibration lives.
+
+#### How to read the diagnostic
+
+**Healthy output — do nothing:**
+```
+val-diag  phase CE: early=0.42(15%) mid=0.15(25%) late=0.02(60%)
+          ECE=0.03  calib[... conf≈acc in every bucket ...]
+```
+- Monotone drop early → late: position info is being used.
+- ECE < 0.05: predictions are calibrated.
+- `conf ≈ acc` in every bucket with ≥10% samples.
+
+**Red-flag patterns and what to do:**
+
+| Pattern | Likely cause | Action |
+|---|---|---|
+| `early ≈ mid ≈ late` (flat) | Model ignores position features; trunk underfit or value head bottlenecked | Increase `value_weight`, check trunk capacity, verify training data isn't corrupted |
+| `early > 1.0` (very high) | Value head not learning opening at all | Raise `value_weight`; check that `value_target` derivation is correct |
+| `early < 0.1` but `ECE` large | Overconfident on opening positions (dangerous — MCTS will over-commit at root) | Lower `value_weight`, add label smoothing, or regularize |
+| `late% > 80%` | Games very long / opening samples scarce | Usually fine — selfplay just produces long games; consider data augmentation if opening play is weak |
+| `late% ≈ 0%` | Games too short to reach endgame | Usually only iter 1–3; self-heals as model improves |
+| `ECE > 0.10` | Confidence doesn't match accuracy | Value head is miscalibrated; MCTS will make bad decisions.  Lower `value_weight` or add KL-to-uniform regularization |
+| `[0.9–1.0]` bucket: `conf=0.95, acc=0.70` | Overconfident on "easy" positions | Dangerous; model is assigning near-certainty to positions that aren't.  Check for value-head collapse or insufficient data variety |
+| `[0.7–0.9]` bucket: `conf=0.80, acc=0.50` | Overconfident on hard middle-game positions | Most actionable — these are the positions MCTS actually searches.  Increase diversity in selfplay, lower temperature threshold, or bump `value_weight` |
+
+**When to bump `value_weight`:** if `early CE > 0.5` for 3+ iterations
+in a row while policy loss keeps dropping — value is lagging behind
+policy.  Default `1.5` may be too low for small models; try `2.5–3.0`.
+
+**When to lower `value_weight`:** if `ECE > 0.10` or overconfidence in
+the `[0.9-1.0]` bucket persists — too much gradient on value is
+collapsing the head.  Try `1.0` and add score-head supervision via a
+higher `score_mean_weight`.
+
+Diagnostic cost: one softmax + one cross-entropy with `reduction='none'`
+per batch under `torch.no_grad()` — well under 1% of step time.
+
+DDP note: each rank computes on its own data shard; rank-0 prints.
+For 2-GPU configs this is close to global; for 4+ GPU configs the
+per-bucket counts may be noisier.
 
 #### GPU auto-detection
 
