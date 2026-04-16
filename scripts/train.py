@@ -434,19 +434,16 @@ def main():
 
     t_train_start = time.time()
     # Value-head diagnostic bin edges (KataGo-style calibration tracking).
-    # Phase bins by stone-count proxy for move number on 9x9 Go where
-    # end-of-game boards typically carry 50-70 stones (max 81):
-    #   early 0-20   — opening + early middle (first ~20 moves)
-    #   mid  21-50   — middle game / fighting
-    #   late 51+     — endgame (often decided)
-    # Chosen to be robust across training stages: early-iteration runs
-    # produce many short games (10-30 moves) where late-bin would be
-    # near-empty under the earlier 41+ threshold, making early-vs-late
-    # comparison meaningless; mid-iteration runs produce 90-130 move
-    # games that fill all three bins.  If late% is ~0 for an iteration,
-    # it's a signal that games are too short for endgame analysis — not
-    # a bug in the diagnostic.
-    phase_edges = [0, 21, 51, 999]
+    # Phase bins by stone-count proxy for move number on 9x9 Go:
+    #   early 0-15   — opening (position fundamentally fluid)
+    #   mid  16-40   — middle game / fighting (decisive moves)
+    #   late 41+     — endgame (usually decided; low-CE zone)
+    # Binning is per-sample not per-game — a 100-move game contributes
+    # ~100 samples spread across all phases, so even iterations with
+    # many short games produce plenty of late-bin samples as long as
+    # the average game length is 60+ moves (both iter-4 and iter-40
+    # satisfy this).  Typical split: early ~15%, mid ~25%, late ~55%.
+    phase_edges = [0, 16, 41, 999]
     # Confidence bins on max softmax prob of 3-class value (W/L/D; chance = 1/3)
     conf_edges = [0.333, 0.50, 0.70, 0.90, 1.0001]
 
