@@ -174,7 +174,7 @@ def build_data_window(window_size, end_iter):
 # ══════════════════════════════════════════════════════════
 
 def _stage(name, start, end, games, sims, epochs, lr, eval_games,
-           score_weight, score_mean_weight, window_size,
+           score_weight, score_mean_weight, value_weight, window_size,
            c_puct, temp_threshold, dirichlet_epsilon,
            eval_threshold=None, **extra_weights):
     """Build a stage dict with all per-stage overrides.
@@ -189,6 +189,7 @@ def _stage(name, start, end, games, sims, epochs, lr, eval_games,
          "games": games, "sims": sims, "epochs": epochs, "lr": lr,
          "eval_games": eval_games,
          "score_weight": score_weight, "score_mean_weight": score_mean_weight,
+         "value_weight": value_weight,
          "window_size": window_size,
          "c_puct": c_puct, "temp_threshold": temp_threshold,
          "dirichlet_epsilon": dirichlet_epsilon}
@@ -197,49 +198,50 @@ def _stage(name, start, end, games, sims, epochs, lr, eval_games,
     d.update(extra_weights)
     return d
 
-# Per-stage exploration schedule (explore→exploit as model strengthens)
-# smn_wt is applied to raw MSE in points² — keep small (0.001-0.01).
-# Early stages: very small smn_wt to avoid noisy early-score gradients
-# dominating.  Late stages: raise smn_wt so score head sharpens.
-#                    score_wt  smn_wt   window  c_puct  temp  dir_eps
-_EXPLORE = [
-    # Bootstrap:     aggressive explore — network is random
-    (0.0,    0.002,    3,      2.0,    20,   0.30),
-    # Warm up:       still exploring, score head too noisy
-    (0.0,    0.002,    3,      1.75,   18,   0.28),
-    # Early gated:   tiny score, keep exploring
-    (0.02,   0.005,    4,      1.5,    15,   0.25),
-    # Consolidate:   still exploring — model needs diverse data
-    (0.02,   0.005,    6,      1.5,    15,   0.25),
-    # Steady:        start exploiting, score head becoming useful
-    (0.05,   0.008,    8,      1.25,   12,   0.22),
-    # Overnight:     moderate exploitation
-    (0.1,    0.010,    8,      1.1,    12,   0.20),
-]
-# xlarge preset uses wider sliding windows and stronger score weighting in
-# later stages — appropriate for 200-iter deep training runs.
-_EXPLORE_XLARGE = list(_EXPLORE)
-_EXPLORE_XLARGE[3] = (0.1,  0.015, 8,  1.25, 15, 0.22)
-_EXPLORE_XLARGE[4] = (0.15, 0.020, 10, 1.1,  12, 0.20)
-_EXPLORE_XLARGE[5] = (0.15, 0.020, 10, 1.1,  12, 0.20)
-
-# large preset (72 iters, ~2x small) — tuned separately from small:
-# wider early windows, escalating eval gating, slightly more exploration in
-# late stages (keep c_puct higher than small's overnight), and a lower
-# score CE loss weight to prevent the score head from dominating gradients.
+# Per-stage exploration schedule (explore→exploit as model strengthens).
+# Weights calibrated to match KataGo proportions: policy ~55%, value ~18%,
+# ownership ~10%, score total ~5%, opponent ~9%.
 #
-# Late-stage windows are wider than small (10/12 vs 8/8) to prevent data
-# homogeneity when the best model is stuck for several iterations — all
-# selfplay data from the same policy makes the optimizer overfit and
-# produce dramatically worse candidates (3-22% win rates observed in v1).
+# value_weight ramps UP because raw value CE drops from ~0.8 (init) to
+# ~0.08 (converged) — fixed weight would make value negligible once trained.
+# score losses use Huber (not MSE); smn_wt sized for Huber raw loss (~half MSE).
+# score_weight (MCTS utility) ramps to 0.30 with score_scale=18 (= 2*sqrt(81),
+# matching KataGo's formula).
+#
+#                  score_wt smn_wt val_wt  window c_puct temp dir_eps
+_EXPLORE = [
+    # Bootstrap:   aggressive explore — network is random
+    (0.0,   0.004, 1.5,    3,     2.0,   20,  0.30),
+    # Warm up:     still exploring, score head too noisy
+    (0.0,   0.004, 1.5,    3,     1.75,  18,  0.28),
+    # Early gated: tiny score, keep exploring
+    (0.05,  0.010, 2.0,    4,     1.5,   15,  0.25),
+    # Consolidate: model needs diverse data
+    (0.10,  0.010, 3.0,    6,     1.5,   15,  0.25),
+    # Steady:      start exploiting, score head becoming useful
+    (0.20,  0.015, 4.0,    8,     1.25,  12,  0.22),
+    # Overnight:   moderate exploitation
+    (0.30,  0.015, 5.0,    8,     1.1,   12,  0.20),
+]
+# xlarge preset uses wider sliding windows — appropriate for 200-iter deep
+# training runs.
+_EXPLORE_XLARGE = list(_EXPLORE)
+_EXPLORE_XLARGE[3] = (0.10, 0.010, 3.0,  8,  1.25, 15, 0.22)
+_EXPLORE_XLARGE[4] = (0.20, 0.015, 4.0, 10,  1.1,  12, 0.20)
+_EXPLORE_XLARGE[5] = (0.30, 0.015, 5.0, 10,  1.1,  12, 0.20)
+
+# large preset (72 iters, ~2x small) — wider late-stage windows (10/12 vs
+# 8/8) to prevent data homogeneity when the best model is stuck for several
+# iterations.  All selfplay from the same policy makes the optimizer overfit
+# and produce dramatically worse candidates (3-22% win rates observed in v1).
+#                  score_wt smn_wt val_wt  window c_puct temp dir_eps
 _EXPLORE_LARGE = [
-    # score_wt  smn_wt  window  c_puct  temp  dir_eps
-    (0.0,      0.002,  4,      2.0,    20,   0.30),  # 0 Bootstrap
-    (0.0,      0.002,  4,      1.75,   18,   0.28),  # 1 Warm up
-    (0.02,     0.005,  6,      1.5,    15,   0.25),  # 2 Early gated
-    (0.02,     0.005,  6,      1.5,    15,   0.25),  # 3 Consolidate
-    (0.10,     0.010, 10,      1.3,    12,   0.22),  # 4 Steady
-    (0.15,     0.015, 12,      1.25,   12,   0.20),  # 5 Overnight
+    (0.0,   0.004, 1.5,    4,     2.0,   20,  0.30),  # 0 Bootstrap
+    (0.0,   0.004, 1.5,    4,     1.75,  18,  0.28),  # 1 Warm up
+    (0.05,  0.010, 2.0,    6,     1.5,   15,  0.25),  # 2 Early gated
+    (0.10,  0.010, 3.0,    6,     1.5,   15,  0.25),  # 3 Consolidate
+    (0.20,  0.015, 4.0,   10,     1.3,   12,  0.22),  # 4 Steady
+    (0.30,  0.015, 5.0,   12,     1.25,  12,  0.20),  # 5 Overnight
 ]
 # Progressive eval gating: weak candidates pass easily early, strict late.
 _EVAL_TH_LARGE = [None, None, 0.53, 0.54, 0.55, 0.55]
@@ -262,20 +264,23 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
     # to an exploitative overnight phase.
     if preset == "small":
         if vit:
-            #        score_wt smn_wt  win  cpuct temp  eps
+            # ViT small ≈ ResNet large in parameters → same iter count (72).
+            # ViT-specific: higher sims (attention needs more positions),
+            # lower c_puct, lower temp_threshold.
+            #              score_wt smn_wt val_wt  cpuct temp  eps
             return [
                 _stage("Bootstrap",       1,  4,  500, 256, 3, lrs[0], 0,
-                       0.0,  0.002, 3,  2.0,  20, 0.30),
+                       0.0,  0.004, 1.5, 3,  2.0,  20, 0.30),
                 _stage("Warm up",         5,  8,  700, 384, 3, lrs[1], 0,
-                       0.0,  0.002, 4,  1.75, 18, 0.28),
+                       0.0,  0.004, 1.5, 4,  1.75, 18, 0.28),
                 _stage("Early gated",     9, 14, 1000, 512, 4, lrs[2], 120,
-                       0.02, 0.004, 4,  1.5,  15, 0.25),
-                _stage("Consolidate",    15, 22, 1200, 512, 5, lrs[3], 200,
-                       0.03, 0.006, 6,  1.4,  14, 0.23),
-                _stage("Steady improve", 23, 32, 1400, 640, 5, lrs[4], 240,
-                       0.05, 0.008, 8,  1.25, 12, 0.20),
-                _stage("Overnight extend",33,48, 1600, 768, 5, lrs[5], 240,
-                       0.08, 0.012, 8,  1.1,  10, 0.18),
+                       0.05, 0.010, 2.0, 4,  1.5,  15, 0.25),
+                _stage("Consolidate",    15, 24, 1200, 512, 5, lrs[3], 200,
+                       0.10, 0.010, 3.0, 6,  1.4,  14, 0.23),
+                _stage("Steady improve", 25, 40, 1400, 640, 5, lrs[4], 240,
+                       0.20, 0.015, 4.0, 8,  1.25, 12, 0.20),
+                _stage("Overnight extend",41,72, 1600, 768, 3, lrs[5], 240,
+                       0.30, 0.015, 5.0, 10, 1.1,  10, 0.18),
             ]
         ex = _EXPLORE
         ep = [3, 3, 3, 4, 5, 5]
@@ -295,26 +300,24 @@ def generate_stages(preset, board, filters, blocks, arch="resnet"):
     # *independent* of model size — use it with either 64f/5b or 128f/10b.
     if preset == "large":
         if vit:
-            # TODO: tune VIT large separately.  For now, mirror the ResNet
-            # iter schedule with VIT's own game/sim/exploration params.
-            # Same late-stage fixes as ResNet: wider windows, lower LR,
-            # fewer overnight epochs.
+            # ViT large: same 72-iter schedule as ResNet large, with
+            # ViT-specific game/sim counts and KataGo-matched weights.
             lrs_v = list(lrs)
             lrs_v[4] = "2e-4"
             lrs_v[5] = "1e-4"
             return [
                 _stage("Bootstrap",       1,  4,  500, 256, 3, lrs_v[0], 0,
-                       0.0,  0.002, 3,  2.0,  20, 0.30),
+                       0.0,  0.004, 1.5, 3,  2.0,  20, 0.30),
                 _stage("Warm up",         5,  8,  700, 384, 3, lrs_v[1], 0,
-                       0.0,  0.002, 4,  1.75, 18, 0.28),
+                       0.0,  0.004, 1.5, 4,  1.75, 18, 0.28),
                 _stage("Early gated",     9, 14, 1000, 512, 4, lrs_v[2], 120,
-                       0.02, 0.004, 4,  1.5,  15, 0.25),
+                       0.05, 0.010, 2.0, 4,  1.5,  15, 0.25),
                 _stage("Consolidate",    15, 24, 1300, 576, 5, lrs_v[3], 200,
-                       0.03, 0.006, 6,  1.4,  14, 0.23),
+                       0.10, 0.010, 3.0, 6,  1.4,  14, 0.23),
                 _stage("Steady improve", 25, 40, 1500, 700, 5, lrs_v[4], 240,
-                       0.05, 0.010, 10, 1.25, 12, 0.20),
+                       0.20, 0.015, 4.0, 10, 1.25, 12, 0.20),
                 _stage("Overnight extend",41, 72, 1700, 800, 3, lrs_v[5], 240,
-                       0.08, 0.015, 12, 1.1,  10, 0.18),
+                       0.30, 0.015, 5.0, 12, 1.1,  10, 0.18),
             ]
         ex = _EXPLORE_LARGE
         et = _EVAL_TH_LARGE
@@ -378,7 +381,7 @@ def generate_plan(board, filters, blocks, preset, arch="resnet",
     window = 8 if arch == "vit" else 6
     temp_threshold = 14 if arch == "vit" else 15
     dirichlet_alpha = 0.15
-    score_weight = 0.03 if arch == "vit" else 0.02
+    score_weight = 0.05
 
     if preset == "quick":
         batch_size = 64; window = 3; eval_threshold = 0.5; temp_threshold = 8
