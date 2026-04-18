@@ -72,6 +72,7 @@ def export_to_onnx(
 ):
     model.eval()
     wrapper = ExportWrapper(model)
+    wrapper.eval()
     dummy = torch.randn(1, input_channels, board_rows, board_cols)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -88,7 +89,7 @@ def export_to_onnx(
             "policy_logits": {0: "batch"},
             "value": {0: "batch"},
         },
-        opset_version=17,
+        opset_version=18,
     )
 
     # Re-attach raw PyTorch weights so the C++ loader can find BN params
