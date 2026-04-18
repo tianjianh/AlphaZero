@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.distributed.algorithms.join import Join
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -361,49 +362,48 @@ def main():
         total_loss = total_policy = total_value = 0.0
         batches = 0
 
-        for states, policies, values in loader:
-            states = states.to(device, non_blocking=True)
-            policies = policies.to(device, non_blocking=True)
-            values = values.to(device, non_blocking=True).view(-1)
-            wdl_target = wdl_target_from_value(values)
+        # DDP ranks see unequal record counts per epoch because the
+        # IterableDataset partitions *files* (not records), and games
+        # vary in length.  Join lets ranks that run out of data keep
+        # participating in DDP collectives with shadow forwards until
+        # every rank is done, avoiding the mismatched-collective hang
+        # (rank 0 end-of-epoch all_reduce vs rank 1 mid-batch broadcast).
+        join_ctx = Join([model]) if ddp_enabled else _null_context()
 
-            optimizer.zero_grad(set_to_none=True)
+        with join_ctx:
+            for states, policies, values in loader:
+                states = states.to(device, non_blocking=True)
+                policies = policies.to(device, non_blocking=True)
+                values = values.to(device, non_blocking=True).view(-1)
+                wdl_target = wdl_target_from_value(values)
 
-            if amp_mode == "bf16":
-                ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
-            elif amp_mode == "fp16":
-                ctx = torch.amp.autocast("cuda", dtype=torch.float16)
-            else:
-                ctx = _null_context()
+                optimizer.zero_grad(set_to_none=True)
 
-            with ctx:
-                pred_policy, pred_wdl = model(states)
-                policy_loss = soft_cross_entropy(pred_policy, policies)
-                value_loss = F.cross_entropy(pred_wdl, wdl_target)
-                loss = args.policy_weight * policy_loss + args.value_weight * value_loss
+                if amp_mode == "bf16":
+                    ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
+                elif amp_mode == "fp16":
+                    ctx = torch.amp.autocast("cuda", dtype=torch.float16)
+                else:
+                    ctx = _null_context()
 
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+                with ctx:
+                    pred_policy, pred_wdl = model(states)
+                    policy_loss = soft_cross_entropy(pred_policy, policies)
+                    value_loss = F.cross_entropy(pred_wdl, wdl_target)
+                    loss = args.policy_weight * policy_loss + args.value_weight * value_loss
 
-            total_loss += float(loss.item())
-            total_policy += float(policy_loss.item())
-            total_value += float(value_loss.item())
-            batches += 1
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
-        # Synchronize batch count so DDP ranks don't hang on unbalanced files.
-        if ddp_enabled:
-            tensor = torch.tensor([batches], dtype=torch.long, device=device)
-            dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
-            min_batches = int(tensor.item())
-            if min_batches == 0:
-                min_batches = 1
-        else:
-            min_batches = max(1, batches)
+                total_loss += float(loss.item())
+                total_policy += float(policy_loss.item())
+                total_value += float(value_loss.item())
+                batches += 1
 
         if is_main_process(rank):
             elapsed = time.time() - t0
