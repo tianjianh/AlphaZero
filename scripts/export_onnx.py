@@ -15,7 +15,9 @@ import argparse
 import os
 import sys
 
+import onnx
 import torch
+from onnx import numpy_helper
 
 sys.path.insert(0, os.path.dirname(__file__))
 from model import create_model
@@ -30,6 +32,35 @@ class ExportWrapper(torch.nn.Module):
 
     def forward(self, x):
         return self.model.forward_inference(x)
+
+
+def _embed_state_dict(onnx_path: str, model: torch.nn.Module) -> None:
+    """Append PyTorch state_dict tensors to the ONNX graph as extra initializers.
+
+    The graph exporter may fuse BatchNorm into the preceding Conv (always under
+    the Dynamo exporter, sometimes under TorchScript), which drops the original
+    `*.bn.weight / bias / running_mean / running_var` names from the graph.
+    The project's lightweight ONNX loader (src/loaded_model.cpp) looks up those
+    names directly and re-fuses BN itself.
+
+    Attaching the raw state_dict as inert extra initializers lets the loader
+    recover every weight by its PyTorch name regardless of what the graph
+    optimizer did to the compute ops.  Graph-execution backends (TRT, ONNX
+    Runtime) ignore the extras.
+    """
+    onnx_model = onnx.load(onnx_path)
+
+    existing = {init.name for init in onnx_model.graph.initializer}
+    for node in onnx_model.graph.node:
+        existing.update(node.output)
+
+    for name, tensor in model.state_dict().items():
+        if name in existing:
+            continue
+        np_data = tensor.detach().cpu().numpy()
+        onnx_model.graph.initializer.append(numpy_helper.from_array(np_data, name=name))
+
+    onnx.save(onnx_model, onnx_path)
 
 
 def export_to_onnx(
@@ -51,8 +82,7 @@ def export_to_onnx(
         input_names=["input"],
         output_names=["policy_logits", "value"],
         export_params=True,
-        do_constant_folding=False,
-        keep_initializers_as_inputs=True,
+        do_constant_folding=True,
         dynamic_axes={
             "input": {0: "batch"},
             "policy_logits": {0: "batch"},
@@ -60,6 +90,10 @@ def export_to_onnx(
         },
         opset_version=17,
     )
+
+    # Re-attach raw PyTorch weights so the C++ loader can find BN params
+    # even if the exporter folded them into Conv.
+    _embed_state_dict(output_path, model)
 
     action_size = board_rows * board_cols * board_rows * board_cols
     print(f"Exported ONNX model to {output_path}")

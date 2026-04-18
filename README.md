@@ -1,7 +1,9 @@
-# MiniXiangqi C++ — AlphaZero-Style Chinese Chess on Metal
+# MiniXiangqi C++ — AlphaZero-Style Chinese Chess
 
-This repository is now a **Chinese chess (Xiangqi) AI** built from the original
-MiniGo/KataGo-style C++ search architecture.
+This repository is a **Chinese chess (Xiangqi) AI** built from the original
+MiniGo/KataGo-style C++ search architecture.  The preferred runtimes are
+**TensorRT on Linux + NVIDIA** and **Metal on macOS Apple Silicon**; both are
+auto-selected from `cmake`.
 
 The project goal of this port was not to throw away the old engine shape and
 start over. The goal was to keep the parts that matter architecturally:
@@ -19,7 +21,8 @@ What changed is the domain:
 - the board is now fixed at **10 rows × 9 columns**
 - pass/komi/territory logic is gone
 - moves are now **source-square → destination-square**
-- the default backend is **Metal on macOS**
+- the default backends are **TensorRT** (Linux + NVIDIA, SM 7.5+) and **Metal**
+  (macOS Apple Silicon); `cmake` picks whichever is available
 - the network is now a simpler **policy + value** residual net designed for Xiangqi
 
 The `xqwlight_win32/` folder is treated as a **reference implementation for
@@ -32,8 +35,8 @@ preserved.
 
 The current port is:
 
-- built and verified on **macOS / Apple Silicon**
-- centered on the **Metal** inference path
+- built and verified on **macOS / Apple Silicon** (Metal)
+- built and verified on **Linux + NVIDIA** (TensorRT 10 + CUDA 12)
 - capable of:
   - interactive play in ncurses
   - self-play data generation
@@ -41,19 +44,27 @@ The current port is:
   - PyTorch training
   - ONNX export
 
-Verified locally during the port:
+Verified locally during the port (on both platforms):
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j4
+cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 python3 scripts/export_onnx.py --output /tmp/xiangqi_test.onnx
 ./build/selfplay --model /tmp/xiangqi_test.onnx --games 1 --threads 1 \
-  --search-threads 1 --sims 1 --max-batch 1 \
+  --search-threads 1 --sims 4 --max-batch 4 \
   --nn-server-threads 1 --nn-device-ids 0
 ```
 
-The last command successfully loaded the exported ONNX model and ran a
-one-game self-play smoke test through the **Metal** backend.
+`cmake` auto-selects the backend:
+
+- Apple Silicon → `metal`
+- Linux + NVIDIA GPU (SM ≥ 7.5, TensorRT installed) → `tensorrt`
+- Linux + NVIDIA GPU without TensorRT → `cuda`
+- anything else with OpenCL → `opencl`
+- fallback → `eigen` (CPU)
+
+The smoke test above loads the exported ONNX model and runs one self-play game
+through whichever backend was selected at build time.
 
 ## What Was Preserved
 
@@ -104,8 +115,8 @@ The runtime remains:
 
 The original `GoGame` interface is now aliased to `XiangqiGame`:
 
-- rules live in [include/game.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/game.h)
-- implementation lives in [src/game.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/game.cpp)
+- rules live in [include/game.h](include/game.h)
+- implementation lives in [src/game.cpp](src/game.cpp)
 
 The game layer now handles:
 
@@ -142,7 +153,7 @@ Those assumptions were replaced with:
 - `board_area()`
 - action count = `board_area * board_area`
 
-Default config lives in [include/config.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/config.h).
+Default config lives in [include/config.h](include/config.h).
 
 ### 3. Move Encoding
 
@@ -169,13 +180,20 @@ So the policy head size is:
 
 The original Go project had a larger multi-head network.
 
-This Xiangqi port intentionally simplifies the model to:
+This Xiangqi port simplifies the model to:
 
 - **policy logits**: `[B, 8100]`
-- **value**: `[B, 1]`, tanh-compressed to `[-1, 1]`
+- **value** (internally a 3-class **WDL** head → `[B, 3]` logits)
 
-This was done to make the Metal-first port smaller, easier to verify, and more
-aligned with classical AlphaZero-style Xiangqi search.
+The ONNX export wrapper ([scripts/export_onnx.py](scripts/export_onnx.py))
+collapses the WDL head into a single scalar `P(win) - P(loss)` via softmax,
+so the graph has exactly two outputs:
+
+- `policy_logits` : `[B, 8100]`
+- `value`         : `[B, 1]` ∈ `[-1, 1]`
+
+Backends read the scalar value directly.  The TensorRT backend also handles
+the raw 3-logit form in case the wrapper is bypassed.
 
 ### 5. Training Data Format
 
@@ -318,25 +336,27 @@ This encoding is produced by `XiangqiGame::encode()`.
 
 ## Neural Network Architecture
 
-The Xiangqi network lives in [scripts/model.py](/Users/tianjianh/Downloads/AZ/AlphaZero/scripts/model.py).
+The Xiangqi network lives in [scripts/model.py](scripts/model.py).
 
 Default model:
 
 - residual CNN
-- 10 residual blocks
+- 10 residual blocks (mixed **SE** and **GPool** — Plain blocks are supported
+  but not used by default)
 - 128 trunk channels
 - policy head:
   - 1×1 conv to 4 channels
-  - batch norm
+  - batch norm + ReLU
   - fully connected layer to 8100 logits
 - value head:
   - 1×1 conv to 2 channels
-  - batch norm
-  - FC 256
-  - FC 1
-  - tanh output
+  - batch norm + ReLU
+  - FC 256 (+ ReLU)
+  - FC 3 (WDL logits)
+  - the export wrapper adds a final softmax + `P(win) - P(loss)` to emit a
+    scalar value in `[-1, 1]`
 
-The ONNX loader in [src/loaded_model.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/loaded_model.cpp)
+The ONNX loader in [src/loaded_model.cpp](src/loaded_model.cpp)
 expects these parameter names:
 
 - `input_conv.*`
@@ -356,16 +376,16 @@ expects these parameter names:
 The exporter deliberately keeps initializer names stable so the lightweight C++
 ONNX loader can recover weights without a heavyweight ONNX runtime dependency.
 
-## Metal Backend
+## Backends
 
-The Xiangqi port is intentionally **Metal-first**.
+### Metal Backend (macOS Apple Silicon)
 
 Relevant files:
 
-- [include/metal_compute.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/metal_compute.h)
-- [src/metal_compute.mm](/Users/tianjianh/Downloads/AZ/AlphaZero/src/metal_compute.mm)
+- [include/metal_compute.h](include/metal_compute.h)
+- [src/metal_compute.mm](src/metal_compute.mm)
 
-The current Metal path uses:
+The Metal path uses:
 
 - `MTLCreateSystemDefaultDevice()`
 - `MPSGraph`
@@ -373,22 +393,52 @@ The current Metal path uses:
 - FP32 input tensors
 - graph-side conv/batchnorm/relu/fc execution
 
-The backend now supports the Xiangqi residual policy/value network directly.
+### TensorRT Backend (Linux + NVIDIA)
+
+Relevant files:
+
+- [include/tensorrt_compute.h](include/tensorrt_compute.h)
+- [src/tensorrt_compute.cpp](src/tensorrt_compute.cpp)
+
+The TensorRT path:
+
+- parses the exported ONNX model directly via `nvonnxparser`
+- compiles a per-GPU TRT engine with a dynamic batch-size optimization profile
+  (`[1, max_batch_size]`) the first time the model is loaded
+- caches the compiled engine to `trt_cache/` so subsequent runs start in under
+  a second (cache key includes the TRT version, GPU name, max batch, and
+  precision, so mixed setups don't collide)
+- auto-picks precision from the GPU's compute capability:
+  - SM ≥ 8.0 (Ampere, Ada, Hopper, Blackwell) → **BF16** (same range as FP32,
+    avoids score-head NaNs that FP16 can hit)
+  - SM 7.x (Volta/Turing) → **FP16**
+  - older → **FP32**
+- uses `cudaStreamPerThread` so each NN-server thread has its own CUDA stream;
+  two server threads on the same GPU run concurrently without host-side
+  contention
+- serializes engine lifecycle and `createExecutionContext` / `~IExecutionContext`
+  under a per-engine mutex (required by TRT 10 even when inference itself is
+  parallel)
+
+The current code identifies the engine's I/O tensors by name (`input`,
+`policy_logits`, `value`) with a shape-based fallback; optional heads
+(`score_mean`, `score_stdev`, `ownership`) are bound only if the ONNX exports
+them.
 
 ### Supported / Intended Runtime Path
 
-Documented and tested path:
+Documented and tested paths:
 
-- macOS
-- Apple Silicon
-- Metal backend
+- **Linux + NVIDIA** (TensorRT 10 + CUDA 12, SM ≥ 7.5)
+- **macOS Apple Silicon** (Metal / MPSGraph)
 
-Other legacy backends from the old repository still exist in the tree, but this
-port was intentionally documented and validated around Metal only.
+Other backends (`cuda`, `opencl`, `eigen`) still exist in the tree as
+fall-backs.  They compile and run but are not the primary validation target
+of this port.
 
 ## ncurses Play UI
 
-Interactive play lives in [src/main_play.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/main_play.cpp).
+Interactive play lives in [src/main_play.cpp](src/main_play.cpp).
 
 The UI was redesigned from a Go board to a Xiangqi board:
 
@@ -410,6 +460,50 @@ The UI was redesigned from a Go board to a Xiangqi board:
 - `q`: quit
 
 ## Build
+
+### Linux + NVIDIA (TensorRT)
+
+System requirements:
+
+- NVIDIA GPU with compute capability ≥ **7.5** (Turing or newer)
+- CUDA Toolkit 12.x
+- TensorRT 10.x (`libnvinfer-dev`, `libnvonnxparsers-dev`, `libnvinfer-headers-dev`)
+- Eigen3 (`libeigen3-dev`), CMake ≥ 3.16, ncursesw (`libncursesw5-dev`)
+
+Ubuntu/Debian:
+
+```bash
+# CUDA and TensorRT come from the NVIDIA repo; see
+# https://docs.nvidia.com/deeplearning/tensorrt/install-guide/
+sudo apt install cmake libeigen3-dev libncursesw5-dev \
+                 libnvinfer-dev libnvinfer-headers-dev libnvonnxparsers-dev
+```
+
+Build:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+On a Linux host with a TRT-compatible NVIDIA GPU the build auto-selects:
+
+```text
+Backend: tensorrt
+```
+
+If TensorRT is missing (or the GPU is SM < 7.5, e.g. V100) the build falls
+back to:
+
+```text
+Backend: cuda
+```
+
+To force a particular backend regardless of auto-detection:
+
+```bash
+cmake -S . -B build -DMINIGO_BACKEND=tensorrt   # or cuda | opencl | eigen
+```
 
 ### macOS / Apple Silicon
 
@@ -491,6 +585,42 @@ python3 scripts/train.py \
 ```bash
 ./build/benchmark --model models/model.onnx
 ```
+
+### Full self-play + training loop
+
+`run_loop.py` orchestrates the AlphaZero-style loop (self-play → train →
+head-to-head eval gate) using the C++ binaries above.  It generates a plan
+file (`training/plan.json`) describing the stages of the run — number of
+iterations, games per iteration, simulations per move, learning-rate
+schedule, optional promotion gate — and then iterates over that plan.
+
+```bash
+# Choose one preset:
+#   quick   ~  5 iter,   20 games / iter,  100 sims    (smoke test)
+#   small   ~ 48 iter,  400-1400 games,    200-500 sims
+#   large   ~ 72 iter,  400-1400 games,    200-600 sims
+#   xlarge  ~200 iter, 800-5000 games,    300-1000 sims
+python3 run_loop.py init small -y
+
+# Run until the final planned iteration:
+python3 run_loop.py train
+
+# At any time:
+python3 run_loop.py status
+```
+
+The generated plan:
+
+- scales model size with the preset (quick=32×3, small=64×5, large/xlarge=128×10)
+- raises `games` and `sims` gradually across stages so the early iterations
+  churn through many quick games and the later iterations spend more compute
+  per move
+- enables a head-to-head promotion gate from "Early gated" onwards
+- auto-configures hardware knobs (NN server threads, device ids, batch size)
+  from the detected GPU count via `detect_hardware()`
+
+You can override `--filters` / `--blocks` at `init` time to pin the network
+size independently of the preset.
 
 ## CLI Reference
 
@@ -752,7 +882,9 @@ The remaining differences are intentional and tied to tool purpose.
 
 ## Known Limitations
 
-- the port is documented and validated around **Metal on macOS**
+- the port is documented and validated around **TensorRT on Linux** and
+  **Metal on macOS**; the other backends compile but are not the primary
+  validation target
 - the current training loop uses only policy/value supervision even though the
   self-play record still stores extra trailing fields
 - `evaluate --output` writes text records, not a standard Xiangqi notation file
@@ -762,26 +894,29 @@ The remaining differences are intentional and tied to tool purpose.
 
 | Area | File |
 |---|---|
-| Xiangqi rules | [include/game.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/game.h) |
-| Xiangqi rules impl | [src/game.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/game.cpp) |
-| shared config | [include/config.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/config.h) |
-| MCTS | [include/mcts.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/mcts.h) / [src/mcts.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/mcts.cpp) |
-| async bot | [include/async_bot.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/async_bot.h) / [src/async_bot.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/async_bot.cpp) |
-| evaluator | [include/nn_evaluator.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/nn_evaluator.h) / [src/nn_evaluator.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/nn_evaluator.cpp) |
-| ONNX loader | [include/loaded_model.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/loaded_model.h) / [src/loaded_model.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/loaded_model.cpp) |
-| Metal backend | [include/metal_compute.h](/Users/tianjianh/Downloads/AZ/AlphaZero/include/metal_compute.h) / [src/metal_compute.mm](/Users/tianjianh/Downloads/AZ/AlphaZero/src/metal_compute.mm) |
-| play UI | [src/main_play.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/main_play.cpp) |
-| self-play tool | [src/main_selfplay.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/main_selfplay.cpp) |
-| evaluate tool | [src/main_evaluate.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/main_evaluate.cpp) |
-| benchmark tool | [src/main_benchmark.cpp](/Users/tianjianh/Downloads/AZ/AlphaZero/src/main_benchmark.cpp) |
-| model definition | [scripts/model.py](/Users/tianjianh/Downloads/AZ/AlphaZero/scripts/model.py) |
-| training | [scripts/train.py](/Users/tianjianh/Downloads/AZ/AlphaZero/scripts/train.py) |
-| ONNX export | [scripts/export_onnx.py](/Users/tianjianh/Downloads/AZ/AlphaZero/scripts/export_onnx.py) |
+| Xiangqi rules | [include/game.h](include/game.h) |
+| Xiangqi rules impl | [src/game.cpp](src/game.cpp) |
+| shared config | [include/config.h](include/config.h) |
+| MCTS | [include/mcts.h](include/mcts.h) / [src/mcts.cpp](src/mcts.cpp) |
+| async bot | [include/async_bot.h](include/async_bot.h) / [src/async_bot.cpp](src/async_bot.cpp) |
+| evaluator | [include/nn_evaluator.h](include/nn_evaluator.h) / [src/nn_evaluator.cpp](src/nn_evaluator.cpp) |
+| ONNX loader | [include/loaded_model.h](include/loaded_model.h) / [src/loaded_model.cpp](src/loaded_model.cpp) |
+| Metal backend | [include/metal_compute.h](include/metal_compute.h) / [src/metal_compute.mm](src/metal_compute.mm) |
+| TensorRT backend | [include/tensorrt_compute.h](include/tensorrt_compute.h) / [src/tensorrt_compute.cpp](src/tensorrt_compute.cpp) |
+| training pipeline | [run_loop.py](run_loop.py) |
+| play UI | [src/main_play.cpp](src/main_play.cpp) |
+| self-play tool | [src/main_selfplay.cpp](src/main_selfplay.cpp) |
+| evaluate tool | [src/main_evaluate.cpp](src/main_evaluate.cpp) |
+| benchmark tool | [src/main_benchmark.cpp](src/main_benchmark.cpp) |
+| model definition | [scripts/model.py](scripts/model.py) |
+| training | [scripts/train.py](scripts/train.py) |
+| ONNX export | [scripts/export_onnx.py](scripts/export_onnx.py) |
 
 ## Short Version
 
 This repository is no longer “MiniGo with a few edits.”
 
-It is now a **Metal-first Xiangqi AlphaZero-style engine** that keeps the
-original project’s best architectural property: the search/evaluator threading
+It is now a **Xiangqi AlphaZero-style engine** with first-class **TensorRT on
+Linux + NVIDIA** and **Metal on macOS Apple Silicon** backends, keeping the
+original project's best architectural property: the search/evaluator threading
 model.

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import shutil
@@ -331,45 +330,33 @@ def detect_gpu_count() -> int:
 def detect_hardware() -> dict:
     """Auto-configure hardware knobs from the detected GPU topology.
 
-    Follows the Go multi-gpu branch layout:
-      * 0 GPUs  -> single CPU selfplay instance, 1 NN server thread
-      * 1 GPU   -> single instance, 2 NN servers on the same GPU (pipelined)
-      * N>1 GPU -> N selfplay instances, 2N NN servers (two per GPU)
+    Single-process layout (matches the Go multi-gpu branch):
+      * 0 GPUs  -> 1 selfplay instance, 1 NN server thread (CPU fallback)
+      * 1 GPU   -> 1 instance, 2 NN servers on GPU 0 (0,0)
+      * N GPUs  -> 1 instance, 2N NN servers, device_ids = "0,0,1,1,..."
+
+    One selfplay process owns all GPUs.  This keeps the in-process TRT
+    engine-build mutex effective — launching multiple selfplay processes
+    would race on the trt_cache/ file on a cold start.
     """
     gpus = detect_gpu_count()
-    if gpus <= 0:
-        return {
-            "threads": num_cores(),
-            "search_threads": 16,
-            "selfplay_instances": 1,
-            "nn_server_threads": 1,
-            "nn_device_ids": "0",
-            "max_batch": 256,
-            "gpu_count": 0,
-        }
-    if gpus == 1:
-        return {
-            "threads": num_cores(),
-            "search_threads": 16,
-            "selfplay_instances": 1,
-            "nn_server_threads": 2,
-            "nn_device_ids": "0,0",
-            "max_batch": 256,
-            "gpu_count": 1,
-        }
-    # Multi-GPU: two NN servers per GPU, one selfplay instance per GPU.
-    device_ids = ",".join(str(g) for _ in range(2) for g in range(gpus))  # e.g. "0,1,0,1"
-    # Reorder so devices are grouped: "0,0,1,1,..."
-    device_ids = ",".join(str(g) for g in range(gpus) for _ in range(2))
-    return {
+    hw = {
         "threads": num_cores(),
         "search_threads": 16,
-        "selfplay_instances": gpus,
-        "nn_server_threads": gpus * 2,
-        "nn_device_ids": device_ids,
+        "selfplay_instances": 1,
         "max_batch": 256,
-        "gpu_count": gpus,
+        "gpu_count": max(0, gpus),
     }
+    if gpus <= 0:
+        hw["nn_server_threads"] = 1
+        hw["nn_device_ids"] = "0"
+    elif gpus == 1:
+        hw["nn_server_threads"] = 2
+        hw["nn_device_ids"] = "0,0"
+    else:
+        hw["nn_server_threads"] = gpus * 2
+        hw["nn_device_ids"] = ",".join(f"{g},{g}" for g in range(gpus))
+    return hw
 
 
 def build_if_needed() -> None:
@@ -434,43 +421,16 @@ def run_selfplay(iter_data: Path, model: Path, games: int, sims: int, hw: dict, 
         "--nn-device-ids", hw["nn_device_ids"],
     ] + mcts_flags
 
-    instances = hw["selfplay_instances"]
-    if instances <= 1:
-        subprocess.run(
-            base_cmd + [
-                "--output", str(iter_data),
-                "--games", str(games),
-                "--threads", str(hw["threads"]),
-            ],
-            check=True,
-        )
-        return
-
-    games_per_instance = math.ceil(games / instances)
-    threads_per_instance = max(1, math.ceil(hw["threads"] / instances))
-    log(
-        f"  launching {instances} selfplay instances "
-        f"({games_per_instance} games each, {threads_per_instance} threads each)"
+    # Single selfplay process owns all GPUs; the in-process TRT build
+    # mutex then serializes engine construction across NN server threads.
+    subprocess.run(
+        base_cmd + [
+            "--output", str(iter_data),
+            "--games", str(games),
+            "--threads", str(hw["threads"]),
+        ],
+        check=True,
     )
-    procs = []
-    batch_tag = int(time.time())
-    for idx in range(instances):
-        instance_dir = iter_data / f"batch_{batch_tag}_{idx:02d}"
-        instance_dir.mkdir(parents=True, exist_ok=True)
-        procs.append(
-            subprocess.Popen(
-                base_cmd + [
-                    "--output", str(instance_dir),
-                    "--games", str(games_per_instance),
-                    "--threads", str(threads_per_instance),
-                ]
-            )
-        )
-
-    for proc in procs:
-        ret = proc.wait()
-        if ret != 0:
-            raise subprocess.CalledProcessError(ret, base_cmd)
 
 
 def compress_selfplay(iter_data: Path) -> None:

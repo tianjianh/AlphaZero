@@ -409,8 +409,10 @@ struct TensorRTComputeHandle::Impl {
     TRTDeviceState& dev;
     nvinfer1::IExecutionContext* exec_ctx = nullptr;
 
-    int board_size     = 0;
+    int board_rows     = 0;
+    int board_cols     = 0;
     int input_channels = 0;
+    int action_size    = 0;
     int max_batch_size = 0;
 
     // I/O device buffers (256-byte aligned as required by TRT 10)
@@ -419,7 +421,7 @@ struct TensorRTComputeHandle::Impl {
     float* d_value     = nullptr;   // [max_batch, 1]
     float* d_score     = nullptr;   // [max_batch, 1]
     float* d_score_sd  = nullptr;   // [max_batch, 1]
-    float* d_ownership = nullptr;   // [max_batch, board²]
+    float* d_ownership = nullptr;   // [max_batch, rows*cols]
 
     // Tensor names from engine
     std::string input_name;
@@ -533,9 +535,11 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     impl_ = new Impl(dev);
     auto& I = *impl_;
 
-    I.board_size     = model->board_size;
-    I.input_channels = model->input_channels;
-    I.max_batch_size = max_batch_size;
+    I.board_rows      = model->board_rows;
+    I.board_cols      = model->board_cols;
+    I.input_channels  = model->input_channels;
+    I.action_size     = model->action_size;
+    I.max_batch_size  = max_batch_size;
     I.input_name      = dev.input_name;
     I.policy_name     = dev.policy_name;
     I.value_name      = dev.value_name;
@@ -553,11 +557,10 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
         throw std::runtime_error("TensorRT: failed to create execution context");
 
     // Allocate I/O buffers
-    int HW = I.board_size * I.board_size;
-    int action_size = HW + 1;
+    int HW = I.board_rows * I.board_cols;
 
     size_t input_bytes  = (size_t)max_batch_size * I.input_channels * HW * sizeof(float);
-    size_t policy_bytes = (size_t)max_batch_size * action_size * sizeof(float);
+    size_t policy_bytes = (size_t)max_batch_size * I.action_size * sizeof(float);
     size_t value_bytes  = (size_t)max_batch_size * 1 * sizeof(float);
 
     CUDA_CHECK(cudaMalloc(&I.d_input,  input_bytes));
@@ -567,16 +570,11 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     CUDA_CHECK(cudaMalloc(&I.d_score_sd,  (size_t)max_batch_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&I.d_ownership, (size_t)max_batch_size * HW * sizeof(float)));
 
-    std::cout << "TensorRT handle ready (" << I.dev.precision << "): board=" << I.board_size;
-    if (model->model_type == "vit")
-        std::cout << " d_model=" << model->num_filters
-                  << " depth=" << model->vit_depth
-                  << " heads=" << model->vit_heads
-                  << " kv=" << model->vit_kv_groups;
-    else
-        std::cout << " filters=" << model->num_filters
-                  << " blocks=" << model->num_res_blocks;
-    std::cout << "\n";
+    std::cout << "TensorRT handle ready (" << I.dev.precision
+              << "): board=" << I.board_rows << "x" << I.board_cols
+              << " filters=" << model->num_filters
+              << " blocks=" << model->num_res_blocks
+              << " actions=" << I.action_size << "\n";
 }
 
 TensorRTComputeHandle::~TensorRTComputeHandle() {
@@ -603,9 +601,9 @@ TensorRTComputeHandle::predict_batch(
     // submit to independent streams and the GPU interleaves them.
 
     int N = (int)states.size();
-    int H = I.board_size, W = I.board_size;
+    int H = I.board_rows, W = I.board_cols;
     int HW = H * W;
-    int action_size = HW + 1;
+    int action_size = I.action_size;
 
     // Flatten input states and upload
     size_t input_floats = (size_t)N * I.input_channels * HW;
