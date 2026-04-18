@@ -16,7 +16,7 @@
 namespace minigo {
 
 // ================================================================
-// MetalComputeContext::Impl — shared Metal device + graph template
+// MetalComputeContext::Impl - shared Metal device + command queue
 // ================================================================
 
 struct MetalComputeContext::Impl {
@@ -43,133 +43,215 @@ MetalComputeContext::create_handle(const LoadedModel* model, int /*gpu_id*/, int
 }
 
 // ================================================================
-// MetalComputeHandle::Impl — per-thread MPSGraph + tensors
+// MetalComputeHandle::Impl - per-handle MPSGraph + graph-construction helpers
 // ================================================================
 
 struct MetalComputeHandle::Impl {
-    MetalComputeContext::Impl* ctx = nullptr;
-    MPSGraph*           graph       = nil;
-    MPSGraphTensor*     inputTensor = nil;
-    MPSGraphTensor*     policyOutput = nil;
-    MPSGraphTensor*     valueOutput  = nil;
+    MetalComputeContext::Impl* ctx = nil;
+    MPSGraph*       graph       = nil;
+    MPSGraphTensor* inputTensor = nil;
+    MPSGraphTensor* policyOutput = nil;
+    MPSGraphTensor* valueOutput  = nil;
     int board_rows = 0, board_cols = 0, input_channels = 0, action_size = 0;
+    int value_head_size = 3;
 
-    // Graph construction helpers
-    MPSGraphTensor* addConv2d(MPSGraphTensor* input, const std::vector<float>& w,
-                               int c_out, int c_in, int kH, int kW) {
-        MPSGraphTensor* wfp32 = [graph constantWithData:
-            [NSData dataWithBytes:w.data() length:w.size() * sizeof(float)]
-            shape:@[@(c_out), @(c_in), @(kH), @(kW)] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* weight = [graph castTensor:wfp32 toType:MPSDataTypeFloat16 name:nil];
+    // ── graph-construction helpers ───────────────────────────────
 
+    MPSGraphTensor* constF16(const std::vector<float>& src, NSArray<NSNumber*>* shape) {
+        MPSGraphTensor* fp32 = [graph constantWithData:
+            [NSData dataWithBytes:src.data() length:src.size() * sizeof(float)]
+            shape:shape dataType:MPSDataTypeFloat32];
+        return [graph castTensor:fp32 toType:MPSDataTypeFloat16 name:nil];
+    }
+
+    MPSGraphTensor* conv2d(MPSGraphTensor* input, const std::vector<float>& w,
+                           int c_out, int c_in, int kH, int kW) {
+        MPSGraphTensor* weight = constF16(w, @[@(c_out), @(c_in), @(kH), @(kW)]);
+        int pad = (kW > 1 || kH > 1) ? 1 : 0;
         auto* desc = [MPSGraphConvolution2DOpDescriptor
             descriptorWithStrideInX:1 strideInY:1 dilationRateInX:1 dilationRateInY:1
             groups:1
-            paddingLeft:(kW>1?1:0) paddingRight:(kW>1?1:0)
-            paddingTop:(kH>1?1:0) paddingBottom:(kH>1?1:0)
+            paddingLeft:pad paddingRight:pad paddingTop:pad paddingBottom:pad
             paddingStyle:MPSGraphPaddingStyleExplicit
             dataLayout:MPSGraphTensorNamedDataLayoutNCHW
             weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-
         return [graph convolution2DWithSourceTensor:input weightsTensor:weight
                                          descriptor:desc name:nil];
     }
 
-    MPSGraphTensor* addBN(MPSGraphTensor* input, const std::vector<float>& sc,
-                           const std::vector<float>& bi, int ch) {
-        MPSGraphTensor* s32 = [graph constantWithData:
-            [NSData dataWithBytes:sc.data() length:sc.size()*sizeof(float)]
-            shape:@[@(ch),@1,@1] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* b32 = [graph constantWithData:
-            [NSData dataWithBytes:bi.data() length:bi.size()*sizeof(float)]
-            shape:@[@(ch),@1,@1] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* s = [graph castTensor:s32 toType:MPSDataTypeFloat16 name:nil];
-        MPSGraphTensor* b = [graph castTensor:b32 toType:MPSDataTypeFloat16 name:nil];
-        auto* scaled = [graph multiplicationWithPrimaryTensor:input secondaryTensor:s name:nil];
+    MPSGraphTensor* applyBN(MPSGraphTensor* x,
+                            const std::vector<float>& scale,
+                            const std::vector<float>& biasv, int ch) {
+        MPSGraphTensor* s = constF16(scale, @[@(ch), @1, @1]);
+        MPSGraphTensor* b = constF16(biasv, @[@(ch), @1, @1]);
+        auto* scaled = [graph multiplicationWithPrimaryTensor:x secondaryTensor:s name:nil];
         return [graph additionWithPrimaryTensor:scaled secondaryTensor:b name:nil];
     }
 
-    MPSGraphTensor* addReLU(MPSGraphTensor* x) { return [graph reLUWithTensor:x name:nil]; }
+    MPSGraphTensor* relu(MPSGraphTensor* x) {
+        return [graph reLUWithTensor:x name:nil];
+    }
 
-    MPSGraphTensor* addFC(MPSGraphTensor* input, const std::vector<float>& w,
-                           const std::vector<float>& b, int out, int in) {
-        MPSGraphTensor* w32 = [graph constantWithData:
-            [NSData dataWithBytes:w.data() length:w.size()*sizeof(float)]
-            shape:@[@(out),@(in)] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* wt = [graph castTensor:w32 toType:MPSDataTypeFloat16 name:nil];
-        MPSGraphTensor* b32 = [graph constantWithData:
-            [NSData dataWithBytes:b.data() length:b.size()*sizeof(float)]
-            shape:@[@1,@(out)] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* bias = [graph castTensor:b32 toType:MPSDataTypeFloat16 name:nil];
-        MPSGraphTensor* wtT = [graph transposeTensor:wt dimension:0 withDimension:1 name:nil];
-        auto* mm = [graph matrixMultiplicationWithPrimaryTensor:input secondaryTensor:wtT name:nil];
+    MPSGraphTensor* linear(MPSGraphTensor* input,
+                           const std::vector<float>& w,
+                           const std::vector<float>& b,
+                           int out_features, int in_features) {
+        MPSGraphTensor* weight = constF16(w, @[@(out_features), @(in_features)]);
+        MPSGraphTensor* bias = constF16(b, @[@1, @(out_features)]);
+        MPSGraphTensor* wt = [graph transposeTensor:weight dimension:0 withDimension:1 name:nil];
+        auto* mm = [graph matrixMultiplicationWithPrimaryTensor:input secondaryTensor:wt name:nil];
         return [graph additionWithPrimaryTensor:mm secondaryTensor:bias name:nil];
+    }
+
+    MPSGraphTensor* convBNReLU(MPSGraphTensor* input, const ConvBNWeights& conv) {
+        int pad_k = conv.k;
+        MPSGraphTensor* x = conv2d(input, conv.weight, conv.c_out, conv.c_in, pad_k, pad_k);
+        x = applyBN(x, conv.bn_scale, conv.bn_bias, conv.c_out);
+        return relu(x);
+    }
+
+    MPSGraphTensor* convBN(MPSGraphTensor* input, const ConvBNWeights& conv) {
+        MPSGraphTensor* x = conv2d(input, conv.weight, conv.c_out, conv.c_in, conv.k, conv.k);
+        return applyBN(x, conv.bn_scale, conv.bn_bias, conv.c_out);
+    }
+
+    // ── Residual block variants ──────────────────────────────────
+
+    MPSGraphTensor* plainBlock(MPSGraphTensor* x, const BlockWeights& blk) {
+        MPSGraphTensor* residual = x;
+        MPSGraphTensor* y = convBNReLU(x, blk.conv1);
+        y = convBN(y, blk.conv2);
+        y = [graph additionWithPrimaryTensor:y secondaryTensor:residual name:nil];
+        return relu(y);
+    }
+
+    MPSGraphTensor* seBlock(MPSGraphTensor* x, const BlockWeights& blk) {
+        int C = blk.conv2.c_out;
+        MPSGraphTensor* residual = x;
+        MPSGraphTensor* y = convBNReLU(x, blk.conv1);
+        y = convBN(y, blk.conv2);  // [B, C, H, W], no relu yet
+
+        // Global average pool over spatial dims -> [B, C]
+        MPSGraphTensor* pooled = [graph meanOfTensor:y axes:@[@2, @3] name:nil];
+        pooled = [graph squeezeTensor:pooled axes:@[@2, @3] name:nil];
+
+        MPSGraphTensor* h = linear(pooled, blk.se_fc1.weight, blk.se_fc1.bias,
+                                   blk.se_fc1.out_features, blk.se_fc1.in_features);
+        h = relu(h);
+        MPSGraphTensor* gate = linear(h, blk.se_fc2.weight, blk.se_fc2.bias,
+                                      blk.se_fc2.out_features, blk.se_fc2.in_features);
+        gate = [graph sigmoidWithTensor:gate name:nil];
+        gate = [graph reshapeTensor:gate withShape:@[@(-1), @(C), @1, @1] name:nil];
+
+        y = [graph multiplicationWithPrimaryTensor:y secondaryTensor:gate name:nil];
+        y = [graph additionWithPrimaryTensor:y secondaryTensor:residual name:nil];
+        return relu(y);
+    }
+
+    MPSGraphTensor* gpoolBlock(MPSGraphTensor* x, const BlockWeights& blk) {
+        int C = blk.conv2.c_out;
+        MPSGraphTensor* residual = x;
+
+        MPSGraphTensor* y = convBNReLU(x, blk.conv1);
+
+        // Parallel pool branch (from the block input, matches the Python model).
+        MPSGraphTensor* p = convBNReLU(x, blk.pool_conv);
+        MPSGraphTensor* pool_mean = [graph meanOfTensor:p axes:@[@2, @3] name:nil];
+        pool_mean = [graph squeezeTensor:pool_mean axes:@[@2, @3] name:nil];
+        MPSGraphTensor* pool_max = [graph reductionMaximumWithTensor:p axes:@[@2, @3] name:nil];
+        pool_max = [graph squeezeTensor:pool_max axes:@[@2, @3] name:nil];
+        MPSGraphTensor* stats = [graph concatTensor:pool_mean withTensor:pool_max
+                                          dimension:1 name:nil];   // [B, 2C]
+        MPSGraphTensor* bias = linear(stats, blk.pool_fc.weight, blk.pool_fc.bias,
+                                      blk.pool_fc.out_features, blk.pool_fc.in_features);
+        bias = [graph reshapeTensor:bias withShape:@[@(-1), @(C), @1, @1] name:nil];
+        y = [graph additionWithPrimaryTensor:y secondaryTensor:bias name:nil];
+
+        y = convBN(y, blk.conv2);
+        y = [graph additionWithPrimaryTensor:y secondaryTensor:residual name:nil];
+        return relu(y);
     }
 };
 
+// ================================================================
+// Graph construction
+// ================================================================
+
 MetalComputeHandle::MetalComputeHandle(MetalComputeContext::Impl* ctx_impl,
-                                         const LoadedModel* model) {
+                                        const LoadedModel* model) {
     impl_ = new Impl();
     impl_->ctx = ctx_impl;
     impl_->board_rows = model->board_rows;
     impl_->board_cols = model->board_cols;
     impl_->input_channels = model->input_channels;
     impl_->action_size = model->action_size;
+    impl_->value_head_size = model->value_head_size;
 
     auto* g = impl_;
     g->graph = [[MPSGraph alloc] init];
 
-    int H = model->board_rows, W = model->board_cols, HW = H * W;
-    int nf = model->num_filters;
+    const int H = model->board_rows, W = model->board_cols, HW = H * W;
+    const int nf = model->num_filters;
 
-    // Input placeholder [N, C, H, W] FP32 → cast to FP16
+    // Input placeholder [N, C, H, W] fp32, cast to fp16 for compute.
     g->inputTensor = [g->graph placeholderWithShape:@[@(-1), @(model->input_channels), @(H), @(W)]
                                            dataType:MPSDataTypeFloat32 name:@"input"];
     MPSGraphTensor* x = [g->graph castTensor:g->inputTensor toType:MPSDataTypeFloat16 name:nil];
 
-    // Input conv + BN + ReLU
-    x = g->addConv2d(x, model->input_conv.weight, nf, model->input_channels, 3, 3);
-    x = g->addBN(x, model->input_conv.bn_scale, model->input_conv.bn_bias, nf);
-    x = g->addReLU(x);
+    // Input conv + BN + ReLU.
+    x = g->convBNReLU(x, model->input_conv);
 
-    // Residual blocks
-    for (int i = 0; i < model->num_res_blocks; i++) {
-        MPSGraphTensor* residual = x;
-        x = g->addConv2d(x, model->res_conv1[i].weight, nf, nf, 3, 3);
-        x = g->addBN(x, model->res_conv1[i].bn_scale, model->res_conv1[i].bn_bias, nf);
-        x = g->addReLU(x);
-        x = g->addConv2d(x, model->res_conv2[i].weight, nf, nf, 3, 3);
-        x = g->addBN(x, model->res_conv2[i].bn_scale, model->res_conv2[i].bn_bias, nf);
-        x = [g->graph additionWithPrimaryTensor:x secondaryTensor:residual name:nil];
-        x = g->addReLU(x);
+    // Residual tower.
+    for (const BlockWeights& blk : model->blocks) {
+        switch (blk.kind) {
+            case BlockKind::SE:    x = g->seBlock(x, blk); break;
+            case BlockKind::GPool: x = g->gpoolBlock(x, blk); break;
+            case BlockKind::Plain: default: x = g->plainBlock(x, blk); break;
+        }
     }
 
-    // Policy head
+    // Policy head.
     {
-        int pc = model->policy_conv.c_out;
-        MPSGraphTensor* pol = g->addConv2d(x, model->policy_conv.weight, pc, nf, 1, 1);
-        pol = g->addBN(pol, model->policy_conv.bn_scale, model->policy_conv.bn_bias, pc);
-        pol = g->addReLU(pol);
+        const int pc = model->policy_conv.c_out;
+        MPSGraphTensor* pol = g->convBNReLU(x, model->policy_conv);
         pol = [g->graph reshapeTensor:pol withShape:@[@(-1), @(pc * HW)] name:nil];
-        int as = model->action_size;
-        pol = g->addFC(pol, model->policy_fc.weight, model->policy_fc.bias, as, pc * HW);
+        pol = g->linear(pol, model->policy_fc.weight, model->policy_fc.bias,
+                        model->action_size, pc * HW);
         g->policyOutput = [g->graph castTensor:pol toType:MPSDataTypeFloat32 name:nil];
     }
 
-    // Value head
+    // Value head.  value_fc2 produces `value_head_size` logits; collapse to
+    // P(win) - P(loss) for the 3-class WLD head.
     {
-        int vc = model->value_conv.c_out;
-        MPSGraphTensor* val = g->addConv2d(x, model->value_conv.weight, vc, nf, 1, 1);
-        val = g->addBN(val, model->value_conv.bn_scale, model->value_conv.bn_bias, vc);
-        val = g->addReLU(val);
+        const int vc = model->value_conv.c_out;
+        MPSGraphTensor* val = g->convBNReLU(x, model->value_conv);
         val = [g->graph reshapeTensor:val withShape:@[@(-1), @(vc * HW)] name:nil];
-        val = g->addFC(val, model->value_fc1.weight, model->value_fc1.bias,
+        val = g->linear(val, model->value_fc1.weight, model->value_fc1.bias,
                         model->value_fc1.out_features, vc * HW);
-        val = g->addReLU(val);
-        val = g->addFC(val, model->value_fc2.weight, model->value_fc2.bias,
-                        1, model->value_fc1.out_features);
+        val = g->relu(val);
+        val = g->linear(val, model->value_fc2.weight, model->value_fc2.bias,
+                        model->value_fc2.out_features, model->value_fc2.in_features);
         val = [g->graph castTensor:val toType:MPSDataTypeFloat32 name:nil];
-        g->valueOutput = [g->graph tanhWithTensor:val name:nil];
+
+        if (model->value_head_size == 3) {
+            MPSGraphTensor* wdl = [g->graph softMaxWithTensor:val axis:1 name:nil];
+            // Slice P(win) and P(loss) along dim=1.
+            MPSGraphTensor* pwin = [g->graph sliceTensor:wdl dimension:1 start:0 length:1 name:nil];
+            MPSGraphTensor* ploss = [g->graph sliceTensor:wdl dimension:1 start:2 length:1 name:nil];
+            g->valueOutput = [g->graph subtractionWithPrimaryTensor:pwin
+                                                     secondaryTensor:ploss name:nil];
+        } else if (model->value_head_size == 1) {
+            g->valueOutput = [g->graph tanhWithTensor:val name:nil];
+        } else {
+            // Generic fallback: softmax and report (first - last).
+            MPSGraphTensor* sm = [g->graph softMaxWithTensor:val axis:1 name:nil];
+            MPSGraphTensor* first = [g->graph sliceTensor:sm dimension:1 start:0 length:1 name:nil];
+            MPSGraphTensor* last = [g->graph sliceTensor:sm dimension:1
+                                                   start:model->value_head_size - 1
+                                                  length:1 name:nil];
+            g->valueOutput = [g->graph subtractionWithPrimaryTensor:first
+                                                     secondaryTensor:last name:nil];
+        }
     }
 }
 
@@ -185,17 +267,16 @@ std::vector<MetalComputeHandle::Result>
 MetalComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) {
     if (states.empty()) return {};
 
-    int N = (int)states.size();
-    int H = impl_->board_rows, W = impl_->board_cols;
-    int HW = H * W;
-    int C = impl_->input_channels;
-    int action_size = impl_->action_size;
+    const int N = (int)states.size();
+    const int H = impl_->board_rows, W = impl_->board_cols;
+    const int HW = H * W;
+    const int C = impl_->input_channels;
+    const int action_size = impl_->action_size;
 
     size_t input_floats = (size_t)N * C * HW;
     std::vector<float> flat;
     flat.reserve(input_floats);
-    for (auto& s : states)
-        flat.insert(flat.end(), s.begin(), s.end());
+    for (const auto& s : states) flat.insert(flat.end(), s.begin(), s.end());
 
     __block float* polPtr = nullptr;
     __block float* valPtr = nullptr;
@@ -218,20 +299,21 @@ MetalComputeHandle::predict_batch(const std::vector<std::vector<float>>& states)
         MPSNDArray* polArr = results[impl_->policyOutput].mpsndarray;
         MPSNDArray* valArr = results[impl_->valueOutput].mpsndarray;
 
-        polPtr = (float*)malloc(N * action_size * sizeof(float));
-        valPtr = (float*)malloc(N * sizeof(float));
+        polPtr = (float*)malloc((size_t)N * action_size * sizeof(float));
+        valPtr = (float*)malloc((size_t)N * sizeof(float));
         [polArr readBytes:polPtr strideBytes:nil];
         [valArr readBytes:valPtr strideBytes:nil];
     }
 
     std::vector<Result> output(N);
-    for (int n = 0; n < N; n++) {
+    for (int n = 0; n < N; ++n) {
         std::vector<float> pol(action_size);
-        for (int a = 0; a < action_size; a++)
-            pol[a] = polPtr[n * action_size + a];
-        output[n].policy = std::move(pol);
-        output[n].value  = valPtr[n];
-        output[n].score  = 0.0f;  // TODO: Metal score head not yet implemented
+        std::memcpy(pol.data(), polPtr + (size_t)n * action_size,
+                    (size_t)action_size * sizeof(float));
+        output[n].policy   = std::move(pol);
+        output[n].value    = valPtr[n];
+        output[n].score    = 0.0f;
+        output[n].score_sd = 0.0f;
     }
 
     free(polPtr);

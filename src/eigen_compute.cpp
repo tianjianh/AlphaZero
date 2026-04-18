@@ -1,25 +1,17 @@
 #ifdef MINIGO_HAS_EIGEN
 #include "eigen_compute.h"
+
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#include <algorithm>
 #include <stdexcept>
 
 namespace minigo {
 
-// ================================================================
-// EigenComputeContext — trivial for CPU
-// ================================================================
-
-std::unique_ptr<ComputeHandle>
-EigenComputeContext::create_handle(const LoadedModel* model, int /*gpu_id*/, int /*max_batch_size*/) {
-    return std::make_unique<EigenComputeHandle>(model);
-}
-
-// ================================================================
-// EigenComputeHandle — loads weights from LoadedModel into Eigen matrices
-// ================================================================
+// ────────────────────────────────────────────────────────────────
+// Helpers for pushing LoadedModel weights into Eigen matrices
+// ────────────────────────────────────────────────────────────────
 
 static Eigen::MatrixXf to_matrix(const std::vector<float>& data, int rows, int cols) {
     return Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
@@ -27,83 +19,94 @@ static Eigen::MatrixXf to_matrix(const std::vector<float>& data, int rows, int c
 }
 
 static Eigen::VectorXf to_vector(const std::vector<float>& data) {
-    return Eigen::Map<const Eigen::VectorXf>(data.data(), (int)data.size());
+    return Eigen::Map<const Eigen::VectorXf>(data.data(), static_cast<int>(data.size()));
 }
 
+static void load_conv(EigenComputeHandle::ConvBN& dst, const ConvBNWeights& src) {
+    dst.c_out = src.c_out;
+    dst.c_in = src.c_in;
+    dst.k = src.k;
+    dst.weight = to_matrix(src.weight, src.c_out, src.c_in * src.k * src.k);
+    dst.bn_scale = to_vector(src.bn_scale);
+    dst.bn_bias = to_vector(src.bn_bias);
+}
+
+static void load_fc(EigenComputeHandle::FC& dst, const FCWeights& src) {
+    dst.out_features = src.out_features;
+    dst.in_features = src.in_features;
+    dst.weight = to_matrix(src.weight, src.out_features, src.in_features);
+    dst.bias = to_vector(src.bias);
+}
+
+// ────────────────────────────────────────────────────────────────
+// EigenComputeContext
+// ────────────────────────────────────────────────────────────────
+
+std::unique_ptr<ComputeHandle>
+EigenComputeContext::create_handle(const LoadedModel* model,
+                                   int /*gpu_id*/,
+                                   int /*max_batch_size*/) {
+    return std::make_unique<EigenComputeHandle>(model);
+}
+
+// ────────────────────────────────────────────────────────────────
+// EigenComputeHandle - weight loading
+// ────────────────────────────────────────────────────────────────
+
 EigenComputeHandle::EigenComputeHandle(const LoadedModel* model) {
-    // TODO(resnet_v2): the new KataGo-style ResNet (alternating SE + GPool
-    // residual blocks, global-pool value/score heads) is not yet supported
-    // by the Eigen backend.  To re-enable it, add forward passes for:
-    //   - SEModule (global avg pool → FC → sigmoid → broadcast multiply)
-    //   - GPoolResBlock (parallel 3x3 main + 3x3 pool branches, global
-    //     mean+max pool on the pool branch, FC → broadcast additive bias
-    //     into the main branch before conv2)
-    //   - GPoolHead (1x1 conv → global mean+max pool → 2-layer MLP)
-    // and load the corresponding weights from LoadedModel.  Until then,
-    // use the TensorRT backend.
-    throw std::runtime_error(
-        "Eigen backend currently disabled: the KataGo-style ResNet "
-        "(SE + GPool blocks + global-pool heads) and ViT models both "
-        "require TensorRT.  TODO: add Eigen kernels for the new blocks.");
-    if (model->model_type == "vit")
-        throw std::runtime_error("Eigen backend does not support ViT models. Use TensorRT.");
-    board_size     = model->board_size;
-    input_channels = model->input_channels;
-    num_filters    = model->num_filters;
-    num_res_blocks = model->num_res_blocks;
+    if (!model) throw std::runtime_error("EigenComputeHandle: null model");
 
-    auto load_conv = [](ConvBN& dst, const ConvBNWeights& src) {
-        dst.c_out = src.c_out;
-        dst.c_in  = src.c_in;
-        dst.k     = src.k;
-        dst.weight   = to_matrix(src.weight, src.c_out, src.c_in * src.k * src.k);
-        dst.bn_scale = to_vector(src.bn_scale);
-        dst.bn_bias  = to_vector(src.bn_bias);
-    };
-
-    auto load_fc = [](FC& dst, const FCWeights& src) {
-        dst.out_features = src.out_features;
-        dst.in_features  = src.in_features;
-        dst.weight = to_matrix(src.weight, src.out_features, src.in_features);
-        dst.bias   = to_vector(src.bias);
-    };
+    board_rows_      = model->board_rows;
+    board_cols_      = model->board_cols;
+    input_channels_  = model->input_channels;
+    num_filters_     = model->num_filters;
+    action_size_     = model->action_size;
+    value_head_size_ = model->value_head_size;
 
     load_conv(input_conv_, model->input_conv);
 
-    res_conv1_.resize(num_res_blocks);
-    res_conv2_.resize(num_res_blocks);
-    for (int i = 0; i < num_res_blocks; i++) {
-        load_conv(res_conv1_[i], model->res_conv1[i]);
-        load_conv(res_conv2_[i], model->res_conv2[i]);
+    blocks_.resize(model->blocks.size());
+    for (size_t i = 0; i < model->blocks.size(); ++i) {
+        const BlockWeights& src = model->blocks[i];
+        Block& dst = blocks_[i];
+        dst.kind = src.kind;
+        load_conv(dst.conv1, src.conv1);
+        load_conv(dst.conv2, src.conv2);
+        if (src.kind == BlockKind::SE) {
+            load_fc(dst.se_fc1, src.se_fc1);
+            load_fc(dst.se_fc2, src.se_fc2);
+        } else if (src.kind == BlockKind::GPool) {
+            load_conv(dst.pool_conv, src.pool_conv);
+            load_fc(dst.pool_fc, src.pool_fc);
+        }
     }
 
     load_conv(policy_conv_, model->policy_conv);
-    load_conv(value_conv_,  model->value_conv);
+    load_conv(value_conv_, model->value_conv);
     load_fc(policy_fc_, model->policy_fc);
     load_fc(value_fc1_, model->value_fc1);
     load_fc(value_fc2_, model->value_fc2);
 
-    load_conv(score_conv_, model->score_conv);
-    load_fc(score_fc1_, model->score_fc1);
-    load_fc(score_fc2_, model->score_fc2);
+    std::cout << "[eigen] handle ready: "
+              << board_rows_ << "x" << board_cols_
+              << " filters=" << num_filters_
+              << " blocks=" << blocks_.size() << "\n";
 }
 
-// ================================================================
-// Im2col for 3x3 convolution with padding=1, stride=1
-// ================================================================
+// ────────────────────────────────────────────────────────────────
+// Kernels
+// ────────────────────────────────────────────────────────────────
 
 void EigenComputeHandle::im2col(const float* input, int C, int H, int W,
-                                 int kH, int kW, int padH, int padW, float* col) {
-    int patch_size = C * kH * kW;
+                                int kH, int kW, int padH, int padW, float* col) {
     int hw = H * W;
-
-    for (int ic = 0; ic < C; ic++) {
-        for (int kh = 0; kh < kH; kh++) {
-            for (int kw = 0; kw < kW; kw++) {
+    for (int ic = 0; ic < C; ++ic) {
+        for (int kh = 0; kh < kH; ++kh) {
+            for (int kw = 0; kw < kW; ++kw) {
                 int row = ic * kH * kW + kh * kW + kw;
-                for (int oh = 0; oh < H; oh++) {
+                for (int oh = 0; oh < H; ++oh) {
                     int ih = oh + kh - padH;
-                    for (int ow = 0; ow < W; ow++) {
+                    for (int ow = 0; ow < W; ++ow) {
                         int iw = ow + kw - padW;
                         int c = oh * W + ow;
                         if (ih >= 0 && ih < H && iw >= 0 && iw < W)
@@ -117,114 +120,153 @@ void EigenComputeHandle::im2col(const float* input, int C, int H, int W,
     }
 }
 
-// ================================================================
+void EigenComputeHandle::conv3x3(const MatF& input, MatF& output, const ConvBN& conv,
+                                 int H, int W, std::vector<float>& scratch) {
+    int patch = conv.c_in * 9;
+    int hw = H * W;
+    scratch.resize(static_cast<size_t>(patch) * hw);
+    im2col(input.data(), conv.c_in, H, W, 3, 3, 1, 1, scratch.data());
+    Eigen::Map<MatF> col(scratch.data(), patch, hw);
+    output.noalias() = conv.weight * col;
+}
+
+void EigenComputeHandle::conv1x1(const MatF& input, MatF& output, const ConvBN& conv) {
+    // 1x1 conv is just a GEMM on the channel dimension.
+    output.noalias() = conv.weight * input;
+}
+
+void EigenComputeHandle::bn(MatF& x, const ConvBN& conv) {
+    for (int c = 0; c < static_cast<int>(x.rows()); ++c) {
+        x.row(c) = x.row(c) * conv.bn_scale(c) +
+                   Eigen::RowVectorXf::Constant(x.cols(), conv.bn_bias(c));
+    }
+}
+
+void EigenComputeHandle::bn_relu(MatF& x, const ConvBN& conv) {
+    bn(x, conv);
+    x = x.cwiseMax(0.0f);
+}
+
+// ────────────────────────────────────────────────────────────────
 // Forward pass (single sample)
-// ================================================================
+// ────────────────────────────────────────────────────────────────
 
 EigenComputeHandle::Result
 EigenComputeHandle::predict_single(const std::vector<float>& state) {
-    int n  = board_size;
-    int hw = n * n;
-    int action_size = hw + 1;
+    const int H = board_rows_;
+    const int W = board_cols_;
+    const int hw = H * W;
 
-    using MatF = Eigen::MatrixXf;
-    using VecF = Eigen::VectorXf;
+    MatF trunk = Eigen::Map<const MatF>(state.data(), input_channels_, hw);
 
-    MatF x = Eigen::Map<const MatF>(state.data(), input_channels, hw);
-
-    // Im2col workspace
-    int max_patch = num_filters * 9;
-    im2col_buf_.resize(max_patch * hw);
-
-    // Helper lambdas
-    auto conv3x3 = [&](const MatF& input, MatF& output, const ConvBN& conv) {
-        im2col(input.data(), conv.c_in, n, n, 3, 3, 1, 1, im2col_buf_.data());
-        Eigen::Map<MatF> col(im2col_buf_.data(), conv.c_in * 9, hw);
-        output.noalias() = conv.weight * col;
-    };
-
-    auto conv1x1 = [&](const MatF& input, MatF& output, const ConvBN& conv) {
-        output.noalias() = conv.weight * input;
-    };
-
-    auto bn_relu = [&](MatF& x, const ConvBN& conv) {
-        for (int c = 0; c < (int)x.rows(); c++)
-            x.row(c) = x.row(c) * conv.bn_scale(c) +
-                        Eigen::RowVectorXf::Constant(x.cols(), conv.bn_bias(c));
-        x = x.cwiseMax(0.0f);
-    };
-
-    // Input conv + BN + ReLU
-    MatF trunk;
-    conv3x3(x, trunk, input_conv_);
-    bn_relu(trunk, input_conv_);
-
-    // Residual blocks
-    for (int i = 0; i < num_res_blocks; i++) {
-        MatF residual = trunk;
+    {
         MatF tmp;
-        conv3x3(trunk, tmp, res_conv1_[i]);
-        bn_relu(tmp, res_conv1_[i]);
-
-        MatF tmp2;
-        conv3x3(tmp, tmp2, res_conv2_[i]);
-        // BN (no ReLU yet)
-        for (int c = 0; c < (int)tmp2.rows(); c++)
-            tmp2.row(c) = tmp2.row(c) * res_conv2_[i].bn_scale(c) +
-                           Eigen::RowVectorXf::Constant(tmp2.cols(), res_conv2_[i].bn_bias(c));
-        trunk = (tmp2 + residual).cwiseMax(0.0f);  // residual add + ReLU
+        conv3x3(trunk, tmp, input_conv_, H, W, im2col_buf_);
+        bn_relu(tmp, input_conv_);
+        trunk = std::move(tmp);
     }
 
-    // Policy head
+    MatF tmp, tmp2, pool_branch;
+    for (const Block& blk : blocks_) {
+        MatF residual = trunk;
+
+        // First 3x3 + BN + ReLU.
+        conv3x3(trunk, tmp, blk.conv1, H, W, im2col_buf_);
+        bn_relu(tmp, blk.conv1);
+
+        if (blk.kind == BlockKind::GPool) {
+            // Parallel pool branch from the block input.
+            conv3x3(residual, pool_branch, blk.pool_conv, H, W, im2col_buf_);
+            bn_relu(pool_branch, blk.pool_conv);
+
+            int C = static_cast<int>(pool_branch.rows());
+            VecF mean = pool_branch.rowwise().mean();
+            VecF mx(C);
+            for (int c = 0; c < C; ++c) mx(c) = pool_branch.row(c).maxCoeff();
+            VecF stats(2 * C);
+            stats.head(C) = mean;
+            stats.tail(C) = mx;
+            VecF bias = blk.pool_fc.weight * stats + blk.pool_fc.bias;
+
+            // Broadcast bias per-channel into tmp before conv2.
+            for (int c = 0; c < C; ++c)
+                tmp.row(c).array() += bias(c);
+        }
+
+        // Second 3x3 + BN (no ReLU yet).
+        conv3x3(tmp, tmp2, blk.conv2, H, W, im2col_buf_);
+        bn(tmp2, blk.conv2);
+
+        if (blk.kind == BlockKind::SE) {
+            int C = static_cast<int>(tmp2.rows());
+            VecF pooled = tmp2.rowwise().mean();                           // [C]
+            VecF h = (blk.se_fc1.weight * pooled + blk.se_fc1.bias).cwiseMax(0.0f);
+            VecF gate_logits = blk.se_fc2.weight * h + blk.se_fc2.bias;    // [C]
+            VecF gate(C);
+            for (int c = 0; c < C; ++c) gate(c) = 1.0f / (1.0f + std::exp(-gate_logits(c)));
+            for (int c = 0; c < C; ++c) tmp2.row(c) *= gate(c);
+        }
+
+        trunk = (tmp2 + residual).cwiseMax(0.0f);
+    }
+
+    // ── Policy head ────────────────────────────────────────────
     MatF p_conv;
     conv1x1(trunk, p_conv, policy_conv_);
     bn_relu(p_conv, policy_conv_);
-
     Eigen::Map<VecF> p_flat(p_conv.data(), policy_conv_.c_out * hw);
     VecF p_logits = policy_fc_.weight * p_flat + policy_fc_.bias;
-
-    // Softmax
     float max_logit = p_logits.maxCoeff();
     VecF p_exp = (p_logits.array() - max_logit).exp();
     VecF p_probs = p_exp / p_exp.sum();
 
-    std::vector<float> policy(action_size);
-    for (int i = 0; i < action_size; i++)
-        policy[i] = p_probs(i);
+    std::vector<float> policy(action_size_);
+    for (int i = 0; i < action_size_; ++i) policy[i] = p_probs(i);
 
-    // Value head
+    // ── Value head (WLD -> scalar P(win) - P(loss)) ────────────
     MatF v_conv;
     conv1x1(trunk, v_conv, value_conv_);
     bn_relu(v_conv, value_conv_);
-
     Eigen::Map<VecF> v_flat(v_conv.data(), value_conv_.c_out * hw);
     VecF v_hidden = (value_fc1_.weight * v_flat + value_fc1_.bias).cwiseMax(0.0f);
-    VecF v_out = value_fc2_.weight * v_hidden + value_fc2_.bias;
-    float value = std::tanh(v_out(0));
+    VecF wdl = value_fc2_.weight * v_hidden + value_fc2_.bias;      // [value_head_size]
 
-    // Score head (same structure as value head)
-    MatF s_conv;
-    conv1x1(trunk, s_conv, score_conv_);
-    bn_relu(s_conv, score_conv_);
+    float value_scalar = 0.0f;
+    if (value_head_size_ >= 3) {
+        float m = wdl.maxCoeff();
+        float ew = std::exp(wdl(0) - m);
+        float ed = std::exp(wdl(1) - m);
+        float el = std::exp(wdl(2) - m);
+        float z = ew + ed + el;
+        value_scalar = (ew - el) / z;
+    } else if (value_head_size_ == 1) {
+        // Legacy scalar-tanh model (export compatibility).
+        value_scalar = std::tanh(wdl(0));
+    } else {
+        float m = wdl.maxCoeff();
+        VecF ex = (wdl.array() - m).exp();
+        float z = ex.sum();
+        value_scalar = (ex(0) - ex(value_head_size_ - 1)) / z;
+    }
 
-    Eigen::Map<VecF> s_flat(s_conv.data(), score_conv_.c_out * hw);
-    VecF s_hidden = (score_fc1_.weight * s_flat + score_fc1_.bias).cwiseMax(0.0f);
-    VecF s_out = score_fc2_.weight * s_hidden + score_fc2_.bias;
-    float score = std::tanh(s_out(0));
-
-    return { policy, value, score };
+    Result r;
+    r.policy = std::move(policy);
+    r.value = value_scalar;
+    r.score = 0.0f;
+    r.score_sd = 0.0f;
+    return r;
 }
 
-// ================================================================
-// Batch predict (loops over single predict)
-// ================================================================
+// ────────────────────────────────────────────────────────────────
+// Batch predict (loops over single predict - simpler, still plenty fast
+// for a CPU fallback used at test-time).
+// ────────────────────────────────────────────────────────────────
 
 std::vector<EigenComputeHandle::Result>
 EigenComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) {
     std::vector<Result> results;
     results.reserve(states.size());
-    for (auto& s : states)
-        results.push_back(predict_single(s));
+    for (const auto& s : states) results.push_back(predict_single(s));
     return results;
 }
 

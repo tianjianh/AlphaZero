@@ -122,11 +122,11 @@ public:
     // ── Search ──────────────────────────────────────────────
     // search() builds a fresh root unless reuse_tree=true AND root_ is
     // already expanded (e.g. after a previous search + make_move()).
-    void search(GoGame& game, std::vector<float>& visits,
+    void search(XiangqiGame& game, std::vector<float>& visits,
                 int num_simulations = -1, bool add_noise = true,
                 bool reuse_tree = false);
 
-    int get_action(GoGame& game, std::vector<float>& policy,
+    int get_action(XiangqiGame& game, std::vector<float>& policy,
                    float temperature = 1.0f, int num_simulations = -1,
                    bool add_noise = true, bool reuse_tree = false);
 
@@ -179,7 +179,7 @@ private:
     std::vector<float> dirichlet(int n, float alpha);
 
     // ── Multi-threaded search internals ──────────────────────────
-    void search_thread_loop(MCTSNode* root, const GoGame& game,
+    void search_thread_loop(MCTSNode* root, const XiangqiGame& game,
                             int action_size,
                             std::atomic<int>& sims_done,
                             int num_simulations);
@@ -191,7 +191,7 @@ private:
     void revert_virtual_losses(const std::vector<MCTSNode*>& path);
 
     // ── Single-threaded search (fallback for DirectEvaluator) ────
-    void search_single_threaded(MCTSNode* root, const GoGame& game,
+    void search_single_threaded(MCTSNode* root, const XiangqiGame& game,
                                 int action_size, int num_simulations);
 };
 

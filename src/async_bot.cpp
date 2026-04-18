@@ -78,7 +78,7 @@ void AsyncBot::clear_callback() {
 
 // ── Game state ──────────────────────────────────────────────
 
-void AsyncBot::reset(const GoGame& initial_game) {
+void AsyncBot::reset(const XiangqiGame& initial_game) {
     {
         std::unique_lock<std::mutex> lock(control_mutex_);
         stop_locked(lock);
@@ -91,10 +91,10 @@ void AsyncBot::reset(const GoGame& initial_game) {
 }
 
 void AsyncBot::reset() {
-    reset(GoGame(config_.history_length));
+    reset(XiangqiGame(config_.history_length));
 }
 
-GoGame AsyncBot::game() const {
+XiangqiGame AsyncBot::game() const {
     std::lock_guard<std::mutex> lock(game_mutex_);
     return game_.copy();
 }
@@ -258,7 +258,7 @@ void AsyncBot::worker_loop() {
         }
 
         // ── Snapshot game state for the search ──
-        GoGame game_copy;
+        XiangqiGame game_copy;
         {
             std::lock_guard<std::mutex> gl(game_mutex_);
             game_copy = game_.copy();

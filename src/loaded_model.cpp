@@ -75,16 +75,33 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     model->input_channels = model->input_conv.c_in;
     model->num_filters = model->input_conv.c_out;
 
-    while (has("res_blocks." + std::to_string(model->num_res_blocks) + ".conv1.weight")) {
-        model->res_conv1.emplace_back();
-        model->res_conv2.emplace_back();
-        int idx = model->num_res_blocks;
-        load_conv(model->res_conv1.back(), "res_blocks." + std::to_string(idx) + ".conv1.weight");
-        load_bn(model->res_conv1.back(), "res_blocks." + std::to_string(idx) + ".bn1");
-        load_conv(model->res_conv2.back(), "res_blocks." + std::to_string(idx) + ".conv2.weight");
-        load_bn(model->res_conv2.back(), "res_blocks." + std::to_string(idx) + ".bn2");
-        model->num_res_blocks++;
+    // Scan residual blocks.  Kind is detected by presence of auxiliary weights.
+    int idx = 0;
+    while (has("res_blocks." + std::to_string(idx) + ".conv1.weight")) {
+        model->blocks.emplace_back();
+        BlockWeights& blk = model->blocks.back();
+        const std::string base = "res_blocks." + std::to_string(idx);
+
+        load_conv(blk.conv1, base + ".conv1.weight");
+        load_bn(blk.conv1, base + ".bn1");
+        load_conv(blk.conv2, base + ".conv2.weight");
+        load_bn(blk.conv2, base + ".bn2");
+
+        if (has(base + ".se.fc1.weight")) {
+            blk.kind = BlockKind::SE;
+            load_fc(blk.se_fc1, base + ".se.fc1");
+            load_fc(blk.se_fc2, base + ".se.fc2");
+        } else if (has(base + ".pool_conv.weight")) {
+            blk.kind = BlockKind::GPool;
+            load_conv(blk.pool_conv, base + ".pool_conv.weight");
+            load_bn(blk.pool_conv, base + ".pool_bn");
+            load_fc(blk.pool_fc, base + ".pool_fc");
+        } else {
+            blk.kind = BlockKind::Plain;
+        }
+        ++idx;
     }
+    model->num_res_blocks = idx;
 
     load_conv(model->policy_conv, "policy_conv.weight");
     load_bn(model->policy_conv, "policy_bn");
@@ -94,15 +111,27 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     load_bn(model->value_conv, "value_bn");
     load_fc(model->value_fc1, "value_fc1");
     load_fc(model->value_fc2, "value_fc2");
+    model->value_head_size = model->value_fc2.out_features;
 
     model->action_size = model->policy_fc.out_features;
+
+    int se_count = 0, gpool_count = 0, plain_count = 0;
+    for (const auto& b : model->blocks) {
+        if (b.kind == BlockKind::SE) ++se_count;
+        else if (b.kind == BlockKind::GPool) ++gpool_count;
+        else ++plain_count;
+    }
 
     std::cout << "Model loaded: type=" << model->model_type
               << " board=" << model->board_rows << "x" << model->board_cols
               << " filters=" << model->num_filters
               << " blocks=" << model->num_res_blocks
+              << " (SE=" << se_count
+              << " GPool=" << gpool_count
+              << " Plain=" << plain_count << ")"
               << " channels=" << model->input_channels
-              << " actions=" << model->action_size << "\n";
+              << " actions=" << model->action_size
+              << " value_head=" << model->value_head_size << "\n";
     return model;
 }
 

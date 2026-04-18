@@ -56,7 +56,7 @@ static std::vector<int> parse_device_ids(const std::string& str) {
     return ids;
 }
 
-static int random_legal_move(GoGame& game) {
+static int random_legal_move(XiangqiGame& game) {
     std::vector<float> legal;
     game.get_legal_moves(legal);
     std::vector<int> moves;
@@ -96,7 +96,7 @@ static Stone piece_side(int8_t piece) {
     return EMPTY;
 }
 
-static bool try_parse_iccs(const std::string& input, GoGame& game, int& action) {
+static bool try_parse_iccs(const std::string& input, XiangqiGame& game, int& action) {
     try {
         action = game.str_to_action(input);
         return true;
@@ -105,7 +105,7 @@ static bool try_parse_iccs(const std::string& input, GoGame& game, int& action) 
     }
 }
 
-static void draw_board(WINDOW* win, const GoGame& game,
+static void draw_board(WINDOW* win, const XiangqiGame& game,
                        int cursor_r, int cursor_c, bool cursor_active,
                        int selected_sq, const std::string& status_msg,
                        const std::string& ai_info,
@@ -333,7 +333,7 @@ int main(int argc, char* argv[]) {
         Stone human_color = RED;
         if (choice_buf[0] == 'B' || choice_buf[0] == 'b') human_color = BLACK;
 
-        GoGame game(config.history_length);
+        XiangqiGame game(config.history_length);
         if (bot) bot->reset(game);
 
         int cursor_r = 9;

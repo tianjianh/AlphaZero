@@ -15,7 +15,7 @@
 namespace minigo {
 
 // ================================================================
-// AsyncBot — KataGo-style wrapper around MCTS + GoGame
+// AsyncBot — KataGo-style wrapper around MCTS + XiangqiGame
 //
 // Architecture: one persistent worker thread runs `worker_loop()` for
 // the bot's lifetime, idle-waiting on a condvar between searches.  All
@@ -84,11 +84,11 @@ public:
     // ── Game state ──────────────────────────────────────────
     // Start a new game from the given position (default: empty board
     // with configured komi).  Stops any running search and clears tree.
-    void reset(const GoGame& initial_game);
+    void reset(const XiangqiGame& initial_game);
     void reset();
 
     // Thread-safe snapshot of the authoritative game state.
-    GoGame game() const;
+    XiangqiGame game() const;
 
     // ── Synchronous gen_move (AI move) ──────────────────────
     // Stops any running async search, runs a blocking GENMOVE search
@@ -135,7 +135,7 @@ private:
     Config          config_;
 
     mutable std::mutex       game_mutex_;  // protects game_
-    GoGame                   game_;
+    XiangqiGame                   game_;
 
     std::unique_ptr<MCTS>    mcts_;
 

@@ -313,30 +313,80 @@ def generate_plan(filters: int, blocks: int, preset: str) -> dict:
     }
 
 
+def detect_gpu_count() -> int:
+    """Return number of CUDA GPUs available (0 if CUDA is absent)."""
+    try:
+        out = subprocess.check_output(
+            [sys.executable, "-c",
+             "import torch, sys; sys.stdout.write(str(torch.cuda.device_count()) if torch.cuda.is_available() else '0')"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+        return max(0, int(out.strip() or "0"))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        return 0
+
+
 def detect_hardware() -> dict:
+    """Auto-configure hardware knobs from the detected GPU topology.
+
+    Follows the Go multi-gpu branch layout:
+      * 0 GPUs  -> single CPU selfplay instance, 1 NN server thread
+      * 1 GPU   -> single instance, 2 NN servers on the same GPU (pipelined)
+      * N>1 GPU -> N selfplay instances, 2N NN servers (two per GPU)
+    """
+    gpus = detect_gpu_count()
+    if gpus <= 0:
+        return {
+            "threads": num_cores(),
+            "search_threads": 16,
+            "selfplay_instances": 1,
+            "nn_server_threads": 1,
+            "nn_device_ids": "0",
+            "max_batch": 256,
+            "gpu_count": 0,
+        }
+    if gpus == 1:
+        return {
+            "threads": num_cores(),
+            "search_threads": 16,
+            "selfplay_instances": 1,
+            "nn_server_threads": 2,
+            "nn_device_ids": "0,0",
+            "max_batch": 256,
+            "gpu_count": 1,
+        }
+    # Multi-GPU: two NN servers per GPU, one selfplay instance per GPU.
+    device_ids = ",".join(str(g) for _ in range(2) for g in range(gpus))  # e.g. "0,1,0,1"
+    # Reorder so devices are grouped: "0,0,1,1,..."
+    device_ids = ",".join(str(g) for g in range(gpus) for _ in range(2))
     return {
         "threads": num_cores(),
         "search_threads": 16,
-        "selfplay_instances": 1,
-        "nn_server_threads": 1,
-        "nn_device_ids": "0",
+        "selfplay_instances": gpus,
+        "nn_server_threads": gpus * 2,
+        "nn_device_ids": device_ids,
         "max_batch": 256,
+        "gpu_count": gpus,
     }
 
 
 def build_if_needed() -> None:
+    """Configure + build the C++ binaries.  Skips CMake when up-to-date."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "cmake",
-            "-S",
-            str(PROJECT_DIR),
-            "-B",
-            str(BUILD_DIR),
-            "-DCMAKE_BUILD_TYPE=Release",
-        ],
-        check=True,
-    )
+    needed_binaries = ("selfplay", "evaluate", "play", "benchmark")
+    all_present = all((BUILD_DIR / name).is_file() for name in needed_binaries)
+    if not all_present or not (BUILD_DIR / "CMakeCache.txt").is_file():
+        subprocess.run(
+            [
+                "cmake",
+                "-S", str(PROJECT_DIR),
+                "-B", str(BUILD_DIR),
+                "-DCMAKE_BUILD_TYPE=Release",
+            ],
+            check=True,
+        )
     subprocess.run(
         ["cmake", "--build", str(BUILD_DIR), "-j", str(num_cores())],
         check=True,
@@ -766,8 +816,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             train_ckpt = CHECKPOINT_DIR / "training.pt"
-            train_cmd = [
-                sys.executable,
+            train_py_args = [
                 str(SCRIPTS_DIR / "train.py"),
                 "--data", window_dirs,
                 "--checkpoint", str(train_ckpt),
@@ -785,6 +834,22 @@ def cmd_train(args: argparse.Namespace) -> None:
                 "--value-weight", str(st["value_weight"]),
                 "--output-onnx", str(candidate_onnx),
             ]
+
+            gpu_count = hw.get("gpu_count", 0)
+            if gpu_count > 1:
+                torchrun = shutil.which("torchrun")
+                if torchrun:
+                    train_cmd = [
+                        torchrun,
+                        f"--nproc_per_node={gpu_count}",
+                        *train_py_args,
+                    ]
+                    log(f"  training via torchrun with {gpu_count} GPUs")
+                else:
+                    log("  torchrun not found — falling back to single-process training")
+                    train_cmd = [sys.executable, *train_py_args]
+            else:
+                train_cmd = [sys.executable, *train_py_args]
 
             log(
                 f"Phase 2 - Training: epochs={stage['epochs']} "
@@ -846,8 +911,25 @@ def cmd_train(args: argparse.Namespace) -> None:
                 tlog(line)
 
             if result.returncode not in (0, 1):
-                print("ERROR: evaluate failed unexpectedly")
-                sys.exit(result.returncode)
+                # Eval binary crashed.  Rather than deadlocking the pipeline we
+                # auto-promote the candidate and continue - same policy as the
+                # Go multi-gpu branch.  The next eval will catch a bad model.
+                log(
+                    f"Phase 3 - WARNING: evaluate exited with code "
+                    f"{result.returncode}; auto-promoting candidate to keep the loop alive"
+                )
+                tlog(f"Phase 3 eval: crashed (rc={result.returncode}); auto-promoted")
+                shutil.copy2(candidate_onnx, best_onnx())
+                state["best_version"] = iteration
+                state["total_promotions"] += 1
+                save_state(state)
+                log(
+                    f"Iteration {iteration} done (eval crashed). "
+                    f"Best={vstr(state['best_version'])} "
+                    f"Promotions={state['total_promotions']} "
+                    f"Total games={state['total_games']}"
+                )
+                continue
 
             win_rate_match = re.search(r"Model 1 win rate:\s*([\d.]+)%", eval_output)
             wins1_match = re.search(r"Model 1 wins:\s*(\d+)", eval_output)

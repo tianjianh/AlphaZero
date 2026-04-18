@@ -120,6 +120,4 @@ private:
     void score_game();
 };
 
-using GoGame = XiangqiGame;
-
 }  // namespace minigo

@@ -122,7 +122,7 @@ int main(int argc, char* argv[]) {
         auto t0 = std::chrono::steady_clock::now();
 
         for (int g = 0; g < 10000; g++) {
-            GoGame game(config.history_length);
+            XiangqiGame game(config.history_length);
             while (!game.game_over && game.move_count < config.max_moves_per_game) {
                 std::vector<float> legal;
                 game.get_legal_moves(legal);
@@ -156,7 +156,7 @@ int main(int argc, char* argv[]) {
     {
         std::cout << "2. NN inference, single-thread (" << context->backend_name() << ")...\n";
 
-        GoGame game(config.history_length);
+        XiangqiGame game(config.history_length);
         std::vector<float> state;
         game.encode(state);
 
@@ -179,7 +179,7 @@ int main(int argc, char* argv[]) {
     {
         std::cout << "3. Batch NN inference throughput...\n";
 
-        GoGame game(config.history_length);
+        XiangqiGame game(config.history_length);
         std::vector<float> state;
         game.encode(state);
 
@@ -211,7 +211,7 @@ int main(int argc, char* argv[]) {
 
         config.num_search_threads = 1;
         MCTS mcts(eval_single.get(), config);
-        GoGame game(config.history_length);
+        XiangqiGame game(config.history_length);
 
         auto t0 = std::chrono::steady_clock::now();
         std::vector<float> pi;

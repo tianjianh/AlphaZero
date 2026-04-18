@@ -159,14 +159,14 @@ void MCTS::revert_virtual_losses(const std::vector<MCTSNode*>& path) {
 // Speed scales linearly with search threads (more threads → bigger batch).
 // ================================================================
 
-void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
+void MCTS::search_thread_loop(MCTSNode* root, const XiangqiGame& game,
                                int action_size,
                                std::atomic<int>& sims_done,
                                int num_simulations) {
     // Pre-allocate ONE NNResultBuf for this thread's entire lifetime.
     NNResultBuf result_buf;
-    // Pre-allocate GoGame on heap — reused across playouts (avoids ~4KB on stack)
-    auto game_copy_ptr = std::make_unique<GoGame>(game.copy());
+    // Pre-allocate XiangqiGame on heap — reused across playouts (avoids ~4KB on stack)
+    auto game_copy_ptr = std::make_unique<XiangqiGame>(game.copy());
 
     while (true) {
         if (sims_done.load(std::memory_order_relaxed) >= num_simulations
@@ -275,7 +275,7 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
 // server thread and batch submission is direct.
 // ================================================================
 
-void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
+void MCTS::search_single_threaded(MCTSNode* root, const XiangqiGame& game,
                                    int action_size, int num_simulations) {
     int sims_done      = 0;
     int vloss_parallel = config_.virtual_loss_parallel;
@@ -293,8 +293,8 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
         std::vector<PendingLeaf> pending;
         pending.reserve(batch_count);
 
-        // Pre-allocate GoGame on heap — reused across batch
-        auto game_copy_ptr = std::make_unique<GoGame>(game.copy());
+        // Pre-allocate XiangqiGame on heap — reused across batch
+        auto game_copy_ptr = std::make_unique<XiangqiGame>(game.copy());
 
         for (int i = 0; i < batch_count; i++) {
             PendingLeaf leaf;
@@ -372,7 +372,7 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
 // search() — dispatch
 // ================================================================
 
-void MCTS::search(GoGame& game, std::vector<float>& visits,
+void MCTS::search(XiangqiGame& game, std::vector<float>& visits,
                   int num_simulations, bool add_noise, bool reuse_tree) {
     if (num_simulations < 0) num_simulations = config_.num_simulations;
     // NOTE: should_stop_ is NOT cleared here.  Clearing it inside
@@ -448,7 +448,7 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     int nthreads = std::max(1, config_.num_search_threads);
     std::atomic<int> sims_done{0};
 
-    // Spawn search threads — GoGame is heap-allocated inside each thread,
+    // Spawn search threads — XiangqiGame is heap-allocated inside each thread,
     // so default stack size is fine (no large stack objects).
     std::vector<std::thread> search_threads;
     search_threads.reserve(nthreads - 1);
@@ -512,7 +512,7 @@ void MCTS::reset_tree() {
     }
 }
 
-int MCTS::get_action(GoGame& game, std::vector<float>& policy,
+int MCTS::get_action(XiangqiGame& game, std::vector<float>& policy,
                      float temperature, int num_simulations,
                      bool add_noise, bool reuse_tree) {
     int action_size = config_.action_size();
@@ -665,7 +665,7 @@ static void augment_sample(const std::vector<float>& state,
 // ================================================================
 static std::vector<TrainingRecord> self_play_game_impl(
         MCTS& mcts, const Config& config) {
-    GoGame game(config.history_length);
+    XiangqiGame game(config.history_length);
 
     struct Step {
         std::vector<float> state;

@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+"""Export the Xiangqi network to ONNX.
+
+The exported graph exposes two outputs:
+  - policy_logits: [batch, rows * cols * rows * cols]
+  - value:         [batch, 1]   (P(win) - P(loss) after WDL softmax)
+
+The wrapper collapses the internal 3-class WDL head into a single scalar
+value so existing C++ backends can keep reading NNOutput.value as a float.
+"""
+
+from __future__ import annotations
 
 import argparse
 import os
@@ -11,13 +22,14 @@ from model import create_model
 
 
 class ExportWrapper(torch.nn.Module):
+    """Thin inference wrapper used by torch.onnx.export."""
+
     def __init__(self, model: torch.nn.Module):
         super().__init__()
         self.model = model
 
     def forward(self, x):
-        policy_logits, value = self.model.forward_inference(x)
-        return policy_logits, value
+        return self.model.forward_inference(x)
 
 
 def export_to_onnx(
@@ -31,6 +43,7 @@ def export_to_onnx(
     wrapper = ExportWrapper(model)
     dummy = torch.randn(1, input_channels, board_rows, board_cols)
 
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     torch.onnx.export(
         wrapper,
         dummy,
@@ -48,10 +61,11 @@ def export_to_onnx(
         opset_version=17,
     )
 
+    action_size = board_rows * board_cols * board_rows * board_cols
     print(f"Exported ONNX model to {output_path}")
     print(f"  Input:  [batch, {input_channels}, {board_rows}, {board_cols}]")
-    print(f"  Policy: [batch, {board_rows * board_cols * board_rows * board_cols}]")
-    print("  Value:  [batch, 1]")
+    print(f"  Policy: [batch, {action_size}]")
+    print("  Value:  [batch, 1]  (P(win) - P(loss))")
 
 
 def main():
@@ -60,16 +74,12 @@ def main():
                         help="Checkpoint to export. If missing, exports a freshly initialized model.")
     parser.add_argument("--output", default="models/model.onnx",
                         help="Destination ONNX file")
-    parser.add_argument("--rows", type=int, default=10,
-                        help="Board row count")
-    parser.add_argument("--cols", type=int, default=9,
-                        help="Board column count")
+    parser.add_argument("--rows", type=int, default=10, help="Board row count")
+    parser.add_argument("--cols", type=int, default=9, help="Board column count")
     parser.add_argument("--history-length", type=int, default=4,
                         help="History snapshots encoded into the input tensor")
-    parser.add_argument("--filters", type=int, default=128,
-                        help="Residual tower channel count")
-    parser.add_argument("--blocks", type=int, default=10,
-                        help="Residual block count")
+    parser.add_argument("--filters", type=int, default=128, help="Residual tower channel count")
+    parser.add_argument("--blocks", type=int, default=10, help="Residual block count")
     args = parser.parse_args()
 
     input_channels = args.history_length * 14 + 1
@@ -84,6 +94,8 @@ def main():
     if os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model_state_dict", ckpt)
+        # Strip DDP "module." prefixes.
+        state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict, strict=False)
 
     export_to_onnx(

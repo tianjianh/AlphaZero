@@ -39,7 +39,7 @@ struct GameRecord {
 
 static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
                                 const Config& config, bool eval1_is_black) {
-    GoGame game(config.history_length);
+    XiangqiGame game(config.history_length);
     MCTS mcts1(eval1, config);
     MCTS mcts2(eval2, config);
 
@@ -75,7 +75,7 @@ static void write_game_record(const std::string& path, const GameRecord& rec,
                               int game_id, const std::string& m1_name,
                               const std::string& m2_name) {
     std::ofstream out(path);
-    GoGame formatter;
+    XiangqiGame formatter;
     out << "game " << game_id << "\n";
     out << "board " << rec.board_rows << "x" << rec.board_cols << "\n";
     out << "black " << (rec.model1_is_black ? m1_name : m2_name) << "\n";
