@@ -301,6 +301,130 @@ bool XiangqiGame::is_pseudo_legal(int sr, int sc, int dr, int dc) const {
     }
 }
 
+int XiangqiGame::collect_pseudo_legal_dsts(int sr, int sc, int out[32]) const {
+    int8_t piece = board[sr][sc];
+    Stone side = piece_color(piece);
+    int type = piece_type(piece);
+    int n = 0;
+    auto push = [&](int dr, int dc) { out[n++] = sq_index(dr, dc); };
+
+    switch (type) {
+        case 0: {  // King / General
+            // Flying-general capture: only legal if the column between
+            // the two kings is completely clear.
+            int opp_r = -1, opp_c = -1;
+            if (find_king(opponent(side), opp_r, opp_c) && opp_c == sc) {
+                bool clear = true;
+                int step = (opp_r > sr) ? 1 : -1;
+                for (int r = sr + step; r != opp_r; r += step) {
+                    if (board[r][sc] != NO_PIECE) { clear = false; break; }
+                }
+                if (clear) push(opp_r, opp_c);
+            }
+            for (const auto& d : kKingDirs) {
+                int dr = sr + d[0], dc = sc + d[1];
+                if (!in_palace(side, dr, dc)) continue;
+                if (is_side_piece(board[dr][dc], side)) continue;
+                push(dr, dc);
+            }
+            break;
+        }
+        case 1: {  // Advisor / Guard
+            for (const auto& d : kAdvisorDirs) {
+                int dr = sr + d[0], dc = sc + d[1];
+                if (!in_palace(side, dr, dc)) continue;
+                if (is_side_piece(board[dr][dc], side)) continue;
+                push(dr, dc);
+            }
+            break;
+        }
+        case 2: {  // Bishop / Elephant
+            for (const auto& off : kBishopOffsets) {
+                int dr = sr + off[0], dc = sc + off[1];
+                int er = sr + off[2], ec = sc + off[3];
+                if (!in_bounds(dr, dc)) continue;
+                if (side == RED && dr < 5) continue;           // can't cross river
+                if (side == BLACK && dr > 4) continue;
+                if (board[er][ec] != NO_PIECE) continue;       // "elephant eye" blocked
+                if (is_side_piece(board[dr][dc], side)) continue;
+                push(dr, dc);
+            }
+            break;
+        }
+        case 3: {  // Knight / Horse
+            for (const auto& off : kKnightOffsets) {
+                int dr = sr + off[0], dc = sc + off[1];
+                int lr = sr + off[2], lc = sc + off[3];
+                if (!in_bounds(dr, dc)) continue;
+                if (board[lr][lc] != NO_PIECE) continue;       // "horse leg" blocked
+                if (is_side_piece(board[dr][dc], side)) continue;
+                push(dr, dc);
+            }
+            break;
+        }
+        case 4: {  // Rook / Chariot — slide until blocker
+            for (const auto& dir : kKingDirs) {
+                int dr = sr + dir[0], dc = sc + dir[1];
+                while (in_bounds(dr, dc)) {
+                    int8_t p = board[dr][dc];
+                    if (p == NO_PIECE) {
+                        push(dr, dc);
+                    } else {
+                        if (!is_side_piece(p, side)) push(dr, dc);
+                        break;
+                    }
+                    dr += dir[0];
+                    dc += dir[1];
+                }
+            }
+            break;
+        }
+        case 5: {  // Cannon — slide for non-capture, jump exactly 1 screen for capture
+            for (const auto& dir : kKingDirs) {
+                int dr = sr + dir[0], dc = sc + dir[1];
+                // Phase 1: empty-square moves (non-capture)
+                while (in_bounds(dr, dc) && board[dr][dc] == NO_PIECE) {
+                    push(dr, dc);
+                    dr += dir[0];
+                    dc += dir[1];
+                }
+                if (!in_bounds(dr, dc)) continue;              // ray ran off the board
+                // Phase 2: jump over the single screen, then the first piece
+                // encountered is capturable iff it belongs to the opponent.
+                dr += dir[0];
+                dc += dir[1];
+                while (in_bounds(dr, dc)) {
+                    int8_t p = board[dr][dc];
+                    if (p != NO_PIECE) {
+                        if (!is_side_piece(p, side)) push(dr, dc);
+                        break;
+                    }
+                    dr += dir[0];
+                    dc += dir[1];
+                }
+            }
+            break;
+        }
+        case 6: {  // Pawn / Soldier
+            int forward = (side == RED) ? -1 : 1;
+            int dr = sr + forward;
+            if (in_bounds(dr, sc) && !is_side_piece(board[dr][sc], side))
+                push(dr, sc);
+            if (crossed_river(side, sr)) {
+                for (int dc_off : {-1, 1}) {
+                    int nc = sc + dc_off;
+                    if (in_bounds(sr, nc) && !is_side_piece(board[sr][nc], side))
+                        push(sr, nc);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return n;
+}
+
 bool XiangqiGame::is_legal(int action) const {
     if (game_over) return false;
     if (action < 0 || action >= action_size()) return false;
@@ -321,15 +445,18 @@ bool XiangqiGame::is_legal(int action) const {
 bool XiangqiGame::has_any_legal_move(Stone side) const {
     XiangqiGame tmp = *this;
     tmp.current_player = side;
+    int dsts[32];
     for (int sr = 0; sr < BOARD_ROWS; ++sr) {
         for (int sc = 0; sc < BOARD_COLS; ++sc) {
             if (!is_side_piece(tmp.board[sr][sc], side)) continue;
-            int src = sq_index(sr, sc);
-            for (int dr = 0; dr < BOARD_ROWS; ++dr) {
-                for (int dc = 0; dc < BOARD_COLS; ++dc) {
-                    int dst = sq_index(dr, dc);
-                    if (tmp.is_legal(encode_action(src, dst))) return true;
-                }
+            int n = tmp.collect_pseudo_legal_dsts(sr, sc, dsts);
+            for (int i = 0; i < n; ++i) {
+                int dr = dsts[i] / BOARD_COLS;
+                int dc = dsts[i] % BOARD_COLS;
+                XiangqiGame t2 = tmp;
+                int8_t captured = NO_PIECE;
+                t2.apply_move_unchecked(sr, sc, dr, dc, captured);
+                if (!t2.is_in_check(side)) return true;
             }
         }
     }
@@ -386,15 +513,27 @@ int XiangqiGame::repetition_status(int n_recur) const {
 void XiangqiGame::get_legal_moves(std::vector<float>& legal) const {
     legal.assign(action_size(), 0.0f);
     if (game_over) return;
+    // Two-phase move generation:
+    //   1) collect_pseudo_legal_dsts emits only the ~6 destinations each
+    //      piece can reach by its movement rules (vs the old 90-dst rejection
+    //      scan that called is_pseudo_legal on every (src, dst) pair).
+    //   2) for each candidate, do the copy + apply + is_in_check king-safety
+    //      test.  Same king-safety cost per candidate as before; the saving
+    //      is in phase 1.
+    int dsts[32];
     for (int sr = 0; sr < BOARD_ROWS; ++sr) {
         for (int sc = 0; sc < BOARD_COLS; ++sc) {
             if (!is_side_piece(board[sr][sc], current_player)) continue;
             int src = sq_index(sr, sc);
-            for (int dr = 0; dr < BOARD_ROWS; ++dr) {
-                for (int dc = 0; dc < BOARD_COLS; ++dc) {
-                    int action = encode_action(src, sq_index(dr, dc));
-                    if (is_legal(action)) legal[action] = 1.0f;
-                }
+            int n = collect_pseudo_legal_dsts(sr, sc, dsts);
+            for (int i = 0; i < n; ++i) {
+                int dr = dsts[i] / BOARD_COLS;
+                int dc = dsts[i] % BOARD_COLS;
+                XiangqiGame tmp = *this;
+                int8_t captured = NO_PIECE;
+                tmp.apply_move_unchecked(sr, sc, dr, dc, captured);
+                if (!tmp.is_in_check(current_player))
+                    legal[encode_action(src, dsts[i])] = 1.0f;
             }
         }
     }

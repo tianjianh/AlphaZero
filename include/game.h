@@ -109,6 +109,12 @@ private:
 
     bool find_king(Stone side, int& r, int& c) const;
     bool is_pseudo_legal(int sr, int sc, int dr, int dc) const;
+    // Enumerate pseudo-legal destinations for the piece at (sr, sc), without
+    // king-safety filtering.  Writes sq_index(dr, dc) values into out[] and
+    // returns the count.  Worst case per piece is 17 (rook / cannon rays);
+    // 32 is a safe upper bound.  Avoids the old "try all 90 destinations
+    // then reject via is_pseudo_legal" scan in the hot path.
+    int collect_pseudo_legal_dsts(int sr, int sc, int out[32]) const;
     void apply_move_unchecked(int sr, int sc, int dr, int dc, int8_t& captured);
     void undo_move_unchecked(int sr, int sc, int dr, int dc, int8_t captured);
     bool is_in_check(Stone side) const;

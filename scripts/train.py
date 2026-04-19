@@ -335,11 +335,18 @@ def main():
     )
 
     # ── AMP config ──────────────────────────────────────────────
+    # torch.cuda.is_bf16_supported() returns True on Turing (SM 7.5,
+    # e.g. RTX 2080 Ti) because BF16 is emulated through the FP32 path
+    # on pre-Ampere GPUs — SM 7.x has FP16 tensor cores but no native
+    # BF16 tensor cores.  Emulated BF16 keeps the SMs busy (hence "GPU
+    # 100%") while the tensor cores stay idle, which shows up as low
+    # power draw.  Prefer FP16 on Turing to actually use the tensor
+    # cores; BF16 on Ampere+ (SM 8.0+) where it's native.
     if args.amp == "auto":
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
-            amp_mode = "bf16"
-        elif device.type == "cuda":
-            amp_mode = "fp16"
+        if device.type == "cuda":
+            dev_idx = local_rank if ddp_enabled else 0
+            major = torch.cuda.get_device_capability(dev_idx)[0]
+            amp_mode = "bf16" if major >= 8 else "fp16"
         else:
             amp_mode = "off"
     else:
