@@ -11,9 +11,8 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
     : model_(std::move(model)),
       context_(std::move(context)),
       max_batch_size_(max_batch_size) {
-    queue_.reserve(max_batch_size);
-
     int num_threads = (int)gpu_ids.size();
+
     std::cout << "NNEvaluator: " << num_threads << " server thread(s), devices=[";
     for (int i = 0; i < num_threads; i++) {
         if (i > 0) std::cout << ",";
@@ -21,7 +20,7 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
     }
     std::cout << "], backend=" << context_->backend_name() << "\n";
 
-    // Spawn N server threads — each creates its own ComputeHandle
+    // Spawn N server threads — each creates its own ComputeHandle.
     num_threads_ = num_threads;
     for (int i = 0; i < num_threads; i++)
         server_threads_.emplace_back(&NNEvaluator::server_loop, this, i, gpu_ids[i]);
@@ -33,11 +32,7 @@ void NNEvaluator::wait_ready() {
 }
 
 NNEvaluator::~NNEvaluator() {
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        stop_ = true;
-    }
-    queue_cv_.notify_all();  // wake ALL server threads
+    queue_.close();            // wakes all server threads to observe closed state
     for (auto& t : server_threads_)
         t.join();
 }
@@ -49,11 +44,7 @@ NNEvaluator::Result NNEvaluator::evaluate_with_buf(
     buf.state_data = state.data();
     buf.state_size = (int)state.size();
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.push_back(&buf);
-    }
-    queue_cv_.notify_all();
+    queue_.push(&buf);
 
     {
         std::unique_lock<std::mutex> lock(buf.mu);
@@ -80,15 +71,15 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
     for (int i = 0; i < n; i++)
         bufs.push_back(std::make_unique<NNResultBuf>());
 
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (int i = 0; i < n; i++) {
-            bufs[i]->state_data = states[i].data();
-            bufs[i]->state_size = (int)states[i].size();
-            queue_.push_back(bufs[i].get());
-        }
+    // Collect raw pointers to hand to the queue under one lock.
+    std::vector<NNResultBuf*> ptrs;
+    ptrs.reserve(n);
+    for (int i = 0; i < n; i++) {
+        bufs[i]->state_data = states[i].data();
+        bufs[i]->state_size = (int)states[i].size();
+        ptrs.push_back(bufs[i].get());
     }
-    queue_cv_.notify_all();
+    queue_.push_batch(ptrs);
 
     std::vector<Result> results;
     results.reserve(n);
@@ -106,7 +97,7 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
 // All threads drain from the same shared queue (competing consumers).
 // Whichever GPU finishes first picks up the next batch — self-balancing.
 void NNEvaluator::server_loop(int thread_id, int gpu_id) {
-    // Create ComputeHandle ON this thread — uploads weights to GPU
+    // Create ComputeHandle ON this thread — uploads weights to GPU.
     std::unique_ptr<ComputeHandle> handle;
     try {
         handle = context_->create_handle(model_.get(), gpu_id, max_batch_size_);
@@ -129,17 +120,10 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
     batch.reserve(max_batch_size_);
 
     while (true) {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] { return !queue_.empty() || stop_; });
-            if (stop_ && queue_.empty()) break;
-
-            int n = std::min((int)queue_.size(), max_batch_size_);
-            batch.assign(queue_.begin(), queue_.begin() + n);
-            queue_.erase(queue_.begin(), queue_.begin() + n);
-        }
-
-        if (batch.empty()) continue;
+        batch.clear();
+        if (!queue_.wait_drain_up_to(batch, (size_t)max_batch_size_))
+            break;   // queue closed and empty → exit
+        if (batch.empty()) continue;   // spurious; queue is non-empty but nothing drained
 
         // Flatten states
         int n = (int)batch.size();
@@ -166,11 +150,11 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
                 buf->done = true;
                 buf->cv.notify_one();
             }
-            batch.clear();
             continue;
         }
 
-        // Deliver results
+        // Deliver results — per-buf buf->cv is always notify_one: exactly
+        // one search thread owns this buf and is blocked on it.
         for (int i = 0; i < n; i++) {
             NNResultBuf* buf = batch[i];
             {
@@ -182,8 +166,6 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
             }
             buf->cv.notify_one();
         }
-
-        batch.clear();
     }
 }
 
