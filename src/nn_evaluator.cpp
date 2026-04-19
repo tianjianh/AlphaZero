@@ -1,4 +1,5 @@
 #include "nn_evaluator.h"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
@@ -11,9 +12,17 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
     : model_(std::move(model)),
       context_(std::move(context)),
       max_batch_size_(max_batch_size) {
-    queue_.reserve(max_batch_size);
-
     int num_threads = (int)gpu_ids.size();
+    // KataGo-style pre-reserve: max_batch_size × 4 × num_server_threads.
+    // Under load the queue routinely holds far more items than one batch
+    // because producers (search threads) keep pushing while servers are
+    // mid-inference.  Reserving only max_batch_size was too tight — the
+    // underlying std::vector doubles (256 → 512 → 1024 → …) under the
+    // queue_mutex_, blocking every other producer and all servers during
+    // the reallocation.  KataGo reserves 4× batch per server thread so
+    // the steady-state high-water mark fits without realloc.
+    queue_.reserve((size_t)max_batch_size * 4 * std::max(1, num_threads));
+
     std::cout << "NNEvaluator: " << num_threads << " server thread(s), devices=[";
     for (int i = 0; i < num_threads; i++) {
         if (i > 0) std::cout << ",";
@@ -49,11 +58,18 @@ NNEvaluator::Result NNEvaluator::evaluate_with_buf(
     buf.state_data = state.data();
     buf.state_size = (int)state.size();
 
+    // KataGo pattern: only notify when we make the queue transition from
+    // empty to non-empty.  Past that edge, any server thread that wants
+    // work has already been woken and is either processing or will check
+    // !queue_.empty() on its next loop iteration without a CV wake.
+    // Eliminates the futex-wake syscall on every subsequent push.
+    bool was_empty;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        was_empty = queue_.empty();
         queue_.push_back(&buf);
     }
-    queue_cv_.notify_all();
+    if (was_empty) queue_cv_.notify_one();
 
     {
         std::unique_lock<std::mutex> lock(buf.mu);
@@ -80,15 +96,19 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
     for (int i = 0; i < n; i++)
         bufs.push_back(std::make_unique<NNResultBuf>());
 
+    bool was_empty;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        was_empty = queue_.empty();
         for (int i = 0; i < n; i++) {
             bufs[i]->state_data = states[i].data();
             bufs[i]->state_size = (int)states[i].size();
             queue_.push_back(bufs[i].get());
         }
     }
-    queue_cv_.notify_all();
+    // Batch push of N leaves can legitimately need more than one server
+    // (up to min(N, num_threads)).  notify_all() here instead of notify_one.
+    if (was_empty) queue_cv_.notify_all();
 
     std::vector<Result> results;
     results.reserve(n);
