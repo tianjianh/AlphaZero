@@ -13,9 +13,12 @@ namespace minigo {
 MCTSNode* MCTSNode::select_child(float c_puct) {
     // Hoist the parent terms (visit_count + virtual_loss + sqrt) out of
     // the per-child loop — they don't change while we iterate, and
-    // ucb_score() was re-reading them per child via 2 atomic loads + a
-    // sqrt.  For a 82-child root that's 164 atomic ops + 82 sqrts saved
-    // per descent step.  The math here mirrors ucb_score() exactly.
+    // ucb_score() would re-read them per child via 2 atomic loads + a
+    // sqrt otherwise.  The math here mirrors ucb_score() exactly.
+    //
+    // children is a dense list of legal children (no null slots), so
+    // this loop runs exactly `children.size()` iterations.  For Xiangqi
+    // that's ~30-50 per node instead of 8100 with the old sparse layout.
     int parent_total =
         visit_count.load(std::memory_order_relaxed) +
         virtual_loss_count.load(std::memory_order_relaxed);
@@ -25,7 +28,6 @@ MCTSNode* MCTSNode::select_child(float c_puct) {
     float best_score = -1e9f;
     for (auto& child_ptr : children) {
         MCTSNode* child = child_ptr.get();
-        if (!child) continue;
 
         int vc  = child->visit_count.load(std::memory_order_relaxed);
         int vlc = child->virtual_loss_count.load(std::memory_order_relaxed);
@@ -64,15 +66,22 @@ std::vector<float> MCTS::dirichlet(int n, float alpha) {
 
 void MCTS::expand(MCTSNode* node, const std::vector<float>& policy,
                   const std::vector<float>& legal) {
+    // Build a dense list of just the legal children.  The parent's
+    // `children` vector used to be sized to action_size (8100 for
+    // Xiangqi) with ~8050 nullptr slots; that cost 64 KB per node and
+    // made every descent step scan all 8100 pointers.  Keeping only
+    // the ~30-50 legal children drops descent per-node from 8100
+    // pointer loads to ~40 and allocates ~400 B per node.
     int action_size = (int)policy.size();
-    node->children.resize(action_size);
+    node->children.clear();
+    node->children.reserve(64);   // typical Xiangqi branching factor
     for (int a = 0; a < action_size; a++) {
         if (legal[a] > 0.0f) {
             auto child = std::make_unique<MCTSNode>();
             child->parent = node;
             child->action = a;
             child->prior  = policy[a];
-            node->children[a] = std::move(child);
+            node->children.push_back(std::move(child));
         }
     }
 }
@@ -107,13 +116,20 @@ void MCTS::mask_policy(std::vector<float>& policy,
     }
 }
 
-void MCTS::add_dirichlet_noise(MCTSNode* node, int action_size) {
-    auto noise = dirichlet(action_size, config_.dirichlet_alpha);
+void MCTS::add_dirichlet_noise(MCTSNode* node, int /*action_size*/) {
+    // Generate Dirichlet over the LEGAL children count so the noise sums
+    // to 1 over the legal subset.  The previous implementation generated
+    // Dir(alpha, action_size) — 8100 samples summing to 1 over ALL
+    // actions — then applied only the ~50 entries that landed on legal
+    // action ids.  The resulting noise mass across legal children summed
+    // to ~50/8100 ≈ 0.6% instead of 1, so with eps=0.25 the blended prior
+    // received ~0.0015 worth of exploration noise, not 0.25.
+    if (node->children.empty()) return;
+    auto noise = dirichlet((int)node->children.size(), config_.dirichlet_alpha);
     float eps  = config_.dirichlet_epsilon;
-    for (int a = 0; a < (int)node->children.size(); a++) {
-        if (node->children[a])
-            node->children[a]->prior = (1.0f - eps) * node->children[a]->prior
-                                     + eps * noise[a];
+    for (size_t i = 0; i < node->children.size(); i++) {
+        node->children[i]->prior =
+            (1.0f - eps) * node->children[i]->prior + eps * noise[i];
     }
 }
 
@@ -463,10 +479,12 @@ void MCTS::search(XiangqiGame& game, std::vector<float>& visits,
         t.join();
 
     // ── Extract visit counts ─────────────────────────────────────
+    // The output `visits` is still an 8100-wide action-indexed vector
+    // (contract with self_play / training records).  Iterating the
+    // dense children list writes only the ~50 non-zero entries.
     visits.assign(action_size, 0.0f);
-    for (int a = 0; a < (int)root_->children.size(); a++)
-        if (root_->children[a])
-            visits[a] = (float)root_->children[a]->visit_count.load(std::memory_order_relaxed);
+    for (auto& child : root_->children)
+        visits[child->action] = (float)child->visit_count.load(std::memory_order_relaxed);
 }
 
 // ================================================================
@@ -481,15 +499,27 @@ void MCTS::make_move(int action) {
         std::lock_guard<std::mutex> lock(tree_mutex_);
         if (!root_) return;
 
-        if (action < 0 || action >= (int)root_->children.size()
-            || !root_->children[action]) {
+        // Linear scan for the child whose `action` matches.  Children
+        // are a dense list (~30-50 entries), so this is fast; called
+        // once per actual game ply, not in any hot loop.
+        MCTSNode* match = nullptr;
+        size_t match_idx = 0;
+        for (size_t i = 0; i < root_->children.size(); i++) {
+            if (root_->children[i] && root_->children[i]->action == action) {
+                match = root_->children[i].get();
+                match_idx = i;
+                break;
+            }
+        }
+
+        if (!match) {
             // Unexplored branch — drop the whole tree.
             old_root = std::move(root_);
             root_noise_added_ = false;
             return;  // old_root destroyed after lock release
         }
 
-        auto new_root = std::move(root_->children[action]);
+        auto new_root = std::move(root_->children[match_idx]);
         new_root->parent = nullptr;
         // Any virtual loss left over from an interrupted search is stale.
         new_root->virtual_loss_count.store(0, std::memory_order_relaxed);
@@ -573,13 +603,11 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
     info.root_utility = (vc > 0) ? root_->total_value() / (float)vc : 0.0f;
 
     // Collect child moves
-    for (int a = 0; a < (int)root_->children.size(); a++) {
-        auto& child = root_->children[a];
-        if (!child) continue;
+    for (auto& child : root_->children) {
         int cv = child->visit_count.load(std::memory_order_relaxed);
         if (cv == 0) continue;
         MoveInfo mi;
-        mi.action  = a;
+        mi.action  = child->action;
         mi.visits  = cv;
         mi.prior   = child->prior;
         mi.utility = -child->total_value() / (float)cv;  // negate: child stores from child's perspective

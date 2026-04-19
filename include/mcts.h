@@ -37,7 +37,11 @@ struct MCTSNode {
     std::atomic<int> virtual_loss_count{0};
     std::atomic<int> state{NODE_UNEVALUATED};
 
-    // Flat vector indexed by action (set during expand)
+    // Dense list of legal children (set during expand).  Each child's
+    // own `action` field is the action id that leads to it; random-access
+    // lookup by action is a linear scan, which is fine because it's only
+    // used at ply boundaries (make_move / get_analysis), not in the
+    // descent hot loop.
     std::vector<std::unique_ptr<MCTSNode>> children;
 
     // ── Atomic float total_value via int32 CAS ───────────────────
