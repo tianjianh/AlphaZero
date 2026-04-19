@@ -7,10 +7,11 @@ Side-by-side comparison of implementation details across all major subsystems.
 | Aspect | KataGo | MiniGo C++ |
 |---|---|---|
 | **Server loop function** | `NNEvaluator::serve()` | `NNEvaluator::server_loop()` |
-| **Queue type** | `ThreadSafeQueue<NNResultBuf*>` (custom, dual-vector swap) | `std::vector<NNResultBuf*>` + mutex |
-| **Queue drain** | `waitPopUpToN(buf, N)` — atomic multi-pop under one lock | `queue_.erase(begin, begin+n)` — O(n) copy |
-| **Queue capacity** | Pre-allocated `maxBatchSize * 4 * numGPUs` | Pre-allocated `max_batch_size` |
-| **Queue bounded?** | Yes — `notFullCondVar` blocks pushers when full | No — unbounded vector |
+| **Queue type** | `ThreadSafeQueue<NNResultBuf*>` (custom, dual-vector swap) | `NNRequestQueue` class wrapping `std::deque<NNResultBuf*>` + mutex + cv |
+| **Queue drain** | `waitPopUpToN(buf, N)` — atomic multi-pop under one lock | `NNRequestQueue::wait_drain_up_to(out, N)` — loop of `pop_front` under one lock (O(1) per element) |
+| **Queue capacity** | Pre-allocated `maxBatchSize * 4 * numGPUs` | Lazy chunked allocation via `std::deque` (each chunk holds ≈ 64 pointers, allocated on demand) |
+| **Queue bounded?** | Yes — `notFullCondVar` blocks pushers when full | No — `NNRequestQueue::push` never blocks (matches KataGo's `forcePush`) |
+| **Queue notify rule** | `notify_all` only on empty→1 transition (`if sizeUnsynchronized()==1`) | Same: `cv_.notify_all()` inside `NNRequestQueue` only on empty→non-empty edge |
 | **Batch sizing** | Dynamic — `setCurrentBatchSize()` adjustable at runtime | Static — `min(queue.size(), max_batch_size)` |
 | **Batch timeout** | None (blocks indefinitely) | None (blocks indefinitely) |
 | **GPU call** | `NeuralNet::getOutput()` — synchronous, blocks | `handle->predict_batch()` — synchronous, blocks |
@@ -112,9 +113,9 @@ Side-by-side comparison of implementation details across all major subsystems.
 
 | Aspect | KataGo | MiniGo C++ |
 |---|---|---|
-| **Queue lock** | `std::mutex` inside `ThreadSafeQueue` | `std::mutex queue_mutex_` |
-| **Queue signal** | `notEmptyCondVar` + `notFullCondVar` | Single `queue_cv_` |
-| **Shutdown** | `isKilled` flag + queue `close()`/`setReadOnly()` | `bool stop_` flag |
+| **Queue lock** | `std::mutex` inside `ThreadSafeQueue` | `std::mutex` inside `NNRequestQueue::mu_` (encapsulated; `NNEvaluator` does not touch it directly) |
+| **Queue signal** | `notEmptyCondVar` + `notFullCondVar` | Single `NNRequestQueue::cv_` (no `notFull` — the queue is unbounded, matching KataGo's `forcePush` semantics) |
+| **Shutdown** | `isKilled` flag + queue `close()`/`setReadOnly()` (which internally `notify_all`s) | `NNRequestQueue::close()` sets `closed_` and `notify_all`s; `wait_drain_up_to` returns false on closed+empty so servers exit |
 | **Atomic float** | `std::atomic<double>` (platform support) | CAS loop on `std::atomic<int32_t>` bit pattern |
 | **Per-node lock** | `MutexPool` indexed by hash (for expansion) | Lock-free CAS on state enum |
 | **Stats lock** | `statsLock` mutex for virtual loss writes | Lock-free `fetch_add`/`fetch_sub` |
@@ -242,13 +243,14 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
 
     while (true) {
         // ── Step 1: Block until queue has items ──
-        // Lock queue_mutex_, wait on queue_cv_ until !queue_.empty() || stop_
-        // If stop_ && empty: exit thread
+        // batch.clear();
+        // if (!queue_.wait_drain_up_to(batch, max_batch_size_)) break;
+        //   — blocks inside NNRequestQueue on cv_ until !items_.empty() || closed_
+        //   — returns false when queue is closed AND empty → thread exits
 
         // ── Step 2: Drain up to max_batch_size items ──
-        // batch.assign(queue_.begin(), queue_.begin() + n)
-        // queue_.erase(queue_.begin(), queue_.begin() + n)   ← O(n) shift
-        // Release queue_mutex_
+        // Handled inside wait_drain_up_to: std::deque::pop_front × n
+        // (O(1) per element, no shift); lock released on return.
 
         // ── Step 3: Flatten states (CPU work) ──
         // For each NNResultBuf* in batch:
@@ -325,13 +327,12 @@ Search thread calls evaluate_with_buf(buf, state):
   1. buf.done = false
   2. buf.state_data = state.data()     ← pointer, no copy
   3. buf.state_size = state.size()
-  4. Lock queue_mutex_
-  5. queue_.push_back(&buf)            ← push pointer
-  6. Unlock queue_mutex_
-  7. queue_cv_.notify_all()            ← wake all server threads
-  8. Lock buf.mu
-  9. buf.cv.wait(lock, [&]{ return buf.done; })  ← BLOCK here
-  10. Return {buf.policy, buf.value}
+  4. queue_.push(&buf)                 ← NNRequestQueue handles mutex,
+                                         push, and the empty→1 notify
+                                         gate internally
+  5. Lock buf.mu
+  6. buf.cv.wait(lock, [&]{ return buf.done; })  ← BLOCK here
+  7. Return {buf.policy, buf.value}
 ```
 
 ### Client-side (search thread → server) — KataGo
@@ -379,10 +380,9 @@ OpenCLComputeContext (shared)         │                               │
          └── cl_program
 
 NNEvaluator (shared)
-  ├── queue_mutex_         ← all server threads + all search threads contend
-  ├── queue_cv_            ← notify_all wakes all servers
-  ├── queue_<NNResultBuf*> ← competing consumers drain
-  └── server_threads_[]    ← joined on destructor
+  ├── queue_ : NNRequestQueue   ← encapsulated: mutex, cv, deque<NNResultBuf*>,
+  │                               closed_ flag, KataGo-style empty→1 notify gate
+  └── server_threads_[]         ← joined on destructor (via queue_.close())
 ```
 
 ### GPU pipeline timing (why 2 servers on 1 GPU helps)
@@ -428,15 +428,17 @@ overhead (small models, small batches).
 
 ```
 NNEvaluator destructor:
-  1. Lock queue_mutex_, set stop_ = true, unlock
-  2. queue_cv_.notify_all()              ← wake all servers
-  3. Each server thread sees stop_ && queue_.empty() → breaks out of loop
-  4. ComputeHandle destructor:
+  1. queue_.close()                         ← NNRequestQueue sets closed_=true
+                                              and notify_all on cv_
+  2. Each server thread sees wait_drain_up_to return false once the queue
+     is closed AND empty → breaks out of loop.  (Any items pushed right
+     before close still get drained and processed first.)
+  3. ComputeHandle destructor:
        - free workspace (clReleaseMemObject × 10)
        - free weights (clReleaseMemObject for all conv/fc buffers)
        - clReleaseKernel × 6
-  5. join() all server threads
-  6. ComputeContext destructor (later, when shared_ptr refcount → 0):
+  4. join() all server threads
+  5. ComputeContext destructor (later, when shared_ptr refcount → 0):
        - clReleaseProgram, clReleaseCommandQueue, clReleaseContext per GPU
 ```
 
