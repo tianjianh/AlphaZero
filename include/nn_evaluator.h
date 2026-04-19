@@ -3,6 +3,7 @@
 #include "batch_evaluator.h"
 #include "loaded_model.h"
 #include "compute_context.h"
+#include "nn_request_queue.h"
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -58,11 +59,9 @@ private:
     std::shared_ptr<ComputeContext> context_;
     int                             max_batch_size_;
 
-    // Shared queue: search threads push NNResultBuf*, server threads pop
-    std::mutex                    queue_mutex_;
-    std::condition_variable       queue_cv_;
-    std::vector<NNResultBuf*>     queue_;
-    bool                          stop_ = false;
+    // Shared queue: search threads push NNResultBuf*, server threads drain.
+    // All mutex / condvar / notify / close semantics live inside the queue.
+    NNRequestQueue                queue_;
 
     // N server threads (one per GPU assignment)
     std::vector<std::thread>      server_threads_;
