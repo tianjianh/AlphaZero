@@ -1,4 +1,5 @@
 #include "nn_evaluator.h"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
@@ -10,7 +11,16 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
                          int max_batch_size)
     : model_(std::move(model)),
       context_(std::move(context)),
-      max_batch_size_(max_batch_size) {
+      max_batch_size_(max_batch_size),
+      // Ring-buffer capacity: smallest power-of-two ≥ KataGo's
+      // max_batch_size * 4 * num_server_threads heuristic (see
+      // nneval.cpp:156).  Power-of-two size lets the ring use
+      // bitwise AND for modulo on push/pop.  Hard-capped: exceeding
+      // it would indicate the producer upper-bound assumption is
+      // wrong (expected: num_search_threads × num_games ≪ capacity).
+      queue_(next_pow2_ge(
+          (size_t)std::max(1, max_batch_size) * 4 *
+          std::max<size_t>(1, gpu_ids.size()))) {
     int num_threads = (int)gpu_ids.size();
 
     std::cout << "NNEvaluator: " << num_threads << " server thread(s), devices=[";
