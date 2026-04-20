@@ -11,14 +11,6 @@
 
 namespace minigo {
 
-// Smallest power of two >= x.  Returns 1 for x == 0.
-constexpr size_t next_pow2_ge(size_t x) {
-    if (x <= 1) return 1;
-    size_t p = 1;
-    while (p < x) p <<= 1;
-    return p;
-}
-
 // ----------------------------------------------------------------
 // NNRequestQueue — fixed-capacity ring buffer for NN evaluation
 // requests.
@@ -29,7 +21,7 @@ constexpr size_t next_pow2_ge(size_t x) {
 // those primitives directly.
 //
 // Layout:
-//   buf_: std::vector<NNResultBuf*> of fixed power-of-two capacity
+//   buf_: std::vector<NNResultBuf*> of power-of-two capacity
 //   head_, tail_: wrap modulo capacity via bitwise AND (free modulo)
 //   size_: count of in-flight items (used for empty/full check; head_
 //          == tail_ alone cannot distinguish the two)
@@ -41,31 +33,27 @@ constexpr size_t next_pow2_ge(size_t x) {
 //   cv_.notify_all() only on the empty → non-empty transition.
 //
 // Capacity:
-//   - Must be a power of two (validated at construction).
-//   - Caller chooses size based on workload upper bound.  For the
-//     NNEvaluator the heuristic is
-//       next_pow2_ge(max_batch_size * 4 * num_server_threads)
-//     matching KataGo's reserve formula at nneval.cpp:156 but applied
-//     as a hard cap instead of a vector-reserve hint.
-//   - The ring is bounded.  Push throws std::runtime_error on full.
-//     With the heuristic above this should never happen in normal
-//     operation — hitting it means the assumed producer upper bound
-//     (num_threads × num_search_threads) was wrong.
+//   - Construction takes any positive desired_capacity and rounds it
+//     up to the next power of two internally (so the bitwise-AND
+//     modulo is always valid).  Callers do not need to think about
+//     power-of-two sizing.
+//   - The ring is bounded.  Push throws std::runtime_error on full —
+//     with KataGo's max_batch × 4 × num_server_threads heuristic that
+//     should never happen in normal operation; hitting it means the
+//     assumed producer upper bound was wrong.
 // ----------------------------------------------------------------
 class NNRequestQueue {
 public:
-    explicit NNRequestQueue(size_t capacity_pow2)
-        : buf_(capacity_pow2), mask_(capacity_pow2 - 1) {
-        if (capacity_pow2 == 0 || (capacity_pow2 & (capacity_pow2 - 1)) != 0)
-            throw std::invalid_argument(
-                "NNRequestQueue capacity must be a power of two and > 0");
-    }
+    explicit NNRequestQueue(size_t desired_capacity)
+        : buf_(round_up_pow2(std::max<size_t>(1, desired_capacity))),
+          mask_(buf_.size() - 1) {}
 
     ~NNRequestQueue() = default;
 
     NNRequestQueue(const NNRequestQueue&) = delete;
     NNRequestQueue& operator=(const NNRequestQueue&) = delete;
 
+    // Final capacity (rounded up to the next power of two at construction).
     size_t capacity() const { return buf_.size(); }
 
     // Non-blocking push of a single item.  Notify_all on the empty→1
@@ -143,6 +131,13 @@ public:
     }
 
 private:
+    // Smallest power of two >= x.  Assumes x >= 1.
+    static size_t round_up_pow2(size_t x) {
+        size_t p = 1;
+        while (p < x) p <<= 1;
+        return p;
+    }
+
     std::mutex                   mu_;
     std::condition_variable      cv_;
     std::vector<NNResultBuf*>    buf_;

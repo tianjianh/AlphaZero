@@ -12,15 +12,11 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
     : model_(std::move(model)),
       context_(std::move(context)),
       max_batch_size_(max_batch_size),
-      // Ring-buffer capacity: smallest power-of-two ≥ KataGo's
-      // max_batch_size * 4 * num_server_threads heuristic (see
-      // nneval.cpp:156).  Power-of-two size lets the ring use
-      // bitwise AND for modulo on push/pop.  Hard-capped: exceeding
-      // it would indicate the producer upper-bound assumption is
-      // wrong (expected: num_search_threads × num_games ≪ capacity).
-      queue_(next_pow2_ge(
-          (size_t)std::max(1, max_batch_size) * 4 *
-          std::max<size_t>(1, gpu_ids.size()))) {
+      // Ring-buffer capacity is KataGo's max_batch × 4 × num_server_threads
+      // heuristic (nneval.cpp:156).  The queue rounds up to the next power
+      // of two internally so the ring can use bitwise-AND modulo.
+      queue_((size_t)std::max(1, max_batch_size) * 4 *
+             std::max<size_t>(1, gpu_ids.size())) {
     int num_threads = (int)gpu_ids.size();
 
     std::cout << "NNEvaluator: " << num_threads << " server thread(s), devices=[";
@@ -28,7 +24,8 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
         if (i > 0) std::cout << ",";
         std::cout << gpu_ids[i];
     }
-    std::cout << "], backend=" << context_->backend_name() << "\n";
+    std::cout << "], backend=" << context_->backend_name()
+              << ", queue=" << queue_.capacity() << " slots (power-of-2 for fast modulo)\n";
 
     // Spawn N server threads — each creates its own ComputeHandle.
     num_threads_ = num_threads;
