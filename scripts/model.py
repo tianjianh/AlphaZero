@@ -130,14 +130,40 @@ class XiangqiNet(nn.Module):
         # 3-class WLD logits (index 0 = win, 1 = draw, 2 = loss).
         self.value_fc2 = nn.Linear(256, 3)
 
+        # ── Auxiliary heads (training-only, never used at inference) ──
+        # Opponent-policy head: predicts opponent's next move distribution.
+        self.opp_policy_conv = nn.Conv2d(num_filters, 4, 1, bias=False)
+        self.opp_policy_bn = nn.BatchNorm2d(4)
+        self.opp_policy_fc = nn.Linear(4 * self.board_area, self.action_size)
+
+        # Game-length head: predicts tanh-scaled remaining plies.
+        self.length_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
+        self.length_bn = nn.BatchNorm2d(1)
+        self.length_fc = nn.Linear(self.board_area, 1)
+
+        # Ownership head: per-square regression in [-1, +1] against the
+        # terminal board encoded from current player's perspective.
+        self.ownership_conv = nn.Conv2d(num_filters, 1, 1, bias=False)
+        self.ownership_bn = nn.BatchNorm2d(1)
+
     def trunk(self, x: torch.Tensor) -> torch.Tensor:
         out = F.relu(self.input_bn(self.input_conv(x)))
         for block in self.res_blocks:
             out = block(out)
         return out
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Training forward — returns (policy_logits, wdl_logits)."""
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Training forward.
+
+        Returns:
+            policy_logits    [B, action_size]
+            wdl_logits       [B, 3]
+            opp_policy_logits [B, action_size]
+            length_pred      [B, 1]  (raw — loss applies tanh on the target)
+            ownership_pred   [B, board_area]  (raw — MSE on tanh squash below)
+        """
         trunk = self.trunk(x)
 
         policy = F.relu(self.policy_bn(self.policy_conv(trunk)))
@@ -148,18 +174,42 @@ class XiangqiNet(nn.Module):
         value = value.view(value.size(0), -1)
         value = F.relu(self.value_fc1(value))
         wdl_logits = self.value_fc2(value)
-        return policy, wdl_logits
+
+        opp = F.relu(self.opp_policy_bn(self.opp_policy_conv(trunk)))
+        opp = opp.view(opp.size(0), -1)
+        opp_policy_logits = self.opp_policy_fc(opp)
+
+        length = F.relu(self.length_bn(self.length_conv(trunk)))
+        length = length.view(length.size(0), -1)
+        length_pred = self.length_fc(length)
+
+        own = self.ownership_bn(self.ownership_conv(trunk))
+        ownership_pred = torch.tanh(own).view(own.size(0), -1)
+
+        return policy, wdl_logits, opp_policy_logits, length_pred, ownership_pred
 
     def forward_inference(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Inference forward — returns (policy_logits, scalar_value).
 
+        Aux heads are skipped entirely so they never appear in the traced
+        graph (and the exported ONNX stays policy + value only).
+
         The scalar value is P(win) - P(loss) after softmax over the WDL head.
         This matches the single-float value the C++ NNOutput expects.
         """
-        policy_logits, wdl_logits = self.forward(x)
+        trunk = self.trunk(x)
+
+        policy = F.relu(self.policy_bn(self.policy_conv(trunk)))
+        policy = policy.view(policy.size(0), -1)
+        policy_logits = self.policy_fc(policy)
+
+        value = F.relu(self.value_bn(self.value_conv(trunk)))
+        value = value.view(value.size(0), -1)
+        value = F.relu(self.value_fc1(value))
+        wdl_logits = self.value_fc2(value)
         wdl = F.softmax(wdl_logits, dim=-1)
-        value = (wdl[..., 0] - wdl[..., 2]).unsqueeze(-1)
-        return policy_logits, value
+        value_out = (wdl[..., 0] - wdl[..., 2]).unsqueeze(-1)
+        return policy_logits, value_out
 
     def predict(self, state_tensor: np.ndarray, device: str = "cpu"):
         self.eval()

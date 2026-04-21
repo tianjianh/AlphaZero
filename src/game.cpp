@@ -613,13 +613,13 @@ std::pair<float, float> XiangqiGame::score() const {
     return {red_score, black_score};
 }
 
-void XiangqiGame::get_ownership(Stone player, std::vector<float>& out) const {
+void XiangqiGame::get_final_ownership_from(Stone side, std::vector<float>& out) const {
     out.assign(BOARD_AREA, 0.0f);
     for (int r = 0; r < BOARD_ROWS; ++r) {
         for (int c = 0; c < BOARD_COLS; ++c) {
-            if (piece_color(board[r][c]) == player) {
-                out[sq_index(r, c)] = 1.0f;
-            }
+            Stone color = piece_color(board[r][c]);
+            if (color == side)         out[sq_index(r, c)] =  1.0f;
+            else if (color != EMPTY)   out[sq_index(r, c)] = -1.0f;
         }
     }
 }

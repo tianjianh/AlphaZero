@@ -4,9 +4,10 @@
 Mirrors the multi-gpu Go trainer where it makes sense:
   * DistributedDataParallel (torchrun / LOCAL_RANK) for multi-GPU runs
   * Mixed precision (BF16 autocast on CUDA, FP16 + GradScaler fallback)
-  * Bulk numpy parsing of the V3 self-play format (no per-record Python loop)
+  * Bulk numpy parsing of the V4 self-play format (no per-record Python loop)
   * 3-class WLD cross-entropy on the value head
-  * Only two loss heads (policy + value) - auxiliary heads deferred
+  * Training-only auxiliary heads: opponent policy, game length, end-of-game
+    ownership.  These do not appear in the exported ONNX graph.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from model import create_model
 
 
 MAGIC = 0x4D47
-VERSION = 3
+VERSION = 4
 HEADER_STRUCT = struct.Struct("<HHiii")         # magic, version, count, rows, cols
 HEADER_BYTES = HEADER_STRUCT.size               # 16
 
@@ -84,14 +85,13 @@ def _read_header(data: bytes):
 
 
 def _parse_file_bulk(data: bytes, board_rows: int, board_cols: int, input_channels: int):
-    """Bulk numpy parser for V3 self-play records (Go-branch pattern).
+    """Bulk numpy parser for V4 self-play records.
 
     Record layout (all little-endian):
         state_size:i32  state:f32*state_size
         policy_size:i32 policy:f32*policy_size
         value:f32
-        score:f32
-        ownership:f32*(rows*cols)
+        ownership:f32*(rows*cols)   — terminal-board, current player's POV
         opponent_action:i32
     """
     count, rows, cols = _read_header(data)
@@ -110,7 +110,6 @@ def _parse_file_bulk(data: bytes, board_rows: int, board_cols: int, input_channe
         4 + state_size * 4
         + 4 + action_size * 4
         + 4                      # value (f32)
-        + 4                      # score (f32)
         + hw * 4                 # ownership
         + 4                      # opponent_action (i32)
     )
@@ -125,8 +124,7 @@ def _parse_file_bulk(data: bytes, board_rows: int, board_cols: int, input_channe
     arr = np.frombuffer(payload, dtype=np.uint8, count=expected).reshape(count, record_bytes)
 
     cursor = 0
-    # state_size (skip the prefix i32 - it's always == state_size)
-    cursor += 4
+    cursor += 4  # state_size prefix
     states = np.frombuffer(
         arr[:, cursor:cursor + state_size * 4].tobytes(),
         dtype=FP32,
@@ -146,17 +144,20 @@ def _parse_file_bulk(data: bytes, board_rows: int, board_cols: int, input_channe
     ).reshape(count).copy()
     cursor += 4
 
-    # score (f32) - unused by this trainer
-    cursor += 4
-
-    # ownership (f32 * hw) - unused
+    ownerships = np.frombuffer(
+        arr[:, cursor:cursor + hw * 4].tobytes(),
+        dtype=FP32,
+    ).reshape(count, hw).copy()
     cursor += hw * 4
 
-    # opponent_action (i32) - unused
+    opp_actions = np.frombuffer(
+        arr[:, cursor:cursor + 4].tobytes(),
+        dtype=INT32,
+    ).reshape(count).copy()
     cursor += 4
 
     assert cursor == record_bytes
-    return states, policies, values
+    return states, policies, values, ownerships, opp_actions
 
 
 class SelfPlayDataset(IterableDataset):
@@ -195,14 +196,25 @@ class SelfPlayDataset(IterableDataset):
                 continue
             if parsed is None:
                 continue
-            states, policies, values = parsed
-            idx = np.arange(len(values))
+            states, policies, values, ownerships, opp_actions = parsed
+            n = len(values)
+            # Records are (original, mirror) pairs per move — the move index
+            # of record i is i // 2.  Remaining moves from that position is
+            # therefore (last_move_idx - move_idx), in MOVE units.
+            total_moves = n // 2
+            move_idx = np.arange(n, dtype=np.float32) // 2
+            remaining_plies = (total_moves - 1) - move_idx
+            remaining_plies = np.clip(remaining_plies, 0.0, None).astype(np.float32)
+            idx = np.arange(n)
             rng.shuffle(idx)
             for i in idx:
                 yield (
                     torch.from_numpy(states[i]),
                     torch.from_numpy(policies[i]),
                     torch.tensor(values[i], dtype=torch.float32),
+                    torch.from_numpy(ownerships[i]),
+                    torch.tensor(opp_actions[i], dtype=torch.long),
+                    torch.tensor(remaining_plies[i], dtype=torch.float32),
                 )
 
 
@@ -245,6 +257,14 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--policy-weight", type=float, default=1.0)
     parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--opp-policy-weight", type=float, default=0.25,
+                        help="Loss weight on the opponent-policy aux head")
+    parser.add_argument("--length-weight", type=float, default=0.10,
+                        help="Loss weight on the remaining-plies aux head")
+    parser.add_argument("--ownership-weight", type=float, default=0.10,
+                        help="Loss weight on the end-of-game ownership aux head")
+    parser.add_argument("--length-scale", type=float, default=50.0,
+                        help="Ply normalization for tanh length target")
     parser.add_argument("--output-onnx", default="models/model.onnx")
     parser.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto",
                         help="Mixed precision mode (auto picks bf16 when the GPU supports it)")
@@ -362,11 +382,14 @@ def main():
     os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
 
     # ── Training loop ───────────────────────────────────────────
+    action_size = args.rows * args.cols * args.rows * args.cols
     for epoch in range(args.epochs):
         dataset.set_epoch(epoch)
         model.train()
         t0 = time.time()
         total_loss = total_policy = total_value = 0.0
+        total_opp = total_length = total_own = 0.0
+        opp_batches = 0
         batches = 0
 
         # DDP ranks see unequal record counts per epoch because the
@@ -378,10 +401,13 @@ def main():
         join_ctx = Join([model]) if ddp_enabled else _null_context()
 
         with join_ctx:
-            for states, policies, values in loader:
+            for states, policies, values, ownerships, opp_actions, rem_plies in loader:
                 states = states.to(device, non_blocking=True)
                 policies = policies.to(device, non_blocking=True)
                 values = values.to(device, non_blocking=True).view(-1)
+                ownerships = ownerships.to(device, non_blocking=True)
+                opp_actions = opp_actions.to(device, non_blocking=True).view(-1)
+                rem_plies = rem_plies.to(device, non_blocking=True).view(-1)
                 wdl_target = wdl_target_from_value(values)
 
                 optimizer.zero_grad(set_to_none=True)
@@ -394,10 +420,37 @@ def main():
                     ctx = _null_context()
 
                 with ctx:
-                    pred_policy, pred_wdl = model(states)
+                    pred_policy, pred_wdl, pred_opp, pred_len, pred_own = model(states)
                     policy_loss = soft_cross_entropy(pred_policy, policies)
                     value_loss = F.cross_entropy(pred_wdl, wdl_target)
-                    loss = args.policy_weight * policy_loss + args.value_weight * value_loss
+
+                    # Opp-policy: masked cross-entropy (skip terminal records
+                    # where no opponent response exists).
+                    opp_mask = opp_actions.ge(0) & opp_actions.lt(action_size)
+                    n_opp = int(opp_mask.sum().item())
+                    if n_opp > 0:
+                        opp_targets = opp_actions.clamp(min=0, max=action_size - 1)
+                        opp_ce = F.cross_entropy(
+                            pred_opp, opp_targets, reduction="none")
+                        opp_loss = (opp_ce * opp_mask.float()).sum() / n_opp
+                    else:
+                        opp_loss = pred_opp.sum() * 0.0
+
+                    # Length: Huber on tanh-squashed remaining plies.
+                    length_target = torch.tanh(rem_plies / args.length_scale)
+                    length_loss = F.smooth_l1_loss(
+                        pred_len.view(-1), length_target)
+
+                    # Ownership: MSE per square.
+                    ownership_loss = F.mse_loss(pred_own, ownerships)
+
+                    loss = (
+                        args.policy_weight * policy_loss
+                        + args.value_weight * value_loss
+                        + args.opp_policy_weight * opp_loss
+                        + args.length_weight * length_loss
+                        + args.ownership_weight * ownership_loss
+                    )
 
                 if scaler is not None:
                     scaler.scale(loss).backward()
@@ -410,6 +463,11 @@ def main():
                 total_loss += float(loss.item())
                 total_policy += float(policy_loss.item())
                 total_value += float(value_loss.item())
+                total_opp += float(opp_loss.item())
+                total_length += float(length_loss.item())
+                total_own += float(ownership_loss.item())
+                if n_opp > 0:
+                    opp_batches += 1
                 batches += 1
 
         if is_main_process(rank):
@@ -419,6 +477,9 @@ def main():
                 f"loss={total_loss / max(1, batches):.4f} "
                 f"policy={total_policy / max(1, batches):.4f} "
                 f"value={total_value / max(1, batches):.4f} "
+                f"opp={total_opp / max(1, opp_batches):.4f} "
+                f"length={total_length / max(1, batches):.4f} "
+                f"own={total_own / max(1, batches):.4f} "
                 f"batches={batches} "
                 f"time={elapsed:.1f}s",
                 flush=True,

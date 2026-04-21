@@ -625,16 +625,16 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
 }
 
 // ================================================================
-// Dihedral augmentation (8-fold symmetry)
+// Dihedral augmentation (2-fold horizontal mirror)
 // ================================================================
-static void augment_sample(const std::vector<float>& state,
-                           const std::vector<float>& policy,
-                           float value, float score,
-                           const std::vector<float>& ownership,
-                           int opponent_action,
-                           int board_rows, int board_cols,
-                           int input_channels,
-                           std::vector<TrainingRecord>& out) {
+void augment_sample(const std::vector<float>& state,
+                    const std::vector<float>& policy,
+                    float value,
+                    const std::vector<float>& ownership,
+                    int opponent_action,
+                    int board_rows, int board_cols,
+                    int input_channels,
+                    std::vector<TrainingRecord>& out) {
     int area = board_rows * board_cols;
     int action_size = area * area;
 
@@ -657,7 +657,6 @@ static void augment_sample(const std::vector<float>& state,
         rec.policy.resize(action_size);
         rec.ownership.resize(area);
         rec.value = value;
-        rec.score = score;
         rec.opponent_action = flip ? mirror_action(opponent_action) : opponent_action;
 
         if (!flip) {
@@ -728,12 +727,12 @@ static std::vector<TrainingRecord> self_play_game_impl(
 
     if (!game.game_over) game.force_draw();
 
-    auto [red_score, black_score_total] = game.score();
-    float black_score = black_score_total - red_score;
-
-    std::vector<float> black_ownership, red_ownership;
-    game.get_ownership(BLACK, black_ownership);
-    game.get_ownership(RED, red_ownership);
+    // End-of-game ownership: +1 own-side piece, -1 opponent piece, 0 empty.
+    // Computed once from the terminal board; each record uses its own
+    // player's perspective below.
+    std::vector<float> red_final_ownership, black_final_ownership;
+    game.get_final_ownership_from(RED, red_final_ownership);
+    game.get_final_ownership_from(BLACK, black_final_ownership);
 
     std::vector<TrainingRecord> records;
     records.reserve(trajectory.size() * 2);
@@ -745,11 +744,9 @@ static std::vector<TrainingRecord> self_play_game_impl(
         else if (game.winner == step.player)  value =  1.0f;
         else                                  value = -1.0f;
 
-        // Score from current player's perspective (raw points)
-        float score = (step.player == BLACK) ? black_score : -black_score;
-
-        // Ownership from current player's perspective
-        const auto& ownership = (step.player == BLACK) ? black_ownership : red_ownership;
+        // Terminal-board ownership from current player's perspective.
+        const auto& ownership = (step.player == BLACK)
+                ? black_final_ownership : red_final_ownership;
 
         // Opponent's next action (look-ahead by one step)
         int opponent_action = -1;
@@ -757,7 +754,7 @@ static std::vector<TrainingRecord> self_play_game_impl(
             opponent_action = trajectory[i + 1].action;
         }
 
-        augment_sample(step.state, step.policy, value, score,
+        augment_sample(step.state, step.policy, value,
                        ownership, opponent_action,
                        config.board_rows, config.board_cols,
                        config.input_channels, records);

@@ -4,10 +4,11 @@
 #include "loaded_model.h"
 #include "compute_context.h"
 #include "nn_evaluator.h"
+#include "training_io.h"
+
 #include <atomic>
 #include <algorithm>
 #include <chrono>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -16,42 +17,6 @@
 #include <mutex>
 
 using namespace minigo;
-
-static void write_records(const std::string& path,
-                           const std::vector<TrainingRecord>& records,
-                           int board_rows,
-                           int board_cols) {
-    std::ofstream out(path, std::ios::binary);
-
-    // V3 header: [magic:u16][version:u16][count:i32][rows:i32][cols:i32]
-    uint16_t magic   = 0x4D47;  // 'MG'
-    uint16_t version = 3;
-    int32_t  n       = (int32_t)records.size();
-    int32_t  rows    = board_rows;
-    int32_t  cols    = board_cols;
-    out.write(reinterpret_cast<const char*>(&magic), 2);
-    out.write(reinterpret_cast<const char*>(&version), 2);
-    out.write(reinterpret_cast<const char*>(&n), 4);
-    out.write(reinterpret_cast<const char*>(&rows), 4);
-    out.write(reinterpret_cast<const char*>(&cols), 4);
-
-    int board_sq = board_rows * board_cols;
-
-    for (auto& rec : records) {
-        int32_t ss = (int32_t)rec.state.size();
-        int32_t ps = (int32_t)rec.policy.size();
-        out.write(reinterpret_cast<const char*>(&ss), 4);
-        out.write(reinterpret_cast<const char*>(rec.state.data()), ss * sizeof(float));
-        out.write(reinterpret_cast<const char*>(&ps), 4);
-        out.write(reinterpret_cast<const char*>(rec.policy.data()), ps * sizeof(float));
-        out.write(reinterpret_cast<const char*>(&rec.value), sizeof(float));
-        out.write(reinterpret_cast<const char*>(&rec.score), sizeof(float));
-        // Trailing fields preserved for future targets/analysis.
-        out.write(reinterpret_cast<const char*>(rec.ownership.data()), board_sq * sizeof(float));
-        int32_t opp = rec.opponent_action;
-        out.write(reinterpret_cast<const char*>(&opp), 4);
-    }
-}
 
 static std::vector<int> parse_device_ids(const std::string& str) {
     std::vector<int> ids;

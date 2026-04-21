@@ -47,7 +47,11 @@ public:
 
     void get_legal_moves(std::vector<float>& legal) const;
     std::pair<float, float> score() const;
-    void get_ownership(Stone player, std::vector<float>& out) const;
+    // Signed ownership from `side`'s perspective: +1 for own piece,
+    // -1 for opponent piece, 0 for empty.  Intended to be called once at
+    // game end: every training record in the game receives the same terminal
+    // board (sign-flipped across the two sides).
+    void get_final_ownership_from(Stone side, std::vector<float>& out) const;
     void encode(std::vector<float>& out) const;
 
     std::string display() const;

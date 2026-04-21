@@ -30,6 +30,7 @@ BUILD_DIR = PROJECT_DIR / "build"
 MODELS_DIR = PROJECT_DIR / "models"
 TRAINING_DIR = PROJECT_DIR / "training"
 DATA_DIR = TRAINING_DIR / "selfplay"
+BOOTSTRAP_DIR = TRAINING_DIR / "bootstrap"
 EVAL_DIR = TRAINING_DIR / "eval"
 LOGS_DIR = TRAINING_DIR / "logs"
 CHECKPOINT_DIR = TRAINING_DIR / "checkpoints"
@@ -136,9 +137,19 @@ def get_stage_config(stage: dict, plan: dict) -> tuple[dict, dict]:
     return training, mcts
 
 
-def build_data_window(window_size: int, end_iter: int) -> str:
+def build_data_window(window_size: int, end_iter: int, plan: dict | None = None) -> str:
     start_iter = max(1, end_iter - window_size + 1)
     dirs = []
+    # Bootstrap dir (from XQWL06, only if set up at init) rides along for the
+    # first N iterations as a stabilizer on top of selfplay.  Decays off once
+    # the plan-configured decay iteration is reached.
+    if BOOTSTRAP_DIR.is_dir() and any(BOOTSTRAP_DIR.iterdir()):
+        decay_iters = window_size + 2
+        if plan is not None:
+            decay_iters = int(plan.get("training", {}).get(
+                "bootstrap_decay_iters", decay_iters))
+        if end_iter <= decay_iters:
+            dirs.append(str(BOOTSTRAP_DIR.resolve()))
     for version in range(start_iter, end_iter + 1):
         path = DATA_DIR / f"iter_{version:04d}"
         if path.is_dir():
@@ -362,7 +373,7 @@ def detect_hardware() -> dict:
 def build_if_needed() -> None:
     """Configure + build the C++ binaries.  Skips CMake when up-to-date."""
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    needed_binaries = ("selfplay", "evaluate", "play", "benchmark")
+    needed_binaries = ("selfplay", "evaluate", "play", "benchmark", "bootstrap")
     all_present = all((BUILD_DIR / name).is_file() for name in needed_binaries)
     if not all_present or not (BUILD_DIR / "CMakeCache.txt").is_file():
         subprocess.run(
@@ -447,6 +458,75 @@ def compress_selfplay(iter_data: Path) -> None:
         pass
 
 
+def run_bootstrap(args: argparse.Namespace, plan: dict) -> None:
+    """Generate XQWL06 bootstrap games and train v0000 on them.
+
+    Invariants:
+      - The selfplay data dir (training/selfplay/) is untouched; bootstrap
+        games land in training/bootstrap/.
+      - v0000.onnx is replaced by the bootstrap-trained weights.
+      - Requires the `bootstrap` binary to be built.
+    """
+    BOOTSTRAP_DIR.mkdir(parents=True, exist_ok=True)
+
+    build_if_needed()
+    bootstrap_bin = BUILD_DIR / "bootstrap"
+    if not bootstrap_bin.is_file():
+        print("ERROR: build/bootstrap missing; re-run with a clean build dir")
+        sys.exit(1)
+
+    threads = args.bootstrap_threads or max(1, num_cores() // 2)
+    cmd = [
+        str(bootstrap_bin),
+        "--games",   str(args.bootstrap_games),
+        "--depth",   str(args.bootstrap_depth),
+        "--threads", str(threads),
+        "--output",  str(BOOTSTRAP_DIR),
+    ]
+    if args.bootstrap_time_ms and args.bootstrap_time_ms > 0:
+        cmd += ["--time-ms", str(args.bootstrap_time_ms)]
+    print()
+    print(f"Bootstrap: {args.bootstrap_games} games @ depth {args.bootstrap_depth}, "
+          f"{threads} threads -> {BOOTSTRAP_DIR}")
+    subprocess.run(cmd, check=True)
+
+    # Compress bootstrap output same as selfplay.
+    compress_selfplay(BOOTSTRAP_DIR)
+
+    epochs = args.bootstrap_epochs
+    if epochs <= 0:
+        print("Bootstrap games written but --bootstrap-epochs=0; skipping train")
+        return
+
+    training = plan["training"]
+    model_cfg = plan["model"]
+    train_ckpt = CHECKPOINT_DIR / "training.pt"
+    train_cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "train.py"),
+        "--data", str(BOOTSTRAP_DIR),
+        "--checkpoint", str(train_ckpt),
+        "--epochs", str(epochs),
+        "--batch-size", str(training["batch_size"]),
+        "--lr", "1e-3",
+        "--weight-decay", str(training["weight_decay"]),
+        "--rows", str(model_cfg["rows"]),
+        "--cols", str(model_cfg["cols"]),
+        "--history-length", str(model_cfg["history_length"]),
+        "--filters", str(model_cfg["filters"]),
+        "--blocks", str(model_cfg["blocks"]),
+        "--num-workers", str(training["num_workers"]),
+        "--policy-weight", str(training["policy_weight"]),
+        "--value-weight", str(training["value_weight"]),
+        "--output-onnx", str(version_onnx(0)),
+    ]
+    print(f"Bootstrap: training {epochs} epochs on {BOOTSTRAP_DIR}")
+    subprocess.run(train_cmd, cwd=str(PROJECT_DIR), check=True)
+    if version_onnx(0).is_file():
+        shutil.copy2(version_onnx(0), best_onnx())
+        print(f"Bootstrap: overwrote {version_onnx(0).name} and best.onnx")
+
+
 def count_existing_games(iter_data: Path) -> int:
     if not iter_data.is_dir():
         return 0
@@ -504,6 +584,13 @@ def cmd_init(args: argparse.Namespace) -> None:
     ]
     subprocess.run(export_cmd, cwd=str(PROJECT_DIR), check=True)
     shutil.copy2(version_onnx(0), best_onnx())
+
+    # Optional: XQWL06 bootstrap — generates alpha-beta games and pretrains
+    # v0000.onnx on them, then uses that as the starting best.onnx.  The
+    # directory also rides along inside the training data window for the
+    # first `bootstrap_decay_iters` iterations (default: window_size + 2).
+    if args.bootstrap_games and args.bootstrap_games > 0:
+        run_bootstrap(args, plan)
 
     save_state({
         "pipeline_iter": 0,
@@ -770,7 +857,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             log(f"Phase 2 - Training: skip ({vstr(iteration)} already exists)")
             tlog(f"Phase 2 training: skip ({vstr(iteration)} exists)")
         else:
-            window_dirs = build_data_window(st["window_size"], iteration)
+            window_dirs = build_data_window(st["window_size"], iteration, plan)
             if not window_dirs:
                 print("ERROR: no selfplay data available in the training window")
                 sys.exit(1)
@@ -971,6 +1058,16 @@ def main() -> None:
     p_init.add_argument("--filters", type=int, default=None, help="Residual tower channels")
     p_init.add_argument("--blocks", type=int, default=None, help="Residual block count")
     p_init.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    p_init.add_argument("--bootstrap-games", type=int, default=0,
+                        help="XQWL06 bootstrap: number of games (0 = disabled)")
+    p_init.add_argument("--bootstrap-depth", type=int, default=6,
+                        help="XQWL06 bootstrap: alpha-beta search depth")
+    p_init.add_argument("--bootstrap-time-ms", type=int, default=0,
+                        help="XQWL06 bootstrap: per-move time budget in ms (0 = off)")
+    p_init.add_argument("--bootstrap-threads", type=int, default=0,
+                        help="XQWL06 bootstrap: worker threads (0 = cores/2)")
+    p_init.add_argument("--bootstrap-epochs", type=int, default=5,
+                        help="XQWL06 bootstrap: epochs of train.py on the generated data")
 
     p_train = sub.add_parser("train", help="Start or resume training")
     p_train.add_argument("--threads", type=int, default=None, help="Parallel selfplay workers")

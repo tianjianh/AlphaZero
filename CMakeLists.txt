@@ -243,6 +243,7 @@ set(CORE_SOURCES
     src/nn_evaluator.cpp
     src/mcts.cpp
     src/async_bot.cpp
+    src/training_io.cpp
 )
 
 if(HAS_EIGEN)
@@ -311,6 +312,7 @@ add_executable(play      src/main_play.cpp)
 add_executable(selfplay  src/main_selfplay.cpp)
 add_executable(benchmark src/main_benchmark.cpp)
 add_executable(evaluate  src/main_evaluate.cpp)
+add_executable(bootstrap src/main_bootstrap.cpp src/xqwl_engine.cpp)
 
 # Prefer ncursesw for wide-character (Unicode) support
 find_library(NCURSESW_LIB ncursesw)
@@ -324,6 +326,7 @@ endif()
 target_link_libraries(selfplay  PRIVATE minigo_core)
 target_link_libraries(benchmark PRIVATE minigo_core)
 target_link_libraries(evaluate  PRIVATE minigo_core)
+target_link_libraries(bootstrap PRIVATE minigo_core)
 
 # ── Summary ─────────────────────────────────────────────────
 message(STATUS "System:     ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")

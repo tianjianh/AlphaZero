@@ -39,10 +39,13 @@ The current port is:
 - built and verified on **Linux + NVIDIA** (TensorRT 10 + CUDA 12)
 - capable of:
   - interactive play in ncurses
-  - self-play data generation
+  - self-play data generation (MCTS + NN)
+  - **XQWL06 alpha-beta bootstrap data generation** — see
+    [XQWL06 Bootstrap](#xqwl06-bootstrap)
   - offline evaluation matches
-  - PyTorch training
-  - ONNX export
+  - PyTorch training with **policy + WDL-value + three training-only
+    auxiliary heads** (opponent-policy, game length, end-of-game ownership)
+  - ONNX export (exactly two inference outputs: `policy_logits` + `value`)
 
 Verified locally during the port (on both platforms):
 
@@ -180,31 +183,54 @@ So the policy head size is:
 
 The original Go project had a larger multi-head network.
 
-This Xiangqi port simplifies the model to:
+This Xiangqi port keeps the inference surface small — **policy logits** and
+**value** are the only things that leave the graph — and stacks three
+**training-only auxiliary heads** on top of the shared trunk:
 
-- **policy logits**: `[B, 8100]`
-- **value** (internally a 3-class **WDL** head → `[B, 3]` logits)
+Inference-time outputs:
+
+- `policy_logits`    : `[B, 8100]`
+- `value`            : `[B, 1]` ∈ `[-1, 1]`  (P(win) − P(loss) after a softmax
+  over an internal 3-class WDL head)
+
+Training-time heads (all derived from the same trunk, wired through
+`forward()` but bypassed in `forward_inference()` — they never appear in the
+exported ONNX graph):
+
+- **opponent-policy**:  `[B, 8100]` cross-entropy against the opponent's next
+  move (masked out on the last record of a game)
+- **game length**:      `[B, 1]` Huber loss against `tanh(remaining_plies / 50)`
+- **end-of-game ownership**: `[B, 90]` MSE against the terminal board from the
+  current player's perspective (+1 own piece / −1 opponent piece / 0 empty)
+
+The aux heads exist to give the trunk richer per-record supervision so the
+value head doesn't collapse onto the draw target early in training.  They do
+**not** alter inference, do not touch MCTS utility, and do not require
+backend changes.  Weights are stored in the checkpoint, are exported into the
+ONNX file as inert extra initializers (ignored by `loaded_model.cpp`), and
+loss weights are CLI-configurable:
+
+```bash
+--opp-policy-weight 0.25   # default
+--length-weight     0.10   # default
+--ownership-weight  0.10   # default
+```
 
 The ONNX export wrapper ([scripts/export_onnx.py](scripts/export_onnx.py))
-collapses the WDL head into a single scalar `P(win) - P(loss)` via softmax,
-so the graph has exactly two outputs:
-
-- `policy_logits` : `[B, 8100]`
-- `value`         : `[B, 1]` ∈ `[-1, 1]`
-
-Backends read the scalar value directly.  The TensorRT backend also handles
-the raw 3-logit form in case the wrapper is bypassed.
+keeps the inference graph at exactly two outputs.  Backends read the scalar
+value directly.  The TensorRT backend also handles the raw 3-logit form in
+case the wrapper is bypassed.
 
 ### 5. Training Data Format
 
-The self-play file format changed from the old Go-oriented layout to a
-rectangular-board Xiangqi format.
-
-Current format:
+The self-play file format is a rectangular-board Xiangqi layout.  Both
+`selfplay` (MCTS self-play) and `bootstrap` (XQWL06 alpha-beta self-play)
+emit the same V4 format via the shared writer in
+[src/training_io.cpp](src/training_io.cpp).
 
 ```text
-magic   : u16   = 0x4D47
-version : u16   = 3
+magic   : u16   = 0x4D47   ('MG')
+version : u16   = 4
 count   : i32
 rows    : i32
 cols    : i32
@@ -215,20 +241,23 @@ Per record:
   [policy_size: i32]
   [policy: f32 × policy_size]
   [value: f32]
-  [score: f32]
-  [ownership: f32 × (rows * cols)]
-  [opponent_action: i32]
+  [ownership: f32 × (rows * cols)]   — terminal-board, current player's POV
+  [opponent_action: i32]             — next-ply opponent move, -1 at terminal
 ```
 
-Notes:
+Every slot is consumed by training:
 
-- `ownership` and `opponent_action` are still written for compatibility with the
-  existing record structure, but the current training loop only consumes:
-  - state
-  - policy
-  - value
-  - score
-- header `version = 3` is the key format discriminator for the Xiangqi port
+- `state`, `policy`, `value` feed the primary policy + WDL heads
+- `ownership` is the MSE target for the **end-of-game ownership** aux head
+  (same terminal board for every record in a game, sign-flipped by POV)
+- `opponent_action` is the masked cross-entropy target for the
+  **opponent-policy** aux head
+- `remaining_plies` is derived in the Python dataloader from the record
+  index inside its file — no extra slot on disk
+
+The V3 → V4 jump dropped a dead `score` slot that was always written as 0
+after the hand-coded piece-value score was removed from training.  Old V3
+files are rejected at parse time with a clean `ValueError`.
 
 ## Xiangqi Rules Engine
 
@@ -538,6 +567,185 @@ Notes:
 - `train.py --help` now works even if `zstandard` is not installed yet
 - reading `.zst` self-play files still requires `zstandard`
 
+## XQWL06 Bootstrap
+
+A cold AlphaZero-style run starts from random weights — the resulting
+self-play is close to uniform, almost all games end in a draw, and the value
+head has nothing to learn from because everyone's target is ~0.  The
+bootstrap hands the trunk a burst of **decisive, positionally-reasonable
+games** *once* at initialization time so the first few iterations have real
+signal to train on.
+
+The bootstrap binary is a direct C++ port of the classical alpha-beta engine
+**XQWL06** (XiangQi Wizard Light 0.6, Morning Yellow 2008) — same search
+(PVS + quiescence + null-move + transposition table + killer moves + history
+heuristic), same piece-square evaluation, Win32 UI stripped out.  Source lives in
+[src/xqwl_engine.cpp](src/xqwl_engine.cpp) /
+[include/xqwl_engine.h](include/xqwl_engine.h); no neural net is involved.
+
+### TL;DR
+
+- **Games are generated exactly once, at `init` time.** Not per iteration.
+- Those games then **pretrain `v0000.onnx`** (replacing the random-weight
+  export) and **ride along in the training window** for a handful of early
+  iterations, then decay out.
+- Everything past `init` (`run_loop.py train`, `status`, checkpoint
+  handling) is identical to a non-bootstrapped run — no per-iteration
+  bootstrap step ever kicks in.
+
+### When does bootstrap run?
+
+Only during `run_loop.py init`, and only if `--bootstrap-games > 0`.  During
+that single `init` call, in this order:
+
+1. The usual random-weights `v0000.onnx` is exported.
+2. `./build/bootstrap` runs *once*, generating `N` games under
+   `training/bootstrap/game_*.bin.zst`.  This is the only time the XQWL06
+   engine is invoked.
+3. `scripts/train.py` runs on `training/bootstrap/` for
+   `--bootstrap-epochs` epochs, writing a **new** `v0000.onnx` on top of
+   the random-weight one from step 1.  The bootstrap-trained net also
+   becomes `best.onnx`.
+
+After `init` exits, `./build/bootstrap` is never invoked again by the
+pipeline.  `run_loop.py train` is completely unaware that a bootstrap
+happened; it just sees a `v0000.onnx` that happens to already play
+reasonable moves.
+
+### How the plan uses bootstrap data *during* training
+
+Each iteration of `run_loop.py train` calls
+[`build_data_window(window_size, iteration, plan)`](run_loop.py) to decide
+which directories to feed into `train.py --data ...` for that iteration.
+The rule is:
+
+```text
+window = [training/bootstrap/]            if it exists AND
+                                          iteration ≤ bootstrap_decay_iters
+       + [training/selfplay/iter_NNNN/]   for NNNN in the usual
+                                          [iteration - window_size + 1,
+                                           iteration] range (only dirs that
+                                          actually exist on disk)
+```
+
+The bootstrap dir is prepended to the window (not replacing self-play,
+added *alongside* it).  The `iteration ≤ bootstrap_decay_iters` gate is the
+only thing that ever removes it.
+
+### How many iterations does bootstrap stay in the window?
+
+Default: `window_size + 2` iterations.  Presets:
+
+| Preset | `window_size` | Default decay | Bootstrap rides until… |
+|---|---:|---:|---|
+| `quick`  | 3 | 5  | iter 5 (and there are only 5 iters total)  |
+| `small`  | 6 | 8  | iter 8, then dropped for iters 9–48 |
+| `large`  | 6 | 8  | iter 8, then dropped for iters 9–72 |
+| `xlarge` | 6 | 8  | iter 8, then dropped for iters 9–200 |
+
+The rationale: the value head is hungriest for signal when self-play
+decisive-rate is still ~1 %; once the net is producing its own decisive
+games, mixing alpha-beta records in starts to push the policy toward
+classical piece-value play, which is not what you want long-term.
+
+**Tuning.**  `bootstrap_decay_iters` is not a CLI flag; it lives in
+`training/plan.json` under `training.bootstrap_decay_iters`.  Edit the
+JSON between `train` invocations if you want to extend or shorten the
+ride-along period, e.g.:
+
+```json
+{
+  "training": {
+    "batch_size": 256,
+    "bootstrap_decay_iters": 12,
+    ...
+  }
+}
+```
+
+### Walk-through: `small` preset with 20 000 bootstrap games
+
+```bash
+python3 run_loop.py init small -y \
+    --bootstrap-games   20000 \
+    --bootstrap-depth   6 \
+    --bootstrap-threads 16 \
+    --bootstrap-epochs  5
+```
+
+What happens:
+
+- **During `init`** (one-time, ~30 min on a 32-core box at depth 6):
+  1. `v0000.onnx` = random-init net. Written once, overwritten in step 3.
+  2. `./build/bootstrap` plays 20 000 XQWL-vs-XQWL games, writes
+     `training/bootstrap/game_*.bin.zst` (~2 GB compressed).
+  3. `scripts/train.py` does 5 epochs on those records; overwrites
+     `v0000.onnx` and `best.onnx`.
+
+Then `python3 run_loop.py train` runs through the `small` preset with 48
+iterations, and the window composition is:
+
+| Iteration | Window contents (in order) |
+|---:|---|
+| 1  | `bootstrap/`, `selfplay/iter_0001/` |
+| 2  | `bootstrap/`, `iter_0001/..iter_0002/` |
+| 3  | `bootstrap/`, `iter_0001/..iter_0003/` |
+| 4  | `bootstrap/`, `iter_0001/..iter_0004/` |
+| 5  | `bootstrap/`, `iter_0001/..iter_0005/` |
+| 6  | `bootstrap/`, `iter_0001/..iter_0006/` (window now full) |
+| 7  | `bootstrap/`, `iter_0002/..iter_0007/` |
+| 8  | `bootstrap/`, `iter_0003/..iter_0008/` *(last iter with bootstrap)* |
+| 9  | `iter_0004/..iter_0009/` *(decay kicks in)* |
+| 10+ | `iter_{N-5}../iter_N/` (fresh self-play only, forever) |
+
+During iterations 1–8, every epoch mixes bootstrap records with the
+growing pool of self-play records.  There's no re-weighting; records are
+shuffled uniformly, so the bootstrap's relative influence fades naturally
+as the self-play pool grows:
+
+- iter 1: bootstrap is ~100 % of the data (no self-play yet beyond iter_0001)
+- iter 6: bootstrap is roughly proportional to one iteration of self-play
+- iter 8: bootstrap is ~1/7 of the window
+- iter 9: bootstrap is gone
+
+### Picking `--bootstrap-games`
+
+Depth 6 XQWL averages ~3 s/game (roughly 100 ply × 30 ms/move on modern
+x86).  Back-of-envelope wall times:
+
+| Games | Threads | Approx. time |
+|---:|---:|---|
+| 1 000   | 1  | ~50 min   |
+| 1 000   | 8  | ~6 min    |
+| 20 000  | 16 | ~1 hr     |
+| 20 000  | 32 | ~30 min   |
+
+Start with a few thousand games to smoke-test the wiring; go up to
+10 000–20 000 for a run you actually care about.  There's no hard
+requirement, but you want at least as many records as a couple of
+self-play iterations' worth so the window is non-trivially populated at
+iter 1.
+
+### On disk — how long does it stay?
+
+**Forever, until you delete it.**  The bootstrap directory is written
+exactly once at `init`; nothing in the pipeline touches it after that.
+Manual cleanup (`rm -rf training/bootstrap/`) is the only way to remove it,
+and doing so is safe at any point (the training window builder simply
+notices the directory isn't there).
+
+### Caveats
+
+- The bootstrap records encode the XQWL-picked move as a **one-hot policy**
+  (there is no MCTS visit distribution — XQWL is alpha-beta, not MCTS), so
+  early training signal emphasizes move selection over move weighting.
+- Bootstrap games use the same V4 writer and the same end-of-game ownership
+  convention as self-play, so the aux heads train on them cleanly.
+- The XQWL opening book (`LoadBook`) was dropped in the port; the engine
+  plays through to a decisive outcome or repetition without book-varying
+  openings.  Per-thread root-noise in `SearchRoot` keeps games from being
+  identical.
+
 ## Commands
 
 ### Export a Model
@@ -621,6 +829,17 @@ The generated plan:
 
 You can override `--filters` / `--blocks` at `init` time to pin the network
 size independently of the preset.
+
+`init` also accepts the XQWL06 bootstrap flags described in
+[XQWL06 Bootstrap](#xqwl06-bootstrap):
+
+| Argument | Meaning | Default |
+|---|---|---:|
+| `--bootstrap-games N` | XQWL games to generate (0 disables bootstrap) | `0` |
+| `--bootstrap-depth D` | XQWL alpha-beta search depth | `6` |
+| `--bootstrap-time-ms T` | per-move time budget (0 = off, depth-only) | `0` |
+| `--bootstrap-threads T` | worker threads | `cores / 2` |
+| `--bootstrap-epochs E` | epochs of `train.py` on the bootstrap data | `5` |
 
 ## CLI Reference
 
@@ -735,6 +954,25 @@ intentional because the tools do different jobs:
 | `--nn-server-threads N` | evaluator server threads | `1` |
 | `--nn-device-ids IDS` | comma-separated device ids | `"0"` |
 
+### `bootstrap`
+
+```text
+./build/bootstrap [options]
+```
+
+Standalone XQWL06-vs-XQWL06 record generator.  Usually invoked indirectly
+through `run_loop.py init --bootstrap-games N`, but you can run it directly
+to smoke-test the engine or add more data to `training/bootstrap/` later.
+
+| Argument | Meaning | Default |
+|---|---|---:|
+| `--games N` | number of games | `100` |
+| `--depth D` | XQWL alpha-beta depth cap | `6` |
+| `--time-ms T` | per-move time budget, ms (0 = depth-only) | `0` |
+| `--threads T` | worker threads (per-thread TT, so no contention) | `1` |
+| `--max-plies P` | ply cap per game (matches self-play cap) | `300` |
+| `--output DIR` | output directory | `training/bootstrap` |
+
 ### `evaluate`
 
 ```text
@@ -781,6 +1019,10 @@ python3 scripts/train.py [options]
 | `--num-workers` | DataLoader workers | `4` |
 | `--policy-weight` | policy loss weight | `1.0` |
 | `--value-weight` | value loss weight | `1.0` |
+| `--opp-policy-weight` | loss weight on opponent-policy aux head | `0.25` |
+| `--length-weight` | loss weight on remaining-plies aux head | `0.10` |
+| `--ownership-weight` | loss weight on end-of-game ownership aux head | `0.10` |
+| `--length-scale` | ply normalization for `tanh(remaining/scale)` target | `50.0` |
 | `--output-onnx` | ONNX export path after training | `models/model.onnx` |
 
 ### `scripts/export_onnx.py`
@@ -845,20 +1087,28 @@ Python stack:
 - `--heads`
 - `--kv-groups`
 - `--mlp-ratio`
-- auxiliary-loss knobs from the old multi-head network
 
 Why:
 
 - the port currently supports one Xiangqi residual network
-- the active runtime path is Metal-first and policy/value-only
+- the active runtime path is TensorRT-first (Metal second) and
+  inference-time is policy/value-only
 - simplifying the model/export path made the C++ ONNX loader and backend much
   easier to verify
+
+A smaller set of **training-only** auxiliary heads (opponent-policy, game
+length, end-of-game ownership) was later added back — see
+[Neural Network Heads](#4-neural-network-heads).  These do not change the
+inference graph and do not need new CLI arguments at inference time; they
+gain three loss-weight knobs in `scripts/train.py`
+(`--opp-policy-weight`, `--length-weight`, `--ownership-weight`).
 
 ### Output Behavior Changes
 
 - `evaluate --output` now writes **plain text match records**, not SGF
 - `play` now expects **Xiangqi move entry**, not Go coordinates or pass
-- self-play data is now **V3** with explicit `rows` and `cols`
+- self-play data is now **V4** with explicit `rows` and `cols`; see
+  [Training Data Format](#5-training-data-format)
 
 ## Consistency Summary
 
@@ -884,11 +1134,16 @@ The remaining differences are intentional and tied to tool purpose.
 
 - the port is documented and validated around **TensorRT on Linux** and
   **Metal on macOS**; the other backends compile but are not the primary
-  validation target
-- the current training loop uses only policy/value supervision even though the
-  self-play record still stores extra trailing fields
+  validation target — aux-head landing (Track A) is TensorRT-verified only,
+  and other backends will need updates if/when an inference-side head is
+  added
+- the bootstrap records encode the XQWL-picked move as a one-hot policy (no
+  MCTS distribution), so early training over-weighs move selection over
+  move weighting
 - `evaluate --output` writes text records, not a standard Xiangqi notation file
-- the Win32 engine in `xqwlight_win32/` is a rules reference, not a linked runtime dependency
+- the Win32 engine in `xqwlight_win32/` is the original reference; the
+  engine in [src/xqwl_engine.cpp](src/xqwl_engine.cpp) is the linkable C++
+  port used by `bootstrap`
 
 ## Key Files
 
@@ -908,9 +1163,13 @@ The remaining differences are intentional and tied to tool purpose.
 | self-play tool | [src/main_selfplay.cpp](src/main_selfplay.cpp) |
 | evaluate tool | [src/main_evaluate.cpp](src/main_evaluate.cpp) |
 | benchmark tool | [src/main_benchmark.cpp](src/main_benchmark.cpp) |
+| XQWL06 bootstrap tool | [src/main_bootstrap.cpp](src/main_bootstrap.cpp) |
+| XQWL06 engine port | [include/xqwl_engine.h](include/xqwl_engine.h) / [src/xqwl_engine.cpp](src/xqwl_engine.cpp) |
+| training-record writer | [include/training_io.h](include/training_io.h) / [src/training_io.cpp](src/training_io.cpp) |
 | model definition | [scripts/model.py](scripts/model.py) |
 | training | [scripts/train.py](scripts/train.py) |
 | ONNX export | [scripts/export_onnx.py](scripts/export_onnx.py) |
+| selfplay diagnostic | [scripts/diag_selfplay.py](scripts/diag_selfplay.py) |
 
 ## Short Version
 

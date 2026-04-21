@@ -206,12 +206,23 @@ struct TrainingRecord {
     std::vector<float> state;
     std::vector<float> policy;
     float value;
-    float score;                       // points, current player's perspective
-    std::vector<float> ownership;      // [board²] — 1.0 = current player owns
+    std::vector<float> ownership;      // [board²] — terminal-board, signed
     int   opponent_action;             // opponent's next move (-1 if last move)
 };
 
 std::vector<TrainingRecord> self_play_game(
     BatchEvaluator* evaluator, const Config& config);
+
+// Append `(state, policy, value, ownership, opponent_action)` plus its
+// horizontal mirror to `out`.  Shared between self-play (src/mcts.cpp) and
+// the XQWL bootstrap binary.
+void augment_sample(const std::vector<float>& state,
+                    const std::vector<float>& policy,
+                    float value,
+                    const std::vector<float>& ownership,
+                    int opponent_action,
+                    int board_rows, int board_cols,
+                    int input_channels,
+                    std::vector<TrainingRecord>& out);
 
 }  // namespace minigo
