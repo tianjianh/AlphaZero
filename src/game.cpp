@@ -10,10 +10,6 @@ namespace minigo {
 
 namespace {
 
-constexpr std::array<int, 7> kPieceValues = {
-    10000, 110, 110, 300, 600, 350, 70
-};
-
 constexpr int kKnightOffsets[8][4] = {
     {-2, -1, -1,  0},
     {-2,  1, -1,  0},
@@ -91,7 +87,6 @@ void XiangqiGame::reset() {
     last_move = -1;
     game_over = false;
     winner = EMPTY;
-    final_black_score = 0.0f;
     ring_head_ = 0;
     ring_size_ = 0;
     update_history();
@@ -584,7 +579,6 @@ void XiangqiGame::play(int action) {
         } else {
             winner = current_player;
         }
-        score_game();
         return;
     }
     int rep3 = repetition_status(2);
@@ -594,7 +588,6 @@ void XiangqiGame::play(int action) {
         if (!self_perpetual && !opp_perpetual) {
             game_over = true;
             winner = EMPTY;
-            score_game();
             return;
         }
         // Otherwise the attacker must vary before the 4-rep loss above.
@@ -603,32 +596,13 @@ void XiangqiGame::play(int action) {
     if (!has_any_legal_move(current_player)) {
         game_over = true;
         winner = opponent(current_player);
-        score_game();
         return;
     }
-
-    score_game();
 }
 
 void XiangqiGame::force_draw() {
     game_over = true;
     winner = EMPTY;
-    score_game();
-}
-
-std::pair<float, float> XiangqiGame::score() const {
-    float red_score = 0.0f;
-    float black_score = 0.0f;
-    for (int r = 0; r < BOARD_ROWS; ++r) {
-        for (int c = 0; c < BOARD_COLS; ++c) {
-            int8_t piece = board[r][c];
-            if (piece == NO_PIECE) continue;
-            int value = kPieceValues[piece_type(piece)];
-            if (piece_color(piece) == RED) red_score += value;
-            else black_score += value;
-        }
-    }
-    return {red_score, black_score};
 }
 
 void XiangqiGame::get_final_ownership_from(Stone side, std::vector<float>& out) const {
@@ -678,10 +652,6 @@ void XiangqiGame::encode(std::vector<float>& out) const {
     }
 }
 
-void XiangqiGame::score_game() {
-    auto [red_score, black_score] = score();
-    final_black_score = black_score - red_score;
-}
 
 std::string XiangqiGame::action_to_str(int action) const {
     if (action < 0 || action >= action_size()) return "????";

@@ -46,7 +46,6 @@ public:
     void force_draw();
 
     void get_legal_moves(std::vector<float>& legal) const;
-    std::pair<float, float> score() const;
     // Signed ownership from `side`'s perspective: +1 for own piece,
     // -1 for opponent piece, 0 for empty.  Intended to be called once at
     // game end: every training record in the game receives the same terminal
@@ -71,7 +70,6 @@ public:
     int last_move = -1;
     bool game_over = false;
     Stone winner = EMPTY;
-    float final_black_score = 0.0f;
 
     int8_t board[BOARD_ROWS][BOARD_COLS] = {};
 
@@ -127,7 +125,6 @@ private:
     int repetition_status(int n_recur = 1) const;
     uint64_t compute_hash() const;
     void update_history();
-    void score_game();
 };
 
 }  // namespace minigo

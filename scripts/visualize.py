@@ -3,7 +3,7 @@
 Visualize Xiangqi self-play and evaluation games.
 
 Supported inputs:
-- self-play records: .bin / .bin.gz / .bin.zst (V3 Xiangqi format)
+- self-play records: .bin / .bin.gz / .bin.zst (V4 Xiangqi format)
 - evaluation records: .txt files produced by ./build/evaluate --output
 """
 
@@ -29,7 +29,6 @@ class TrainingRecord:
     state: tuple[float, ...]
     policy: tuple[float, ...]
     value: float
-    score: float
     ownership: tuple[float, ...]
     opponent_action: int
 
@@ -122,11 +121,11 @@ def parse_iccs_move(token: str, rows: int, cols: int) -> tuple[int, int]:
 def read_selfplay_file(filepath: str) -> tuple[int, int, list[TrainingRecord]]:
     data = decompress(filepath)
     if len(data) < 16:
-        raise ValueError("file is too short to be a Xiangqi V3 self-play file")
+        raise ValueError("file is too short to be a Xiangqi V4 self-play file")
 
     magic, version, count, rows, cols = struct.unpack_from("<HHiii", data, 0)
-    if magic != 0x4D47 or version != 3:
-        raise ValueError("unsupported self-play format; expected Xiangqi V3 records")
+    if magic != 0x4D47 or version != 4:
+        raise ValueError("unsupported self-play format; expected Xiangqi V4 records")
 
     pos = 16
     records = []
@@ -143,8 +142,6 @@ def read_selfplay_file(filepath: str) -> tuple[int, int, list[TrainingRecord]]:
 
         value = struct.unpack_from("<f", data, pos)[0]
         pos += 4
-        score = struct.unpack_from("<f", data, pos)[0]
-        pos += 4
 
         ownership_size = rows * cols
         ownership = struct.unpack_from(f"<{ownership_size}f", data, pos)
@@ -158,7 +155,6 @@ def read_selfplay_file(filepath: str) -> tuple[int, int, list[TrainingRecord]]:
                 state=state,
                 policy=policy,
                 value=value,
-                score=score,
                 ownership=ownership,
                 opponent_action=opponent_action,
             )
@@ -278,7 +274,6 @@ def load_selfplay_view(path: str) -> GameView:
                 "piece": piece,
                 "captured": captured,
                 "value": record.value,
-                "score": record.score,
             }
         )
 
@@ -327,7 +322,6 @@ def load_eval_view(path: str) -> GameView:
                 "piece": piece,
                 "captured": captured,
                 "value": None,
-                "score": None,
             }
         )
         player = opponent(player)
@@ -345,7 +339,7 @@ def load_eval_view(path: str) -> GameView:
     title_lines = [
         os.path.basename(path),
         f"Black: {fields.get('black', '?')}  Red: {fields.get('red', '?')}",
-        f"{result_text}  black_score={fields.get('black_score', '?')}",
+        result_text,
     ]
     return GameView(rows=rows, cols=cols, snapshots=snapshots, moves=moves, title_lines=title_lines)
 
@@ -463,14 +457,10 @@ def draw_game(stdscr, view: GameView) -> None:
             stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             info_y += 1
 
-            extras = []
-            if last_move["value"] is not None:
-                extras.append(f"V={last_move['value']:+.2f}")
-            if last_move["score"] is not None:
-                extras.append(f"S={last_move['score']:+.1f}")
-            if extras and info_y < h - 1:
+            if last_move["value"] is not None and info_y < h - 1:
                 stdscr.attron(curses.color_pair(8))
-                stdscr.addnstr(info_y, panel_x, "  ".join(extras), max(0, w - panel_x - 2))
+                stdscr.addnstr(info_y, panel_x, f"V={last_move['value']:+.2f}",
+                               max(0, w - panel_x - 2))
                 stdscr.attroff(curses.color_pair(8))
                 info_y += 1
 

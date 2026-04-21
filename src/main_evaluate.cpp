@@ -34,7 +34,6 @@ struct GameRecord {
     bool model1_is_black = false;
     std::vector<int> moves;
     int result = 0;
-    float black_score = 0.0f;
 };
 
 static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
@@ -61,7 +60,6 @@ static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
 
     if (!game.game_over) game.force_draw();
 
-    rec.black_score = game.final_black_score;
     if (game.winner == EMPTY) {
         rec.result = 0;
     } else {
@@ -81,7 +79,6 @@ static void write_game_record(const std::string& path, const GameRecord& rec,
     out << "black " << (rec.model1_is_black ? m1_name : m2_name) << "\n";
     out << "red " << (rec.model1_is_black ? m2_name : m1_name) << "\n";
     out << "result " << rec.result << "\n";
-    out << "black_score " << rec.black_score << "\n";
     out << "moves";
     for (int action : rec.moves) out << ' ' << formatter.action_to_str(action);
     out << "\n";

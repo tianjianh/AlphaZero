@@ -191,22 +191,26 @@ def _stage(
     return stage
 
 
+# Per-stage tuples: (window_size, c_puct, temp_threshold, dirichlet_epsilon).
+# Exploration is held moderately high through the gated stages and decays in
+# the later consolidation stages — the early net has sharp bootstrap-biased
+# priors, so MCTS + root noise need enough slack to wander off the prior.
 _SMALL_STAGE_CFG = [
-    (3, 2.0, 20, 0.30),
-    (4, 1.75, 18, 0.28),
-    (4, 1.5, 15, 0.25),
-    (6, 1.5, 15, 0.25),
-    (8, 1.25, 12, 0.22),
-    (8, 1.1, 10, 0.20),
+    (3, 2.25, 24, 0.35),
+    (4, 2.0,  22, 0.32),
+    (4, 1.75, 18, 0.30),
+    (6, 1.75, 18, 0.30),
+    (8, 1.5,  15, 0.26),
+    (8, 1.3,  12, 0.23),
 ]
 
 _LARGE_STAGE_CFG = [
-    (4, 2.0, 20, 0.30, None),
-    (4, 1.75, 18, 0.28, None),
-    (6, 1.5, 15, 0.25, 0.53),
-    (6, 1.5, 15, 0.25, 0.54),
-    (10, 1.3, 12, 0.22, 0.55),
-    (12, 1.25, 12, 0.20, 0.55),
+    (4,  2.25, 24, 0.35, None),
+    (4,  2.0,  22, 0.32, None),
+    (6,  1.75, 18, 0.30, 0.53),
+    (6,  1.75, 18, 0.30, 0.54),
+    (10, 1.5,  15, 0.26, 0.55),
+    (12, 1.4,  14, 0.23, 0.55),
 ]
 
 
@@ -223,9 +227,9 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
                 lr="2e-3",
                 eval_games=0,
                 window_size=3,
-                c_puct=1.5,
-                temp_threshold=8,
-                dirichlet_epsilon=0.25,
+                c_puct=1.75,
+                temp_threshold=10,
+                dirichlet_epsilon=0.30,
             )
         ]
 
@@ -253,12 +257,12 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
 
     if preset == "xlarge":
         cfg = [
-            (3, 2.0, 20, 0.30),
-            (4, 1.75, 18, 0.28),
-            (6, 1.5, 15, 0.25),
-            (8, 1.25, 15, 0.22),
-            (10, 1.1, 12, 0.20),
-            (10, 1.1, 12, 0.20),
+            (3,  2.25, 24, 0.35),
+            (4,  2.0,  22, 0.32),
+            (6,  1.75, 18, 0.30),
+            (8,  1.5,  18, 0.26),
+            (10, 1.3,  14, 0.23),
+            (10, 1.3,  14, 0.23),
         ]
         return [
             _stage("Bootstrap",        1,   6,  800,  300, 3, "1.2e-3", 0,   *cfg[0]),
@@ -309,12 +313,22 @@ def generate_plan(filters: int, blocks: int, preset: str) -> dict:
             "eval_threshold": eval_threshold,
             "policy_weight": 1.0,
             "value_weight": 1.0,
+            # XQWL bootstrap stays in the training-data window for this many
+            # iterations, then gets dropped.  Covering the whole "Early gated"
+            # stage avoids the eval-gate transition coinciding with a bootstrap
+            # distribution shift.
+            "bootstrap_decay_iters": 12,
         },
         "mcts": {
-            "c_puct": 1.5,
-            "dirichlet_alpha": 0.30,
-            "dirichlet_epsilon": 0.25,
-            "temp_threshold": 18,
+            # Defaults inherited by every stage unless the stage overrides.
+            # c_puct / temp_threshold / dirichlet_epsilon are in fact
+            # overridden per-stage (see *_STAGE_CFG); dirichlet_alpha is
+            # applied globally and is set lower here to produce spikier root
+            # noise that pushes self-play into a wider opening book.
+            "c_puct": 1.75,
+            "dirichlet_alpha": 0.20,
+            "dirichlet_epsilon": 0.30,
+            "temp_threshold": 20,
             "win_loss_weight": 1.0,
             "score_weight": 0.0,
             "score_scale": 1000.0,
