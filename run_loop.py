@@ -459,17 +459,47 @@ def run_selfplay(iter_data: Path, model: Path, games: int, sims: int, hw: dict, 
 
 
 def compress_selfplay(iter_data: Path) -> None:
+    """Compress game_*.bin -> game_*.bin.zst in place.
+
+    Processes files one at a time and only removes the source *after*
+    confirming the compressed output exists and is non-empty.  The previous
+    implementation passed every file to a single `zstd --rm` invocation; if
+    that process died partway (OOM-killer, signal, internal zstd error) the
+    files it had already removed were lost, because --rm unlinks the source
+    as soon as it *thinks* compression succeeded.
+
+    Idempotent: files that already have a non-empty .bin.zst sibling are
+    skipped (and any stale .bin source is cleaned up).  Missing `zstd`
+    binary is tolerated silently — bootstrap/selfplay data stays usable as
+    plain .bin.
+    """
     bins = sorted(iter_data.rglob("game_*.bin"))
     if not bins:
         return
-    try:
-        subprocess.run(
-            ["zstd", "--rm", "-q", *[str(path) for path in bins]],
-            check=False,
-            capture_output=True,
-        )
-    except FileNotFoundError:
-        pass
+    for src in bins:
+        dst = src.with_suffix(src.suffix + ".zst")
+        if dst.exists() and dst.stat().st_size > 0:
+            # Already compressed on a previous run — clean up the stale src.
+            try: src.unlink()
+            except FileNotFoundError: pass
+            continue
+        try:
+            result = subprocess.run(
+                ["zstd", "-q", "-f", "-o", str(dst), str(src)],
+                check=False,
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            # zstd not installed — leave everything as .bin and bail.
+            return
+        if result.returncode == 0 and dst.exists() and dst.stat().st_size > 0:
+            try: src.unlink()
+            except FileNotFoundError: pass
+        else:
+            # Compression failed — make sure we don't leave a half-written
+            # .bin.zst that a later run might trust.
+            try: dst.unlink()
+            except FileNotFoundError: pass
 
 
 def run_bootstrap(args: argparse.Namespace, plan: dict) -> None:
