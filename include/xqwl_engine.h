@@ -13,7 +13,14 @@
 namespace xqwl {
 
 constexpr int MAX_GEN_MOVES = 128;
-constexpr int MAX_MOVES     = 256;
+// mvsList holds the entire game-history stack *plus* the in-flight search
+// stack (up to LIMIT_DEPTH plies of full + quiesce recursion).  The bootstrap
+// driver caps games at 300 plies, and SearchQuiesc only bottoms out at
+// nDistance == LIMIT_DEPTH, so the peak index reached is roughly
+//   1 (SetIrrev sentinel) + max_plies + LIMIT_DEPTH = ~365.
+// 512 gives comfortable headroom; the upstream XQWL06 value of 256 was sized
+// for its own shorter-game GUI and overflows here.
+constexpr int MAX_MOVES     = 512;
 constexpr int LIMIT_DEPTH   = 64;
 constexpr int HASH_SIZE     = 1 << 20;
 

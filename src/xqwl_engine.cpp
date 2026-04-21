@@ -1025,11 +1025,32 @@ int XqwlEngine::legal_move_count() {
 }
 
 Status XqwlEngine::status() {
-    int rep = RepStatus();
-    if (rep != 0) {
-        if (rep & 2) return Status::SELF_PERPETUAL;
-        if (rep & 4) return Status::OPP_PERPETUAL;
+    // Chinese-chess repetition rule:
+    //   3 occurrences of the same position (局面循环三次) → draw, unless
+    //     one side is continuously attacking (长打), in which case that
+    //     side is required to vary and the game continues.
+    //   4 occurrences (第四次重复局面) → the perpetually-attacking side
+    //     loses; otherwise draw.
+    //
+    // RepStatus(n) triggers when n prior matches are found walking back
+    // through the reversible-move history, i.e. n+1 total occurrences.
+    // Perpetual-attack classification here only covers 长将 (perpetual
+    // check) via the ucbCheck flag on each move record; 长捉 / 长杀 are
+    // not distinguished from a normal repetition and will draw at three.
+    int rep4 = RepStatus(3);
+    if (rep4 != 0) {
+        bool self_perp = (rep4 & 2) != 0;
+        bool opp_perp  = (rep4 & 4) != 0;
+        if (self_perp && !opp_perp) return Status::SELF_PERPETUAL;
+        if (opp_perp && !self_perp) return Status::OPP_PERPETUAL;
         return Status::REPETITION_DRAW;
+    }
+    int rep3 = RepStatus(2);
+    if (rep3 != 0) {
+        bool self_perp = (rep3 & 2) != 0;
+        bool opp_perp  = (rep3 & 4) != 0;
+        if (!self_perp && !opp_perp) return Status::REPETITION_DRAW;
+        // Attacker has one more cycle to vary before the 4-rep loss above.
     }
     if (legal_move_count() == 0) {
         return InCheck() ? Status::CHECKMATE : Status::STALEMATE;

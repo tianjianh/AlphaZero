@@ -566,11 +566,17 @@ void XiangqiGame::play(int action) {
         move_history_[move_history_count_++] = MoveRecord{action, captured, gave_check, pre_move_hash};
     }
 
-    int rep_status = repetition_status(3);
-    if (rep_status != REPETITION_NONE) {
+    // Chinese-chess repetition rule: 3 occurrences of the same position
+    // (循环三次) draw unless a side is continuously attacking (长打), in
+    // which case play continues so the attacker must vary.  At 4 occurrences
+    // (第四次重复局面) the perpetually-attacking side loses; otherwise draw.
+    // Perpetual detection here covers 长将 (perpetual check) only; 长捉 /
+    // 长杀 are not classified separately and will draw at three occurrences.
+    int rep4 = repetition_status(3);
+    if (rep4 != REPETITION_NONE) {
         game_over = true;
-        bool self_perpetual = (rep_status & REPETITION_SELF_PERPETUAL_CHECK) != 0;
-        bool opp_perpetual = (rep_status & REPETITION_OPP_PERPETUAL_CHECK) != 0;
+        bool self_perpetual = (rep4 & REPETITION_SELF_PERPETUAL_CHECK) != 0;
+        bool opp_perpetual = (rep4 & REPETITION_OPP_PERPETUAL_CHECK) != 0;
         if (self_perpetual == opp_perpetual) {
             winner = EMPTY;
         } else if (self_perpetual) {
@@ -580,6 +586,18 @@ void XiangqiGame::play(int action) {
         }
         score_game();
         return;
+    }
+    int rep3 = repetition_status(2);
+    if (rep3 != REPETITION_NONE) {
+        bool self_perpetual = (rep3 & REPETITION_SELF_PERPETUAL_CHECK) != 0;
+        bool opp_perpetual = (rep3 & REPETITION_OPP_PERPETUAL_CHECK) != 0;
+        if (!self_perpetual && !opp_perpetual) {
+            game_over = true;
+            winner = EMPTY;
+            score_game();
+            return;
+        }
+        // Otherwise the attacker must vary before the 4-rep loss above.
     }
 
     if (!has_any_legal_move(current_player)) {
