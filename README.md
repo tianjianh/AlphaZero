@@ -726,13 +726,123 @@ requirement, but you want at least as many records as a couple of
 self-play iterations' worth so the window is non-trivially populated at
 iter 1.
 
+### Resuming an interrupted bootstrap
+
+A 10 000-game bootstrap at depth 6 takes ~30 minutes on a 32-core box and
+longer on smaller machines.  Two layers of the pipeline make that work
+recoverable if something goes wrong.
+
+#### Layer 1: the `bootstrap` binary skips completed game IDs
+
+`./build/bootstrap` scans the output directory at startup and ignores any
+game IDs whose `game_{id}.bin` or `game_{id}.bin.zst` file already exists
+and has non-zero size.  Workers compete for the remaining IDs via the
+shared atomic counter, same as before.  The header reports what it found:
+
+```text
+XQWL bootstrap generator
+  Games:       10000
+  Depth:       6
+  ...
+  Existing:    6542 of 10000 (resume)
+  To generate: 3458
+```
+
+And the per-game log shows both the absolute index and the new-games
+counter:
+
+```text
+  Game 6543/10000 [1/3458 new] — 87 moves, 174 samples, 2.84s
+```
+
+This covers two practical scenarios:
+
+- **Interruption recovery.**  Ctrl-C / OOM / power loss / the host
+  rebooting mid-run.  Re-run the same command and it picks up where it
+  died.  Partial writes at the exact moment of termination are possible in
+  principle, but `write_records` uses an `ofstream` whose destructor
+  flushes synchronously, so a file that exists on disk is almost always a
+  complete V4 record.  If one ends up corrupt (rare), `train.py` will fail
+  with a clean `ValueError` — delete the offending file and re-run.
+- **Additive runs.**  Previously generated 5 000 games and now want
+  10 000?  Run with `--games 10000` again; only the missing 5 000 are
+  produced.  Same mechanism for filling specific gaps: delete the files
+  you want redone, re-run, only those IDs get regenerated.
+
+All three smoke-tested: fresh run, all-done (exits with "nothing to do"),
+partial-deletion top-up, and additive size bump.
+
+#### Layer 2: `run_loop.py init` preserves `training/bootstrap/`
+
+Re-running `init` is destructive for `models/`, `training/selfplay/`,
+`training/checkpoints/`, etc. — that part is unchanged.  But
+`training/bootstrap/` is **explicitly preserved** across the wipe: `init`
+detects existing XQWL games, stashes the directory out of the way, runs
+the normal `rmtree`, then moves it back.  The init banner calls it out:
+
+```text
+This will delete:
+  models/
+  training/ (except training/bootstrap/ — see below)
+  trt_cache/   (if present)
+
+  Preserved:  training/bootstrap/ (6542 games)
+              — bootstrap binary is resumable; pass
+                --fresh-bootstrap to regenerate from scratch
+```
+
+So a typical recovery flow after any crash during `init`:
+
+```bash
+# Exactly the same command as the original run.
+python3 run_loop.py init small -y \
+    --bootstrap-games   10000 \
+    --bootstrap-depth   6 \
+    --bootstrap-threads 18 \
+    --bootstrap-epochs  5
+```
+
+Step-by-step of what happens:
+1. `init` sees the existing `training/bootstrap/`, stashes it, wipes the
+   rest, recreates the tree, moves the bootstrap dir back.
+2. Random-init `v0000.onnx` is re-exported.
+3. `./build/bootstrap` runs again — but because every game ID already
+   has a file, it prints `All 10000 games already present — nothing to
+   do` and exits in under a second.
+4. `train.py` trains `v0000.onnx` on the existing bootstrap data (this
+   is the step that crashed in the original run).
+5. The bootstrap-trained net is promoted to `best.onnx`; the training
+   loop is ready to start.
+
+Pass `--fresh-bootstrap` (or `rm -rf training/bootstrap/` manually) if
+you genuinely want the XQWL games regenerated.
+
+#### Common recovery gotcha: `FileNotFoundError: No usable temporary directory`
+
+`train.py` (inside `torch._dynamo`) calls `tempfile.gettempdir()` at
+startup to pick a Dynamo cache directory.  In containers where `/tmp`,
+`/var/tmp`, and `/usr/tmp` are missing or full, this raises
+`FileNotFoundError` and the bootstrap training step dies after the
+(expensive) XQWL game generation already completed.  Fix: point
+`$TMPDIR` at a writable location *before* running `init` or `train`:
+
+```bash
+mkdir -p /path/to/project/training/tmp
+export TMPDIR=/path/to/project/training/tmp
+```
+
+Then the recovery flow above (re-run `init` with the same flags) finishes
+cleanly because the XQWL generation is already done and resumable.
+
 ### On disk — how long does it stay?
 
-**Forever, until you delete it.**  The bootstrap directory is written
-exactly once at `init`; nothing in the pipeline touches it after that.
-Manual cleanup (`rm -rf training/bootstrap/`) is the only way to remove it,
-and doing so is safe at any point (the training window builder simply
-notices the directory isn't there).
+**Forever, until you delete it.**  Every step of the pipeline that could
+touch `training/bootstrap/` — `run_loop.py train`, the training-window
+builder, `scripts/diag_selfplay.py`, the `bootstrap` binary on a fresh
+invocation — either reads it idempotently or preserves it.  Manual cleanup
+(`rm -rf training/bootstrap/`) or `--fresh-bootstrap` at `init` time are
+the only ways to remove it; both are safe at any point (window builder
+simply notices the directory isn't there).
 
 ### Caveats
 
@@ -840,6 +950,7 @@ size independently of the preset.
 | `--bootstrap-time-ms T` | per-move time budget (0 = off, depth-only) | `0` |
 | `--bootstrap-threads T` | worker threads | `cores / 2` |
 | `--bootstrap-epochs E` | epochs of `train.py` on the bootstrap data | `5` |
+| `--fresh-bootstrap` | regenerate `training/bootstrap/` from scratch instead of resuming | off |
 
 ## CLI Reference
 
@@ -962,7 +1073,10 @@ intentional because the tools do different jobs:
 
 Standalone XQWL06-vs-XQWL06 record generator.  Usually invoked indirectly
 through `run_loop.py init --bootstrap-games N`, but you can run it directly
-to smoke-test the engine or add more data to `training/bootstrap/` later.
+to smoke-test the engine, resume an interrupted run, or add more data to
+`training/bootstrap/` later.  Resumable: scans `--output` at startup and
+skips game IDs whose files already exist — see
+[Resuming an interrupted bootstrap](#resuming-an-interrupted-bootstrap).
 
 | Argument | Meaning | Default |
 |---|---|---:|

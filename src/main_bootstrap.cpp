@@ -26,6 +26,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 using namespace minigo;
@@ -194,6 +195,35 @@ std::vector<TrainingRecord> play_one_game(xqwl::XqwlEngine& engine,
     return records;
 }
 
+// Scan the output directory for already-finished games.  Supports both
+// interruption-mid-run resume (some game_N.bin files were written before
+// the crash) and additive runs (existing game_0..game_M-1.bin[.zst] + a
+// larger --games count → only the new IDs are generated).  Recognizes both
+// the raw .bin and the post-compression .bin.zst suffix so a second pass
+// through compress_selfplay stays resume-safe.
+std::unordered_set<int> scan_existing_game_ids(const std::string& dir) {
+    std::unordered_set<int> ids;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return ids;
+    for (auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.rfind("game_", 0) != 0) continue;
+        // Strip .bin.zst or .bin suffix.
+        std::string base = name.substr(5);
+        auto dot = base.find('.');
+        if (dot == std::string::npos) continue;
+        std::string suffix = base.substr(dot);
+        if (suffix != ".bin" && suffix != ".bin.zst") continue;
+        try {
+            int id = std::stoi(base.substr(0, dot));
+            if (entry.file_size(ec) > 0 && !ec) ids.insert(id);
+        } catch (...) { /* skip non-numeric */ }
+    }
+    return ids;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -202,16 +232,33 @@ int main(int argc, char** argv) {
 
     std::filesystem::create_directories(cfg.output_dir);
 
+    auto done_ids = scan_existing_game_ids(cfg.output_dir);
+    int already_done = 0;
+    for (int id : done_ids) if (id < cfg.games) ++already_done;
+    int to_generate = std::max(0, cfg.games - already_done);
+
     std::cout << "XQWL bootstrap generator\n"
-              << "  Games:     " << cfg.games << "\n"
-              << "  Depth:     " << cfg.depth << "\n"
-              << "  Time-ms:   " << cfg.time_ms << "\n"
-              << "  Threads:   " << cfg.threads << "\n"
-              << "  Max plies: " << cfg.max_plies << "\n"
-              << "  Output:    " << cfg.output_dir << "\n\n";
+              << "  Games:       " << cfg.games << "\n"
+              << "  Depth:       " << cfg.depth << "\n"
+              << "  Time-ms:     " << cfg.time_ms << "\n"
+              << "  Threads:     " << cfg.threads << "\n"
+              << "  Max plies:   " << cfg.max_plies << "\n"
+              << "  Output:      " << cfg.output_dir << "\n";
+    if (!done_ids.empty()) {
+        std::cout << "  Existing:    " << already_done
+                  << " of " << cfg.games << " (resume)\n"
+                  << "  To generate: " << to_generate << "\n";
+    }
+    std::cout << "\n";
+
+    if (to_generate == 0) {
+        std::cout << "All " << cfg.games << " games already present — nothing to do.\n";
+        return 0;
+    }
 
     std::atomic<int> next_game{0};
     std::atomic<int> total_records{0};
+    std::atomic<int> generated{0};
     std::mutex io_mutex;
     auto t_start = std::chrono::steady_clock::now();
 
@@ -225,6 +272,7 @@ int main(int argc, char** argv) {
         while (true) {
             int id = next_game.fetch_add(1);
             if (id >= cfg.games) break;
+            if (done_ids.count(id)) continue;  // already on disk, skip
 
             auto tg0 = std::chrono::steady_clock::now();
             auto records = play_one_game(*engine, cfg);
@@ -233,12 +281,14 @@ int main(int argc, char** argv) {
             std::string path = cfg.output_dir + "/game_" + std::to_string(id) + ".bin";
             write_records(path, records, BOARD_ROWS, BOARD_COLS);
             total_records.fetch_add(static_cast<int>(records.size()));
+            int done_now = generated.fetch_add(1) + 1;
 
             double secs = std::chrono::duration<double>(tg1 - tg0).count();
             int moves = static_cast<int>(records.size()) / 2;
 
             std::lock_guard<std::mutex> lk(io_mutex);
             std::cout << "  Game " << (id + 1) << "/" << cfg.games
+                      << " [" << done_now << "/" << to_generate << " new]"
                       << " — " << moves << " moves, "
                       << records.size() << " samples, "
                       << std::fixed << std::setprecision(2) << secs << "s\n";
@@ -252,9 +302,10 @@ int main(int argc, char** argv) {
 
     double total_secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
-    std::cout << "\nDone! " << cfg.games << " games, "
-              << total_records.load() << " records in "
+    int gen = generated.load();
+    std::cout << "\nDone! " << gen << " new games, "
+              << total_records.load() << " new records in "
               << std::fixed << std::setprecision(2) << total_secs << "s "
-              << "(" << (total_secs / std::max(1, cfg.games)) << "s/game)\n";
+              << "(" << (gen > 0 ? total_secs / gen : 0.0) << "s/game)\n";
     return 0;
 }

@@ -556,6 +556,16 @@ def cmd_init(args: argparse.Namespace) -> None:
     filters = args.filters
     blocks = args.blocks
 
+    # Preserve the XQWL bootstrap dir across init if it already contains
+    # games — regenerating can cost hours.  `bootstrap` binary is resumable,
+    # so whatever already-generated games are on disk get topped up to the
+    # requested --bootstrap-games count rather than discarded.  Pass
+    # --fresh-bootstrap to force a clean regeneration.
+    existing_bootstrap = 0
+    if BOOTSTRAP_DIR.is_dir() and not args.fresh_bootstrap:
+        existing_bootstrap = sum(
+            1 for _ in BOOTSTRAP_DIR.glob("game_*.bin*"))
+
     print("============================================")
     print("  MiniXiangqi Training Init")
     print("============================================")
@@ -566,8 +576,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     print()
     print("This will delete:")
     print("  models/")
-    print("  training/")
+    print("  training/ (except training/bootstrap/ — see below)"
+          if existing_bootstrap > 0 else "  training/")
     print("  trt_cache/   (if present)")
+    if existing_bootstrap > 0:
+        print()
+        print(f"  Preserved:  training/bootstrap/ ({existing_bootstrap} games)")
+        print( "              — bootstrap binary is resumable; pass")
+        print( "                --fresh-bootstrap to regenerate from scratch")
     print()
 
     if not args.yes:
@@ -576,12 +592,24 @@ def cmd_init(args: argparse.Namespace) -> None:
             print("Cancelled.")
             return
 
+    # Stash the bootstrap dir (if preserving) out of TRAINING_DIR before the
+    # rmtree, then move it back after we recreate the tree.
+    stash: Path | None = None
+    if existing_bootstrap > 0:
+        stash = PROJECT_DIR / ".bootstrap_stash"
+        if stash.exists():
+            shutil.rmtree(stash)
+        shutil.move(str(BOOTSTRAP_DIR), str(stash))
+
     for path in [MODELS_DIR, TRAINING_DIR, PROJECT_DIR / "trt_cache"]:
         if path.is_dir():
             shutil.rmtree(path)
 
     for path in [MODELS_DIR, DATA_DIR, EVAL_DIR, LOGS_DIR, CHECKPOINT_DIR]:
         path.mkdir(parents=True, exist_ok=True)
+
+    if stash is not None:
+        shutil.move(str(stash), str(BOOTSTRAP_DIR))
 
     plan = generate_plan(filters, blocks, preset)
     PLAN_FILE.write_text(json.dumps(plan, indent=2) + "\n")
@@ -1082,6 +1110,10 @@ def main() -> None:
                         help="XQWL06 bootstrap: worker threads (0 = cores/2)")
     p_init.add_argument("--bootstrap-epochs", type=int, default=5,
                         help="XQWL06 bootstrap: epochs of train.py on the generated data")
+    p_init.add_argument("--fresh-bootstrap", action="store_true",
+                        help="Force regeneration of training/bootstrap/ even if "
+                             "it already contains games (default: preserve and "
+                             "let the bootstrap binary resume)")
 
     p_train = sub.add_parser("train", help="Start or resume training")
     p_train.add_argument("--threads", type=int, default=None, help="Parallel selfplay workers")
