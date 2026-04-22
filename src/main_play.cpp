@@ -66,23 +66,29 @@ static int random_legal_move(XiangqiGame& game) {
     return moves.empty() ? 0 : moves[rng() % moves.size()];
 }
 
-static char piece_char(int8_t piece) {
+// Traditional Chinese xiangqi glyphs.  Red uses the "military" variants,
+// black uses civilian ones — the standard convention on printed boards.
+// Each glyph renders as two terminal columns in a UTF-8 terminal with a
+// CJK-capable font; ncursesw + setlocale(LC_ALL, "") handle the width
+// accounting for the cursor, assuming wcwidth() is set up (the play
+// binary already calls setlocale in main()).
+static const char* piece_glyph(int8_t piece) {
     switch (piece) {
-        case RED_KING: return 'K';
-        case RED_ADVISOR: return 'A';
-        case RED_BISHOP: return 'B';
-        case RED_KNIGHT: return 'N';
-        case RED_ROOK: return 'R';
-        case RED_CANNON: return 'C';
-        case RED_PAWN: return 'P';
-        case BLACK_KING: return 'k';
-        case BLACK_ADVISOR: return 'a';
-        case BLACK_BISHOP: return 'b';
-        case BLACK_KNIGHT: return 'n';
-        case BLACK_ROOK: return 'r';
-        case BLACK_CANNON: return 'c';
-        case BLACK_PAWN: return 'p';
-        default: return '.';
+        case RED_KING:      return "帥";
+        case RED_ADVISOR:   return "仕";
+        case RED_BISHOP:    return "相";
+        case RED_KNIGHT:    return "傌";
+        case RED_ROOK:      return "俥";
+        case RED_CANNON:    return "炮";
+        case RED_PAWN:      return "兵";
+        case BLACK_KING:    return "將";
+        case BLACK_ADVISOR: return "士";
+        case BLACK_BISHOP:  return "象";
+        case BLACK_KNIGHT:  return "馬";
+        case BLACK_ROOK:    return "車";
+        case BLACK_CANNON:  return "砲";
+        case BLACK_PAWN:    return "卒";
+        default:            return "・";  // U+30FB, 2-col intersection dot
     }
 }
 
@@ -151,16 +157,15 @@ static void draw_board(WINDOW* win, const XiangqiGame& game,
         for (int c = 0; c < BOARD_COLS; ++c) {
             int x = ox + 2 + c * 3;
             int sq = r * BOARD_COLS + c;
-            bool is_cursor = cursor_active && r == cursor_r && c == cursor_c;
             bool is_selected = selected_sq == sq;
-            char ch = piece_char(game.board[r][c]);
+            const char* glyph = piece_glyph(game.board[r][c]);
 
             if (is_selected) wattron(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
             else if (is_red_piece(game.board[r][c])) wattron(win, COLOR_PAIR(CP_RED_PIECE) | A_BOLD);
             else if (game.board[r][c] != NO_PIECE) wattron(win, COLOR_PAIR(CP_BLACK_PIECE) | A_BOLD);
             else wattron(win, COLOR_PAIR(CP_GRID));
 
-            mvwaddch(win, y, x, ch);
+            mvwaddstr(win, y, x, glyph);
 
             if (is_selected) wattroff(win, COLOR_PAIR(CP_CURSOR) | A_BOLD);
             else if (is_red_piece(game.board[r][c])) wattroff(win, COLOR_PAIR(CP_RED_PIECE) | A_BOLD);
@@ -169,12 +174,13 @@ static void draw_board(WINDOW* win, const XiangqiGame& game,
 
             if (c < BOARD_COLS - 1) {
                 wattron(win, COLOR_PAIR(CP_GRID));
-                mvwaddstr(win, y, x + 1, "--");
+                // Glyph takes cols [x, x+1]; single-column connector at x+2.
+                mvwaddstr(win, y, x + 2, "─");
                 wattroff(win, COLOR_PAIR(CP_GRID));
             }
             if (r < BOARD_ROWS - 1 && !(r == 4)) {
                 wattron(win, COLOR_PAIR(CP_GRID));
-                mvwaddch(win, y + 1, x, '|');
+                mvwaddstr(win, y + 1, x, "│");
                 wattroff(win, COLOR_PAIR(CP_GRID));
             }
         }
@@ -185,16 +191,22 @@ static void draw_board(WINDOW* win, const XiangqiGame& game,
     }
 
     wattron(win, COLOR_PAIR(CP_LABEL));
-    mvwaddstr(win, oy + 5, ox + 6, "Chu He");
-    mvwaddstr(win, oy + 5, ox + 17, "Han Jie");
+    // 楚河 (Chu River, red's half) and 漢界 (Han Border, black's half) —
+    // the traditional xiangqi river inscription.  Each phrase is two
+    // CJK glyphs = four terminal columns.
+    mvwaddstr(win, oy + 5, ox + 6,  "楚河");
+    mvwaddstr(win, oy + 5, ox + 18, "漢界");
     wattroff(win, COLOR_PAIR(CP_LABEL));
 
     if (cursor_active) {
         int y = oy + cursor_r + (cursor_r >= 5 ? 1 : 0);
         int x = ox + 2 + cursor_c * 3;
         wattron(win, COLOR_PAIR(CP_CURSOR));
+        // Glyph occupies [x, x+1], so brackets flank at x-1 and x+2.
+        // The right bracket overwrites the connector at x+2 while the
+        // cursor is here; a redraw on cursor-move restores the line.
         mvwaddch(win, y, x - 1, '[');
-        mvwaddch(win, y, x + 1, ']');
+        mvwaddch(win, y, x + 2, ']');
         wattroff(win, COLOR_PAIR(CP_CURSOR));
     }
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import curses
 import glob
+import locale
 import os
 import struct
 from dataclasses import dataclass
@@ -22,6 +23,17 @@ BOARD_COLS = 9
 BOARD_AREA = BOARD_ROWS * BOARD_COLS
 PIECE_TYPES = "KABNRCP"
 AUGMENTATIONS_PER_POSITION = 2
+
+# Piece glyphs.  Traditional xiangqi uses different characters for the
+# two sides (red: "military" variants; black: civilian variants).  The
+# board grid is rendered in 3-column slots; each Chinese glyph is two
+# terminal columns wide and sits at the slot's first two positions,
+# with a single-column connector in the third position.
+PIECE_CN = {
+    "K": "帥", "A": "仕", "B": "相", "N": "傌", "R": "俥", "C": "炮", "P": "兵",  # red
+    "k": "將", "a": "士", "b": "象", "n": "馬", "r": "車", "c": "砲", "p": "卒",  # black
+}
+EMPTY_CN = "・"  # U+30FB full-width middle dot (2 cols) — intersection marker
 
 
 @dataclass
@@ -411,7 +423,7 @@ def draw_game(stdscr, view: GameView) -> None:
 
                 if piece == ".":
                     stdscr.attron(curses.color_pair(1))
-                    stdscr.addch(y, x, ord("."))
+                    stdscr.addstr(y, x, EMPTY_CN)
                     stdscr.attroff(curses.color_pair(1))
                 else:
                     color_pair = 4 if piece.isupper() else 5
@@ -419,21 +431,23 @@ def draw_game(stdscr, view: GameView) -> None:
                     if highlight:
                         attrs |= curses.A_REVERSE
                     stdscr.attron(attrs)
-                    stdscr.addch(y, x, ord(piece))
+                    stdscr.addstr(y, x, PIECE_CN.get(piece, piece))
                     stdscr.attroff(attrs)
 
                 if c < cols - 1:
                     stdscr.attron(curses.color_pair(1))
-                    stdscr.addstr(y, x + 1, "--")
+                    stdscr.addstr(y, x + 2, "─")
                     stdscr.attroff(curses.color_pair(1))
                 if r < rows - 1 and r != 4:
                     stdscr.attron(curses.color_pair(1))
-                    stdscr.addch(y + 1, x, ord("|"))
+                    stdscr.addstr(y + 1, x, "│")
                     stdscr.attroff(curses.color_pair(1))
 
         stdscr.attron(curses.color_pair(7))
-        stdscr.addstr(oy + 5, ox + 6, "Chu He")
-        stdscr.addstr(oy + 5, ox + 17, "Han Jie")
+        # 楚河 (Chu River, red's half) and 漢界 (Han Border, black's half) —
+        # the traditional xiangqi river inscription.
+        stdscr.addstr(oy + 5, ox + 6,  "楚河")
+        stdscr.addstr(oy + 5, ox + 18, "漢界")
         stdscr.attroff(curses.color_pair(7))
 
         info_y = oy
@@ -485,6 +499,9 @@ def draw_game(stdscr, view: GameView) -> None:
 
 
 def view_file(path: str) -> None:
+    # Bind to the terminal's UTF-8 locale before curses init so that
+    # wide Chinese glyphs render at their proper two-column width.
+    locale.setlocale(locale.LC_ALL, "")
     view = load_view(path)
     curses.wrapper(lambda stdscr: draw_game(stdscr, view))
 

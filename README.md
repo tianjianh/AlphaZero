@@ -473,10 +473,21 @@ The UI was redesigned from a Go board to a Xiangqi board:
 
 - 10 visible ranks
 - 9 files (`a` through `i`)
-- river gap labeled `Chu He` / `Han Jie`
+- river gap labeled `楚河` / `漢界` (Chu River / Han Border)
+- **traditional Chinese piece glyphs** — red uses the military-style
+  variants (`帥 仕 相 傌 俥 炮 兵`), black uses civilian (`將 士 象 馬 車 砲 卒`).
+  The visualizer (`scripts/visualize.py`) uses the same convention.
 - colored red/black pieces
 - source-square selection with a cursor
 - ICCS-like typed move entry (`b2e2` style)
+
+The glyphs rely on a UTF-8 terminal with a CJK-capable font.  The C++
+binary calls `setlocale(LC_ALL, "")` at startup and the Python script
+does the same before `curses.wrapper`, so a `LANG=C.UTF-8` (or similar)
+environment is all that's needed.  If your terminal renders the pieces
+as `?` or boxes, the font isn't CJK-capable — install one (e.g.
+`fonts-wqy-microhei` on Debian, `Noto Sans CJK` on most distros) or run
+from an xterm/alacritty/kitty instance with CJK support.
 
 ### UI Controls
 
