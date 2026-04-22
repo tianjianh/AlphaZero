@@ -195,22 +195,30 @@ def _stage(
 # Exploration is held moderately high through the gated stages and decays in
 # the later consolidation stages — the early net has sharp bootstrap-biased
 # priors, so MCTS + root noise need enough slack to wander off the prior.
+#
+# Window sizes are deliberately larger than the naive defaults (6 everywhere):
+# after a promotion, the new best model's self-play games only enter the
+# training window one iter at a time, so a small window produces candidates
+# trained almost entirely on games from the *previous* best.  With window=8
+# it takes 8 iters to fully saturate the window with new-best games, but the
+# extra mixed-era data stabilizes the policy loss and makes the candidate
+# better than the previous best much sooner.
 _SMALL_STAGE_CFG = [
     (3, 2.25, 24, 0.35),
     (4, 2.0,  22, 0.32),
-    (4, 1.75, 18, 0.30),
     (6, 1.75, 18, 0.30),
-    (8, 1.5,  15, 0.26),
-    (8, 1.3,  12, 0.23),
+    (8, 1.75, 18, 0.30),
+    (10, 1.5, 15, 0.26),
+    (10, 1.3, 12, 0.23),
 ]
 
 _LARGE_STAGE_CFG = [
     (4,  2.25, 24, 0.35, None),
-    (4,  2.0,  22, 0.32, None),
-    (6,  1.75, 18, 0.30, 0.53),
-    (6,  1.75, 18, 0.30, 0.54),
-    (10, 1.5,  15, 0.26, 0.55),
-    (12, 1.4,  14, 0.23, 0.55),
+    (6,  2.0,  22, 0.32, None),
+    (8,  1.75, 18, 0.30, 0.51),
+    (8,  1.75, 18, 0.30, 0.52),
+    (12, 1.5,  15, 0.26, 0.53),
+    (12, 1.4,  14, 0.23, 0.53),
 ]
 
 
@@ -239,7 +247,11 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
             _stage("Bootstrap",        1,  4,  400, 200, 3, "1.2e-3",   0, *cfg[0]),
             _stage("Warm up",          5,  8,  600, 300, 3, "9e-4",     0, *cfg[1]),
             _stage("Early gated",      9, 14,  900, 400, 3, "6e-4",   100, *cfg[2]),
-            _stage("Consolidate",     15, 22, 1000, 400, 4, "4.5e-4", 200, *cfg[3]),
+            # Consolidate LR dropped from 4.5e-4 -> 3e-4: the 4.5e-4 rate
+            # produced per-epoch loss oscillation immediately after a big
+            # promotion (distribution shift between the new best's games and
+            # the stale previous-best games still in the window).
+            _stage("Consolidate",     15, 22, 1000, 400, 4, "3e-4",   200, *cfg[3]),
             _stage("Steady improve",  23, 32, 1200, 500, 5, "3e-4",   200, *cfg[4]),
             _stage("Overnight extend",33, 48, 1400, 500, 5, "2e-4",   200, *cfg[5]),
         ]
@@ -250,7 +262,7 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
             _stage("Bootstrap",        1,  4,  400, 200, 3, "1.2e-3",   0, cfg[0][0], cfg[0][1], cfg[0][2], cfg[0][3], cfg[0][4]),
             _stage("Warm up",          5,  8,  600, 300, 3, "9e-4",     0, cfg[1][0], cfg[1][1], cfg[1][2], cfg[1][3], cfg[1][4]),
             _stage("Early gated",      9, 14,  900, 400, 3, "6e-4",   100, cfg[2][0], cfg[2][1], cfg[2][2], cfg[2][3], cfg[2][4]),
-            _stage("Consolidate",     15, 24, 1100, 450, 4, "4.5e-4", 200, cfg[3][0], cfg[3][1], cfg[3][2], cfg[3][3], cfg[3][4]),
+            _stage("Consolidate",     15, 24, 1100, 450, 4, "3e-4",   200, cfg[3][0], cfg[3][1], cfg[3][2], cfg[3][3], cfg[3][4]),
             _stage("Steady improve",  25, 40, 1300, 550, 5, "2e-4",   200, cfg[4][0], cfg[4][1], cfg[4][2], cfg[4][3], cfg[4][4]),
             _stage("Overnight extend",41, 72, 1400, 600, 3, "1e-4",   200, cfg[5][0], cfg[5][1], cfg[5][2], cfg[5][3], cfg[5][4]),
         ]
@@ -258,17 +270,17 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
     if preset == "xlarge":
         cfg = [
             (3,  2.25, 24, 0.35),
-            (4,  2.0,  22, 0.32),
-            (6,  1.75, 18, 0.30),
-            (8,  1.5,  18, 0.26),
-            (10, 1.3,  14, 0.23),
-            (10, 1.3,  14, 0.23),
+            (6,  2.0,  22, 0.32),
+            (8,  1.75, 18, 0.30),
+            (10, 1.5,  18, 0.26),
+            (12, 1.3,  14, 0.23),
+            (12, 1.3,  14, 0.23),
         ]
         return [
             _stage("Bootstrap",        1,   6,  800,  300, 3, "1.2e-3", 0,   *cfg[0]),
             _stage("Warm up",          7,  15, 1200,  400, 3, "9e-4",   0,   *cfg[1]),
             _stage("Early gated",     16,  30, 2000,  600, 3, "6e-4",   200, *cfg[2]),
-            _stage("Consolidate",     31,  60, 3000,  600, 4, "4.5e-4", 200, *cfg[3]),
+            _stage("Consolidate",     31,  60, 3000,  600, 4, "3e-4",   200, *cfg[3]),
             _stage("Steady improve",  61, 120, 4000,  800, 5, "3e-4",   200, *cfg[4]),
             _stage("Overnight extend",121,200, 5000, 1000, 5, "2e-4",   200, *cfg[5]),
         ]
@@ -285,7 +297,7 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
         _stage("Bootstrap",        1,        cut1, bg,     200, 4, "1.2e-3",   0, *cfg[0]),
         _stage("Warm up",          cut1 + 1, cut2, bg * 2, 300, 4, "9e-4",     0, *cfg[1]),
         _stage("Early gated",      cut2 + 1, cut3, bg * 3, 400, 4, "6e-4",   100, *cfg[2]),
-        _stage("Consolidate",      cut3 + 1, cut4, bg * 4, 450, 4, "4.5e-4", 200, *cfg[3]),
+        _stage("Consolidate",      cut3 + 1, cut4, bg * 4, 450, 4, "3e-4",   200, *cfg[3]),
         _stage("Steady improve",   cut4 + 1, cut5, bg * 5, 500, 5, "3e-4",   200, *cfg[4]),
         _stage("Overnight extend", cut5 + 1, total, bg * 6, 600, 5, "2e-4",  200, *cfg[5]),
     ]
@@ -294,8 +306,18 @@ def generate_stages(preset: str, filters: int, blocks: int) -> list[dict]:
 def generate_plan(filters: int, blocks: int, preset: str) -> dict:
     num_workers = max(1, min(4, num_cores() // 2))
     batch_size = 64 if preset == "quick" else 256
-    window_size = 3 if preset == "quick" else 6
-    eval_threshold = 0.50 if preset == "quick" else 0.55
+    # Top-level window_size is the fallback used by build_data_window when a
+    # stage doesn't override.  Bumped from 6 -> 8 to keep more mixed-era data
+    # in the window after a promotion; shorter windows produce candidates
+    # trained almost entirely on the previous-best's games and fail eval
+    # repeatedly until the window slowly rolls over.
+    window_size = 3 if preset == "quick" else 8
+    # Eval threshold lowered from 0.55 -> 0.53.  At 200 eval games with the
+    # chess-style (W + 0.5*D) / N score and Xiangqi's high draw rate, the
+    # score's std-dev is ~3.5%, so 0.55 rejects ~60% of real +3% improvements
+    # as noise.  0.53 keeps the gate meaningfully selective while letting
+    # incremental wins through.
+    eval_threshold = 0.50 if preset == "quick" else 0.53
 
     return {
         "model": {
