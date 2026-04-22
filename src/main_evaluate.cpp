@@ -127,7 +127,7 @@ int main(int argc, char* argv[]) {
                 << "  --search-threads N      MCTS threads per move (default: 16)\n"
                 << "  --sims N                MCTS simulations per move (default: 800)\n"
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
-                << "  --threshold FLOAT       Win rate threshold (default: 0.55)\n"
+                << "  --threshold FLOAT       Score threshold — (wins + 0.5*draws)/N (default: 0.55)\n"
                 << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
                 << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
@@ -247,18 +247,26 @@ int main(int argc, char* argv[]) {
     double total = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
     int w1 = m1_wins.load(), w2 = m2_wins.load(), d = draws.load();
-    float wr = (float)w1 / (float)num_games;
+    // Chess-style scoring: win=1, draw=0.5, loss=0.  Chinese chess has a
+    // lot of draws, so counting them as 0 against Model 1 understates
+    // progress and keeps candidates stuck below the promotion threshold
+    // even when they're clearly stronger.
+    float score = (static_cast<float>(w1) + 0.5f * static_cast<float>(d))
+                  / static_cast<float>(num_games);
+    float win_only = static_cast<float>(w1) / static_cast<float>(num_games);
 
     std::cout << "\n============================================\n"
               << "  Model 1 wins: " << w1 << "\n"
               << "  Model 2 wins: " << w2 << "\n"
               << "  Draws:        " << d << "\n"
-              << "  Model 1 win rate: " << std::fixed << std::setprecision(1)
-              << (wr * 100.0f) << "%\n"
+              << "  Model 1 score:    " << std::fixed << std::setprecision(1)
+              << (score * 100.0f) << "%   (W + 0.5*D / N)\n"
+              << "  Model 1 win rate: " << std::setprecision(1)
+              << (win_only * 100.0f) << "%   (W / N, no draw credit)\n"
               << "  Time: " << std::setprecision(1) << total << "s"
               << " (" << std::setprecision(2) << (total / num_games) << "s/game)\n"
-              << "  RESULT: " << (wr >= threshold ? "PASS" : "FAIL") << "\n"
+              << "  RESULT: " << (score >= threshold ? "PASS" : "FAIL") << "\n"
               << "============================================\n";
 
-    return (wr >= threshold) ? 0 : 1;
+    return (score >= threshold) ? 0 : 1;
 }

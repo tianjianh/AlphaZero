@@ -1050,7 +1050,10 @@ def cmd_train(args: argparse.Namespace) -> None:
                 )
                 continue
 
-            win_rate_match = re.search(r"Model 1 win rate:\s*([\d.]+)%", eval_output)
+            # Match the draw-adjusted score — the evaluator bases its
+            # PASS / FAIL on this, and the pipeline log should reflect the
+            # same number so humans and the gate agree.
+            win_rate_match = re.search(r"Model 1 score:\s*([\d.]+)%", eval_output)
             wins1_match = re.search(r"Model 1 wins:\s*(\d+)", eval_output)
             wins2_match = re.search(r"Model 2 wins:\s*(\d+)", eval_output)
             draws_match = re.search(r"Draws:\s*(\d+)", eval_output)
