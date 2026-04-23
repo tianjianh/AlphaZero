@@ -155,20 +155,39 @@ Worked defaults (2×4090, ResNet 64f/5b, 500 sims, all processes sharing GPUs):
 Throughput assumption: **1.5 games/s sustained** (≈ 0.67 s/game, midpoint
 of 1-2 games/s conservative range).
 
-- Trainer is replay-ratio-throttled. Effective training rate =
-  selfplay_rate × positions_per_game × replay_target / (batch_size × world)
-  = 1.5 × 100 × 4 / (1024 × 2) ≈ **0.29 steps/s** sustained average.
+Important: the C++ selfplay writer stores **all 8 dihedral augmentations**
+for every position (`src/mcts.cpp:725`, `augment_sample()`). One game of
+~100 moves produces ~800 rows on disk, not ~100. `replay_target` in this
+plan is **position-level** (matches KataGo's semantics); the bucket
+internally divides by `N_AUGMENTATIONS=8` when crediting, so
+`replay_target=4` means each unique position is visited ~4 times (across
+different augmented views), matching KataGo.
+
+- Row-write rate = selfplay_rate × pos_per_game × N_AUGMENTATIONS
+  = 1.5 × 100 × 8 = 1200 rows/s.
+- Bucket fill rate = `replay_target` × (row_write_rate / N_AUGMENTATIONS)
+  = 4 × (1200 / 8) = 600 samples/s.
+- Sustained training rate = 600 / (batch × world) = 600 / 2048
+  ≈ **0.29 steps/s** average.
 - Over 1 week: 0.29 × 604800 ≈ **180k training steps**.
 - `export_every = 5000 steps` → 1 candidate per ~4.8 hours.
 - Over 1 week: ~36 candidates offered. At ~50-70% accept rate: 18-25
   promotions.
-- Selfplay rolls ~130k positions/day (1.5 × 100 × 86400).
+- Selfplay rolls ~130k unique positions/day (1M augmented rows/day).
 - Gatekeeper workload: ~36 matches × ~90s/match (shared GPU) = ~54 min
   total over a week. Negligible.
 
-If you prefer to reason about exports in game units:
-`export_every_games ≈ export_every_steps × batch_size × world / (pos_per_game × replay_target)`.
-For defaults: 5000 × 1024 × 2 / (100 × 4) ≈ 25600 games per candidate,
+Why this matters: if we instead counted at the row-level (fill 4 × 1200
+= 4800 samples/s), trainer would run at ~2.3 steps/s sustained → 1.4M
+steps/week, each unique position visited 32 times. That's 8× over-replay
+vs. KataGo, risks overfitting even though each visit uses a different
+deterministic augmentation. Position-level replay_target with
+N_AUGMENTATIONS divisor is the principled accounting.
+
+If you prefer to reason about exports in game units (at conservative 1.5
+games/s, replay=4, batch=1024, world=2):
+`export_every_games ≈ export_every_steps × (batch × world) / (pos_per_game × replay_target)`.
+For defaults: 5000 × 2048 / (100 × 4) ≈ 25600 games per candidate,
 or ~4.7 hours at 1.5 games/s.
 
 **Upside scenario** (throughput came in at 3 games/s sustained): 1-week
@@ -180,6 +199,12 @@ over a week, ~24 candidates, first LR milestone hit around day 7. Run
 still produces a usable Elo curve; just slower. If throughput drops
 below 1 games/s, consider reducing replay_target from 4 to 3 (lets
 trainer do slightly more per row) or cutting gatekeeper's share.
+
+**Future optimization**: if we move augmentation from the C++ writer
+into the Python dataloader (online random aug), `N_AUGMENTATIONS`
+becomes 1, pool size shrinks 8×, and `replay_target` reverts to its
+direct row-level meaning. Not required for this plan; noted because it's
+the cleanest long-term fix.
 
 `selfplay_batch_games = 300` is **unrelated to export cadence**. It only
 controls how often the Python wrapper re-reads `accepted/latest`. Does not
@@ -193,15 +218,18 @@ orthogonal.
 
 The train bucket is the trainer's pacing knob. Semantics:
 
-    bucket                 = 0            # current credit, in samples
+    N_AUGMENTATIONS        = 8            # 8-fold dihedral aug at write time
+    bucket                 = 0            # current credit, in samples (rows)
     max_bucket_samples     = BUCKET_CAP_MULT * batch_size * world_size
                                           # soft cap to prevent unbounded growth
-    seen_row_marker        = file-pos into the window; what we've credited
+    seen_row_marker        = (file_index, row_offset) into the sorted pool
 
     Scanner thread (fires every ~5s):
-        new_rows = count positions in training/selfplay/*.bin.zst
+        new_rows = count rows in training/selfplay/*.bin.zst files
                    that arrived since seen_row_marker
-        bucket  += replay_target * new_rows
+        # Credit per row = replay_target / N_AUGMENTATIONS, because
+        # replay_target is defined per UNIQUE position (matches KataGo).
+        bucket  += (replay_target * new_rows) // N_AUGMENTATIONS
         bucket   = min(bucket, max_bucket_samples)
         seen_row_marker = current watermark
 
@@ -215,6 +243,24 @@ The train bucket is the trainer's pacing knob. Semantics:
             step   += 1
             ...
 
+Persistence (at each EXPORT step, and on clean shutdown):
+    save training.pt with:
+        model_state_dict
+        optimizer_state_dict
+        step
+        bucket_level            # current credit in rows
+        seen_row_marker         # file index + offset watermark
+        rng_state               # for reproducible sampling
+
+On resume: restore all fields. Scanner thread starts its loop from the
+saved watermark — any rows that arrived during the outage are picked up
+on the first scan tick and properly credited, without double-crediting
+rows that were already counted. Without this, a restart would either
+(a) re-credit the entire existing pool (burst of training) or (b) start
+empty and BUDGET_SLEEP for hours until fresh rows arrive. KataGo persists
+both `train_bucket_level` and the last-read row index for the same
+reason.
+
 Key properties:
 
 - `bucket` reflects **only** unconsumed selfplay credit. It drains one
@@ -224,7 +270,9 @@ Key properties:
   trainer is slower than selfplay for a stretch (e.g. during a TRT
   recompile). Prevents huge catch-up bursts that would briefly blow past
   the replay-ratio target. Default: `BUCKET_CAP_MULT = 64` → at batch=1024
-  DDP=2, cap = 128k samples ≈ 60s of catch-up.
+  DDP=2, cap = 128k samples.
+- At conservative fill (600 samples/s), cap is reached after ~3.6 min
+  of trainer stall.
 - The scanner thread reads the window (file-reference list) on a timer
   and tops up the bucket. Separate from the training step; no blocking.
 
@@ -235,11 +283,20 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
 
 ## Train loop (pseudocode)
 
-    bucket      = Bucket(max_bucket_samples=BUCKET_CAP_MULT * batch_size * world_size)
-    scanner     = WindowScanner(replay_target=REPLAY_TARGET, bucket=bucket)
+    # Resume or fresh start
+    resume      = load_checkpoint_if_exists()  # None on fresh start
+    step        = resume.step if resume else 0
+    bucket      = Bucket(max_bucket_samples=BUCKET_CAP_MULT * batch_size * world_size,
+                         initial_level=resume.bucket_level if resume else 0)
+    window      = WindowRingBuffer(ring_games=RING_GAMES,
+                                   pool_dir="training/selfplay/",
+                                   window_games=WINDOW_GAMES,
+                                   watermark=resume.seen_row_marker if resume else None)
+    scanner     = WindowScanner(replay_target=REPLAY_TARGET,
+                                n_augmentations=N_AUGMENTATIONS,
+                                bucket=bucket, window=window)
     scanner.start()                           # background thread
 
-    step        = load_step_if_resume()       # from training.pt if present
     lr_schedule = FixedStepLR(warmup=WARMUP_STEPS,
                               base=BASE_LR,
                               milestones=LR_MILESTONES,
@@ -247,8 +304,8 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
     head_ramp   = HeadWeightRamp(end_step=HEAD_RAMP_STEPS)
 
     while True:
-        if len(window.games) < MIN_WINDOW_GAMES:
-            log_event("COLD_START_WAIT", window_games=len(window.games))
+        if window.num_games() < MIN_WINDOW_GAMES:
+            log_event("COLD_START_WAIT", window_games=window.num_games())
             sleep(30); continue
 
         if bucket.available() < batch_size * world_size:
@@ -256,7 +313,7 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
                                       cap=bucket.max)
             sleep(5); continue
 
-        batch = sample_from_window()
+        batch = window.sample_batch(batch_size)
         lr    = lr_schedule(step)
         wts   = head_ramp(step)               # value ramp over HEAD_RAMP_STEPS
         loss  = train_step(batch, lr=lr, head_weights=wts)
@@ -266,19 +323,25 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
 
         log_metric_row(step, wall_time, samples_seen=step * batch_size * world_size,
                        lr, loss, window_positions=scanner.window_positions,
-                       bucket=bucket.available(), ...)
+                       bucket=bucket.available(), ring_rows=window.ring_size(), ...)
 
         if step % EXPORT_EVERY == 0:
             path = f"models/candidates/v{step:09d}.onnx"
             export_onnx(path, atomic=True)    # write .tmp then rename
-            save_checkpoint(step=step, include_optimizer=True)
+            save_checkpoint(step=step,
+                            model=model, optimizer=optimizer,
+                            bucket_level=bucket.available(),
+                            seen_row_marker=scanner.watermark(),
+                            rng_state=get_rng_state())
             log_event("EXPORT", step=step, path=path, loss_ema=..., bucket=...)
 
         if step % LR_HALVE_LOG_STEPS == 0 and lr_schedule.just_halved():
             log_event("LR_DROP", old_lr=..., new_lr=lr, step=step)
 
-- Checkpoint (`training/checkpoints/training.pt`) includes both weights
-  AND `optimizer_state_dict`. On resume: restore both.
+- Checkpoint (`training/checkpoints/training.pt`) includes weights,
+  optimizer_state_dict, step, bucket_level, seen_row_marker, rng_state.
+  On resume: restore all. See Train bucket section above for why the
+  bucket state matters.
 - Metric rows aggregated to one per 100 steps (per-step is ~100MB/day;
   aggregated is ~1MB/day). Loss EMAs and replay-ratio snapshots computed
   across the 100-step window.
@@ -286,21 +349,68 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
 
 ## Selfplay driver (pseudocode)
 
+    global_counter = load_counter("training/selfplay/.counter")  # int, persists across runs
+
+    # Clean up any half-written staging dirs from a prior crash
+    for staging in glob("training/selfplay/staging/batch_*"):
+        rmtree(staging)
+
     while True:
         current_model = resolve(models/accepted/latest)
         if current_model != last_logged_model:
             log_event("MODEL_SWAP", old=last_logged_model, new=current_model)
             last_logged_model = current_model
 
+        # Binary writes to a fresh staging dir (its own "0-indexed" game_N.bin
+        # namespace); Python then renumbers and compresses into the shared pool.
+        batch_id = next_batch_id()
+        staging  = f"training/selfplay/staging/batch_{batch_id:09d}"
+        makedirs(staging)
+
         t0 = time.time()
-        run_cpp_selfplay(model=current_model, games=SELFPLAY_BATCH_GAMES)
+        run_cpp_selfplay(model=current_model,
+                         games=SELFPLAY_BATCH_GAMES,
+                         output=staging)         # build/selfplay writes .bin here
+        t_selfplay = time.time() - t0
+
+        # Rename + compress into shared pool with monotonic filenames,
+        # atomically. Trainer never sees partial files.
+        positions_written = 0
+        for bin_path in sorted(glob(f"{staging}/game_*.bin")):
+            global_counter += 1
+            final = f"training/selfplay/g_{global_counter:017d}.bin.zst"
+            tmp   = final + ".tmp"
+            with open(bin_path, "rb") as fin, \
+                 zstd.open(tmp, "wb") as fout:
+                data = fin.read()
+                fout.write(data)
+            os.rename(tmp, final)                 # atomic publish
+            positions_written += count_rows_in_zst(final)
+            os.remove(bin_path)
+        save_counter("training/selfplay/.counter", global_counter)
+        rmtree(staging)
+
         log_batch_row(batch_id, model=current_model,
                       games=SELFPLAY_BATCH_GAMES,
                       duration=time.time()-t0,
-                      positions_written=count_new_positions())
+                      selfplay_duration=t_selfplay,
+                      positions_written=positions_written)
 
-Game records are written with monotonic filenames (see File layout) via
-atomic `.tmp` → rename so the trainer never sees a partial file.
+Why staging + rename: the current `build/selfplay` binary (see
+`src/main_selfplay.cpp:185`) starts `game_id` at 0 on every invocation
+and writes directly to the final `.bin` name. A flat shared pool with
+multiple invocations would either collide on names or see partial files.
+The staging dir gives each invocation its own namespace; the Python
+driver is responsible for (a) monotonic renaming across the whole run,
+(b) zstd compression, and (c) atomic publish via `rename`. No C++
+changes required.
+
+The `.counter` file holds the monotonic index. On driver restart, it's
+read, so no overlap with prior runs. If the driver itself crashes
+between rename and counter save, worst case: next restart reuses the
+same counter value → the next game overwrites (rare; 1-in-300-game
+window). Acceptable; can be tightened later by checkpointing the
+counter more often if it matters.
 
 
 ## Gatekeeper (pseudocode)
@@ -404,7 +514,7 @@ Taken from mid-to-late stage of the current small/large presets
 to avoid premature exploitation across the full run:
 
   mcts_c_puct           1.25      (between stage-4 1.25 and stage-5 1.1)
-  mcts_dirichlet_alpha  0.03      (9×9 Go — KataGo formula: 10.83/N_legal)
+  mcts_dirichlet_alpha  0.15      (9×9 Go — KataGo formula: 10.83/N_legal ≈ 10/75)
   mcts_dirichlet_eps    0.22      (mid-stage value)
   mcts_temp_threshold   12        (moves with τ=1 at game start)
   mcts_score_weight     0.06      (MCTS utility weight on score delta)
@@ -434,8 +544,13 @@ sustained training → ~180k steps over 1 week. Intended run length: up
 to ~1 week. Scale up only after the first run proves the pipeline.
 
 **Training throughput**
-  replay_target            4                samples per new-row credit (KataGo default)
-  window_games             80000            rolling window (~15h of data at 1.5 games/s)
+  replay_target            4                position-level; KataGo default
+                                            (internally scaled by 1/N_AUGMENTATIONS=1/8
+                                            for row-bucket crediting — see Train bucket section)
+  n_augmentations          8                rows written per position (src/mcts.cpp:725)
+  window_games             80000            files kept on disk (~15h at 1.5 games/s)
+  ring_games               1000             in-RAM ring buffer (~800k rows × 6KB ≈ 5 GB).
+                                            This is the effective sampling window.
   min_window_games         2000             cold-start gate — no training until reached
   bucket_cap_mult          64               max_bucket = 64 × batch × world_size (~4 min catch-up)
   export_every             5000 steps       candidate every ~4.8h at conservative throughput
@@ -468,7 +583,7 @@ to ~1 week. Scale up only after the first run proves the pipeline.
 
 **MCTS params** (fixed; see MCTS section)
   mcts_c_puct              1.25
-  mcts_dirichlet_alpha     0.03
+  mcts_dirichlet_alpha     0.15
   mcts_dirichlet_eps       0.22
   mcts_temp_threshold      12
   mcts_score_weight        0.06
@@ -732,15 +847,35 @@ path-based).
    - Adapt `scripts/train.py`.
    - Remove epoch loop; single continuous step loop gated by train
      bucket. Bucket maintained by a background scanner thread that tails
-     `training/selfplay/*.bin.zst`.
+     `training/selfplay/*.bin.zst` (sorted by filename — monotonic).
    - Fixed step-based LR schedule with warmup + milestone halvings.
    - Step-driven `value_weight` ramp 1.0 → 2.0 over HEAD_RAMP_STEPS.
    - Step-based ONNX export (atomic tmp + rename) into
      `models/candidates/`.
-   - Window reader: scans game files by **filename**, holds a file-ref
-     list for the newest `window_games`; samples lazily (pick file, load
-     + decompress, pick record). No in-memory record cache.
-   - Persist `optimizer_state_dict` (restore on resume).
+   - **Window + ring-buffer reader**: the window is a virtual view
+     `sorted(pool)[-WINDOW_GAMES:]` — the set of files eligible to be
+     sampled. Training never reads the entire window per step; instead:
+       * A background ingest thread decompresses games from the window
+         on a rolling basis (newest first) and pushes their rows into an
+         in-memory ring buffer sized to `RING_ROWS` (default: 800k rows
+         ≈ 1000 games × 800 aug_rows × ~6KB = ~5 GB RAM).
+       * When the ring is full, adding a new game's rows evicts the
+         oldest equal count of rows (FIFO at row granularity; exact
+         game-boundary eviction is unnecessary).
+       * Each decompress is amortized: one file produces ~800 rows →
+         ~400 batches at batch=2048 → ~400 steps between decompresses
+         per ring slot → ~1 decompress per ~0.5s at steady-state
+         (compatible with a few percent of one CPU core).
+       * Trainer samples uniformly from the ring. No pick-file-per-batch
+         decompress cost.
+     Trade-off vs. sampling from the entire window: rows far outside the
+     ring never get sampled, so `RING_ROWS` functions as the effective
+     window. For conservative settings (1500 games in ring, ~15h of
+     fresh data), this is equivalent to `window_games = 1500` for
+     sampling purposes, while the larger file-level `window_games` just
+     bounds when files are deleted off disk.
+   - Persist checkpoint on export: model + optimizer + step +
+     bucket_level + seen_row_marker + rng_state. Restore all on resume.
    - Writes `train.log` and `train_metrics.csv` (per-100-step rollups).
    - Respects `CUDA_VISIBLE_DEVICES` (set by supervisor).
 
@@ -873,9 +1008,10 @@ progress; abort and debug if signals are missing.
    - Launches selfplay driver, train_continuous (under torchrun),
      gatekeeper, and rating — all as subprocesses with GPU assignment.
    - Runs until Ctrl-C.
-   - Resumable: on restart, picks up existing `training.pt` (weights +
-     optimizer state), existing selfplay records, existing accepted
-     models, existing logs (new run opens a fresh `logs/<ts>/`).
+   - Resumable: on restart, picks up existing `training.pt` (weights,
+     optimizer state, step, bucket level, row watermark, rng),
+     existing selfplay records and counter, existing accepted models,
+     existing logs (new run opens a fresh `logs/<ts>/`).
 
 
 ## Deviations from KataGo
@@ -933,10 +1069,15 @@ most likely tuning targets based on real run behavior:
   fill rate. If training stalls for minutes during TRT rebuilds (cache
   bug), bucket saturates and you lose credits — fix the TRT cache first,
   don't raise the cap.
-- `window_games`: 80k covers ~15h at conservative selfplay rate. Shorter
-  windows (e.g. 30k) give fresher data but less diversity — only useful
-  if model is improving very fast. Longer (e.g. 200k) smoother but slower
-  to respond to new strengths, and may not fill within a 1-week run.
+- `window_games`: 80k covers ~15h of disk retention at conservative
+  selfplay rate. Shorter (e.g. 30k) gives fresher data, saves disk; not
+  usually necessary. This knob controls WHEN files get deleted, not
+  sampling — sampling is governed by `ring_games`.
+- `ring_games`: 1000 games × 800 aug_rows ≈ 800k rows ≈ 5 GB RAM. This
+  is the effective sampling window. To get more sample diversity, raise
+  to 2000-3000 (10-15 GB RAM). Lower only if RAM-constrained. Matches
+  KataGo's shuffle-buffer role without needing a separate shuffler
+  process.
 - `lr_milestones[0]`: 100k hits day 4 at conservative throughput. If
   throughput is consistently better, first drop lands earlier — fine,
   model adapts. If consistently worse, drop never fires in a 1-week
