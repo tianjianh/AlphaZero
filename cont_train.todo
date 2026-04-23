@@ -1,0 +1,948 @@
+# Continuous Training Pipeline — Plan (Revised)
+
+## Goal
+
+Replace the phased iterate/train/eval/reject loop with a continuous,
+KataGo-style pipeline. Selfplay, training, gatekeeper, and (optional) rating
+run concurrently as independent processes, coordinating only via the
+filesystem. Same code path scales from a single 2×4090 box to a cluster; the
+only thing that changes is how many selfplay workers you point at the shared
+game pool and how GPUs are split between roles.
+
+Fresh start only. No warm-start from any prior run.
+
+Target hardware for default knobs: 2×4090, ResNet 64f/5b.
+
+Peak selfplay-only throughput on this hardware is ~3-10 games/s (0.1-0.3
+s/game). But in continuous mode all four workers share the same GPUs —
+training is running during selfplay, the gatekeeper briefly takes over
+for matches, and occasional TRT engine rebuilds pause everything. Under
+that contention, **sustained selfplay is ~1-2 games/s**, not the peak.
+The trainer is further throttled by the replay-ratio bucket (only fills
+as fast as new selfplay rows arrive), so **sustained training is ~0.3-0.6
+steps/s**, far below the ~5-10 steps/s the GPUs can push in isolation.
+
+Default knobs below are sized conservatively against those sustained
+rates: a conservative 1-week run yields roughly **150-250k training
+steps** and **25-50 candidates offered**, hitting at least the first LR
+milestone and producing a measurable Elo curve. If actual throughput
+comes in higher, the run reaches further into the LR schedule — no
+re-tuning needed. If lower, the run still completes meaningful work.
+
+We are explicitly **not** aiming for a full converged model on this first
+run. The target is: prove the pipeline end-to-end, observe strength gain
+on the Elo chart, and collect signal about whether the throughput
+assumptions hold. If it works, scale up (more GPUs, larger model, longer
+run) with confidence.
+
+
+## Source-backed alignment with KataGo
+
+Design mirrors KataGo's public training code (`github.com/lightvector/KataGo`).
+Where we deviate it is for small-scale simplification, noted inline.
+
+- Gatekeeper: binary accept/reject by raw winrate ≥ 0.5, default 200 games
+  at 150 visits. `cpp/command/gatekeeper.cpp:271,581`,
+  `cpp/configs/training/gatekeeper1.cfg`. Go-specific deviation: we count
+  only wins (draws count as losses for the candidate) — draws are
+  essentially impossible under area scoring + half-integer komi, and
+  counting draws as losses is stricter.
+- Replay ratio via train-bucket: `-max-train-bucket-per-new-data = 4` in
+  KataGo. Each new selfplay row adds `replay_target` samples of training
+  budget; trainer drains the bucket one sample at a time; stalls when
+  empty. `python/train.py:102`, `SelfplayTraining.md`.
+- Export: step-count-based via `-epochs-per-export`. Filenames encode step
+  count and total rows consumed. `python/train.py:87, 2628-2630`.
+- Promotion mechanism: filesystem `rename()` into `--accepted-models-dir`.
+  KataGo's selfplay polls that dir every 20s in C++. We poll in Python
+  between `build/selfplay` invocations instead (no C++ changes).
+  `cpp/command/gatekeeper.cpp:225-240`, `cpp/command/selfplay.cpp:332-347`.
+- Adam state: KataGo persists optimizer state across restarts in their
+  ckpt.ckpt. We do too — cold-starting Adam on every restart throws away
+  useful momentum and there are no phase boundaries in continuous training
+  that justify discarding it.
+- Rating/match: a separate `match` subcommand for tournament Elo across
+  many nets. Not tied to promotion. `cpp/command/match.cpp:39`.
+
+
+## Motivation
+
+The current phased loop has three architectural problems that scale badly:
+
+- Sequential phases (selfplay → train → eval) leave GPUs under-utilized at
+  phase boundaries and make each "iteration" a 30-60 minute blocking unit.
+- Binary eval gate rejects borderline-stronger candidates by random chance,
+  and the rejected iterations accumulate Adam-state drift because
+  `training.pt` keeps the optimizer moments across rejected runs.
+- The iteration concept creates discrete data-distribution boundaries —
+  stage transitions change exploration knobs and LR at the same moment, which
+  the training dynamics do not absorb gracefully.
+
+KataGo and AlphaZero avoid all three by training continuously on a growing
+data pool, with snapshots exported periodically, a gatekeeper that decides
+which snapshots become the new selfplay model, and (separately) a rating
+tournament for monitoring. This plan ports that structure down to our scale.
+
+
+## Architecture
+
+Four independent long-running workers plus one supervisor. File-only
+coordination, no IPC.
+
+  selfplay ──(game records)──> training/selfplay/   <──(read)── train
+                                                                  │
+                                                                  │ (export every N steps)
+                                                                  ▼
+                                                           models/candidates/
+                                                                  │
+                                                                  ▼
+                                                            gatekeeper
+                                                          (200 games, 150 sims)
+                                                           accept/reject
+                                                         ╱              ╲
+                                                        ▼                ▼
+                                             models/accepted/     models/rejected/
+                                                        │
+                                                        │ (atomic symlink swap)
+                                                        ▼
+                                            selfplay polls this dir
+                                                        │
+                                                        │
+                                                        ▼
+                                            rating (optional, monitoring only)
+                                            ──> ratings/elo.csv
+
+- **selfplay driver**: Python supervisor around the existing C++
+  `build/selfplay` binary. Loops in batches of N games; between batches,
+  rereads `models/accepted/latest` and next invocation uses the updated
+  model. Effective model-check cadence ≈ one per batch (~30-60s wall clock
+  at N=300 on 2×4090). No C++ changes; no mid-batch hot-swap.
+- **train (continuous)**: one torchrun DDP process. Continuous step loop,
+  no epochs. Throttled by a KataGo-style train bucket that fills as new
+  selfplay rows arrive and drains as training consumes samples. Exports
+  ONNX at fixed step intervals into `models/candidates/`. Persists Adam
+  state.
+- **gatekeeper**: long-running Python process. Polls `models/candidates/`
+  every 30s. Always evaluates the newest candidate against the current
+  `models/accepted/latest`; any older candidates still in the directory
+  are moved to `models/rejected/` unevaluated (stale-drop). Accepts iff
+  candidate wins > 50% of 200 games at 150 sims (draws count as losses).
+  On accept: rename into `models/accepted/` and atomically swap symlink.
+  Else: rename into `models/rejected/`. Not triggered by the trainer —
+  filesystem-polled, decoupled.
+- **rating (optional)**: periodically plays tournament matches between
+  recent accepted snapshots, writes Bayesian Elo to CSV. Pure monitoring.
+  Does not gate anything.
+
+All four run in parallel. GPU assignment per-process via
+`CUDA_VISIBLE_DEVICES`; see GPU Assignment section below. Training stays DDP
+across its assigned GPUs. Selfplay stays at per-device NN server threads
+(preserving the existing `--nn-device-ids` flag).
+
+
+## Units and cadence: step vs game
+
+Two separate counters that move at different rates. Never confuse them.
+
+- **1 step** = one optimizer update = one batch forward+backward. With
+  default batch=1024 and DDP across 2 GPUs, one step consumes **1024
+  training samples**.
+- **1 game** = one full selfplay game, ~100 moves → ~100 positions written
+  to disk.
+
+Worked defaults (2×4090, ResNet 64f/5b, 500 sims, all processes sharing GPUs):
+
+Throughput assumption: **1.5 games/s sustained** (≈ 0.67 s/game, midpoint
+of 1-2 games/s conservative range).
+
+- Trainer is replay-ratio-throttled. Effective training rate =
+  selfplay_rate × positions_per_game × replay_target / (batch_size × world)
+  = 1.5 × 100 × 4 / (1024 × 2) ≈ **0.29 steps/s** sustained average.
+- Over 1 week: 0.29 × 604800 ≈ **180k training steps**.
+- `export_every = 5000 steps` → 1 candidate per ~4.8 hours.
+- Over 1 week: ~36 candidates offered. At ~50-70% accept rate: 18-25
+  promotions.
+- Selfplay rolls ~130k positions/day (1.5 × 100 × 86400).
+- Gatekeeper workload: ~36 matches × ~90s/match (shared GPU) = ~54 min
+  total over a week. Negligible.
+
+If you prefer to reason about exports in game units:
+`export_every_games ≈ export_every_steps × batch_size × world / (pos_per_game × replay_target)`.
+For defaults: 5000 × 1024 × 2 / (100 × 4) ≈ 25600 games per candidate,
+or ~4.7 hours at 1.5 games/s.
+
+**Upside scenario** (throughput came in at 3 games/s sustained): 1-week
+run produces ~360k steps, ~72 candidates, hits first LR milestone at day
+4 and is approaching the second by end of week. Still fine, no retuning.
+
+**Downside scenario** (throughput at 1 games/s sustained): ~120k steps
+over a week, ~24 candidates, first LR milestone hit around day 7. Run
+still produces a usable Elo curve; just slower. If throughput drops
+below 1 games/s, consider reducing replay_target from 4 to 3 (lets
+trainer do slightly more per row) or cutting gatekeeper's share.
+
+`selfplay_batch_games = 300` is **unrelated to export cadence**. It only
+controls how often the Python wrapper re-reads `accepted/latest`. Does not
+affect training step count, replay ratio, or gatekeeper verdict rate.
+
+
+## Train bucket (KataGo-style replay-ratio enforcement)
+
+Both the replay-ratio cap and the export cadence are needed. They are
+orthogonal.
+
+The train bucket is the trainer's pacing knob. Semantics:
+
+    bucket                 = 0            # current credit, in samples
+    max_bucket_samples     = BUCKET_CAP_MULT * batch_size * world_size
+                                          # soft cap to prevent unbounded growth
+    seen_row_marker        = file-pos into the window; what we've credited
+
+    Scanner thread (fires every ~5s):
+        new_rows = count positions in training/selfplay/*.bin.zst
+                   that arrived since seen_row_marker
+        bucket  += replay_target * new_rows
+        bucket   = min(bucket, max_bucket_samples)
+        seen_row_marker = current watermark
+
+    Trainer:
+        while True:
+            if bucket < batch_size * world_size:
+                log BUDGET_SLEEP; sleep(5); continue
+            batch = sample_from_window()
+            loss  = train_step(batch)
+            bucket -= batch_size * world_size
+            step   += 1
+            ...
+
+Key properties:
+
+- `bucket` reflects **only** unconsumed selfplay credit. It drains one
+  step at a time. No accumulating counters that grow indefinitely. This
+  is the fix for the "loop sleeps forever at steady state" bug.
+- `max_bucket_samples` caps how much training "credit" can pile up if the
+  trainer is slower than selfplay for a stretch (e.g. during a TRT
+  recompile). Prevents huge catch-up bursts that would briefly blow past
+  the replay-ratio target. Default: `BUCKET_CAP_MULT = 64` → at batch=1024
+  DDP=2, cap = 128k samples ≈ 60s of catch-up.
+- The scanner thread reads the window (file-reference list) on a timer
+  and tops up the bucket. Separate from the training step; no blocking.
+
+Export cadence is the signal-rate knob for the gatekeeper. It controls
+how often the trainer offers a new candidate for evaluation. Each export
+is a cheap ONNX dump done in the training process (~1-3s blocking).
+
+
+## Train loop (pseudocode)
+
+    bucket      = Bucket(max_bucket_samples=BUCKET_CAP_MULT * batch_size * world_size)
+    scanner     = WindowScanner(replay_target=REPLAY_TARGET, bucket=bucket)
+    scanner.start()                           # background thread
+
+    step        = load_step_if_resume()       # from training.pt if present
+    lr_schedule = FixedStepLR(warmup=WARMUP_STEPS,
+                              base=BASE_LR,
+                              milestones=LR_MILESTONES,
+                              gammas=LR_GAMMAS)
+    head_ramp   = HeadWeightRamp(end_step=HEAD_RAMP_STEPS)
+
+    while True:
+        if len(window.games) < MIN_WINDOW_GAMES:
+            log_event("COLD_START_WAIT", window_games=len(window.games))
+            sleep(30); continue
+
+        if bucket.available() < batch_size * world_size:
+            log_event("BUDGET_SLEEP", bucket=bucket.available(),
+                                      cap=bucket.max)
+            sleep(5); continue
+
+        batch = sample_from_window()
+        lr    = lr_schedule(step)
+        wts   = head_ramp(step)               # value ramp over HEAD_RAMP_STEPS
+        loss  = train_step(batch, lr=lr, head_weights=wts)
+
+        bucket.drain(batch_size * world_size)
+        step += 1
+
+        log_metric_row(step, wall_time, samples_seen=step * batch_size * world_size,
+                       lr, loss, window_positions=scanner.window_positions,
+                       bucket=bucket.available(), ...)
+
+        if step % EXPORT_EVERY == 0:
+            path = f"models/candidates/v{step:09d}.onnx"
+            export_onnx(path, atomic=True)    # write .tmp then rename
+            save_checkpoint(step=step, include_optimizer=True)
+            log_event("EXPORT", step=step, path=path, loss_ema=..., bucket=...)
+
+        if step % LR_HALVE_LOG_STEPS == 0 and lr_schedule.just_halved():
+            log_event("LR_DROP", old_lr=..., new_lr=lr, step=step)
+
+- Checkpoint (`training/checkpoints/training.pt`) includes both weights
+  AND `optimizer_state_dict`. On resume: restore both.
+- Metric rows aggregated to one per 100 steps (per-step is ~100MB/day;
+  aggregated is ~1MB/day). Loss EMAs and replay-ratio snapshots computed
+  across the 100-step window.
+
+
+## Selfplay driver (pseudocode)
+
+    while True:
+        current_model = resolve(models/accepted/latest)
+        if current_model != last_logged_model:
+            log_event("MODEL_SWAP", old=last_logged_model, new=current_model)
+            last_logged_model = current_model
+
+        t0 = time.time()
+        run_cpp_selfplay(model=current_model, games=SELFPLAY_BATCH_GAMES)
+        log_batch_row(batch_id, model=current_model,
+                      games=SELFPLAY_BATCH_GAMES,
+                      duration=time.time()-t0,
+                      positions_written=count_new_positions())
+
+Game records are written with monotonic filenames (see File layout) via
+atomic `.tmp` → rename so the trainer never sees a partial file.
+
+
+## Gatekeeper (pseudocode)
+
+    while True:
+        candidates = sorted(glob("models/candidates/*.onnx"))  # lex-sort = step-sort
+        if not candidates:
+            sleep(GATE_POLL_INTERVAL); continue
+
+        # Newest wins; older candidates in the queue are stale — drop them.
+        newest = candidates[-1]
+        for stale in candidates[:-1]:
+            atomic_move(stale, f"models/rejected/{basename(stale)}")
+            log_event("GATE_STALE_DROP", cand=stale)
+
+        current = resolve(models/accepted/latest)
+        # (init always seeds one, so current is never None; no first-candidate branch.)
+
+        log_event("GATE_MATCH_START", cand=newest, baseline=current)
+        t0 = time.time()
+        wins, draws, losses = play_match(candidate=newest, current=current,
+                                         games=GATE_GAMES, sims=GATE_SIMS)
+        duration = time.time() - t0
+        total    = wins + draws + losses
+        score    = wins / total           # Go: count wins only; draws/losses are non-wins
+
+        verdict  = "ACCEPT" if (total > 0 and score > GATE_THRESHOLD) else "REJECT"
+        log_decision_row(newest, current, wins, draws, losses, score,
+                         verdict, duration)
+        log_event(f"GATE_{verdict}", cand=newest, score=score, games=GATE_GAMES)
+
+        if verdict == "ACCEPT":
+            atomic_move(newest, f"models/accepted/{basename(newest)}")
+            atomic_symlink_swap(f"models/accepted/{basename(newest)}",
+                                "models/accepted/latest")
+        else:
+            atomic_move(newest, f"models/rejected/{basename(newest)}")
+
+`atomic_symlink_swap(target, link)` = create `link + ".tmp"` pointing to
+target, then `os.rename(link + ".tmp", link)`. Guaranteed atomic on POSIX;
+no window where selfplay resolves a missing or half-swapped symlink.
+
+`atomic_move(src, dst)` = `os.rename(src, dst)` — atomic within the same
+filesystem (which `models/` is).
+
+
+## Rating loop (pseudocode, optional)
+
+    # Monitoring only. Does not gate.
+    while True:
+        accepted = sorted(glob("models/accepted/v*.onnx"))
+        to_rate = most_recent(accepted, k=RATING_POOL_SIZE)
+        run_round_robin(to_rate, games_per_pair=RATING_GAMES, sims=RATING_SIMS)
+        update_bayesian_elo()
+        append_csv(ratings/elo.csv)
+        sleep(RATING_INTERVAL)
+
+
+## Learning rate schedule (fixed step schedule)
+
+Fixed, step-based. No auto-plateau detection — train-loss EMA is too
+noisy in early training and triggers premature drops.
+
+- Linear warmup from 0 to `BASE_LR` over the first `WARMUP_STEPS`.
+- Hold at `BASE_LR` through `LR_MILESTONES[0]`.
+- At each milestone, multiply current LR by `LR_GAMMA` (default 0.5).
+- No upper bound on total steps. Training runs indefinitely; after the
+  final milestone, LR stays at the floor.
+
+Default schedule is sized so the **first** halving reliably lands
+mid-run under conservative throughput (~180k steps/week → first drop at
+100k steps ≈ day 4), and later milestones only matter if throughput
+outperforms or the run extends past one week. A too-early drop costs
+little; a drop that never fires costs a usable LR-schedule test.
+
+
+## MCTS and training-head weights (continuous = fixed)
+
+The phased pipeline ramps MCTS and head weights across stages. In
+continuous training there are no stage boundaries, so these are fixed
+throughout the run, with one exception:
+
+### Value-head weight ramp (fresh-start only)
+
+Raw value CE drops from ~0.8 (random init) to ~0.08 (converged). If
+`value_weight` is fixed at 2.0 from step 0, value loss contribution
+(0.8 × 2.0 = 1.6) dwarfs policy loss and the model wastes early capacity
+on a noise signal. To avoid this:
+
+- `value_weight` ramps **linearly from 1.0 at step 0 to 2.0 at step
+  HEAD_RAMP_STEPS**, then holds at 2.0.
+- All other head weights are fixed from step 0.
+- Ramp is step-driven, not signal-driven. HEAD_RAMP_STEPS = 30k (default).
+  At conservative throughput (~0.3 steps/s), the ramp completes around
+  28 hours in — early enough that most of the run is at the full weight.
+
+### Fixed MCTS params (from late-stage `_EXPLORE` tuple, slightly more conservative)
+
+Taken from mid-to-late stage of the current small/large presets
+(`run_loop.py:215-228`), backing off the exploration aggression slightly
+to avoid premature exploitation across the full run:
+
+  mcts_c_puct           1.25      (between stage-4 1.25 and stage-5 1.1)
+  mcts_dirichlet_alpha  0.03      (9×9 Go — KataGo formula: 10.83/N_legal)
+  mcts_dirichlet_eps    0.22      (mid-stage value)
+  mcts_temp_threshold   12        (moves with τ=1 at game start)
+  mcts_score_weight     0.06      (MCTS utility weight on score delta)
+  mcts_win_loss_weight  1.0
+  mcts_score_scale      18.0      (= 2·sqrt(81); KataGo formula)
+  mcts_komi             7.5       (9×9 area scoring, half-integer → no draws)
+
+### Fixed head weights (from `run_loop.py:419-425`)
+
+  head_policy_weight        1.0
+  head_value_weight         1.0 → 2.0 ramp over HEAD_RAMP_STEPS
+  head_score_mean_weight    0.010
+  head_score_stdev_weight   0.006
+  head_ownership_weight     0.85
+  head_score_belief_weight  0.035
+  head_opp_policy_weight    0.1
+
+If experiments show a specific head is under/over-trained in continuous
+mode, override individual weights via CLI — do not reintroduce stages.
+
+
+## Default knobs
+
+Sized **conservatively** for 2×4090, ResNet 64f/5b, shared-GPU
+contention. Assumes ~1.5 games/s sustained selfplay → ~0.3 steps/s
+sustained training → ~180k steps over 1 week. Intended run length: up
+to ~1 week. Scale up only after the first run proves the pipeline.
+
+**Training throughput**
+  replay_target            4                samples per new-row credit (KataGo default)
+  window_games             80000            rolling window (~15h of data at 1.5 games/s)
+  min_window_games         2000             cold-start gate — no training until reached
+  bucket_cap_mult          64               max_bucket = 64 × batch × world_size (~4 min catch-up)
+  export_every             5000 steps       candidate every ~4.8h at conservative throughput
+  batch_size               1024             per DDP rank (total 2048 for 2-GPU DDP)
+  head_ramp_steps          30000            value-weight ramp 1.0 → 2.0 (~28h at conservative)
+
+**Selfplay**
+  selfplay_batch_games     300              ~3-5 min per invocation at conservative throughput
+
+**Gatekeeper**
+  gate_games               200              (KataGo default)
+  gate_sims                150              (KataGo default)
+  gate_threshold           0.5              wins / total must exceed this (Go: draws count as losses)
+  gate_poll_interval       30s              how often gatekeeper scans candidates/
+
+**LR schedule (ResNet)**
+  base_lr                  3e-4
+  warmup_steps             2000
+  lr_milestones            [100000, 400000, 1500000]     (steps)
+  lr_gamma                 0.5               (halve at each milestone)
+  # First drop @100k steps ≈ day 4 conservative / day 2 if throughput is higher.
+  # Second drop @400k only reachable at ~2x conservative throughput or multi-week run.
+  # Third is a guard for very long runs.
+
+**LR schedule (ViT — override when --arch vit)**
+  base_lr                  8e-4
+  warmup_steps             3000
+  lr_milestones            [100000, 400000, 1500000]
+  lr_gamma                 0.5
+
+**MCTS params** (fixed; see MCTS section)
+  mcts_c_puct              1.25
+  mcts_dirichlet_alpha     0.03
+  mcts_dirichlet_eps       0.22
+  mcts_temp_threshold      12
+  mcts_score_weight        0.06
+  mcts_win_loss_weight     1.0
+  mcts_score_scale         18.0
+  mcts_komi                7.5
+
+**Head weights** (fixed except value ramp; see MCTS section)
+  head_policy_weight         1.0
+  head_value_weight          1.0 → 2.0 over head_ramp_steps
+  head_score_mean_weight     0.010
+  head_score_stdev_weight    0.006
+  head_ownership_weight      0.85
+  head_score_belief_weight   0.035
+  head_opp_policy_weight     0.1
+
+**Rating (optional — GPU-time-intensive, defer if uncertain)**
+  rating_games             80 per pair      (~47 Elo SE; enough signal for monitoring)
+  rating_sims              200
+  rating_pool_size         5                most-recent accepted models
+  rating_interval          7200s            (2 hrs between rounds; ~84 rounds/week)
+  # At ~4 min/round shared-GPU, rating costs ~5.5 hrs/week of GPU time.
+  # If trainer BUDGET_SLEEPs grow after enabling rating, extend interval
+  # or disable until the run's main throughput is proven.
+
+**GPU assignment (DEFAULT = single-GPU; override via CLI)**
+  selfplay_gpus            "0"              CUDA_VISIBLE_DEVICES for selfplay
+  train_gpus               "0"              CUDA_VISIBLE_DEVICES for torchrun
+  gate_gpus                "0"              CUDA_VISIBLE_DEVICES for gatekeeper
+  rate_gpus                "0"              CUDA_VISIBLE_DEVICES for rate
+  nn_device_ids_selfplay   "0,0"            2 NN server threads on visible GPU 0
+  nn_device_ids_gate       "0"
+  nn_device_ids_rate       "0"
+
+
+## GPU assignment
+
+Each worker runs with its own `CUDA_VISIBLE_DEVICES`, set by the
+supervisor in the subprocess environment. Inside each process, device IDs
+are 0-indexed **against the visible set**, not the physical GPUs. This
+preserves the existing `--nn-device-ids 0,0,1,1` convention and lets the
+user slot roles onto specific physical cards.
+
+**Default: single GPU (everything stacked on GPU 0). Override at launch.**
+
+**2×4090 box (recommended, selfplay + training share both GPUs):**
+
+    python scripts/run_continuous.py run \
+      --selfplay-gpus 0,1 \
+      --train-gpus 0,1 \
+      --gate-gpus 0 \
+      --rate-gpus 1 \
+      --nn-device-ids-selfplay 0,0,1,1 \
+      --nn-device-ids-gate 0 \
+      --nn-device-ids-rate 0
+
+    # selfplay:   4 NN server threads across both GPUs
+    # training:   torchrun --nproc_per_node=2, DDP
+    # gatekeeper: shares GPU 0 (brief, infrequent)
+    # rate:       shares GPU 1 (infrequent)
+    # CUDA driver time-slices between processes. VRAM fits all workloads
+    # at our model size (model ~100MB + TRT engine ~80MB per device).
+
+**6-GPU box (dedicated split):**
+
+    python scripts/run_continuous.py run \
+      --selfplay-gpus 0,1,2,3 \
+      --train-gpus 4,5 \
+      --gate-gpus 4 \
+      --rate-gpus 5 \
+      --nn-device-ids-selfplay 0,0,1,1,2,2,3,3 \
+      --nn-device-ids-gate 0 \
+      --nn-device-ids-rate 0
+
+    # selfplay gets physical 0-3 (visible as 0-3 internally), 8 NN threads
+    # training gets physical 4-5 (visible as 0-1), DDP across them
+    # gatekeeper shares physical 4 (visible as 0)
+    # rate uses physical 5 (visible as 0)
+
+**Rules**
+
+- `--<proc>-gpus` flag sets `CUDA_VISIBLE_DEVICES` for that subprocess.
+- `--nn-device-ids-<proc>` is passed through to the underlying C++ binary
+  and is **0-indexed against the visible set**.
+- For training, `--train-gpus A,B` implies `torchrun --nproc_per_node=N`
+  where N = length of the list.
+- If a flag is omitted, default = single visible GPU 0.
+- Overlapping assignments (e.g. gate shares a GPU with train) are allowed;
+  driver handles contention.
+
+
+## TRT engine cache sharing (avoid rebuild on every promotion)
+
+Without care, every promotion triggers a 30-120s TRT engine rebuild in
+the next selfplay batch — at one promotion per ~1 hour, that's a ~2-3%
+throughput tax. We avoid it by making gatekeeper and selfplay share the
+cache.
+
+Requirements for the cache to hit:
+
+1. **Single cache directory**: all three binaries (`build/selfplay`,
+   `build/evaluate`, any future tool) use `models/trt_cache/`.
+
+2. **Content-hashed cache keys**: the TRT backend must key the cached
+   engine by ONNX-content-hash (or filename, since filenames are unique
+   per version), **not** by absolute path. Otherwise a file that moves
+   `candidates/v2000.onnx` → `accepted/v2000.onnx` invalidates its own
+   cache. Implementation requirement: verify current behavior in
+   `src/tensorrt_compute.cpp` (or wherever the cache key is formed) and
+   fix if it uses absolute path. Prefer `{basename, content-hash,
+   max_batch, device_sm}` as the key.
+
+3. **Same dynamic-batch profile across binaries**: gatekeeper calls
+   `build/evaluate` at low sims (150), selfplay calls `build/selfplay`
+   at high sims (500). If each builds an engine with a different opt
+   batch size, the cache misses. Fix: both binaries build dynamic-batch
+   engines with the same `(min=1, max=MAX_BATCH_SIZE)` profile; only the
+   opt value varies (and opt size does not invalidate the cache — TRT
+   reuses the same plan file).
+
+4. **Filename uniqueness across the run**: candidates are named
+   `v{step:09d}.onnx` (monotonic, zero-padded). Acceptance is a
+   `rename()` inside `models/`, so the basename is preserved. Selfplay
+   resolves `accepted/latest` → `accepted/v2000.onnx`; cache key
+   (basename=v2000.onnx + content hash) is identical to what the
+   gatekeeper produced during the match. Hit.
+
+With this setup, the gatekeeper match itself warms the TRT cache for the
+winner. Selfplay's next batch loads the plan from disk in <1s. Rejected
+candidates also leave a cached plan behind — small cost, worth keeping
+for forensic/rating-rerun purposes.
+
+
+## Logging and diagnostics
+
+The loop runs autonomously. When something goes wrong you need logs
+granular enough to pinpoint the misbehaving knob without re-running. All
+four workers write both a human-readable text log and a structured
+CSV/JSONL alongside.
+
+**Per-process log files** (under `logs/<ts>/`):
+
+| Process    | Text log         | Structured                     | Row cadence       |
+| ---------- | ---------------- | ------------------------------ | ----------------- |
+| train      | train.log        | train_metrics.csv              | one per 100 steps |
+| selfplay   | selfplay.log     | selfplay_batches.csv           | one per batch     |
+| gatekeeper | gatekeeper.log   | gate_decisions.csv             | one per cand      |
+| rate       | rate.log         | elo.csv                        | one per round     |
+
+**Columns in `train_metrics.csv` (aggregated per 100 steps):**
+step, wall_time, samples_seen, lr, value_weight, loss_total_mean,
+loss_total_p10, loss_total_p90, loss_policy, loss_value, loss_opp,
+loss_length, loss_own, loss_score_mean, loss_score_stdev, loss_belief,
+window_games, window_positions, bucket_samples, bucket_fill_ratio,
+steps_per_sec, gpu_mem_mb
+
+**Columns in `selfplay_batches.csv`:**
+batch_id, wall_time_start, wall_time_end, model_in_use, games_played,
+positions_written, duration_s
+
+**Columns in `gate_decisions.csv`:**
+wall_time, cand_step, baseline_step, games, sims, wins, draws, losses,
+score, threshold, verdict, match_duration_s
+
+**Event tags written to text logs:**
+
+- `EXPORT step=5000 path=... loss_ema=2.3 bucket=41024`
+- `MODEL_SWAP old=v000001000 new=v000002000`
+- `GATE_MATCH_START cand=... baseline=...`
+- `GATE_ACCEPT cand=... score=0.54 games=200`
+- `GATE_REJECT cand=... score=0.41 games=200`
+- `GATE_STALE_DROP cand=...`
+- `LR_DROP old_lr=3e-4 new_lr=1.5e-4 step=200000`
+- `BUDGET_SLEEP bucket=0 cap=131072`
+- `COLD_START_WAIT window_games=412`
+- `CRASH proc=... exit_code=... traceback_file=...`
+- `RESTART proc=... reason=...`
+
+**Diagnostic playbook** (symptom → which log → likely knob):
+
+| Symptom                               | Where to look                                      | Likely knob                               |
+| ------------------------------------- | -------------------------------------------------- | ----------------------------------------- |
+| Trainer sleeping often                | train.log `BUDGET_SLEEP` frequency                 | replay_target too low, or selfplay slow   |
+| Trainer bucket saturated              | train_metrics.csv bucket_fill_ratio near 1         | bucket_cap_mult too high; trainer slow    |
+| Gatekeeper queue growing              | gate_decisions.csv arrival rate vs verdict time    | export_every too low or gate_games high   |
+| Many GATE_STALE_DROP events           | gatekeeper.log                                     | export_every too low relative to gate rate|
+| All candidates ACCEPT                 | gate_decisions.csv verdict column                  | gate_threshold too loose                  |
+| All candidates REJECT                 | same                                               | gate_threshold too tight, or LR too high  |
+| Selfplay using stale model            | selfplay.log MODEL_SWAP vs gatekeeper GATE_ACCEPT  | selfplay_batch_games too large            |
+| LR never drops                        | train.log LR_DROP timing vs milestones             | lr_milestones set beyond run length       |
+| Elo chart flat despite promotions     | ratings/elo.csv deltas small                       | gate_threshold too loose (false accepts)  |
+| Elo chart jittery                     | ratings/elo.csv                                    | rating_games too small for signal         |
+| TRT rebuild on every batch            | selfplay.log slow batch starts                     | cache key bug or MAX_BATCH mismatch       |
+
+**Log retention**: keep everything for the duration of a run. Logs are
+small compared to selfplay `.bin.zst` files. On `init`, old runs are
+archived into `logs/archive-<ts>/`, not deleted (see Fresh-start flow).
+
+
+## File layout
+
+    training/
+    ├── selfplay/                         # flat pool; no iteration subdirs
+    │   ├── g_00000000000000001.bin.zst   # monotonic, sortable-by-name
+    │   ├── g_00000000000000002.bin.zst
+    │   └── ...                           # {epoch_ns}_{seq}_{uuid4prefix} also works
+    └── checkpoints/
+        └── training.pt                   # weights + optimizer_state_dict
+
+    models/
+    ├── candidates/                       # trainer writes here
+    │   └── v000005000.onnx
+    ├── accepted/                         # gatekeeper promotes here
+    │   ├── v000000000.onnx               # bootstrap
+    │   ├── v000005000.onnx
+    │   └── latest -> v000005000.onnx
+    ├── rejected/                         # rejected / stale-dropped candidates
+    │   └── v000002500.onnx
+    └── trt_cache/                        # shared between all C++ binaries
+
+    ratings/
+    └── elo.csv                           # step, model, elo, games
+
+    logs/<ts>/
+    ├── train.log
+    ├── train_metrics.csv
+    ├── selfplay.log
+    ├── selfplay_batches.csv
+    ├── gatekeeper.log
+    ├── gate_decisions.csv
+    ├── rate.log
+    └── supervisor.log                    # run_continuous.py own log
+
+    logs/archive-<ts>/                    # archived logs from previous init
+
+**Game file naming**:
+- Format: `g_{idx:017d}.bin.zst` where `idx` is a monotonic counter per
+  selfplay driver invocation, combined with a host-tag if multi-host
+  later. Zero-padded wide enough that lex-sort == arrival-order for the
+  life of the project (17 digits covers 10^17 games).
+- Alternative: `g_{epoch_ns}_{hostshort}_{seq:06d}.bin.zst` if multi-host
+  or single-counter coordination becomes awkward.
+- Do NOT use mtime-based ordering — fragile under clock skew / NFS.
+
+**Atomic writes**:
+- Selfplay writes each game record to `<name>.bin.zst.tmp`, then
+  `os.rename(...tmp, ...bin.zst)` on success. Trainer never sees
+  partial files.
+- Trainer writes candidate ONNX to `v<step>.onnx.tmp` then rename.
+- Gatekeeper moves candidate in/out via `os.rename` (atomic within a
+  filesystem; `models/` is one filesystem).
+- Symlink swap is tmp-symlink + rename (see Gatekeeper section).
+
+
+## Implementation phases
+
+All Python plus one tiny C++ change (TRT cache key if it's currently
+path-based).
+
+1. `scripts/train_continuous.py`
+   - Adapt `scripts/train.py`.
+   - Remove epoch loop; single continuous step loop gated by train
+     bucket. Bucket maintained by a background scanner thread that tails
+     `training/selfplay/*.bin.zst`.
+   - Fixed step-based LR schedule with warmup + milestone halvings.
+   - Step-driven `value_weight` ramp 1.0 → 2.0 over HEAD_RAMP_STEPS.
+   - Step-based ONNX export (atomic tmp + rename) into
+     `models/candidates/`.
+   - Window reader: scans game files by **filename**, holds a file-ref
+     list for the newest `window_games`; samples lazily (pick file, load
+     + decompress, pick record). No in-memory record cache.
+   - Persist `optimizer_state_dict` (restore on resume).
+   - Writes `train.log` and `train_metrics.csv` (per-100-step rollups).
+   - Respects `CUDA_VISIBLE_DEVICES` (set by supervisor).
+
+2. `scripts/selfplay_driver.py`
+   - Thin supervisor.
+   - Resolves `models/accepted/latest`.
+   - Invokes `build/selfplay --nn-device-ids <cfg>` with
+     `--games SELFPLAY_BATCH_GAMES`.
+   - Writes game records directly into `training/selfplay/` with
+     monotonic filenames + atomic `.tmp` → rename.
+   - Loops on clean exit; restarted by outer supervisor on crash.
+   - Writes `selfplay.log` and `selfplay_batches.csv`.
+
+3. `scripts/gatekeeper.py`
+   - Polls `models/candidates/` every `gate_poll_interval` seconds.
+   - Picks the newest candidate (`sorted(...)[-1]`).
+   - Moves older candidates to `rejected/` as GATE_STALE_DROP.
+   - Plays match vs `accepted/latest` using `build/evaluate` at
+     `gate_sims` visits and `gate_games` games.
+   - On accept: atomic rename into `accepted/`, atomic symlink swap.
+   - On reject: atomic rename into `rejected/`.
+   - Writes `gatekeeper.log` and `gate_decisions.csv`.
+
+4. `scripts/rate.py` (optional)
+   - Watches `models/accepted/` for new promotions.
+   - Periodic round-robin tournament between the k most recent accepted
+     models.
+   - Bayesian Elo via pairwise Bradley-Terry MLE on accumulated game
+     counts.
+   - Writes `rate.log` and `ratings/elo.csv`. Does not gate.
+
+5. `scripts/run_continuous.py`
+   - Top-level supervisor.
+   - Parses CLI flags: `--selfplay-gpus`, `--train-gpus`, `--gate-gpus`,
+     `--rate-gpus`, `--nn-device-ids-<proc>`, plus all knobs overridable.
+   - Creates `logs/<ts>/` directory.
+   - For each subprocess: sets `CUDA_VISIBLE_DEVICES` in env, spawns,
+     tees stdout/stderr into `logs/<ts>/<proc>.log`.
+   - Launches (1) under torchrun with `nproc_per_node=len(train_gpus)`.
+   - Launches (2), (3), (optionally 4) as plain subprocesses.
+   - Writes its own `supervisor.log` with process spawn/restart/exit
+     events.
+   - Handles Ctrl-C: send SIGTERM to all, wait N seconds, SIGKILL
+     leftover.
+   - On crash of any worker: log `CRASH`, restart after exponential
+     backoff (cap at 5 min), log `RESTART`. If a single worker crashes
+     3 times within 10 min, stop restarting it and alert; keep other
+     workers running.
+   - `init` subcommand: archives existing `training/`, `models/`,
+     `ratings/`, `logs/` into timestamped `archive-<ts>/` subdirs (not
+     delete); runs XQWL06 bootstrap to produce initial model; places it
+     in `models/accepted/v000000000.onnx` with `latest` symlink.
+
+6. C++ change (one file): ensure TRT cache key is content-hashed (or at
+   least basename-based), not absolute-path. Verify and fix in
+   `src/tensorrt_compute.cpp`. Verify MAX_BATCH_SIZE is identical across
+   `build/selfplay` and `build/evaluate`. Small change; testable by
+   doing a single promotion and timing selfplay startup.
+
+7. Archive old loop: rename `run_loop.py` → `run_loop_phased.py`.
+   `run_continuous.py` becomes the default entry point.
+
+
+## Sanity checkpoints and scale-up decision
+
+A 1-week run is too long to discover the pipeline is broken on day 6.
+At each of these checkpoints, look at the logs and confirm forward
+progress; abort and debug if signals are missing.
+
+**6 hours in** — basic pipeline health:
+- `selfplay_batches.csv` shows batches completing with
+  `games_played == 300` (no crashes mid-batch).
+- `train_metrics.csv` has ≥ 5000 steps logged. Loss total is decreasing
+  (policy loss trending down is the strongest signal).
+- At least one `EXPORT` event in `train.log`.
+- `bucket_fill_ratio` fluctuates in 0.05-0.9 range (neither pinned empty
+  nor pinned full).
+- No repeating `CRASH`/`RESTART` events on any worker.
+
+**24 hours in** — early strength signal:
+- ≥ 5 `GATE_ACCEPT` events. If accept rate is 0% the model isn't
+  improving fast enough to beat itself; check loss curves and LR.
+- If accept rate is 100%, gate_threshold is too loose (every slightly-
+  different weight-set wins) — not critical but tighten after the run.
+- `ratings/elo.csv` (if rating enabled) shows ≥ 100 Elo gain between
+  v000000000 (bootstrap) and the newest accepted. If flat, the
+  gatekeeper's promotions aren't translating to real strength — check
+  `gate_decisions.csv` score distribution.
+- `selfplay.log` MODEL_SWAP events within minutes of GATE_ACCEPT events
+  (not hours — that would mean selfplay_batch_games is too large).
+
+**72 hours in** — steady-state check:
+- Training step count roughly matches the conservative projection
+  (~78k steps at 0.3 steps/s). If far below, either selfplay is slower
+  than expected or BUDGET_SLEEP is pinning the trainer — check
+  `bucket_fill_ratio` logs.
+- Elo curve is still rising (not plateaued at ~200-300 Elo above
+  bootstrap — that would suggest the model has converged for this LR
+  and the next milestone hasn't hit yet).
+- If LR milestone already hit, verify the drop is reflected in the
+  `lr` column of `train_metrics.csv`.
+
+**Scale-up decision (after 1-week run completes):**
+- If pipeline worked and Elo is still rising at end of week: extend
+  runtime, don't change knobs. Trajectory will keep improving.
+- If trainer was BUDGET_SLEEPing > 50% of the time: selfplay is the
+  bottleneck. Options: add GPUs to selfplay, reduce gatekeeper/rating
+  GPU share, lower `replay_target` to 3.
+- If bucket was saturated > 80% of the time: trainer is the bottleneck.
+  Options: add GPUs to training (wider DDP), raise `replay_target` to
+  5-6, or raise `batch_size` to 2048.
+- If Elo gains plateau and no obvious throughput imbalance: model
+  capacity is likely the limit. Scale model (64f/5b → 128f/10b) before
+  scaling runtime.
+- If throughput assumptions held (~0.3 steps/s sustained) and the run
+  was productive: the pipeline is proven. Next run can push
+  `window_games`, `export_every`, and `lr_milestones` higher with
+  confidence.
+
+
+## Fresh-start flow
+
+1. `python scripts/run_continuous.py init`
+   - Archives `training/`, `models/`, `ratings/`, `logs/` into
+     `archive-<ts>/` subdirs. Nothing deleted.
+   - Runs XQWL06 bootstrap to produce `models/accepted/v000000000.onnx`.
+   - Points `models/accepted/latest` at it.
+
+2. `python scripts/run_continuous.py run [--<proc>-gpus ...] [knob overrides]`
+   - Launches selfplay driver, train_continuous (under torchrun),
+     gatekeeper, and rating — all as subprocesses with GPU assignment.
+   - Runs until Ctrl-C.
+   - Resumable: on restart, picks up existing `training.pt` (weights +
+     optimizer state), existing selfplay records, existing accepted
+     models, existing logs (new run opens a fresh `logs/<ts>/`).
+
+
+## Deviations from KataGo
+
+Where we simplify because we are small-scale:
+
+- Rolling window is "newest M games" (flat count) rather than KataGo's
+  row-count power-law taper. Power-law matters at hundreds-of-millions
+  scale; a flat window is fine at ours.
+- Selfplay polls `accepted/latest` symlink from Python between C++ binary
+  invocations, instead of calling `findLatestModel` in a C++ background
+  thread. Simpler; avoids C++ changes; ~30-60s check cadence vs their
+  20s.
+- No separate shuffled-row data files (`shuffle.py`). Training samples
+  directly from the flat selfplay pool. KataGo's shuffler becomes
+  necessary only when the pool is too big to hold in memory; ours is
+  not.
+- Rating is a single-process, optional monitoring tool rather than a
+  full `match` tournament infrastructure.
+- Gatekeeper picks newest candidate and drops older ones (stale-drop),
+  rather than FIFO-evaluating every candidate KataGo queues up. Matches
+  KataGo's "throw away old candidates if you fall behind" behavior
+  implemented differently.
+- Go scoring: count wins only (draws count as losses), not (w +
+  0.5d)/total. Draws are near-impossible under half-integer komi
+  anyway.
+
+Where we match KataGo exactly:
+
+- Persist Adam optimizer state across restarts.
+- Train bucket for replay-ratio enforcement (not monotonic-counter).
+- Fixed LR step schedule (no auto-plateau).
+- Fixed MCTS and head weights during continuous training.
+
+
+## Open choices / tuning notes
+
+All numbered knobs have reasonable defaults above, but these are the
+most likely tuning targets based on real run behavior:
+
+- `replay_target`: 4 (matches KataGo). If trainer BUDGET_SLEEPs
+  frequently, consider 3; if trainer always saturates the bucket,
+  consider 5-6. Do not go above 8 (overfitting risk).
+- `export_every`: 5000 steps gives ~1 candidate per 4.8h at conservative
+  throughput. Lower if you want snappier feedback; but gate_games=200
+  matches cost ~60-120s each on shared GPUs, so going below 2000 starts
+  queuing (and triggering GATE_STALE_DROP).
+- `gate_threshold`: 0.5 is KataGo's permissive default. If Elo chart
+  shows many accepts with no real Elo gain, bump to 0.52-0.55.
+- `head_ramp_steps`: 30k targets ~day 1-2 completion at conservative
+  throughput. If value loss plateaus before the ramp finishes, shorten
+  to 15k. If the ramp completes before the model has meaningful
+  value-head competence, lengthen to 50k+.
+- `bucket_cap_mult`: 64 allows ~4 min of trainer catch-up at conservative
+  fill rate. If training stalls for minutes during TRT rebuilds (cache
+  bug), bucket saturates and you lose credits — fix the TRT cache first,
+  don't raise the cap.
+- `window_games`: 80k covers ~15h at conservative selfplay rate. Shorter
+  windows (e.g. 30k) give fresher data but less diversity — only useful
+  if model is improving very fast. Longer (e.g. 200k) smoother but slower
+  to respond to new strengths, and may not fill within a 1-week run.
+- `lr_milestones[0]`: 100k hits day 4 at conservative throughput. If
+  throughput is consistently better, first drop lands earlier — fine,
+  model adapts. If consistently worse, drop never fires in a 1-week
+  run — consider lowering to 80k for the next run, but raising floor
+  LR (`base_lr` → smaller) is usually the cleaner fix.
+- **Bigger knobs for scaling up later** (only after first run proves
+  out): `batch_size` to 2048 if memory allows, `window_games` to
+  200-500k for longer runs, extend LR milestones proportionally to
+  expected step count.
