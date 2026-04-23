@@ -281,72 +281,151 @@ how often the trainer offers a new candidate for evaluation. Each export
 is a cheap ONNX dump done in the training process (~1-3s blocking).
 
 
+## DDP ownership of bucket and window state
+
+`torchrun --nproc_per_node=N` launches N trainer processes. They all
+share one logical training loop via collective ops, but each process
+has its own Python interpreter and memory. Bucket and scanner state
+must be single-sourced, otherwise ranks can disagree on whether the
+current step is fundable — one rank enters `train_step` while another
+is still sleeping, and the DDP allreduce hangs.
+
+Ownership rules:
+
+- **Rank 0 owns**: the Bucket, the Scanner thread, the file watermark,
+  and the authority to decide whether this step runs. All persistence
+  (training.pt checkpoint, status.json) happens on rank 0 only.
+- **All ranks own**: their own WindowRingBuffer with their own ingest
+  thread. Every rank scans the same pool directory and independently
+  fills its ring. Random sampling inside each rank's ring uses a
+  rank-offset RNG seed so batches differ — DDP then averages gradients
+  as usual. Rings may drift slightly in decompression timing, but
+  correctness doesn't depend on ring contents being identical across
+  ranks.
+- **Every step is a collective decision**:
+    1. Rank 0 checks bucket; computes `step_ok: bool`.
+    2. Broadcast `step_ok` from rank 0 to all ranks (single bool =
+       negligible cost).
+    3. If `step_ok` is False: all ranks sleep 5s and loop back.
+    4. If True: all ranks run `train_step`, then rank 0 drains bucket
+       by `batch_size × world_size`.
+- **Resume / checkpoint**: only rank 0 writes training.pt and
+  status.json. All ranks enter `torch.distributed.barrier()` around the
+  save so nobody advances the step counter mid-write. On resume, rank 0
+  reads training.pt, broadcasts `{step, bucket_level, watermark}` to
+  other ranks, and all ranks load model/optimizer state identically
+  from the same file.
+- **Cold-start gate**: rank 0 decides, broadcasts. Same collective
+  pattern.
+
+This keeps all bucket bookkeeping single-owner (no rank-drift possible)
+while still parallelizing the expensive decompression work across
+ranks.
+
+
 ## Train loop (pseudocode)
 
-    # Resume or fresh start
-    resume      = load_checkpoint_if_exists()  # None on fresh start
-    step        = resume.step if resume else 0
-    bucket      = Bucket(max_bucket_samples=BUCKET_CAP_MULT * batch_size * world_size,
-                         initial_level=resume.bucket_level if resume else 0)
-    window      = WindowRingBuffer(ring_games=RING_GAMES,
-                                   pool_dir="training/selfplay/",
-                                   window_games=WINDOW_GAMES,
-                                   watermark=resume.seen_row_marker if resume else None)
-    scanner     = WindowScanner(replay_target=REPLAY_TARGET,
+    # Resume or fresh start — rank 0 drives; non-zero ranks wait for broadcast.
+    if rank == 0:
+        resume = load_checkpoint_if_exists()
+    else:
+        resume = None
+    resume_meta = broadcast_object_from_rank0(
+        resume.meta() if (rank == 0 and resume) else None)
+
+    step = resume_meta["step"] if resume_meta else 0
+    load_model_and_optimizer(model, optimizer,
+                             path="training/checkpoints/training.pt",
+                             exists=bool(resume_meta))
+
+    # Rank 0 only: bucket + scanner + file watermark
+    if rank == 0:
+        bucket  = Bucket(max_bucket_samples=BUCKET_CAP_MULT * batch_size * world_size,
+                         initial_level=resume_meta["bucket_level"] if resume_meta else 0)
+        scanner = WindowScanner(replay_target=REPLAY_TARGET,
                                 n_augmentations=N_AUGMENTATIONS,
-                                bucket=bucket, window=window)
-    scanner.start()                           # background thread
+                                bucket=bucket,
+                                pool_dir="training/selfplay/",
+                                watermark=resume_meta["watermark"] if resume_meta else None)
+        scanner.start()                       # background thread
+
+    # All ranks: local ring buffer + ingest thread
+    window = WindowRingBuffer(ring_games=RING_GAMES,
+                              pool_dir="training/selfplay/",
+                              rng_seed=BASE_SEED + rank)
+    window.start_ingest()                     # background thread
 
     lr_schedule = FixedStepLR(warmup=WARMUP_STEPS,
                               base=BASE_LR,
                               milestones=LR_MILESTONES,
                               gammas=LR_GAMMAS)
-    value_ramp  = LinearRamp(start=1.0,  end=2.0,   end_step=VALUE_RAMP_STEPS)
-    score_ramp  = LinearRamp(start=0.0,  end=1.0,   end_step=SCORE_RAMP_STEPS)
+    value_ramp  = LinearRamp(start=1.0, end=2.0, end_step=VALUE_RAMP_STEPS)
+    score_ramp  = LinearRamp(start=0.0, end=1.0, end_step=SCORE_RAMP_STEPS)
 
     while True:
-        if window.num_games() < MIN_WINDOW_GAMES:
-            log_event("COLD_START_WAIT", window_games=window.num_games())
+        # Cold-start gate: rank 0 checks window size, broadcasts.
+        go = torch.tensor(0, device=device)
+        if rank == 0:
+            go.fill_(1 if scanner.window_games() >= MIN_WINDOW_GAMES else 0)
+        dist.broadcast(go, src=0)
+        if go.item() == 0:
+            if rank == 0:
+                log_event("COLD_START_WAIT", window_games=scanner.window_games())
             sleep(30); continue
 
-        if bucket.available() < batch_size * world_size:
-            log_event("BUDGET_SLEEP", bucket=bucket.available(),
-                                      cap=bucket.max)
+        # Bucket gate: rank 0 checks, broadcasts.
+        if rank == 0:
+            go.fill_(1 if bucket.available() >= batch_size * world_size else 0)
+        dist.broadcast(go, src=0)
+        if go.item() == 0:
+            if rank == 0:
+                log_event("BUDGET_SLEEP", bucket=bucket.available(),
+                                          cap=bucket.max)
             sleep(5); continue
 
+        # All ranks: local sample + DDP step.
         batch = window.sample_batch(batch_size)
         lr    = lr_schedule(step)
         f_v   = value_ramp(step)              # value weight 1.0 → 2.0
         f_s   = score_ramp(step)              # 0 → 1 multiplier for score knobs
         wts   = head_weights_with_ramps(f_v, f_s)
-        # The mcts_score_weight ramp is consumed by SELFPLAY (not training),
-        # but the ramp factor is driven by training step count. The trainer
-        # publishes the current factor in a status file that the selfplay
-        # driver reads before each batch (see Selfplay driver).
-        loss  = train_step(batch, lr=lr, head_weights=wts)
+        loss  = train_step(batch, lr=lr, head_weights=wts)  # DDP allreduce inside
 
-        bucket.drain(batch_size * world_size)
+        if rank == 0:
+            bucket.drain(batch_size * world_size)
         step += 1
 
-        log_metric_row(step, wall_time, samples_seen=step * batch_size * world_size,
-                       lr, loss, window_positions=scanner.window_positions,
-                       bucket=bucket.available(), ring_rows=window.ring_size(), ...)
-
-        if step % EXPORT_EVERY == 0:
-            path = f"models/candidates/v{step:09d}.onnx"
-            export_onnx(path, atomic=True)    # write .tmp then rename
-            save_checkpoint(step=step,
-                            model=model, optimizer=optimizer,
-                            bucket_level=bucket.available(),
-                            seen_row_marker=scanner.watermark(),
-                            rng_state=get_rng_state())
-            # Publish ramp state for selfplay (atomic tmp + rename)
+        # Publish ramp state at a MUCH higher cadence than export, so
+        # selfplay sees a smooth ramp. Cheap JSON write; does not block
+        # other ranks (rank 0 only).
+        if rank == 0 and step % STATUS_PUBLISH_EVERY == 0:
             write_json_atomic("training/status.json",
                               {"step": step,
                                "score_ramp": f_s,
                                "value_ramp": f_v,
-                               "lr": lr})
-            log_event("EXPORT", step=step, path=path, loss_ema=..., bucket=...)
+                               "lr": lr,
+                               "wall_time": time.time()})
+
+        if rank == 0 and step % LOG_EVERY == 0:
+            log_metric_row(step, wall_time, samples_seen=step * batch_size * world_size,
+                           lr, loss, window_positions=scanner.window_positions,
+                           bucket=bucket.available(), ring_rows=window.ring_size(), ...)
+
+        if step % EXPORT_EVERY == 0:
+            # Barrier ensures all ranks have finished the step before
+            # rank 0 exports/checkpoints. Prevents half-written state.
+            dist.barrier()
+            if rank == 0:
+                path = f"models/candidates/v{step:09d}.onnx"
+                export_onnx(path, atomic=True)
+                save_checkpoint(step=step,
+                                model=model, optimizer=optimizer,
+                                bucket_level=bucket.available(),
+                                watermark=scanner.watermark(),
+                                rng_state=get_rng_state())
+                log_event("EXPORT", step=step, path=path,
+                          loss_ema=..., bucket=...)
+            dist.barrier()
 
         if step % LR_HALVE_LOG_STEPS == 0 and lr_schedule.just_halved():
             log_event("LR_DROP", old_lr=..., new_lr=lr, step=step)
@@ -362,10 +441,23 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
 
 ## Selfplay driver (pseudocode)
 
-    global_counter = load_counter("training/selfplay/.counter")  # int, persists across runs
+    POOL = "training/selfplay"
 
-    # Clean up any half-written staging dirs from a prior crash
-    for staging in glob("training/selfplay/staging/batch_*"):
+    # Crash-safe: derive the next filename ID from what's already on
+    # disk. No separate counter file to get out of sync.
+    def next_id(pool_dir):
+        existing = glob(f"{pool_dir}/g_*.bin.zst")
+        if not existing:
+            return 1
+        def id_of(p):
+            stem = Path(p).name[len("g_"):-len(".bin.zst")]
+            return int(stem)
+        return max(id_of(p) for p in existing) + 1
+
+    # Startup cleanup: half-written .tmp files and orphan staging dirs.
+    for orphan in glob(f"{POOL}/g_*.bin.zst.tmp"):
+        os.remove(orphan)
+    for staging in glob(f"{POOL}/staging/batch_*"):
         rmtree(staging)
 
     while True:
@@ -375,7 +467,7 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
             last_logged_model = current_model
 
         # Read trainer's ramp state — defaults to 0 if trainer hasn't
-        # exported yet (very early run) or status.json is missing.
+        # published yet (very early run) or status.json is missing.
         status = read_json_safely("training/status.json",
                                   default={"score_ramp": 0.0})
         mcts_score_weight = 0.06 * status["score_ramp"]
@@ -383,7 +475,7 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
         # Binary writes to a fresh staging dir (its own "0-indexed" game_N.bin
         # namespace); Python then renumbers and compresses into the shared pool.
         batch_id = next_batch_id()
-        staging  = f"training/selfplay/staging/batch_{batch_id:09d}"
+        staging  = f"{POOL}/staging/batch_{batch_id:09d}"
         makedirs(staging)
 
         t0 = time.time()
@@ -393,28 +485,42 @@ is a cheap ONNX dump done in the training process (~1-3s blocking).
                          mcts_score_weight=mcts_score_weight)  # passes --score-weight
         t_selfplay = time.time() - t0
 
-        # Rename + compress into shared pool with monotonic filenames,
-        # atomically. Trainer never sees partial files.
+        # Compute all final filenames BEFORE any rename, so that if we
+        # crash mid-loop the next restart computes a new next_id that
+        # is strictly greater than any already-published file.
+        # (next_id is called here, AFTER all prior ranames landed.)
+        start_id = next_id(POOL)
+        bin_paths = sorted(glob(f"{staging}/game_*.bin"))
+
         positions_written = 0
-        for bin_path in sorted(glob(f"{staging}/game_*.bin")):
-            global_counter += 1
-            final = f"training/selfplay/g_{global_counter:017d}.bin.zst"
+        for i, bin_path in enumerate(bin_paths):
+            gid   = start_id + i
+            final = f"{POOL}/g_{gid:017d}.bin.zst"
             tmp   = final + ".tmp"
             with open(bin_path, "rb") as fin, \
                  zstd.open(tmp, "wb") as fout:
-                data = fin.read()
-                fout.write(data)
+                fout.write(fin.read())
             os.rename(tmp, final)                 # atomic publish
             positions_written += count_rows_in_zst(final)
             os.remove(bin_path)
-        save_counter("training/selfplay/.counter", global_counter)
+
+        # Disk pruning: after publishing, cap the pool at window_games.
+        all_pool = sorted(glob(f"{POOL}/g_*.bin.zst"))
+        if len(all_pool) > WINDOW_GAMES:
+            for old in all_pool[:-WINDOW_GAMES]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass  # races are benign; next iteration retries
+
         rmtree(staging)
 
         log_batch_row(batch_id, model=current_model,
                       games=SELFPLAY_BATCH_GAMES,
                       duration=time.time()-t0,
                       selfplay_duration=t_selfplay,
-                      positions_written=positions_written)
+                      positions_written=positions_written,
+                      pool_size=min(len(all_pool), WINDOW_GAMES))
 
 Why staging + rename: the current `build/selfplay` binary (see
 `src/main_selfplay.cpp:185`) starts `game_id` at 0 on every invocation
@@ -425,12 +531,32 @@ driver is responsible for (a) monotonic renaming across the whole run,
 (b) zstd compression, and (c) atomic publish via `rename`. No C++
 changes required.
 
-The `.counter` file holds the monotonic index. On driver restart, it's
-read, so no overlap with prior runs. If the driver itself crashes
-between rename and counter save, worst case: next restart reuses the
-same counter value → the next game overwrites (rare; 1-in-300-game
-window). Acceptable; can be tightened later by checkpointing the
-counter more often if it matters.
+**Crash-safety of the monotonic filename scheme**: there is no persistent
+counter file. Each batch computes `start_id = max(existing IDs on
+disk) + 1` atomically at the moment of first publish. If the driver
+crashes mid-batch, some files from that batch may be published and some
+may be in `.tmp` state. On restart:
+
+- orphan `.tmp` files are deleted,
+- staging dirs are deleted,
+- the next `next_id()` call observes the max ID that actually landed
+  (monotonic from the on-disk truth), and publishes the next batch
+  starting at `max + 1`.
+
+So the invariant "published filenames are strictly increasing, no ID
+collisions, ever" holds across any crash pattern. The scanner watermark
+(tracked by rank-0 trainer) is robust because it references specific
+filenames, not counter values.
+
+**Disk pruning**: the selfplay driver is the single writer and also
+owns pruning. After each batch, if the pool has more than
+`WINDOW_GAMES` files, the oldest ones (by sorted filename) are deleted.
+This is why `window_games` in the knobs table actually governs disk
+retention — because a process enforces it. Pruning races with the
+trainer's ingest thread are benign: trainer's ingest reads file,
+decompresses, copies rows into ring, closes; if a race hits an
+already-decompressed file, the OS simply returns the data it already
+read, and the file is removed afterwards.
 
 
 ## Gatekeeper (pseudocode)
@@ -606,12 +732,18 @@ to ~1 week. Scale up only after the first run proves the pipeline.
                                             (internally scaled by 1/N_AUGMENTATIONS=1/8
                                             for row-bucket crediting — see Train bucket section)
   n_augmentations          8                rows written per position (src/mcts.cpp:725)
-  window_games             80000            files kept on disk (~15h at 1.5 games/s)
-  ring_games               1000             in-RAM ring buffer (~800k rows × 6KB ≈ 5 GB).
-                                            This is the effective sampling window.
+  window_games             80000            disk retention cap; selfplay driver
+                                            prunes oldest beyond this (~15h at 1.5 games/s)
+  ring_games               2000             per-rank in-RAM ring buffer
+                                            (~1.6M rows × 6KB ≈ 10 GB per rank).
+                                            This is the effective sampling window
+                                            (~22 min at 1.5 games/s).
   min_window_games         2000             cold-start gate — no training until reached
   bucket_cap_mult          64               max_bucket = 64 × batch × world_size (~4 min catch-up)
   export_every             5000 steps       candidate every ~4.8h at conservative throughput
+  status_publish_every     100 steps        rank 0 writes training/status.json
+                                            (~5 min at conservative — smooth ramp for selfplay)
+  log_every                100 steps        aggregated metric row cadence
   batch_size               1024             per DDP rank (total 2048 for 2-GPU DDP)
   value_ramp_steps         30000            value-weight ramp 1.0 → 2.0 (~28h at conservative)
   score_ramp_steps         50000            score-knobs ramp 0 → full (~46h at conservative)
@@ -914,33 +1046,47 @@ path-based).
      VALUE_RAMP_STEPS, and a single `score_ramp(step)` factor that
      scales `mcts_score_weight`, `head_score_mean_weight`,
      `head_score_stdev_weight`, and `head_score_belief_weight` over
-     SCORE_RAMP_STEPS. Publishes both factors to `training/status.json`
-     atomically at each export so the selfplay driver can pick up the
-     MCTS ramp.
+     SCORE_RAMP_STEPS. Rank 0 publishes both factors to
+     `training/status.json` atomically every STATUS_PUBLISH_EVERY steps
+     (default: 100 steps ≈ every ~5 min at conservative throughput),
+     not just at export. This gives selfplay a smooth ramp signal
+     rather than multi-hour jumps tied to candidate exports.
    - Step-based ONNX export (atomic tmp + rename) into
      `models/candidates/`.
-   - **Window + ring-buffer reader**: the window is a virtual view
-     `sorted(pool)[-WINDOW_GAMES:]` — the set of files eligible to be
-     sampled. Training never reads the entire window per step; instead:
-       * A background ingest thread decompresses games from the window
-         on a rolling basis (newest first) and pushes their rows into an
-         in-memory ring buffer sized to `RING_ROWS` (default: 800k rows
-         ≈ 1000 games × 800 aug_rows × ~6KB = ~5 GB RAM).
+   - **Window + ring-buffer reader**: `window_games` governs disk
+     retention (enforced by selfplay driver's pruner — see Selfplay
+     driver). The trainer-side effective sampling window is the
+     in-memory ring buffer, which is much smaller than `window_games`:
+       * Each rank runs a background ingest thread that decompresses
+         newly-arrived games and pushes their rows into a local ring
+         buffer sized to `RING_ROWS` (default: 1.6M rows ≈ 2000 games ×
+         800 aug_rows × ~6KB = ~10 GB RAM per rank).
        * When the ring is full, adding a new game's rows evicts the
          oldest equal count of rows (FIFO at row granularity; exact
          game-boundary eviction is unnecessary).
        * Each decompress is amortized: one file produces ~800 rows →
-         ~400 batches at batch=2048 → ~400 steps between decompresses
-         per ring slot → ~1 decompress per ~0.5s at steady-state
-         (compatible with a few percent of one CPU core).
-       * Trainer samples uniformly from the ring. No pick-file-per-batch
-         decompress cost.
-     Trade-off vs. sampling from the entire window: rows far outside the
-     ring never get sampled, so `RING_ROWS` functions as the effective
-     window. For conservative settings (1500 games in ring, ~15h of
-     fresh data), this is equivalent to `window_games = 1500` for
-     sampling purposes, while the larger file-level `window_games` just
-     bounds when files are deleted off disk.
+         ~400 batches at batch=2048 → ~400 steps before that file's
+         rows get evicted → ingest decompresses ~1 file per 1.3s
+         sustained (compatible with a few percent of one CPU core).
+       * Trainer samples uniformly from its local ring. No pick-file-
+         per-batch decompress cost.
+     **Freshness math** (corrected): at 1.5 games/s × 800 rows/game =
+     1200 rows/s fill rate, a 1.6M-row ring evicts in 1.6M / 1200 ≈
+     1333 s ≈ **22 minutes**. So the effective sampling window is ~22
+     min of selfplay data, not hours. This is much tighter than the
+     80k-file disk window, and tighter than KataGo's hour-scale shuffle
+     buffer, but adequate for continuous training: the model changes
+     slowly enough that 22 min of current-strength games is
+     representative.
+     Per-row sample-probability during its ring lifetime: at 614
+     samples/s × 1333 s / 1.6M rows ≈ **0.51**, matching position-level
+     replay_target=4 across 8 augmentations (each position's 8 aug rows
+     each sampled once with p=0.5 → expected 4 position-level visits).
+     **Tradeoff**: larger ring (more RAM) gives more diversity within
+     each batch but doesn't change the replay accounting. Smaller ring
+     (less RAM) risks per-batch gradient correlation. 2000 games × 10
+     GB/rank is a reasonable starting point for a 2×4090 / 64+ GB RAM
+     box. Scale linearly with available RAM.
    - Persist checkpoint on export: model + optimizer + step +
      bucket_level + seen_row_marker + rng_state. Restore all on resume.
    - Writes `train.log` and `train_metrics.csv` (per-100-step rollups).
@@ -949,10 +1095,23 @@ path-based).
 2. `scripts/selfplay_driver.py`
    - Thin supervisor.
    - Resolves `models/accepted/latest`.
-   - Invokes `build/selfplay --nn-device-ids <cfg>` with
-     `--games SELFPLAY_BATCH_GAMES`.
-   - Writes game records directly into `training/selfplay/` with
-     monotonic filenames + atomic `.tmp` → rename.
+   - Invokes `build/selfplay --nn-device-ids <cfg>` into a staging dir
+     (`training/selfplay/staging/batch_<id>/`); then compresses,
+     monotonic-renames via `g_<idx:017d>.bin.zst.tmp` → `...bin.zst`
+     (atomic) into the shared pool.
+   - Crash-safe monotonic IDs: `next_id = max(existing g_*.bin.zst IDs) + 1`,
+     recomputed from disk each batch. No separate counter file; no
+     possibility of overwriting a published file across any crash
+     pattern.
+   - Reads `training/status.json` each iteration, passes
+     `--score-weight = 0.06 × score_ramp` to the binary for the MCTS
+     ramp.
+   - **Owns disk retention**: after each batch's publish step, if the
+     pool exceeds `window_games`, oldest files (by sorted filename)
+     are deleted. This is the only process that deletes files from
+     `training/selfplay/`.
+   - Startup cleanup: deletes orphan `*.bin.zst.tmp` files and any
+     leftover `staging/batch_*` dirs from a prior crash.
    - Loops on clean exit; restarted by outer supervisor on crash.
    - Writes `selfplay.log` and `selfplay_batches.csv`.
 
@@ -1146,10 +1305,13 @@ most likely tuning targets based on real run behavior:
   selfplay rate. Shorter (e.g. 30k) gives fresher data, saves disk; not
   usually necessary. This knob controls WHEN files get deleted, not
   sampling — sampling is governed by `ring_games`.
-- `ring_games`: 1000 games × 800 aug_rows ≈ 800k rows ≈ 5 GB RAM. This
-  is the effective sampling window. To get more sample diversity, raise
-  to 2000-3000 (10-15 GB RAM). Lower only if RAM-constrained. Matches
-  KataGo's shuffle-buffer role without needing a separate shuffler
+- `ring_games`: 2000 games × 800 aug_rows ≈ 1.6M rows ≈ 10 GB RAM PER
+  RANK (so 20 GB total on a 2-GPU DDP box). At 1.5 games/s fill, row
+  lifetime in the ring is ~22 min — that IS the effective sampling
+  window. Raise to 4000-5000 (20-25 GB per rank) for more diversity if
+  you have RAM. Lower only if RAM-constrained. Tighter than KataGo's
+  shuffle-buffer (which is hour-scale) but adequate for continuous
+  training where model strength changes slowly.
   process.
 - `lr_milestones[0]`: 100k hits day 4 at conservative throughput. If
   throughput is consistently better, first drop lands earlier — fine,
