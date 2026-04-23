@@ -3,11 +3,22 @@
 ## Goal
 
 Replace the phased iterate/train/eval/reject loop with a continuous,
-KataGo-style pipeline. Selfplay, training, gatekeeper, and (optional) rating
-run concurrently as independent processes, coordinating only via the
-filesystem. Same code path scales from a single 2×4090 box to a cluster; the
-only thing that changes is how many selfplay workers you point at the shared
-game pool and how GPUs are split between roles.
+KataGo-style pipeline. Selfplay, training, gatekeeper, and (optional)
+rating run concurrently as independent processes, coordinating only via
+the filesystem.
+
+Scope for this plan: **single-host, single selfplay writer**. The
+selfplay driver is the sole owner of filename allocation, staging
+cleanup, and disk pruning (see Selfplay driver section). Scaling
+selfplay to multiple hosts or processes is NOT covered here — doing
+that safely requires a per-writer ID namespace (e.g.
+`g_w{worker_id:02d}_{seq:017d}.bin.zst`) and a coordinated pruner, and
+those changes ripple into the scanner watermark format and the crash-
+recovery protocol. When we need cluster-scale, design that as a
+follow-up; do not assume this plan covers it.
+
+Training DDP scaling (multiple GPUs on ONE host) is covered — see the
+DDP ownership section.
 
 Fresh start only. No warm-start from any prior run.
 
@@ -144,11 +155,17 @@ across its assigned GPUs. Selfplay stays at per-device NN server threads
 
 Two separate counters that move at different rates. Never confuse them.
 
-- **1 step** = one optimizer update = one batch forward+backward. With
-  default batch=1024 and DDP across 2 GPUs, one step consumes **1024
-  training samples**.
-- **1 game** = one full selfplay game, ~100 moves → ~100 positions written
-  to disk.
+- **1 step** = one synchronized DDP optimizer update. `batch_size` in
+  this document is the **per-rank** batch (default 1024). With DDP
+  across `world_size=2` GPUs, one step processes
+  `batch_size × world_size = 2048` training samples total (1024 per
+  rank, gradients allreduced). All bucket/replay/export math below uses
+  this global 2048-sample-per-step unit. Defaults elsewhere
+  (`bucket_cap_mult × batch_size × world_size`, sustained-rate formulas)
+  refer to this same global quantity.
+- **1 game** = one full selfplay game, ~100 moves → ~100 positions
+  written to disk. Each position expands to 8 augmented rows
+  (`src/mcts.cpp:725`), so ~800 rows per game on disk.
 
 Worked defaults (2×4090, ResNet 64f/5b, 500 sims, all processes sharing GPUs):
 
@@ -222,16 +239,23 @@ The train bucket is the trainer's pacing knob. Semantics:
     bucket                 = 0            # current credit, in samples (rows)
     max_bucket_samples     = BUCKET_CAP_MULT * batch_size * world_size
                                           # soft cap to prevent unbounded growth
-    seen_row_marker        = (file_index, row_offset) into the sorted pool
+    watermark_id           = 0            # max g_<id> already credited
+                                          # (filename-based, not index-based)
 
     Scanner thread (fires every ~5s):
-        new_rows = count rows in training/selfplay/*.bin.zst files
-                   that arrived since seen_row_marker
+        # Enumerate pool, parse IDs from filenames. IDs are monotonic
+        # (selfplay driver guarantees this), so new files always have
+        # id > watermark_id even if older files were pruned.
+        new_files = [f for f in glob("training/selfplay/g_*.bin.zst")
+                     if parse_id(f) > watermark_id]
+        new_rows   = sum(count_rows(f) for f in new_files)
+        max_new_id = max(parse_id(f) for f in new_files) if new_files else watermark_id
+
         # Credit per row = replay_target / N_AUGMENTATIONS, because
         # replay_target is defined per UNIQUE position (matches KataGo).
         bucket  += (replay_target * new_rows) // N_AUGMENTATIONS
         bucket   = min(bucket, max_bucket_samples)
-        seen_row_marker = current watermark
+        watermark_id = max_new_id
 
     Trainer:
         while True:
@@ -243,23 +267,35 @@ The train bucket is the trainer's pacing knob. Semantics:
             step   += 1
             ...
 
+Why filename-ID-based (not index-based): old files get pruned by the
+selfplay driver once the pool exceeds `window_games`. If the watermark
+were `(file_index, row_offset)` into `sorted(pool)`, pruning the
+oldest N files would shift every remaining file's index down by N, so
+a persisted marker at (500, X) would point to a different file after
+restart. With a filename-based ID (monotonic, unique, never reused —
+see Selfplay driver's crash-safe ID scheme), the watermark survives
+any pruning pattern: after pruning, files with id ≤ watermark_id
+simply don't exist any more, and the scanner keeps crediting only
+files with id > watermark_id as before.
+
 Persistence (at each EXPORT step, and on clean shutdown):
     save training.pt with:
         model_state_dict
         optimizer_state_dict
         step
-        bucket_level            # current credit in rows
-        seen_row_marker         # file index + offset watermark
+        bucket_level            # current credit, in rows
+        watermark_id            # filename ID-based watermark (int)
         rng_state               # for reproducible sampling
 
 On resume: restore all fields. Scanner thread starts its loop from the
-saved watermark — any rows that arrived during the outage are picked up
-on the first scan tick and properly credited, without double-crediting
-rows that were already counted. Without this, a restart would either
-(a) re-credit the entire existing pool (burst of training) or (b) start
-empty and BUDGET_SLEEP for hours until fresh rows arrive. KataGo persists
-both `train_bucket_level` and the last-read row index for the same
-reason.
+saved `watermark_id` — any rows that arrived during the outage are
+picked up on the first scan tick and properly credited, without
+double-crediting rows that were already counted. Without this, a
+restart would either (a) re-credit the entire existing pool (burst of
+training) or (b) start empty and BUDGET_SLEEP for hours until fresh
+rows arrive. KataGo persists both `train_bucket_level` and the
+last-read row index for the same reason; we use last-credited filename
+ID rather than row index because our pool is pruned.
 
 Key properties:
 
@@ -312,7 +348,7 @@ Ownership rules:
 - **Resume / checkpoint**: only rank 0 writes training.pt and
   status.json. All ranks enter `torch.distributed.barrier()` around the
   save so nobody advances the step counter mid-write. On resume, rank 0
-  reads training.pt, broadcasts `{step, bucket_level, watermark}` to
+  reads training.pt, broadcasts `{step, bucket_level, watermark_id}` to
   other ranks, and all ranks load model/optimizer state identically
   from the same file.
 - **Cold-start gate**: rank 0 decides, broadcasts. Same collective
@@ -346,7 +382,7 @@ ranks.
                                 n_augmentations=N_AUGMENTATIONS,
                                 bucket=bucket,
                                 pool_dir="training/selfplay/",
-                                watermark=resume_meta["watermark"] if resume_meta else None)
+                                watermark_id=resume_meta["watermark_id"] if resume_meta else 0)
         scanner.start()                       # background thread
 
     # All ranks: local ring buffer + ingest thread
@@ -421,7 +457,7 @@ ranks.
                 save_checkpoint(step=step,
                                 model=model, optimizer=optimizer,
                                 bucket_level=bucket.available(),
-                                watermark=scanner.watermark(),
+                                watermark_id=scanner.watermark_id(),
                                 rng_state=get_rng_state())
                 log_event("EXPORT", step=step, path=path,
                           loss_ema=..., bucket=...)
@@ -431,7 +467,7 @@ ranks.
             log_event("LR_DROP", old_lr=..., new_lr=lr, step=step)
 
 - Checkpoint (`training/checkpoints/training.pt`) includes weights,
-  optimizer_state_dict, step, bucket_level, seen_row_marker, rng_state.
+  optimizer_state_dict, step, bucket_level, watermark_id, rng_state.
   On resume: restore all. See Train bucket section above for why the
   bucket state matters.
 - Metric rows aggregated to one per 100 steps (per-step is ~100MB/day;
@@ -1013,12 +1049,16 @@ archived into `logs/archive-<ts>/`, not deleted (see Fresh-start flow).
     logs/archive-<ts>/                    # archived logs from previous init
 
 **Game file naming**:
-- Format: `g_{idx:017d}.bin.zst` where `idx` is a monotonic counter per
-  selfplay driver invocation, combined with a host-tag if multi-host
-  later. Zero-padded wide enough that lex-sort == arrival-order for the
-  life of the project (17 digits covers 10^17 games).
-- Alternative: `g_{epoch_ns}_{hostshort}_{seq:06d}.bin.zst` if multi-host
-  or single-counter coordination becomes awkward.
+- Format: `g_{idx:017d}.bin.zst` where `idx` is monotonic across the
+  life of a run, owned by the single selfplay driver, and computed as
+  `max(existing IDs on disk) + 1` per batch (see Selfplay driver for
+  crash-safety argument). 17 digits covers 10^17 games — far more than
+  any conceivable run.
+- For multi-writer / cluster setups (out of scope for this plan), the
+  format would need a per-writer namespace such as
+  `g_w{worker_id:02d}_{seq:017d}.bin.zst`, plus a coordinated pruner
+  and an updated scanner that parses both fields. Designed as a
+  follow-up if/when we scale beyond a single host.
 - Do NOT use mtime-based ordering — fragile under clock skew / NFS.
 
 **Atomic writes**:
@@ -1070,25 +1110,50 @@ path-based).
          sustained (compatible with a few percent of one CPU core).
        * Trainer samples uniformly from its local ring. No pick-file-
          per-batch decompress cost.
-     **Freshness math** (corrected): at 1.5 games/s × 800 rows/game =
-     1200 rows/s fill rate, a 1.6M-row ring evicts in 1.6M / 1200 ≈
+     **Freshness math**: at 1.5 games/s × 800 rows/game = 1200 rows/s
+     fill rate (same per rank, since each rank ingests the same files
+     independently), a 1.6M-row ring evicts a row in 1.6M / 1200 ≈
      1333 s ≈ **22 minutes**. So the effective sampling window is ~22
      min of selfplay data, not hours. This is much tighter than the
      80k-file disk window, and tighter than KataGo's hour-scale shuffle
      buffer, but adequate for continuous training: the model changes
      slowly enough that 22 min of current-strength games is
      representative.
-     Per-row sample-probability during its ring lifetime: at 614
-     samples/s × 1333 s / 1.6M rows ≈ **0.51**, matching position-level
-     replay_target=4 across 8 augmentations (each position's 8 aug rows
-     each sampled once with p=0.5 → expected 4 position-level visits).
-     **Tradeoff**: larger ring (more RAM) gives more diversity within
-     each batch but doesn't change the replay accounting. Smaller ring
-     (less RAM) risks per-batch gradient correlation. 2000 games × 10
+
+     **Replay accounting** (careful, because rings are per-rank and
+     each disk row is duplicated into every rank's ring):
+
+       Per-rank picture: one rank's ring holds 1.6M rows; that rank
+       samples `batch_size = 1024` rows per step at 0.3 steps/s → 307
+       samples/s from ITS ring. Per-row sample probability during the
+       row's ring lifetime (per-rank) = 307 × 1333 / 1.6M ≈ **0.26**.
+
+       Global picture: a single disk row lives in `world_size = 2` rank
+       rings simultaneously (each rank decompresses the same file into
+       its own ring). A training step draws `batch × world = 2048`
+       samples total, spread across ranks. Expected visits per disk row
+       per step = 2048 / 1.6M ≈ 0.00128. Over the row's 1333 s (≈ 400
+       steps) lifetime: 0.00128 × 400 ≈ **0.51**.
+
+       These are the same count, just framed differently: global
+       visits = per-rank visits × world_size (a row appears in every
+       rank's ring and gets ~0.26 draws from each). 0.51 global visits
+       per disk row × 8 augmented rows per position ≈ 4 position-level
+       visits per unique position, matching `replay_target = 4` with
+       KataGo's semantics.
+
+     **Duplicated ingest cost**: with `world_size = 2`, each disk file
+     is decompressed twice (once per rank's ingest thread). Decompress
+     throughput is ~1200 rows/s × 2 ranks = 2400 rows/s total, well
+     below a single CPU core's capability. Not a concern.
+
+     **Tradeoff**: larger ring (more RAM per rank) gives more per-batch
+     diversity but doesn't change the replay accounting. Smaller ring
+     (less RAM per rank) risks intra-batch correlation. 2000 games × 10
      GB/rank is a reasonable starting point for a 2×4090 / 64+ GB RAM
      box. Scale linearly with available RAM.
    - Persist checkpoint on export: model + optimizer + step +
-     bucket_level + seen_row_marker + rng_state. Restore all on resume.
+     bucket_level + watermark_id + rng_state. Restore all on resume.
    - Writes `train.log` and `train_metrics.csv` (per-100-step rollups).
    - Respects `CUDA_VISIBLE_DEVICES` (set by supervisor).
 
@@ -1235,9 +1300,10 @@ progress; abort and debug if signals are missing.
      gatekeeper, and rating — all as subprocesses with GPU assignment.
    - Runs until Ctrl-C.
    - Resumable: on restart, picks up existing `training.pt` (weights,
-     optimizer state, step, bucket level, row watermark, rng),
-     existing selfplay records and counter, existing accepted models,
-     existing logs (new run opens a fresh `logs/<ts>/`).
+     optimizer state, step, bucket_level, watermark_id, rng_state),
+     existing selfplay records (monotonic filenames; no separate
+     counter file), existing accepted models, existing logs (new run
+     opens a fresh `logs/<ts>/`).
 
 
 ## Deviations from KataGo
