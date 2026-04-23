@@ -64,6 +64,7 @@ endif()
 #   metal  — Metal/MPSGraph (macOS Apple Silicon only)
 #   cuda   — CUDA (NVIDIA GPUs)
 #   opencl — OpenCL 1.2+ (Linux NVIDIA/AMD/Intel, macOS)
+#   rknn   — Rockchip NPU (aarch64 Linux, RK3562/66/68/76/88)
 #   eigen  — CPU only (no GPU)
 #
 # Usage:
@@ -72,10 +73,11 @@ endif()
 #   cmake .. -DMINIGO_BACKEND=tensorrt
 #   cmake .. -DMINIGO_BACKEND=cuda
 #   cmake .. -DMINIGO_BACKEND=opencl
+#   cmake .. -DMINIGO_BACKEND=rknn
 #   cmake .. -DMINIGO_BACKEND=eigen
 #
-set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, eigen")
-set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "eigen")
+set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, rknn, eigen")
+set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "rknn" "eigen")
 
 # ── Auto-detect best backend ────────────────────────────────
 if(MINIGO_BACKEND STREQUAL "auto")
@@ -160,11 +162,25 @@ if(MINIGO_BACKEND STREQUAL "auto")
         set(MINIGO_BACKEND "cuda")
       endif()
     else()
-      find_package(OpenCL QUIET)
-      if(OpenCL_FOUND)
-        set(MINIGO_BACKEND "opencl")
+      # No CUDA — on aarch64 Linux, prefer Rockchip NPU if librknnrt is present.
+      set(_rknn_ok FALSE)
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        find_library(LIBRKNNRT_LIB rknnrt
+          PATHS /usr/lib /usr/lib/aarch64-linux-gnu /usr/local/lib
+          NO_DEFAULT_PATH)
+        if(LIBRKNNRT_LIB AND EXISTS ${CMAKE_SOURCE_DIR}/third_party/rknn/rknn_api.h)
+          set(_rknn_ok TRUE)
+        endif()
+      endif()
+      if(_rknn_ok)
+        set(MINIGO_BACKEND "rknn")
       else()
-        set(MINIGO_BACKEND "eigen")
+        find_package(OpenCL QUIET)
+        if(OpenCL_FOUND)
+          set(MINIGO_BACKEND "opencl")
+        else()
+          set(MINIGO_BACKEND "eigen")
+        endif()
       endif()
     endif()
   endif()
@@ -184,6 +200,7 @@ set(HAS_OPENCL FALSE)
 set(HAS_METAL FALSE)
 set(HAS_CUDA FALSE)
 set(HAS_TENSORRT FALSE)
+set(HAS_RKNN FALSE)
 set(HAS_EIGEN FALSE)
 
 if(MINIGO_BACKEND STREQUAL "metal")
@@ -227,11 +244,22 @@ elseif(MINIGO_BACKEND STREQUAL "opencl")
   find_package(OpenCL REQUIRED)
   set(HAS_OPENCL TRUE)
 
+elseif(MINIGO_BACKEND STREQUAL "rknn")
+  find_library(LIBRKNNRT_LIB rknnrt REQUIRED
+    PATHS /usr/lib /usr/lib/aarch64-linux-gnu /usr/local/lib)
+  if(NOT EXISTS ${CMAKE_SOURCE_DIR}/third_party/rknn/rknn_api.h)
+    message(FATAL_ERROR
+      "RKNN backend needs third_party/rknn/rknn_api.h (vendored). "
+      "Fetch it from airockchip/rknn-toolkit2 "
+      "(rknpu2/runtime/Linux/librknn_api/include/rknn_api.h).")
+  endif()
+  set(HAS_RKNN TRUE)
+
 elseif(MINIGO_BACKEND STREQUAL "eigen")
   set(HAS_EIGEN TRUE)
 
 else()
-  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, eigen")
+  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, rknn, eigen")
 endif()
 
 # ── Library: minigo core ────────────────────────────────────
@@ -263,6 +291,10 @@ endif()
 
 if(HAS_METAL)
   list(APPEND CORE_SOURCES src/metal_compute.mm)
+endif()
+
+if(HAS_RKNN)
+  list(APPEND CORE_SOURCES src/rknn_compute.cpp)
 endif()
 
 add_library(minigo_core STATIC ${CORE_SOURCES})
@@ -304,6 +336,13 @@ if(HAS_METAL)
   target_link_libraries(minigo_core PUBLIC
       ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK}
       ${MPS_FRAMEWORK} ${MPSG_FRAMEWORK})
+endif()
+
+if(HAS_RKNN)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_RKNN=1)
+  target_include_directories(minigo_core PUBLIC
+    ${CMAKE_SOURCE_DIR}/third_party/rknn)
+  target_link_libraries(minigo_core PUBLIC ${LIBRKNNRT_LIB})
 endif()
 
 # ── Executables ─────────────────────────────────────────────

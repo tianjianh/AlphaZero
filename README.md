@@ -13,15 +13,18 @@ Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple
 - **CUDA** (default on Linux with NVIDIA GPU, no TensorRT) — FP16 Tensor Core inference via WMMA; hand-written implicit GEMM kernels. Supports Turing, Ampere, Ada, Hopper, Blackwell
 - **Metal** (default on macOS Apple Silicon) — GPU inference via MPSGraph with FP16 compute; 2-3× faster than OpenCL on the same hardware
 - **OpenCL** — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
+- **RKNN** (aarch64 Linux with Rockchip NPU — RK3562/RK3566/RK3568/RK3576/RK3588) — NPU inference via Rockchip's `librknnrt`; fp16 or int8/hybrid quantisation, multi-core NPU support (auto-distributed across NPU cores). Requires offline ONNX → .rknn conversion on an x86_64 host with `rknn-toolkit2`.
 - **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS
 
-**Multi-GPU support**: KataGo-style architecture with N server threads, each owning
-a `ComputeHandle` on its assigned GPU.  All threads drain from a single shared queue
-— whichever GPU finishes first picks up the next batch (self-balancing).
+**Multi-GPU / Multi-core support**: KataGo-style architecture with N server threads, each owning
+a `ComputeHandle` on its assigned GPU (or NPU core).  All threads drain from a single shared queue
+— whichever device finishes first picks up the next batch (self-balancing).  On Rockchip NPUs, the
+single physical NPU exposes 1–3 cores (SoC-dependent); one server thread per core pins to each core
+via `rknn_set_core_mask`, giving the same topology as one-thread-per-GPU.
 
 Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching KataGo's pattern.
 
-**Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency)
+**Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.
 
 ### Neural network architecture
 
@@ -201,6 +204,34 @@ sudo apt install ocl-icd-opencl-dev
 sudo apt install libopenblas-dev
 ```
 
+### Linux (aarch64 — Rockchip NPU board, e.g. ArmSoM Sige5 / Orange Pi 5)
+
+```bash
+sudo apt install cmake g++ libeigen3-dev libncurses-dev
+
+# Runtime library.  Already present on stock ArmSoM / Radxa / Orange Pi images;
+# otherwise fetch it from airockchip/rknn-toolkit2 (rknpu2/runtime/Linux/
+# librknn_api/aarch64/librknnrt.so) and drop into /usr/lib/.
+ls /usr/lib/librknnrt.so   # verify
+
+# The build embeds third_party/rknn/rknn_api.h (vendored from upstream);
+# no header install needed.
+```
+
+CMake auto-detects the NPU when `librknnrt.so` is present on aarch64; alternatively
+force it with `cmake .. -DMINIGO_BACKEND=rknn`.
+
+**Conversion toolkit** (x86_64 host only — the converter does NOT run on aarch64):
+```bash
+# On an x86_64 Ubuntu 22.04 machine with Python 3.10:
+python3 -m venv ~/.venv/rknn && source ~/.venv/rknn/bin/activate
+pip install "setuptools<81" "numpy==1.26.4" "onnx==1.14.1"
+git clone --depth 1 --branch v2.3.2 https://github.com/airockchip/rknn-toolkit2
+pip install rknn-toolkit2/rknn-toolkit2/packages/x86_64/rknn_toolkit2-2.3.2-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+```
+`rknn-toolkit-lite2` runs on aarch64 but can only *execute* `.rknn` files, not
+compile ONNX → RKNN.  Conversion must happen on x86_64.
+
 ### Python (both platforms — only needed for training)
 
 ```bash
@@ -225,6 +256,8 @@ DistributedDataParallel via `torchrun` (included with PyTorch).
 | TensorRT | TensorRT backend | `libnvinfer-dev`, `libnvonnxparsers-dev` |
 | CUTLASS | CUDA backend (headers only) | [github.com/NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) |
 | OpenCL | OpenCL backend | `ocl-icd-opencl-dev` |
+| librknnrt | RKNN backend (aarch64 Linux) | `/usr/lib/librknnrt.so` from [airockchip/rknn-toolkit2](https://github.com/airockchip/rknn-toolkit2) (`rknpu2/runtime/Linux/librknn_api/aarch64/`) |
+| rknn-toolkit2 | ONNX → .rknn conversion (x86_64 host only) | `pip install rknn-toolkit2==2.3.2` |
 | PyTorch | Training | `pip install torch` |
 | Transformer Engine | FP8 training (optional) | `pip install transformer_engine` |
 
@@ -242,6 +275,7 @@ CMake auto-detects the best backend for your platform:
 -- Backend:    metal      (macOS Apple Silicon)
 -- Backend:    tensorrt   (Linux with NVIDIA GPU + CUDA + TensorRT)
 -- Backend:    cuda       (Linux with NVIDIA GPU + CUDA, no TensorRT)
+-- Backend:    rknn       (aarch64 Linux with librknnrt.so — Rockchip NPU)
 -- Backend:    opencl     (Linux with GPU, no CUDA)
 -- Backend:    eigen      (no GPU available)
 ```
@@ -252,6 +286,7 @@ cmake .. -DMINIGO_BACKEND=tensorrt # TensorRT (NVIDIA, fastest — requires libn
 cmake .. -DMINIGO_BACKEND=cuda     # CUDA FP16 Tensor Cores (NVIDIA)
 cmake .. -DMINIGO_BACKEND=metal    # Metal/MPSGraph (macOS Apple Silicon)
 cmake .. -DMINIGO_BACKEND=opencl   # OpenCL (Linux, macOS)
+cmake .. -DMINIGO_BACKEND=rknn     # Rockchip NPU (aarch64 Linux — RK3562/66/68/76/88)
 cmake .. -DMINIGO_BACKEND=eigen    # CPU only (no GPU)
 ```
 
@@ -913,6 +948,145 @@ graph via `graph.run()`.
   Metal backend pattern for correct ObjC object lifecycle on server threads
 - **Unified memory**: CPU and GPU share the same memory (no explicit copies)
 
+### RKNN NPU Backend (Rockchip, aarch64 Linux)
+
+`RKNNComputeHandle` (`src/rknn_compute.cpp`) runs inference on Rockchip's
+on-chip NPU via the `librknnrt` runtime.  Unlike the GPU backends, which compile
+or build their kernels at program start, the RKNN backend loads a **pre-compiled
+`.rknn` file** produced by `rknn-toolkit2` on an x86_64 host.
+
+The design follows the Context/Handle pattern:
+- **`RKNNComputeContext`** (process-wide): holds the master `rknn_context` (weights)
+  plus cached I/O tensor attrs.  Analogous to `ICudaEngine` in TensorRT.
+- **`RKNNComputeHandle`** (per server thread): holds a `rknn_dup_context`'d
+  context — its own inference state (input/output buffers, scheduler).  Weights
+  are shared across dups by the runtime, so the cost is per-thread scratch
+  only.  Analogous to `IExecutionContext` in TensorRT.
+
+Why dup and not one shared context?  `rknn_inputs_set` / `rknn_run` /
+`rknn_outputs_get` mutate per-inference state inside the context and are not
+thread-safe.  `rknn_dup_context` is Rockchip's documented primitive for
+concurrent inference across threads.
+
+**Multi-core NPU distribution**
+
+The physical NPU exposes 1–3 cores depending on the SoC (auto-detected from
+`/proc/device-tree/compatible`):
+
+| SoC | NPU cores | Peak | Typical thread mask |
+|---|---:|---|---|
+| RK3562 / RK3566 / RK3568 | 1 | ~0.8–1 TOPS | `AUTO` |
+| RK3576 | 2 | ~6 TOPS (INT8) | `CORE_0`, `CORE_1` |
+| RK3588 / RK3588s | 3 | ~6 TOPS (INT8) | `CORE_0`, `CORE_1`, `CORE_2` |
+
+`pick_core_mask(thread_index, num_cores)` round-robins handles across cores;
+if you set `--nn-server-threads 2 --nn-device-ids 0,0` on an RK3576, thread 0
+pins to core 0 and thread 1 pins to core 1 via `rknn_set_core_mask`.  The
+`gpu_id` parameter is always 0 on NPU systems (single logical NPU device).
+
+**Precision and quantisation**
+
+The `.rknn` file can be compiled in several modes (chosen at conversion time):
+- **fp16** (default, no quantisation needed): `do_quantization=False`.  Simple,
+  no calibration data required.  Achieves ~19% of NPU peak on 9×9/128f ResNet.
+- **w8a16** (weights int8, activations int16): modest speedup with good
+  accuracy.  Requires a calibration dataset.
+- **int8 (w8a8)**: maximum throughput, ~2× fp16.  Sensitive logit heads
+  (policy, value) can degrade; use **hybrid quantisation** to keep those
+  in fp16 via `rknn.hybrid_quantization_step1/step2`.  See
+  [ONNX → RKNN conversion](#onnx--rknn-conversion) below.
+
+**Resolving the .rknn file from the ONNX path**
+
+The RKNN backend still uses `LoadedModel::load()` on the `.onnx` to get
+board size / channel count / model type (the ONNX is the single source of
+truth for architecture metadata).  It then derives the `.rknn` path by
+swapping the extension: `models/best.onnx` → `models/best.rknn`.  Both files
+must sit side-by-side.
+
+#### ONNX → RKNN conversion
+
+Run on an **x86_64 Ubuntu 22.04 host** (conversion is not supported on
+aarch64 — the board only runs models, doesn't compile them).
+
+**Step 1: install rknn-toolkit2 (one-time setup).**  See [Linux (aarch64)
+prerequisites](#linux-aarch64--rockchip-npu-board-eg-armsom-sige5--orange-pi-5)
+above for the pip install.
+
+**Step 2: convert.**  Save as `convert.py`:
+
+```python
+import sys
+from rknn.api import RKNN
+
+onnx_path, rknn_path = sys.argv[1], sys.argv[2]
+TARGET = "rk3576"   # or rk3588 / rk3568 / rk3566 / rk3562
+
+rknn = RKNN(verbose=True)
+rknn.config(
+    target_platform=TARGET,
+    mean_values=None, std_values=None,    # identity: features are already normalised
+    disable_rules=['unsqueeze_to_4d_reshape_with_elementwise_op'],
+)
+
+# Fixed input shape — the ONNX has a dynamic batch dim that RKNN rejects.
+# Use a batched shape (e.g. [4, 17, 9, 9]) for better NPU utilisation on
+# self-play workloads; use [1, 17, 9, 9] for live play / single-move latency.
+assert rknn.load_onnx(
+    model=onnx_path,
+    inputs=["state"],
+    input_size_list=[[1, 17, 9, 9]],
+) == 0
+assert rknn.build(do_quantization=False) == 0     # fp16 weights, no calibration
+assert rknn.export_rknn(rknn_path) == 0
+rknn.release()
+```
+
+```bash
+python convert.py best.onnx best.rknn
+scp best.rknn armsom:/path/next/to/best.onnx
+```
+
+**Step 3 (optional): int8 with hybrid quantisation.**  The Go logit heads
+(policy, value, score) don't survive full int8 well — small numeric errors
+in logits become big probability shifts after softmax.  The fix is to int8
+the trunk and keep the heads fp16:
+
+```python
+# Calibration set: dump 100–500 selfplay encodings to .npy files,
+# one `(17, 9, 9)` float32 per file.  calib.txt lists their paths.
+rknn.hybrid_quantization_step1(
+    dataset="calib.txt",
+    proposal=True, proposal_dataset_size=16,
+)
+# → writes v0000.quantization.cfg / v0000.model / v0000.data
+```
+
+Edit `v0000.quantization.cfg` → `custom_quantize_layers:`:
+```yaml
+custom_quantize_layers:
+  /policy_conv/Conv_output_0:          float16
+  /policy_fc/Gemm_output_0:            float16
+  /value_head/fc2/Gemm_output_0:       float16
+  /score_mean_head/fc2/Gemm_output_0:  float16
+  /score_stdev_head/fc2/Gemm_output_0: float16
+  /ownership_conv/Conv_output_0:       float16
+```
+(Use the exact node names the toolkit emitted in your cfg — they reflect
+RKNN's rewritten graph.)
+
+```python
+rknn.hybrid_quantization_step2(
+    model_input="v0000.model",
+    data_input="v0000.data",
+    model_quantization_cfg="v0000.quantization.cfg",
+)
+rknn.export_rknn("v0000_hybrid.rknn")
+```
+
+Heads are <1% of FLOPs, so keeping them fp16 costs almost nothing;
+expected throughput ≈ full int8, expected MCTS strength ≈ fp16.
+
 ### Modular Backend Design (KataGo pattern)
 
 The architecture has three layers:
@@ -1137,6 +1311,7 @@ Handle 1    + bufs   + bufs          + bufs    + bufs     [weights] [weights] (r
 | **CUDA+CUTLASS** | 1 copy per handle (FP16 upload) | None — each handle owns its weight buffers | ~24 MB |
 | **OpenCL** | 1 copy per handle (`cl_mem` upload) | None — each handle creates own buffers | ~24 MB |
 | **Metal** | 1 copy per handle (embedded in `MPSGraph`) | None — weights are graph constants | ~24 MB |
+| **RKNN** | 1 copy in NPU DMA memory (from master `rknn_context`) | Shared — `rknn_dup_context` shares weights across duplicates, per-thread state only | **~6 MB** |
 | **Eigen** | CPU only (in `LoadedModel`) | Shared by pointer — no GPU copies | 0 |
 
 TensorRT is the most memory-efficient because the compiled engine separates
@@ -1161,17 +1336,126 @@ proportionally.
 
 **Large model** (128 filters, 10 blocks):
 
-| Batch | TensorRT FP16 (RTX 2080 Ti) | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) |
-|------:|----------------------------:|-----------------------------:|---------------------------:|
-| 1     | **1,107**                   | 354                          | 324                        |
-| 32    | **31,965**                  | 8,145                        | 4,723                      |
-| 64    | **56,726**                  | 9,347                        | 5,712                      |
-| 128   | **82,781**                  | 10,821                       | 6,012                      |
+| Batch | TensorRT FP16 (RTX 2080 Ti) | CUDA FP16+WMMA (RTX 2080 Ti) | OpenCL FP32 (RTX 2080 Ti) | RKNN fp16 bs=1 model (RK3576, 1 core) | RKNN fp16 bs=4 model (RK3576, 1 core) | ORT CPU 4×A72 (RK3576) |
+|------:|----------------------------:|-----------------------------:|---------------------------:|--------------------------------------:|--------------------------------------:|-----------------------:|
+| 1     | **1,107**                   | 354                          | 324                        | 334                                   | 133¹                                  | 24                     |
+| 8     | —                           | —                            | —                          | 348                                   | 521                                   | 27                     |
+| 32    | **31,965**                  | 8,145                        | 4,723                      | 343                                   | 543                                   | 27                     |
+| 64    | **56,726**                  | 9,347                        | 5,712                      | 356                                   | 544                                   | 27                     |
+| 128   | **82,781**                  | 10,821                       | 6,012                      | 344                                   | 528                                   | 27                     |
+
+¹ The bs=4 compiled RKNN model pads single-sample requests to batch=4 — three
+pad slots are wasted, so bs=1 throughput is worse than the bs=1 compiled model.
 
 TensorRT is **2.6×** faster than CUDA+CUTLASS at batch-128 (small model) due
 to whole-graph layer fusion.  CUDA+CUTLASS is **2.0×** faster than OpenCL FP32.
 At single inference, CUDA+CUTLASS closes to within **1.4×** of TensorRT
 (2,620 vs 3,609) thanks to CUTLASS's optimized software pipelining.
+
+**NPU notes:** at 9×9 / 128 filters / fp16, the RK3576 NPU tops out at ~543
+states/s per core (≈ 279 GFLOPs effective, ~19% of the ~3 TFLOPs fp16 peak).
+Single-sample latency is 2.66 ms on the bs=1 model and ~1.84 ms per-sample
+on the bs=4 model.  Doubling to 2 cores gives ~1,100 states/s total.  The
+NPU is 13–14× faster than the board's A72 CPU running the same ONNX through
+ONNX Runtime, and ~150× slower than a desktop RTX 2080 Ti running TensorRT.
+Quantising the trunk to int8 (with fp16 heads, via hybrid quantisation) is
+expected to roughly double these numbers (~35% of peak).
+
+### How batching works (GPU backends vs RKNN NPU)
+
+The `NNEvaluator` queue, `--max-batch`, and `--search-threads` flags work the
+same on every backend — but what happens **inside `predict_batch()`** differs
+fundamentally between the GPU backends and RKNN.
+
+**GPU backends (TensorRT, CUDA, OpenCL, Metal) — dynamic batch.**  The ONNX
+is compiled (or kernels launched) with the batch dimension left as a free
+variable.  Each `predict_batch()` call passes the runtime batch size as a
+parameter:
+
+- TensorRT: builds the engine with an optimisation profile covering
+  `[MIN=1, OPT=max_batch/2, MAX=max_batch]`; `setInputShape(N)` before
+  `enqueueV3` selects the shape for this call.
+- CUDA/OpenCL: hand-written kernels take `N` as a kernel argument; GEMM
+  tile counts scale with `N`.
+- Metal: MPSGraph rebuilds the graph lazily for each new batch size it
+  sees (cached after first use).
+
+Effect: any batch size `1 ≤ N ≤ max_batch` runs in a single kernel launch,
+and the per-sample cost drops as `N` grows (batching amortises launch
+overhead and fills MAC arrays).  `max_batch` is a soft ceiling — setting
+it higher just means the GPU can absorb bigger bursts.
+
+**RKNN — static batch baked into the `.rknn` file.**  The `.rknn` is
+compiled offline with *one specific batch shape* (the `input_size_list`
+argument of `rknn.load_onnx`).  At runtime the NPU accepts only that exact
+shape — no dynamic `N`.
+
+**Contract with the server loop (same mental model as every other backend):**
+
+- Each `predict_batch(states)` call emits **exactly one `rknn_run`**.
+- The caller must keep `states.size() <= K` (i.e. set `--max-batch <= K`
+  on the CLI).  The backend asserts this at runtime and throws with a
+  hint if violated — no silent truncation, no internal chunking loop.
+- If `states.size() < K`, the backend zero-pads slots `[N..K)` and
+  discards their outputs.
+
+```text
+K = 4, --max-batch = 4, drain = 3:
+    [s0 s1 s2 0] → rknn_run  (3 real + 1 pad, pad output discarded)
+
+K = 4, --max-batch = 4, drain = 4:
+    [s0 s1 s2 s3] → rknn_run  (fully packed)
+
+K = 4, --max-batch = 8  →  RUNTIME ERROR (bump --max-batch down to 4).
+```
+
+The `model_batch` value is read from the rknn input-attr at handle init
+(`dev.model_batch = input_attrs[0].dims[0]`) and logged on startup, so
+picking `--max-batch` is just: "check the log, set the flag ≤ that."
+
+**Consequences — completely different tuning rules:**
+
+| Aspect | GPU backends | RKNN NPU |
+|---|---|---|
+| Batch size at runtime | Anything `1..max_batch` | Exactly `K` (pad if fewer) |
+| Meaning of `--max-batch` | Max N per kernel; any value ≤ engine max is fine | Max N per kernel **and** must be ≤ compiled `K` |
+| Setting `--max-batch > model_max` | soft cap — effectively ignored above engine max | **hard error** at runtime |
+| Batch-1 live play | Fast (kernel specialises for N=1) | **Slow if compiled with K > 1** (you pay for K samples per move) |
+| Self-play throughput | Scales sub-linearly with burst size | Scales with `K` *if the queue consistently fills K slots*; otherwise padding eats the win |
+| Retuning | Change one flag | **Recompile the `.rknn`** on the x86 host |
+
+**Practical rules on the NPU:**
+
+1. **Set `--max-batch == K`** (the compiled `model_batch` shown in the
+   startup log).  Nothing else makes sense.
+
+2. **Pick `K` for the *dominant workload*:**
+   - **Live play / `play` / `evaluate`:** compile `[[1, C, H, W]]` —
+     single-move latency matters, nothing to batch.
+   - **Self-play with 1 worker:** compile `[[1, C, H, W]]` — MCTS
+     virtual-loss rarely generates enough concurrent leaves to keep a
+     bs=4 model's slots full, so padding eats the win (observed on
+     v0000: the bs=4 model was slightly *slower* than bs=1 with one
+     worker).
+   - **Self-play with multiple workers or heavy `--search-threads`:**
+     compile `[[4, C, H, W]]` — queue stays full, padding is rare,
+     peak per-core throughput rises ~55 % (334 → 543 states/s on v0000).
+
+3. **Multi-core distribution is orthogonal to `K`.**  On a multi-core NPU,
+   set `--nn-server-threads` to the number of NPU cores and
+   `--nn-device-ids 0,0,...` (all zeros — there's only one logical NPU).
+   Each server thread runs its own dup'd context pinned to one core via
+   `rknn_set_core_mask`.  Effective throughput ≈ single-core throughput
+   × core count, regardless of `K`.  You can also try `2 × num_cores`
+   threads with two contexts per core — the driver serialises same-core
+   `rknn_run`s but a second thread can overlap its host-side prep
+   (memcpy, NHWC transpose, submission) with the first thread's NPU
+   compute.  Typical gain: 5–15 %.
+
+4. **You can ship both.**  Compile two `.rknn` files with different K
+   (`best.rknn` for live play, `best_bs4.rknn` for self-play) and swap
+   by renaming.  The backend picks up whichever file sits next to the
+   `.onnx` and logs the detected `model_batch` on startup.
 
 ### Self-play throughput (800 sims/move)
 

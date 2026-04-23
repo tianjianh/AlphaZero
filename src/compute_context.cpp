@@ -20,6 +20,10 @@
 #include "tensorrt_compute.h"
 #endif
 
+#ifdef MINIGO_HAS_RKNN
+#include "rknn_compute.h"
+#endif
+
 #include <stdexcept>
 
 namespace minigo {
@@ -31,6 +35,8 @@ std::unique_ptr<ComputeContext> create_compute_context(const std::vector<int>& d
     return std::make_unique<TensorRTComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_CUDA)
     return std::make_unique<CUDAComputeContext>(device_ids);
+#elif defined(MINIGO_HAS_RKNN)
+    return std::make_unique<RKNNComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_OPENCL)
     return std::make_unique<OpenCLComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_EIGEN)
@@ -48,6 +54,8 @@ std::string backend_name() {
     return "tensorrt";
 #elif defined(MINIGO_HAS_CUDA)
     return "cuda";
+#elif defined(MINIGO_HAS_RKNN)
+    return "rknn";
 #elif defined(MINIGO_HAS_OPENCL)
     return "opencl";
 #elif defined(MINIGO_HAS_EIGEN)

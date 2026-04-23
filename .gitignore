@@ -13,8 +13,12 @@ pipeline_config
 *.pt
 *.engine
 *.onnx.data
+*.rknn
+Miniconda*.sh
 
 .DS_Store
 __pycache__/
 *.pyc
-third_party/
+third_party/*
+# …except the vendored RKNN runtime header used by the RKNN backend.
+!third_party/rknn/
