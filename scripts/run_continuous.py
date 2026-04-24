@@ -290,6 +290,8 @@ def selfplay_cmd(args, log_dir):
             "--games-per-batch", str(args.selfplay_batch_games),
             "--window-games", str(args.window_games),
             "--sims", str(args.selfplay_sims),
+            "--threads", str(args.selfplay_threads),
+            "--search-threads", str(args.selfplay_search_threads),
             "--nn-server-threads", str(len(args.nn_device_ids_selfplay.split(","))),
             "--nn-device-ids", args.nn_device_ids_selfplay,
             "--max-batch", str(args.max_batch),
@@ -314,6 +316,8 @@ def gate_cmd(args, log_dir):
             "--sims", str(args.gate_sims),
             "--threshold", str(args.gate_threshold),
             "--poll-interval", str(args.gate_poll_interval),
+            "--threads", str(args.gate_threads),
+            "--search-threads", str(args.gate_search_threads),
             "--nn-server-threads", str(len(args.nn_device_ids_gate.split(","))),
             "--nn-device-ids", args.nn_device_ids_gate,
             "--max-batch", str(args.max_batch),
@@ -333,6 +337,8 @@ def rate_cmd(args, log_dir):
             "--games-per-pair", str(args.rating_games),
             "--sims", str(args.rating_sims),
             "--interval", str(args.rating_interval),
+            "--threads", str(args.rate_threads),
+            "--search-threads", str(args.rate_search_threads),
             "--nn-server-threads", str(len(args.nn_device_ids_rate.split(","))),
             "--nn-device-ids", args.nn_device_ids_rate,
             "--max-batch", str(args.max_batch),
@@ -641,12 +647,19 @@ def add_run_args(p):
     p.add_argument("--score-weight-max", type=float, default=0.06,
                    help="MCTS score weight at full ramp (selfplay reads "
                         "score_ramp from status.json and multiplies)")
+    p.add_argument("--selfplay-threads", type=int, default=0,
+                   help="Parallel game workers (0 = os.cpu_count())")
+    p.add_argument("--selfplay-search-threads", type=int, default=16,
+                   help="MCTS search threads per move")
 
     # Gatekeeper
     p.add_argument("--gate-games", type=int, default=200)
     p.add_argument("--gate-sims", type=int, default=150)
     p.add_argument("--gate-threshold", type=float, default=0.5)
     p.add_argument("--gate-poll-interval", type=float, default=30.0)
+    p.add_argument("--gate-threads", type=int, default=0,
+                   help="Parallel match workers (0 = os.cpu_count())")
+    p.add_argument("--gate-search-threads", type=int, default=16)
 
     # Rating
     p.add_argument("--rating", action="store_true",
@@ -655,6 +668,9 @@ def add_run_args(p):
     p.add_argument("--rating-sims", type=int, default=200)
     p.add_argument("--rating-pool-size", type=int, default=5)
     p.add_argument("--rating-interval", type=float, default=7200.0)
+    p.add_argument("--rate-threads", type=int, default=0,
+                   help="Parallel pair workers (0 = os.cpu_count())")
+    p.add_argument("--rate-search-threads", type=int, default=16)
 
     # MCTS / game (shared across workers)
     p.add_argument("--c-puct", type=float, default=1.25)

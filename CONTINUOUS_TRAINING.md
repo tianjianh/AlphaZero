@@ -275,6 +275,32 @@ sized so the first halving lands mid-run under conservative throughput
 early training loss EMA is too noisy; signal-driven halving fires
 prematurely.
 
+### CPU-side parallelism
+
+Each C++ worker binary (`build/selfplay`, `build/evaluate`) has three
+layers of concurrency that the supervisor exposes separately:
+
+- **`--<proc>-threads`** (default `0` → `os.cpu_count()`): number of
+  parallel game / match / pair workers. Each worker runs one
+  simulation at a time on the CPU side and sends NN requests to the
+  batching layer. Raise to saturate the GPU; lower to reduce
+  oversubscription when workers share a GPU.
+- **`--<proc>-search-threads`** (default `16`): MCTS search threads
+  per worker, per move. These split the 500-simulation tree-search
+  budget inside one position. Higher values trade wall-time per move
+  for parallelism within the search. 16 is a good starting point for
+  9×9; don't exceed the number of physical cores divided by game
+  workers or you just thrash.
+- **`--nn-server-threads`** (derived from `--nn-device-ids-<proc>`
+  length): independent NN server threads that batch up requests from
+  all search threads and ship them to one or more GPUs. `0,0,1,1`
+  means four server threads — two on each of two GPUs.
+
+Rule of thumb for a 2×4090 selfplay run: 64 game workers × 16 search
+threads × 4 NN server threads (`0,0,1,1`). One game worker stays busy
+waiting for NN replies while others queue up, keeping the batcher
+near its `--max-batch` size.
+
 ### TRT engine cache sharing
 
 The TRT cache key is basename-based (see `src/tensorrt_compute.cpp`).
@@ -380,6 +406,8 @@ only what you need.
 --selfplay-sims 500
 --window-games 80000          # disk retention cap
 --score-weight-max 0.06       # MCTS score weight at full ramp
+--selfplay-threads 0          # parallel game workers; 0 = os.cpu_count()
+--selfplay-search-threads 16  # MCTS search threads per move
 ```
 
 **Gatekeeper:**
@@ -388,6 +416,8 @@ only what you need.
 --gate-sims 150
 --gate-threshold 0.5
 --gate-poll-interval 30       # seconds
+--gate-threads 0              # parallel match workers; 0 = os.cpu_count()
+--gate-search-threads 16
 ```
 
 **Rating (optional):**
@@ -397,6 +427,8 @@ only what you need.
 --rating-sims 200
 --rating-pool-size 5          # most-recent accepted
 --rating-interval 7200        # seconds between rounds
+--rate-threads 0              # parallel pair workers; 0 = os.cpu_count()
+--rate-search-threads 16
 ```
 
 **MCTS / game (shared):**
