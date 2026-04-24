@@ -18,7 +18,9 @@ See cont_train.todo for the complete design rationale.
 """
 
 import argparse
+import glob
 import json
+import signal
 import os
 import random
 import re
@@ -760,6 +762,34 @@ def main():
 
     args = ap.parse_args()
 
+    # Share the TRT engine cache dir with the C++ binaries our siblings
+    # launch.  Supervisor-launched runs already set this; setdefault makes
+    # standalone debug runs of the trainer hit the same cache.  (The
+    # trainer itself never builds TRT engines, but we keep the contract
+    # uniform across all workers so the env is consistent wherever C++
+    # is invoked downstream.)
+    os.environ.setdefault(
+        "MINIGO_TRT_CACHE",
+        str(Path(args.pool_dir).resolve().parent.parent / "models" / "trt_cache"))
+
+    # ── Graceful-shutdown signalling ───────────────────────
+    # Each rank installs its own SIGTERM/SIGINT handler that just flips
+    # a threading.Event.  The main loop polls rank 0's flag and
+    # broadcasts a shutdown decision so every rank exits the loop
+    # together.  Without this, Ctrl-C / supervisor SIGTERM would kill
+    # the process between exports and drop up to (export_every - 1)
+    # steps of optimizer + bucket + watermark state.
+    shutdown_event = threading.Event()
+    def _handle_shutdown(sig, _frame):
+        shutdown_event.set()
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    try:
+        signal.signal(signal.SIGINT, _handle_shutdown)
+    except ValueError:
+        # Not in main thread (shouldn't happen since main() runs in main
+        # thread, but be defensive).
+        pass
+
     # ── DDP setup ──────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     use_ddp = local_rank >= 0 and torch.cuda.is_available()
@@ -955,6 +985,18 @@ def main():
     os.makedirs(args.candidates_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
 
+    # Clean up half-written checkpoint tmpfiles from an interrupted save.
+    # (`.tmp.*` files come from tempfile.mkstemp + torch.save interrupted
+    # before the atomic os.replace could run.)
+    ckpt_dir = os.path.dirname(args.checkpoint) or "."
+    for f in glob.glob(os.path.join(ckpt_dir, ".tmp.*")):
+        try:
+            os.remove(f)
+            if is_main:
+                events.log("CLEANUP_CKPT_TMP", path=os.path.basename(f))
+        except OSError:
+            pass
+
     last_steps_sec_t = time.time()
     last_steps_sec_count = 0
     loss_ema = None
@@ -966,9 +1008,31 @@ def main():
              "ownership", "score_belief", "opp_policy"]}
     roll_n = 0
 
-    wait_log_every = 6  # log COLD_START_WAIT every ~30s when sleeping 5s
+    # Time-based rate limit for wait-state logs.  Step doesn't advance
+    # during COLD_START / BUDGET_SLEEP, so a step%N check either spams
+    # every 5 s (step==0) or never fires at all (step misaligned with N).
+    WAIT_LOG_INTERVAL_S = 30.0
+    last_cold_log_t = 0.0
+    last_budget_log_t = 0.0
 
+    def shutdown_requested():
+        """True when rank 0 has received SIGTERM/SIGINT (broadcast-safe
+        across ranks so they exit the loop together)."""
+        if is_main:
+            sd = 1 if shutdown_event.is_set() else 0
+        else:
+            sd = 0
+        sd_t = torch.tensor([sd], dtype=torch.long, device=device)
+        if use_ddp:
+            dist.broadcast(sd_t, src=0)
+        return bool(sd_t.item())
+
+    shutdown_reason = None
     while True:
+        if shutdown_requested():
+            shutdown_reason = "signal"
+            break
+
         # ── Cold-start gate (both conditions must hold) ───
         if is_main:
             disk_games = scanner.window_games()
@@ -986,13 +1050,16 @@ def main():
             dist.all_reduce(local_t, op=dist.ReduceOp.MIN)
 
         if disk_t.item() == 0 or local_t.item() == 0:
-            if is_main and (step % wait_log_every == 0):
+            now = time.time()
+            if is_main and (now - last_cold_log_t) >= WAIT_LOG_INTERVAL_S:
                 events.log("COLD_START_WAIT",
                            window_games=scanner.window_games(),
                            ring_rows_rank0=local_rows,
                            min_window=args.min_window_games,
                            min_ring=args.min_ring_rows)
-            time.sleep(5.0)
+                last_cold_log_t = now
+            # Wait on the event so the signal interrupts the sleep.
+            shutdown_event.wait(5.0)
             continue
 
         # ── Bucket gate (rank 0 authority) ────────────────
@@ -1004,10 +1071,12 @@ def main():
         if use_ddp:
             dist.broadcast(go_t, src=0)
         if go_t.item() == 0:
-            if is_main and (step % wait_log_every == 0):
+            now = time.time()
+            if is_main and (now - last_budget_log_t) >= WAIT_LOG_INTERVAL_S:
                 events.log("BUDGET_SLEEP", bucket=bucket.available(),
                            cap=bucket.max)
-            time.sleep(5.0)
+                last_budget_log_t = now
+            shutdown_event.wait(5.0)
             continue
 
         # ── LR + ramps ────────────────────────────────────
@@ -1172,14 +1241,56 @@ def main():
                 last_milestones_hit = hit
 
         if args.max_steps > 0 and step >= args.max_steps:
+            shutdown_reason = "max_steps"
             break
 
-    # Shutdown
+    # ── Final shutdown: checkpoint before exit ───────────────
+    # Saves step, optimizer, bucket, and watermark so resume picks up
+    # exactly where we stopped.  Without this, anything since the last
+    # EXPORT (up to export_every - 1 steps of optimizer progress and
+    # replay-ratio accounting) is discarded on Ctrl-C / supervised stop.
+    if use_ddp:
+        dist.barrier()
+    if is_main:
+        try:
+            base_model = model.module if use_ddp else model
+            final_ckpt = {
+                "model_state_dict": base_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "step": step,
+                "bucket_level": bucket.available() if bucket else 0,
+                "watermark_id": scanner.watermark() if scanner else 0,
+                "arch": args.arch,
+                "board_size": args.board,
+                "num_filters": args.filters,
+                "num_res_blocks": args.blocks,
+                "d_model": args.d_model,
+                "depth": args.depth,
+                "heads": args.heads,
+                "kv_groups": args.kv_groups,
+                "mlp_ratio": args.mlp_ratio,
+            }
+            _atomic_save_torch(args.checkpoint, final_ckpt)
+            events.log("FINAL_CHECKPOINT", step=step,
+                       reason=shutdown_reason or "loop_exit",
+                       bucket=bucket.available() if bucket else 0,
+                       watermark=scanner.watermark() if scanner else 0)
+        except Exception as e:
+            events.log("FINAL_CHECKPOINT_FAIL", step=step, err=str(e))
+    if use_ddp:
+        # Ensure every rank has finished the save barrier before we tear
+        # down the process group.  Without this, a rank that exits first
+        # and calls destroy_process_group() can race with another rank
+        # still inside a collective op.
+        dist.barrier()
+
+    # Stop background threads (daemons, so already doomed on process
+    # exit — but asking them to stop cleanly avoids stderr spam).
     if scanner is not None:
         scanner.stop()
     window.stop_ingest()
     if is_main:
-        events.log("TRAIN_STOP", step=step)
+        events.log("TRAIN_STOP", step=step, reason=shutdown_reason or "loop_exit")
         events.close()
     if use_ddp:
         dist.destroy_process_group()

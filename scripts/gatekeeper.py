@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -171,6 +172,10 @@ def main():
     os.makedirs(args.accepted_dir, exist_ok=True)
     os.makedirs(args.rejected_dir, exist_ok=True)
 
+    os.environ.setdefault(
+        "MINIGO_TRT_CACHE",
+        str((PROJECT_ROOT / "models" / "trt_cache").resolve()))
+
     log = make_log(os.path.join(args.log_dir, "gatekeeper.log"))
     decisions = CsvLogger(
         os.path.join(args.log_dir, "gate_decisions.csv"),
@@ -180,10 +185,24 @@ def main():
 
     threads = args.threads if args.threads > 0 else (os.cpu_count() or 4)
 
+    # Graceful shutdown: first signal sets flag and wakes any interruptible
+    # sleep (stop_event.wait) so we exit the poll loop promptly; second
+    # signal kills the in-flight evaluate child.
     stop = {"flag": False}
+    stop_event = threading.Event()
+    current_child = {"proc": None}
     def _handle(sig, _f):
+        if stop["flag"]:
+            p = current_child["proc"]
+            if p is not None and p.poll() is None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+            return
         stop["flag"] = True
-        log("SIGNAL", sig=sig)
+        stop_event.set()
+        log("SIGNAL", sig=sig, note="finishing current match, then exiting")
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
@@ -199,7 +218,10 @@ def main():
         cands = sorted(
             glob.glob(os.path.join(args.candidates_dir, "v*.onnx")))
         if not cands:
-            time.sleep(args.poll_interval)
+            # Interruptible wait — stop_event.set() from the signal
+            # handler wakes us immediately instead of stalling up to
+            # poll_interval seconds after Ctrl-C.
+            stop_event.wait(args.poll_interval)
             continue
 
         newest = cands[-1]
@@ -254,16 +276,21 @@ def main():
 
         t0 = time.time()
         try:
-            proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT),
-                                  capture_output=True, text=True)
+            proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT),
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            current_child["proc"] = proc
+            out, err = proc.communicate()
         except Exception as e:
+            current_child["proc"] = None
             log("GATE_SPAWN_ERROR", err=str(e))
             time.sleep(2.0)
             continue
+        current_child["proc"] = None
         match_dt = time.time() - t0
 
-        out = proc.stdout or ""
-        err = proc.stderr or ""
+        out = out or ""
+        err = err or ""
         w1, w2, draws = parse_eval_output(out)
         total = w1 + w2 + draws
 

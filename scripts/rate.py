@@ -20,6 +20,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -169,6 +170,10 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.ratings_dir, exist_ok=True)
+    os.environ.setdefault(
+        "MINIGO_TRT_CACHE",
+        str((PROJECT_ROOT / "models" / "trt_cache").resolve()))
+
     log = make_log(os.path.join(args.log_dir, "rate.log"))
     elo_csv = os.path.join(args.ratings_dir, "elo.csv")
     if not os.path.exists(elo_csv):
@@ -179,9 +184,20 @@ def main():
     threads = args.threads if args.threads > 0 else (os.cpu_count() or 4)
 
     stop = {"flag": False}
+    stop_event = threading.Event()
+    current_child = {"proc": None}
     def _handle(sig, _f):
+        if stop["flag"]:
+            p = current_child["proc"]
+            if p is not None and p.poll() is None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+            return
         stop["flag"] = True
-        log("SIGNAL", sig=sig)
+        stop_event.set()
+        log("SIGNAL", sig=sig, note="finishing current pair, then exiting")
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
@@ -197,7 +213,7 @@ def main():
         if len(accepted) < 2:
             log("RATE_SKIP", reason="not enough accepted models",
                 n=len(accepted))
-            time.sleep(args.interval)
+            stop_event.wait(args.interval)
             continue
 
         pool = accepted[-args.pool_size:]
@@ -205,9 +221,13 @@ def main():
         log("RATE_ROUND_START", n=len(pool),
             newest=os.path.basename(pool[-1]))
 
+        round_aborted = False
         for i in range(len(pool)):
+            if round_aborted:
+                break
             for j in range(i + 1, len(pool)):
                 if stop["flag"]:
+                    round_aborted = True
                     break
                 m1 = pool[i]
                 m2 = pool[j]
@@ -229,12 +249,17 @@ def main():
                     "--score-scale", str(args.score_scale),
                 ]
                 try:
-                    proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT),
-                                          capture_output=True, text=True)
+                    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT),
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, text=True)
+                    current_child["proc"] = proc
+                    out, _err = proc.communicate()
                 except Exception as e:
+                    current_child["proc"] = None
                     log("RATE_SPAWN_ERROR", err=str(e))
                     continue
-                w1, w2, draws = parse_eval_output(proc.stdout or "")
+                current_child["proc"] = None
+                w1, w2, draws = parse_eval_output(out or "")
                 # In rating we split draws evenly — BT supports fractional
                 # wins via rounding; we count half-draws toward each side
                 # (integer-rounded by adding to whichever is smaller first).
@@ -263,10 +288,8 @@ def main():
             n=len(pool),
             sleep=f"{args.interval:.0f}s")
 
-        # Sleep in small chunks so signals stop us promptly
-        deadline = time.time() + args.interval
-        while time.time() < deadline and not stop["flag"]:
-            time.sleep(min(10.0, max(0.1, deadline - time.time())))
+        # Interruptible wait — signal wakes us immediately.
+        stop_event.wait(args.interval)
 
     log("SHUTDOWN")
 

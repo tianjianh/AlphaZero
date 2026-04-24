@@ -114,14 +114,21 @@ static std::string make_cache_path(const std::string& model_path,
             safe_name += '_';
     }
 
-    // Extract model filename; cache in a fixed trt_cache/ directory
+    // Extract model filename; cache in a directory shared across workers.
+    // MINIGO_TRT_CACHE (if set) is an absolute-or-relative directory path
+    // used as the cache root; otherwise fall back to the historical
+    // relative "trt_cache/" next to the launching cwd.  The continuous
+    // pipeline's supervisor sets MINIGO_TRT_CACHE=<project>/models/trt_cache
+    // so gatekeeper + selfplay share plans regardless of their launch cwd.
     std::string base = model_path;
     auto slash = model_path.find_last_of('/');
     if (slash != std::string::npos)
         base = model_path.substr(slash + 1);
 
-    std::string cache_dir = "trt_cache";
-    system(("mkdir -p " + cache_dir).c_str());
+    const char* env_cache = std::getenv("MINIGO_TRT_CACHE");
+    std::string cache_dir = (env_cache && env_cache[0]) ? env_cache : "trt_cache";
+    // Quote to tolerate spaces; -p creates intermediate directories.
+    system(("mkdir -p '" + cache_dir + "'").c_str());
 
     // Include precision so FP16/BF16/FP8 engines don't collide
     std::string prec_tag;

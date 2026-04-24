@@ -114,7 +114,19 @@ def bootstrap_model(args):
 # ═══════════════════════════════════════════════════════════
 
 class Worker:
-    """Tracks one worker subprocess and restart backoff state."""
+    """Tracks one worker subprocess and restart backoff state.
+
+    Each worker is launched as a session leader (start_new_session=True)
+    so the supervisor can reach the whole worker tree (Python wrapper +
+    any C++ child it spawns) via os.killpg.  Shutdown is two-stage:
+
+    1. Graceful: SIGTERM to the wrapper PID ONLY (self.proc.terminate()).
+       The wrapper sets a stop flag and lets the in-flight C++ child
+       finish the current batch/match.  Supervisor waits up to
+       graceful_timeout seconds.
+    2. Hard: SIGKILL to the whole process group (os.killpg).  Used on
+       grace-timeout or on second Ctrl-C.  Guarantees no orphans.
+    """
 
     MAX_BACKOFF_S = 300.0
     MAX_RESTARTS_IN_WINDOW = 3
@@ -142,9 +154,9 @@ class Worker:
         self.log_fh.flush()
         self.proc = subprocess.Popen(
             cmd, cwd=str(PROJECT_ROOT), env=env,
-            stdout=self.log_fh, stderr=subprocess.STDOUT)
+            stdout=self.log_fh, stderr=subprocess.STDOUT,
+            start_new_session=True)   # own session/pgroup = reachable via killpg
         self.start_times.append(time.time())
-        # Prune window
         cutoff = time.time() - self.WINDOW_S
         self.start_times = [t for t in self.start_times if t >= cutoff]
 
@@ -153,36 +165,51 @@ class Worker:
             return None
         return self.proc.poll()
 
-    def terminate(self, grace_s=10.0):
+    def request_graceful_stop(self):
+        """Send SIGTERM to the wrapper PID only.  The wrapper's handler
+        sets a stop flag and lets its in-flight C++ child finish the
+        current batch/match.  Does NOT signal the whole group — that
+        would kill the C++ child immediately."""
         if self.proc and self.proc.poll() is None:
             try:
-                self.proc.terminate()
+                self.proc.terminate()   # SIGTERM to the wrapper PID
             except OSError:
                 pass
+
+    def kill_group(self):
+        """SIGKILL the whole process group — wrapper + any C++ child.
+        Use only after a grace timeout or on hard-shutdown escalation."""
+        if self.proc and self.proc.poll() is None:
             try:
-                self.proc.wait(timeout=grace_s)
-            except subprocess.TimeoutExpired:
-                try:
-                    self.proc.kill()
-                except OSError:
-                    pass
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+
+    def wait(self, timeout):
+        """Block until the wrapper exits or timeout elapses.  Returns
+        True if it exited, False on timeout."""
+        if self.proc is None:
+            return True
+        try:
+            self.proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    def close_log(self):
         if self.log_fh:
             try:
                 self.log_fh.close()
             except OSError:
                 pass
+            self.log_fh = None
 
     def should_disable(self):
         return len(self.start_times) >= self.MAX_RESTARTS_IN_WINDOW
 
     def handle_exit(self, rc, sup_log):
         sup_log("CRASH", proc=self.name, rc=rc)
-        if self.log_fh:
-            try:
-                self.log_fh.close()
-            except OSError:
-                pass
-        self.log_fh = None
+        self.close_log()
         if self.should_disable():
             self.disabled = True
             sup_log("DISABLED", proc=self.name,
@@ -225,17 +252,23 @@ def train_cmd(args, log_dir):
            "--warmup-steps", str(args.warmup_steps),
            "--lr-milestones", args.lr_milestones,
            "--lr-gamma", str(args.lr_gamma),
+           "--weight-decay", str(args.weight_decay),
            "--replay-target", str(args.replay_target),
            "--n-augmentations", str(args.n_augmentations),
            "--ring-games", str(args.ring_games),
            "--bucket-cap-mult", str(args.bucket_cap_mult),
            "--min-window-games", str(args.min_window_games),
            "--min-ring-rows", str(args.min_ring_rows),
+           "--sample-batch-timeout-s", str(args.sample_batch_timeout_s),
            "--export-every", str(args.export_every),
            "--status-publish-every", str(args.status_publish_every),
            "--log-every", str(args.log_every),
            "--value-ramp-steps", str(args.value_ramp_steps),
            "--score-ramp-steps", str(args.score_ramp_steps),
+           "--value-weight-start", str(args.value_weight_start),
+           "--value-weight-end", str(args.value_weight_end),
+           "--score-mean-weight-start", str(args.score_mean_weight_start),
+           "--score-mean-weight-end", str(args.score_mean_weight_end),
            ]
     if args.fp8:
         cmd.append("--fp8")
@@ -261,6 +294,7 @@ def selfplay_cmd(args, log_dir):
             "--temp-threshold", str(args.temp_threshold),
             "--komi", str(args.komi),
             "--score-scale", str(args.score_scale),
+            "--score-weight-max", str(args.score_weight_max),
             ]
 
 
@@ -328,6 +362,13 @@ def cmd_run(args):
 
     build_if_needed()
 
+    # Shared TRT engine cache — set once here and propagated to every
+    # worker's env.  The C++ binaries read MINIGO_TRT_CACHE to locate
+    # the cache dir; without this, cache keys depend on each worker's
+    # cwd, defeating gatekeeper→selfplay plan reuse.
+    trt_cache_dir = (MODELS_DIR / "trt_cache").resolve()
+    trt_cache_dir.mkdir(parents=True, exist_ok=True)
+
     # Timestamped logs dir.  LOGS_ROOT/current is a symlink to the active one
     # for convenience.
     ts = timestamp()
@@ -350,26 +391,33 @@ def cmd_run(args):
             rate_gpus=args.rate_gpus,
             rating=args.rating)
 
+    base_env = {"MINIGO_TRT_CACHE": str(trt_cache_dir)}
+
+    def _env(gpus):
+        e = dict(base_env)
+        e["CUDA_VISIBLE_DEVICES"] = gpus
+        return e
+
     workers = []
     workers.append(Worker(
         "train", lambda: train_cmd(args, log_dir_str),
-        env_overrides={"CUDA_VISIBLE_DEVICES": args.train_gpus},
+        env_overrides=_env(args.train_gpus),
         log_path=str(log_dir / "train.stdio.log"),
     ))
     workers.append(Worker(
         "selfplay", lambda: selfplay_cmd(args, log_dir_str),
-        env_overrides={"CUDA_VISIBLE_DEVICES": args.selfplay_gpus},
+        env_overrides=_env(args.selfplay_gpus),
         log_path=str(log_dir / "selfplay.stdio.log"),
     ))
     workers.append(Worker(
         "gatekeeper", lambda: gate_cmd(args, log_dir_str),
-        env_overrides={"CUDA_VISIBLE_DEVICES": args.gate_gpus},
+        env_overrides=_env(args.gate_gpus),
         log_path=str(log_dir / "gatekeeper.stdio.log"),
     ))
     if args.rating:
         workers.append(Worker(
             "rate", lambda: rate_cmd(args, log_dir_str),
-            env_overrides={"CUDA_VISIBLE_DEVICES": args.rate_gpus},
+            env_overrides=_env(args.rate_gpus),
             log_path=str(log_dir / "rate.stdio.log"),
         ))
 
@@ -378,30 +426,33 @@ def cmd_run(args):
         sup_log("SPAWN", proc=w.name, pid=w.proc.pid,
                 gpus=w.env_overrides.get("CUDA_VISIBLE_DEVICES", "-"))
 
-    # Graceful shutdown
-    shutting_down = {"flag": False}
+    # Two-stage shutdown:
+    #   1st signal:  SIGTERM to each wrapper PID only (not the group).
+    #                Wrapper's handler flips a stop flag and lets its
+    #                in-flight C++ child (selfplay batch / gate match)
+    #                run to completion.  Supervise loop falls out of
+    #                its poll; finally-block waits up to
+    #                --graceful-timeout seconds for each worker.
+    #   Timeout or 2nd signal:
+    #                SIGKILL to each worker's entire process group.
+    #                Wrapper + C++ child die together; no orphans.
+    shutting_down = {"flag": False, "escalated": False}
     def _handle(sig, _f):
         if shutting_down["flag"]:
-            # Second Ctrl-C — hard kill
+            # Second Ctrl-C — escalate to group-kill for the supervise
+            # loop's finally-block to see.
+            shutting_down["escalated"] = True
+            sup_log("SIGNAL_ESCALATE", sig=sig)
             for w in workers:
-                try:
-                    if w.proc and w.proc.poll() is None:
-                        w.proc.kill()
-                except OSError:
-                    pass
-            sys.exit(130)
+                w.kill_group()
+            return
         shutting_down["flag"] = True
-        sup_log("SIGNAL_FORWARD", sig=sig)
+        sup_log("SIGNAL_GRACEFUL", sig=sig, grace_s=args.graceful_timeout)
         for w in workers:
-            try:
-                if w.proc and w.proc.poll() is None:
-                    w.proc.send_signal(sig)
-            except OSError:
-                pass
+            w.request_graceful_stop()
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
-    # Supervise loop
     try:
         while not shutting_down["flag"]:
             any_alive = False
@@ -420,9 +471,30 @@ def cmd_run(args):
                 break
             time.sleep(2.0)
     finally:
+        # Give each worker up to graceful_timeout to exit cleanly, then
+        # hard-kill anything still running.  The supervisor never exits
+        # while a wrapper is still alive, so there are no orphans on
+        # normal termination paths.
+        deadline = time.time() + args.graceful_timeout
         for w in workers:
-            w.terminate()
-        sup_log("SUPERVISOR_STOP")
+            remaining = max(0.1, deadline - time.time())
+            if w.wait(timeout=remaining):
+                sup_log("CLEAN_EXIT", proc=w.name,
+                        rc=(w.proc.returncode if w.proc else None))
+            else:
+                sup_log("KILL_GROUP", proc=w.name,
+                        reason="graceful timeout exceeded")
+                w.kill_group()
+                # Give the kill 5 s to take effect before giving up.
+                w.wait(timeout=5.0)
+            w.close_log()
+        # Belt-and-braces: anything still alive (e.g., SIGKILL race)
+        # gets one more group kill before we exit.
+        for w in workers:
+            if w.proc and w.proc.poll() is None:
+                w.kill_group()
+        sup_log("SUPERVISOR_STOP",
+                escalated=shutting_down.get("escalated", False))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -523,22 +595,32 @@ def add_run_args(p):
     p.add_argument("--warmup-steps", type=int, default=2000)
     p.add_argument("--lr-milestones", default="100000,400000,1500000")
     p.add_argument("--lr-gamma", type=float, default=0.5)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--replay-target", type=float, default=4.0)
     p.add_argument("--n-augmentations", type=int, default=8)
     p.add_argument("--ring-games", type=int, default=2000)
     p.add_argument("--bucket-cap-mult", type=int, default=64)
     p.add_argument("--min-window-games", type=int, default=2000)
     p.add_argument("--min-ring-rows", type=int, default=10240)
+    p.add_argument("--sample-batch-timeout-s", type=float, default=30.0)
     p.add_argument("--export-every", type=int, default=5000)
     p.add_argument("--status-publish-every", type=int, default=100)
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--value-ramp-steps", type=int, default=30000)
     p.add_argument("--score-ramp-steps", type=int, default=50000)
+    # Head-weight endpoints (the ramps interpolate from *_start to *_end).
+    p.add_argument("--value-weight-start", type=float, default=1.0)
+    p.add_argument("--value-weight-end", type=float, default=2.0)
+    p.add_argument("--score-mean-weight-start", type=float, default=0.004)
+    p.add_argument("--score-mean-weight-end", type=float, default=0.010)
 
     # Selfplay
     p.add_argument("--selfplay-batch-games", type=int, default=300)
     p.add_argument("--selfplay-sims", type=int, default=500)
     p.add_argument("--window-games", type=int, default=80000)
+    p.add_argument("--score-weight-max", type=float, default=0.06,
+                   help="MCTS score weight at full ramp (selfplay reads "
+                        "score_ramp from status.json and multiplies)")
 
     # Gatekeeper
     p.add_argument("--gate-games", type=int, default=200)
@@ -562,6 +644,12 @@ def add_run_args(p):
     p.add_argument("--komi", type=float, default=7.5)
     p.add_argument("--score-scale", type=float, default=18.0)
     p.add_argument("--max-batch", type=int, default=256)
+
+    # Shutdown
+    p.add_argument("--graceful-timeout", type=float, default=180.0,
+                   help="Seconds to wait for workers to finish their "
+                        "current batch/match after a shutdown request "
+                        "before SIGKILL'ing the worker process group")
 
 
 def main():

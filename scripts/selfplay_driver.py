@@ -25,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -68,20 +69,30 @@ def read_status(path):
 # ═══════════════════════════════════════════════════════════
 
 def cleanup_orphans(pool_dir, log):
-    """Delete half-written .tmp files and leftover staging dirs."""
+    """Delete half-written .tmp files and in-flight staging dirs.
+    Does NOT touch `.failed` staging dirs — those are kept for
+    postmortem inspection after a PUBLISH_ERROR."""
     tmps = glob.glob(os.path.join(pool_dir, "g_*.bin.zst.tmp"))
     for t in tmps:
         try:
             os.remove(t)
-            log("CLEANUP_TMP", path=t)
+            log("CLEANUP_TMP", path=os.path.basename(t))
         except OSError:
             pass
     staging_root = os.path.join(pool_dir, "staging")
     if os.path.isdir(staging_root):
         for d in glob.glob(os.path.join(staging_root, "batch_*")):
+            # Preserve `.failed` sibling dirs — they contain games whose
+            # publish step failed and the operator may want to inspect
+            # or retry them.  Name pattern is `batch_<id>.failed-<ts>`,
+            # so check for the `.failed` substring rather than an exact
+            # suffix match.
+            if ".failed" in os.path.basename(d):
+                log("CLEANUP_STAGING_SKIP_FAILED", path=os.path.basename(d))
+                continue
             try:
                 shutil.rmtree(d)
-                log("CLEANUP_STAGING", path=d)
+                log("CLEANUP_STAGING", path=os.path.basename(d))
             except OSError:
                 pass
 
@@ -219,23 +230,46 @@ def main():
     os.makedirs(os.path.dirname(args.status_file) or ".", exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
+    # Point the downstream build/selfplay binary at the shared TRT cache
+    # dir so its engine plans are reused by gatekeeper + selfplay across
+    # launches regardless of cwd.
+    os.environ.setdefault(
+        "MINIGO_TRT_CACHE",
+        str((PROJECT_ROOT / "models" / "trt_cache").resolve()))
+
     log = make_log(os.path.join(args.log_dir, "selfplay.log"))
     batches_csv = CsvLogger(os.path.join(args.log_dir, "selfplay_batches.csv"), [
         "batch_id", "wall_time_start", "wall_time_end", "model_in_use",
         "games_played", "positions_written", "duration_s", "selfplay_duration_s",
-        "score_weight", "pool_size",
+        "score_weight", "pool_size", "publish_failures",
     ])
 
     cleanup_orphans(args.pool_dir, log)
 
     threads = args.threads if args.threads > 0 else (os.cpu_count() or 4)
 
-    # Graceful shutdown: catch SIGINT/SIGTERM, let the current batch finish
-    # its compress+publish, then exit cleanly.
+    # Graceful shutdown: first signal sets a flag and lets the current
+    # batch run to completion (the C++ child is NOT signalled — the
+    # supervisor's graceful-timeout + group SIGKILL escalation is the
+    # hard-kill path).  Second signal force-kills the child so we exit
+    # promptly if something is hung.
     stop = {"flag": False}
+    stop_event = threading.Event()
+    current_child = {"proc": None}
     def _handle(sig, _f):
+        if stop["flag"]:
+            # Second signal — escalate: kill the in-flight C++ child
+            # and let subprocess.run return so we exit the loop.
+            p = current_child["proc"]
+            if p is not None and p.poll() is None:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+            return
         stop["flag"] = True
-        log("SIGNAL", sig=sig)
+        stop_event.set()
+        log("SIGNAL", sig=sig, note="finishing current batch, then exiting")
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
@@ -251,7 +285,7 @@ def main():
         model_path = resolve_accepted_latest(args.accepted_dir)
         if model_path is None or not os.path.isfile(model_path):
             log("NO_MODEL", accepted_dir=args.accepted_dir)
-            time.sleep(args.model_poll_interval)
+            stop_event.wait(args.model_poll_interval)
             continue
         if model_path != last_model:
             log("MODEL_SWAP", old=last_model or "-", new=model_path)
@@ -292,16 +326,20 @@ def main():
 
         t0 = time.time()
         try:
-            proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+            proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT))
+            current_child["proc"] = proc
+            rc = proc.wait()
         except Exception as e:
+            current_child["proc"] = None
             log("SELFPLAY_SPAWN_ERROR", err=str(e))
             shutil.rmtree(staging, ignore_errors=True)
             time.sleep(2.0)
             continue
+        current_child["proc"] = None
         selfplay_dt = time.time() - t0
 
-        if proc.returncode != 0:
-            log("SELFPLAY_EXIT_NONZERO", rc=proc.returncode, batch=batch_id)
+        if rc != 0:
+            log("SELFPLAY_EXIT_NONZERO", rc=rc, batch=batch_id)
             # Keep whatever partial output landed — publish it — but don't
             # attempt to recount as a full batch.
         bin_files = sorted(glob.glob(os.path.join(staging, "game_*.bin")))
@@ -314,6 +352,7 @@ def main():
 
         start_id = next_id(args.pool_dir)
         positions = 0
+        publish_failures = 0
         for i, bp in enumerate(bin_files):
             gid = start_id + i
             final = os.path.join(args.pool_dir, f"g_{gid:017d}.bin.zst")
@@ -321,7 +360,20 @@ def main():
                 _compress_and_publish(bp, final, zstd_level=args.zstd_level)
                 positions += _count_rows(final)
             except Exception as e:
-                log("PUBLISH_ERROR", path=bp, err=str(e))
+                log("PUBLISH_ERROR", path=os.path.basename(bp), err=str(e))
+                publish_failures += 1
+                # Half-written compressed tmp may remain — remove it so
+                # the scanner doesn't trip over it next tick.  Leave the
+                # source .bin in staging for retry/postmortem.
+                try:
+                    os.remove(final + ".tmp")
+                except OSError:
+                    pass
+                continue
+            # Remove the source only after a successful publish.  On
+            # any failure the .bin stays in staging; the staging dir
+            # itself is renamed to `.failed` below so that cleanup_orphans
+            # on next startup doesn't wipe it.
             try:
                 os.remove(bp)
             except OSError:
@@ -338,10 +390,22 @@ def main():
                 except OSError:
                     pass
 
-        try:
+        if publish_failures > 0:
+            # Preserve the staging dir for operator inspection.  Name
+            # collisions with earlier `.failed` dirs (e.g., same batch_id
+            # after restart) are prevented by the monotonic batch_id and
+            # a timestamp suffix.
+            failed_dir = f"{staging}.failed-{int(time.time())}"
+            try:
+                os.rename(staging, failed_dir)
+                log("PUBLISH_STAGING_RETAINED",
+                    dir=os.path.basename(failed_dir),
+                    failures=publish_failures,
+                    total_files=len(bin_files))
+            except OSError as e:
+                log("PUBLISH_STAGING_RENAME_FAIL", err=str(e))
+        else:
             shutil.rmtree(staging, ignore_errors=True)
-        except OSError:
-            pass
 
         wall_end = time.time()
         pool_size = min(len(pool), args.window_games)
@@ -350,7 +414,8 @@ def main():
             games=len(bin_files), positions=positions,
             duration=f"{wall_end - wall_start:.1f}",
             selfplay=f"{selfplay_dt:.1f}",
-            pool=pool_size, pruned=removed)
+            pool=pool_size, pruned=removed,
+            publish_failures=publish_failures)
 
         batches_csv.write({
             "batch_id": batch_id,
@@ -363,6 +428,7 @@ def main():
             "selfplay_duration_s": f"{selfplay_dt:.3f}",
             "score_weight": f"{score_w:.6f}",
             "pool_size": pool_size,
+            "publish_failures": publish_failures,
         })
 
     log("SHUTDOWN", batches=batch_id)

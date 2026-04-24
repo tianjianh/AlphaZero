@@ -283,8 +283,17 @@ Candidates are named `v{step:09d}.onnx` and preserved across the
 the TRT cache; selfplay's next batch loads the plan from disk in <1s.
 No 30-120s rebuild tax per promotion.
 
-Requirement: all C++ binaries run from the same CWD (project root)
-and use the same `--max-batch`. Both are enforced by the supervisor.
+The cache directory is resolved from the `MINIGO_TRT_CACHE` environment
+variable, which the supervisor sets to an absolute
+`<project_root>/models/trt_cache` path and propagates to every worker's
+env. Standalone wrapper runs (`python scripts/selfplay_driver.py ...`)
+set the same default via `os.environ.setdefault`, so gatekeeper-warmed
+plans are reused regardless of the launch cwd. If `MINIGO_TRT_CACHE`
+is unset, the C++ binaries fall back to `trt_cache/` relative to cwd
+(legacy behavior; matches the phased pipeline).
+
+Requirement: all workers must pass the same `--max-batch`. The
+supervisor forwards a single shared value.
 
 ---
 
@@ -341,17 +350,23 @@ only what you need.
 --warmup-steps 2000
 --lr-milestones 100000,400000,1500000
 --lr-gamma 0.5
+--weight-decay 1e-4
 --replay-target 4.0
 --n-augmentations 8
 --ring-games 2000
 --bucket-cap-mult 64
 --min-window-games 2000
 --min-ring-rows 10240
+--sample-batch-timeout-s 30
 --export-every 5000
 --status-publish-every 100
 --log-every 100
 --value-ramp-steps 30000
 --score-ramp-steps 50000
+--value-weight-start 1.0     # head-weight ramp endpoints
+--value-weight-end   2.0
+--score-mean-weight-start 0.004
+--score-mean-weight-end   0.010
 ```
 
 **Selfplay:**
@@ -359,6 +374,7 @@ only what you need.
 --selfplay-batch-games 300    # games per build/selfplay invocation
 --selfplay-sims 500
 --window-games 80000          # disk retention cap
+--score-weight-max 0.06       # MCTS score weight at full ramp
 ```
 
 **Gatekeeper:**
@@ -387,6 +403,11 @@ only what you need.
 --komi 7.5
 --score-scale 18.0
 --max-batch 256
+```
+
+**Shutdown:**
+```
+--graceful-timeout 180        # seconds; SIGKILL'd after this on shutdown
 ```
 
 ### `scripts/run_continuous.py status`
@@ -432,7 +453,8 @@ models/
 │   └── latest -> v000005000.onnx     # atomic symlink, updated on promotion
 ├── rejected/
 │   └── v000002500.onnx
-└── trt_cache/                        # shared between selfplay + evaluate
+└── trt_cache/                        # shared TRT engine cache
+                                      # (MINIGO_TRT_CACHE set by supervisor)
 
 ratings/
 ├── rating_state.json                 # accumulated pairwise game counts
@@ -636,12 +658,29 @@ worker's `*.stdio.log` for the traceback.
 
 ### Shutdown
 
-- **Ctrl-C once**: SIGTERM to all workers; they flush logs and exit.
-  Supervisor waits up to 10s per worker before SIGKILL.
-- **Ctrl-C twice**: immediate SIGKILL to everything.
+Two-stage graceful shutdown:
+
+- **Ctrl-C once**: supervisor sends SIGTERM to each worker's Python
+  wrapper PID only (not the process group). The wrapper flips a stop
+  flag and lets its in-flight C++ child (selfplay batch, gatekeeper
+  match, rate round) run to completion. The trainer broadcasts the
+  shutdown decision across DDP ranks, then rank 0 saves a final
+  checkpoint (step + optimizer + bucket + watermark) so resume picks
+  up exactly where we stopped. Supervisor waits up to
+  `--graceful-timeout` seconds (default 180s).
+- **Ctrl-C twice, or graceful timeout exceeded**: supervisor sends
+  SIGKILL to each worker's entire process group (wrapper + any C++
+  child). Guarantees no orphans on supervisor exit.
+
+Each worker is launched with `start_new_session=True` so the supervisor
+can reach the whole tree via `os.killpg`; standalone wrapper runs
+behave the same.
 
 No special teardown needed — all state is on-disk and
-restart-friendly.
+restart-friendly. A SIGKILL between the trainer's FINAL_CHECKPOINT save
+and the next EXPORT still loses at most `status_publish_every` steps,
+because the previous export (or the last FINAL_CHECKPOINT on the
+previous clean stop) is the fallback resume point.
 
 ### Running a single worker standalone
 
