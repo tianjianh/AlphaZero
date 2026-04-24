@@ -230,7 +230,13 @@ def train_cmd(args, log_dir):
     gpus = args.train_gpus.split(",")
     n = len(gpus)
     port = 29500 + (os.getpid() % 1000)
-    cmd = ["torchrun", f"--nproc_per_node={n}",
+    # Invoke torchrun as a Python module via sys.executable so the rank
+    # processes run under the SAME interpreter (and therefore the same
+    # installed packages, incl. zstandard) as the supervisor.  A bare
+    # `torchrun` resolves via PATH and can silently fall back to system
+    # Python, which won't have the project's dependencies.
+    cmd = [sys.executable, "-m", "torch.distributed.run",
+           f"--nproc_per_node={n}",
            f"--master_port={port}",
            str(SCRIPTS_DIR / "train_continuous.py"),
            "--pool-dir", str(TRAINING_DIR / "selfplay"),
