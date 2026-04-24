@@ -181,9 +181,20 @@ survives any pruning pattern.
 `window_games` governs **disk retention** (enforced by selfplay's
 pruner). The trainer's **effective sampling window** is a smaller
 in-RAM ring buffer — default `ring_games = 2000` games × ~800 aug_rows
-= ~1.6M rows × ~6 KB ≈ **10 GB per rank**. Each rank ingests
-independently; when the ring is full, adding a new game's rows evicts
-the oldest equal count of rows (FIFO at row granularity).
+= ~1.6M rows × ~6 KB ≈ **10 GB per rank**.
+
+Circular at row granularity: a `_head` pointer tracks the next write
+slot, new rows overwrite old ones in place, and sampling still draws
+uniformly from `[0, _size)` since every slot holds valid data once
+full. Appending is O(n_new), not O(ring_rows) — a shift-and-append
+design would memmove the entire ~10 GB ring on every ingested game
+and turn ingest into a bandwidth bottleneck.
+
+Each rank ingests independently. On resume, the ring's ingest starts
+from roughly the newest `1.5 × ring_games` files (not id=0), so it
+rehydrates with the freshest window instead of replaying the oldest
+retained pool — which would briefly have the trainer learning from
+hours-stale data before the cold-start gate notices.
 
 Freshness: at 1.5 games/s sustained, a row's ring lifetime is ~1.6M /
 1200 rows/s ≈ 22 min. Tighter than KataGo's hour-scale shuffle buffer,
@@ -203,6 +214,22 @@ A rank-0-only gate is not sufficient — rank 0's scanner can see
 plenty of disk files while a slower rank's ingest is still warming
 up. Proceeding into `train_step` in that state either blocks inside
 `sample_batch` or desyncs the DDP allreduce.
+
+### Pool enumeration cost
+
+Both the scanner (rank 0) and the per-rank ingest threads enumerate
+`training/selfplay/` on a timer. To avoid the retention-sized scan
+becoming a measurable tax on long runs:
+
+- Enumeration uses `os.scandir` — no sorted-glob of the full pool.
+  Each poll filters to `gid > watermark` *before* sorting, so only
+  the tiny "new files" subset is sorted.
+- The scanner caches per-file row counts keyed by filename ID. Pool
+  files are immutable after publish (selfplay writes `.tmp` + rename),
+  so a V2 header read happens exactly once per file per run. Pruned
+  files are evicted from the cache via set-diff each tick.
+- The ingest thread polls aggressively (0.5s) while behind and backs
+  off exponentially (up to 3s) once caught up.
 
 ### Ramps (2 knobs, both with phased-pipeline precedent)
 

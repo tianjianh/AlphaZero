@@ -18,7 +18,6 @@ See cont_train.todo for the complete design rationale.
 """
 
 import argparse
-import glob
 import json
 import os
 import random
@@ -141,15 +140,44 @@ def _parse_id(path):
     return int(m.group(1)) if m else -1
 
 
-def _list_pool(pool_dir):
-    """Return sorted [(id, path)] for every g_*.bin.zst in pool_dir."""
+def _scandir_ids(pool_dir):
+    """Return list[(gid, path)] for every g_*.bin.zst entry in pool_dir.
+
+    Unsorted — callers that only need a filtered subset sort that subset
+    afterward, which is much cheaper than sorting the full pool at
+    80k-file retention.  os.scandir avoids the sorted(glob(...))
+    behavior in _list_pool.
+    """
     out = []
-    for p in glob.glob(os.path.join(pool_dir, "g_*.bin.zst")):
-        gid = _parse_id(p)
-        if gid >= 0:
-            out.append((gid, p))
-    out.sort()
+    try:
+        with os.scandir(pool_dir) as it:
+            for entry in it:
+                m = _ID_RE.search(entry.name)
+                if m:
+                    out.append((int(m.group(1)), entry.path))
+    except FileNotFoundError:
+        return []
     return out
+
+
+def _warmup_watermark(pool_dir, ring_games, overshoot=1.5):
+    """On resume, start the per-rank ring's ingest from the newest-K files
+    instead of id=0.  Without this, ingest rehydrates the ring from the
+    oldest retained pool upward, and the cold-start gate passes as soon
+    as min_ring_rows worth of STALE old data has landed — briefly
+    training on data several hours out of date.
+
+    Returns a watermark value such that the ingest loop's `gid >
+    watermark` filter captures at most overshoot * ring_games files
+    (the newest ones).  On a fresh run or a barely-populated pool,
+    returns 0 so nothing is skipped.
+    """
+    ids = [gid for gid, _ in _scandir_ids(pool_dir)]
+    target = int(ring_games * overshoot)
+    if len(ids) <= target:
+        return 0
+    ids.sort()
+    return ids[-target] - 1
 
 
 # ═══════════════════════════════════════════════════════════
@@ -194,12 +222,18 @@ class Bucket:
 class WindowScanner(threading.Thread):
     """Background thread tailing the selfplay pool and crediting the bucket.
 
-    Iterates every POLL_INTERVAL seconds.  For every pool file with
-    id > watermark_id, adds (replay_target * rows) // n_augmentations
-    to the bucket (clamped at bucket.max).  Advances watermark_id to the
-    max ID observed this pass.  Filename IDs are monotonic and never
-    reused, so this is robust to pruning (pruned IDs are simply below
-    watermark_id on later scans).
+    Iterates every POLL_INTERVAL seconds.  Pool files are immutable once
+    renamed into the pool (the selfplay driver writes via `.tmp` +
+    rename), so a file's row count never changes — we cache it in
+    `_row_counts` and only read the V2 header for files we haven't seen
+    before.  Pruned files are detected by set-diff against the cache and
+    evicted.
+
+    The first scan after a cold start reads headers for every current
+    file (O(pool_size)); subsequent scans only read headers for newly
+    added files (O(new_files_per_tick), typically tiny).  `window_games`
+    updates immediately from the scandir listing so the cold-start gate
+    doesn't block on the one-time header sweep.
     """
 
     POLL_INTERVAL = 5.0
@@ -212,6 +246,7 @@ class WindowScanner(threading.Thread):
         self.replay_target = replay_target
         self.n_aug = n_augmentations
         self._watermark = int(initial_watermark)
+        self._row_counts = {}      # gid -> row count (persisted across ticks)
         self._window_games = 0
         self._window_rows = 0
         self._stop = threading.Event()
@@ -228,33 +263,51 @@ class WindowScanner(threading.Thread):
     def stop(self):
         self._stop.set()
 
+    def _tick(self):
+        """One scan pass.  Exposed for tests; `run()` calls this in a loop."""
+        current = _scandir_ids(self.pool_dir)
+        current_ids = {gid for gid, _ in current}
+        path_by_id = dict(current)
+
+        # Evict row counts for pruned files (gone from disk).
+        for g in [g for g in self._row_counts if g not in current_ids]:
+            del self._row_counts[g]
+
+        # Read headers only for files we haven't cached yet.
+        unknown = sorted(g for g in current_ids
+                         if g not in self._row_counts)
+
+        # Publish games count right away so the cold-start gate can
+        # proceed even while the one-shot header sweep is still running
+        # on large pools.
+        self._window_games = len(current_ids)
+
+        new_rows = 0
+        new_max_id = self._watermark
+        for g in unknown:
+            rows = _peek_row_count(path_by_id[g])
+            self._row_counts[g] = rows
+            if g > self._watermark:
+                new_rows += rows
+                if g > new_max_id:
+                    new_max_id = g
+
+        if new_rows > 0:
+            # replay_target is per unique position; each disk row is
+            # one of N_AUGMENTATIONS views of a position, so credit
+            # replay_target rows of budget per N_AUGMENTATIONS rows seen.
+            credit = (self.replay_target * new_rows) // self.n_aug
+            self.bucket.credit(credit)
+            self._watermark = new_max_id
+
+        self._window_rows = sum(self._row_counts.values())
+
     def run(self):
         while not self._stop.is_set():
             try:
-                pool = _list_pool(self.pool_dir)
-                total_games = len(pool)
-                total_rows = 0
-                new_rows = 0
-                new_max_id = self._watermark
-                for gid, p in pool:
-                    rows = _peek_row_count(p)
-                    total_rows += rows
-                    if gid > self._watermark:
-                        new_rows += rows
-                        if gid > new_max_id:
-                            new_max_id = gid
-                if new_rows > 0:
-                    # replay_target is per unique position; each disk row is
-                    # one of N_AUGMENTATIONS views of a position, so credit
-                    # replay_target rows of budget per N_AUGMENTATIONS rows seen.
-                    credit = (self.replay_target * new_rows) // self.n_aug
-                    self.bucket.credit(credit)
-                    self._watermark = new_max_id
-                self._window_games = total_games
-                self._window_rows = total_rows
+                self._tick()
             except Exception as e:
                 print(f"[scanner] error: {e}", file=sys.stderr, flush=True)
-            # Cooperative sleep
             self._stop.wait(self.POLL_INTERVAL)
 
 
@@ -265,12 +318,23 @@ class WindowScanner(threading.Thread):
 class WindowRingBuffer:
     """Per-rank in-RAM row ring with a background ingest thread.
 
-    Holds decompressed row data for random sampling.  Size target is
-    ring_rows rows (FIFO eviction at row granularity when full).  Uses a
-    lazy append-then-evict policy driven by the ingest thread.
+    Circular buffer at row granularity.  A `_head` pointer tracks the
+    next write position; appending n_new rows does at most two
+    contiguous slice copies (one when the write wraps).  Eviction is
+    implicit — writes into slots that used to hold old rows overwrite
+    them in place.  Appending is O(n_new), not O(ring_rows) — critical
+    at 1.6M rows / 10 GB per rank, where a full-ring shift would make
+    ingest a memory-bandwidth bottleneck.
+
+    Sampling is still uniform over [0, _size) — when the ring is full,
+    _size == N and every index is live regardless of where _head sits.
+    The ordering of rows inside the ring doesn't match their arrival
+    order any more, but batches are sampled randomly anyway so that
+    doesn't matter.
     """
 
-    INGEST_POLL_S = 1.0
+    INGEST_POLL_MIN_S = 0.5
+    INGEST_POLL_MAX_S = 3.0
     MAX_QUEUED_IDS = 256
 
     def __init__(self, pool_dir, ring_rows, board_size, rng_seed,
@@ -288,11 +352,13 @@ class WindowRingBuffer:
         self._scores = None      # [N]
         self._owns = None        # [N, hw]
         self._opps = None        # [N]
-        self._size = 0
+        self._head = 0           # next write slot (mod N)
+        self._size = 0           # number of valid rows (<= N)
 
         self._watermark = int(initial_watermark)
         self._stop = threading.Event()
         self._ingest_thread = None
+        self._ingest_poll = self.INGEST_POLL_MIN_S
 
     # ---- public API ------------------------------------------------
 
@@ -319,7 +385,9 @@ class WindowRingBuffer:
             with self._lock:
                 if self._size >= batch_size:
                     idx = self._rng.integers(0, self._size, size=batch_size)
-                    # Copy slices (not views) — ring may evict after we release lock
+                    # Copy slices (not views) — circular writes after we
+                    # release the lock would otherwise mutate the tensors
+                    # under us.
                     states = np.ascontiguousarray(self._states[idx])
                     policies = np.ascontiguousarray(self._policies[idx])
                     values = np.ascontiguousarray(self._values[idx])
@@ -360,63 +428,81 @@ class WindowRingBuffer:
         self._opps = np.zeros((N,), dtype=np.int64)
 
     def _append(self, parsed):
-        """FIFO append: evict oldest rows if needed, then copy in new rows."""
+        """Circular append.  Writes into [head:head+n_new) mod N; two
+        contiguous slice copies at most.  O(n_new)."""
         states, policies, values, scores, owns, opps = parsed
         with self._lock:
             self._ensure_arrays(states)
             n_new = states.shape[0]
             N = self.ring_rows
+
             if n_new >= N:
-                # Pathological: one file bigger than ring — keep last N rows
-                keep = N
-                states = states[-keep:]
-                policies = policies[-keep:]
-                values = values[-keep:]
-                scores = scores[-keep:]
-                owns = owns[-keep:]
-                opps = opps[-keep:]
+                # Pathological: one file larger than ring — keep last N rows.
+                states = states[-N:]
+                policies = policies[-N:]
+                values = values[-N:]
+                scores = scores[-N:]
+                owns = owns[-N:]
+                opps = opps[-N:]
                 self._states[:] = states
                 self._policies[:] = policies
                 self._values[:] = values
                 self._scores[:] = scores
                 self._owns[:] = owns
                 self._opps[:] = opps
+                self._head = 0
                 self._size = N
                 return
 
-            if self._size + n_new > N:
-                # Shift existing rows left to make room at the end
-                free = N - n_new
-                drop = self._size - free
-                if drop > 0:
-                    self._states[:free] = self._states[drop:drop + free]
-                    self._policies[:free] = self._policies[drop:drop + free]
-                    self._values[:free] = self._values[drop:drop + free]
-                    self._scores[:free] = self._scores[drop:drop + free]
-                    self._owns[:free] = self._owns[drop:drop + free]
-                    self._opps[:free] = self._opps[drop:drop + free]
-                    self._size = free
+            head = self._head
+            end = head + n_new
+            if end <= N:
+                # Single contiguous write.
+                self._states[head:end] = states
+                self._policies[head:end] = policies
+                self._values[head:end] = values
+                self._scores[head:end] = scores
+                self._owns[head:end] = owns
+                self._opps[head:end] = opps
+            else:
+                # Wrap: write [head:N) then [0:end-N).
+                k = N - head
+                self._states[head:] = states[:k]
+                self._states[:n_new - k] = states[k:]
+                self._policies[head:] = policies[:k]
+                self._policies[:n_new - k] = policies[k:]
+                self._values[head:] = values[:k]
+                self._values[:n_new - k] = values[k:]
+                self._scores[head:] = scores[:k]
+                self._scores[:n_new - k] = scores[k:]
+                self._owns[head:] = owns[:k]
+                self._owns[:n_new - k] = owns[k:]
+                self._opps[head:] = opps[:k]
+                self._opps[:n_new - k] = opps[k:]
 
-            off = self._size
-            self._states[off:off + n_new] = states
-            self._policies[off:off + n_new] = policies
-            self._values[off:off + n_new] = values
-            self._scores[off:off + n_new] = scores
-            self._owns[off:off + n_new] = owns
-            self._opps[off:off + n_new] = opps
-            self._size += n_new
+            self._head = end % N
+            self._size = min(self._size + n_new, N)
 
     def _ingest_loop(self):
         while not self._stop.is_set():
             try:
-                pool = _list_pool(self.pool_dir)
-                # Grab a bounded chunk of new files; if there are many (cold
-                # start), subsequent loop iterations will catch up.
-                new_files = [(gid, p) for gid, p in pool if gid > self._watermark]
+                # Filter BEFORE sorting — at 80k retention, sorting only
+                # the small "new" subset is far cheaper than sorting all
+                # 80k paths each tick.
+                current = _scandir_ids(self.pool_dir)
+                new_files = [(g, p) for g, p in current if g > self._watermark]
+                new_files.sort()
                 new_files = new_files[:self.MAX_QUEUED_IDS]
+
                 if not new_files:
-                    self._stop.wait(self.INGEST_POLL_S)
+                    # Exponential back-off when caught up; resets to min
+                    # as soon as new files arrive.
+                    self._ingest_poll = min(
+                        self._ingest_poll * 1.5, self.INGEST_POLL_MAX_S)
+                    self._stop.wait(self._ingest_poll)
                     continue
+
+                self._ingest_poll = self.INGEST_POLL_MIN_S
                 for gid, p in new_files:
                     if self._stop.is_set():
                         break
@@ -434,7 +520,7 @@ class WindowRingBuffer:
                               file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[ingest] error: {e}", file=sys.stderr, flush=True)
-                self._stop.wait(self.INGEST_POLL_S)
+                self._stop.wait(self.INGEST_POLL_MIN_S)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -825,12 +911,25 @@ def main():
     # upper bound for 9x9.  For other board sizes, scale by board area/81.
     avg_moves_per_game = max(50, args.board * args.board * 100 // 81)
     ring_rows = int(args.ring_games * avg_moves_per_game * args.n_augmentations)
+
+    # On resume, start the ring's ingest from the newest ~ring_games
+    # files instead of id=0, so it rehydrates with the freshest window
+    # instead of replaying the oldest retained pool.  Without this, the
+    # cold-start gate passes as soon as min_ring_rows worth of stale old
+    # data has landed, and the trainer briefly trains on data that is
+    # several hours out of date relative to the current selfplay model.
+    # Fresh runs (empty pool) get watermark=0 and ingest everything.
+    ring_warmup_id = _warmup_watermark(args.pool_dir, args.ring_games)
+    if is_main:
+        events.log("RING_WARMUP", initial_watermark=ring_warmup_id,
+                   ring_games=args.ring_games)
+
     window = WindowRingBuffer(
         pool_dir=args.pool_dir,
         ring_rows=ring_rows,
         board_size=args.board,
         rng_seed=args.base_seed + rank + step,  # different per-rank, per-resume
-        initial_watermark=0,  # per-rank starts fresh; disk retention caps catch-up cost
+        initial_watermark=ring_warmup_id,
     )
     window.start_ingest()
 
