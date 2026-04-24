@@ -500,6 +500,20 @@ the workload-shape knobs.)
 --graceful-timeout 180        # seconds; SIGKILL'd after this on shutdown
 ```
 
+**Heartbeat:**
+```
+--heartbeat-interval 60       # seconds between supervisor HEARTBEAT lines
+                              # (pool / candidates / accepted / step / lr).
+                              # 0 disables.
+```
+
+Sample heartbeat line:
+```
+[2026-04-24 10:00:00] HEARTBEAT step=12500 lr=3.00e-04 score_ramp=0.25
+   pool=43207 cand=2 accepted=4 rejected=1 latest=v000012500.onnx
+   alive=train,selfplay,gatekeeper,rate dead=-
+```
+
 ### `scripts/run_continuous.py status`
 
 Prints accepted/candidate/rejected model counts, pool size, current

@@ -53,14 +53,26 @@ _V2_MAGIC = 0x4D47  # 'MG'
 
 
 def _decompress_bytes(filepath):
-    with open(filepath, "rb") as f:
-        data = f.read()
+    """Decompress a selfplay record file to raw V2-format bytes.
+
+    For .zst we use a streaming reader (not dctx.decompress(bytes))
+    because the one-shot API requires the frame header to carry a
+    content-size field, which isn't always present: any zstd stream
+    written without a known total size up front (e.g. historical
+    copy_stream-based writes) omits it.  stream_reader works in both
+    cases, so this is robust to mixed-provenance pool files.
+    """
     if filepath.endswith(".zst"):
-        return zstd.ZstdDecompressor().decompress(data)
+        dctx = zstd.ZstdDecompressor()
+        with open(filepath, "rb") as f:
+            with dctx.stream_reader(f) as reader:
+                return reader.read()
     if filepath.endswith(".gz"):
         import gzip
-        return gzip.decompress(data)
-    return data
+        with open(filepath, "rb") as f:
+            return gzip.decompress(f.read())
+    with open(filepath, "rb") as f:
+        return f.read()
 
 
 def _peek_row_count(filepath):

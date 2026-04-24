@@ -105,11 +105,21 @@ _ZSTD_LEVEL = 3  # fast; selfplay rate is bounded, not IO-bound
 
 
 def _compress_and_publish(bin_path, final_path, zstd_level=_ZSTD_LEVEL):
-    """Compress bin_path → final_path + '.tmp', then atomic rename to final_path."""
+    """Compress bin_path → final_path + '.tmp', then atomic rename to final_path.
+
+    Uses the in-memory one-shot `compress(bytes)` path (not copy_stream)
+    so the zstd frame header includes the content size.  Decompressors
+    using `decompress(data)` need that field — without it, the reader
+    throws `could not determine content size in frame header` and every
+    game silently fails to ingest.  (Game files are small — ~20 KB
+    uncompressed — so loading fully into memory is fine.)
+    """
     tmp = final_path + ".tmp"
-    cctx = zstd.ZstdCompressor(level=zstd_level)
-    with open(bin_path, "rb") as fin, open(tmp, "wb") as fout:
-        cctx.copy_stream(fin, fout)
+    cctx = zstd.ZstdCompressor(level=zstd_level, write_content_size=True)
+    with open(bin_path, "rb") as fin:
+        payload = fin.read()
+    with open(tmp, "wb") as fout:
+        fout.write(cctx.compress(payload))
     os.replace(tmp, final_path)
 
 

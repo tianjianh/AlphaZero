@@ -386,6 +386,55 @@ def make_sup_log(log_dir):
     return log
 
 
+def _heartbeat_snapshot():
+    """Read filesystem + status.json state for a single-line roll-up.
+    Never throws — returns '-' placeholders on any failure so the
+    heartbeat never interrupts the supervise loop."""
+    def _count(patterns):
+        import glob as _glob
+        total = 0
+        for p in patterns:
+            total += len(_glob.glob(p))
+        return total
+
+    pool = _count([str(TRAINING_DIR / "selfplay" / "g_*.bin.zst")])
+    candidates = _count([str(MODELS_DIR / "candidates" / "v*.onnx")])
+    accepted = _count([str(MODELS_DIR / "accepted" / "v*.onnx")])
+    rejected = _count([str(MODELS_DIR / "rejected" / "v*.onnx")])
+
+    latest = "-"
+    latest_link = MODELS_DIR / "accepted" / "latest"
+    if latest_link.is_symlink():
+        latest = os.readlink(str(latest_link))
+
+    step = lr = score_ramp = "-"
+    status_path = TRAINING_DIR / "status.json"
+    if status_path.is_file():
+        try:
+            import json as _json
+            with open(status_path) as f:
+                s = _json.load(f)
+            step = s.get("step", "-")
+            lr = s.get("lr", "-")
+            if isinstance(lr, float):
+                lr = f"{lr:.2e}"
+            sr = s.get("score_ramp", "-")
+            score_ramp = f"{sr:.2f}" if isinstance(sr, (int, float)) else sr
+        except (OSError, ValueError):
+            pass
+
+    return {
+        "step": step,
+        "lr": lr,
+        "score_ramp": score_ramp,
+        "pool": pool,
+        "candidates": candidates,
+        "accepted": accepted,
+        "rejected": rejected,
+        "latest": latest,
+    }
+
+
 def cmd_run(args):
     # Sanity: accepted/latest must exist.
     if not (MODELS_DIR / "accepted" / "latest").exists() and \
@@ -486,6 +535,14 @@ def cmd_run(args):
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
+    # Heartbeat: roll up run state into one line per interval so the
+    # operator can see forward progress without grep'ing per-worker
+    # logs.  HEARTBEAT_INTERVAL_S is cheap (one scandir + one small
+    # JSON read) and happens on the supervise thread, so it never
+    # blocks worker restart handling.
+    HEARTBEAT_INTERVAL_S = args.heartbeat_interval
+    last_heartbeat = 0.0
+
     try:
         while not shutting_down["flag"]:
             any_alive = False
@@ -502,6 +559,24 @@ def cmd_run(args):
             if not any_alive:
                 sup_log("ALL_DEAD", workers=[w.name for w in workers])
                 break
+
+            now = time.time()
+            if HEARTBEAT_INTERVAL_S > 0 and (now - last_heartbeat) >= HEARTBEAT_INTERVAL_S:
+                alive = [w.name for w in workers if w.proc and w.poll() is None]
+                dead = [w.name for w in workers if w.disabled]
+                snap = _heartbeat_snapshot()
+                sup_log("HEARTBEAT",
+                        step=snap["step"], lr=snap["lr"],
+                        score_ramp=snap["score_ramp"],
+                        pool=snap["pool"],
+                        cand=snap["candidates"],
+                        accepted=snap["accepted"],
+                        rejected=snap["rejected"],
+                        latest=snap["latest"],
+                        alive=",".join(alive) or "-",
+                        dead=",".join(dead) or "-")
+                last_heartbeat = now
+
             time.sleep(2.0)
     finally:
         # Every worker gets its OWN graceful_timeout window — not a
@@ -727,6 +802,12 @@ def add_run_args(p):
                    help="Seconds to wait for workers to finish their "
                         "current batch/match after a shutdown request "
                         "before SIGKILL'ing the worker process group")
+
+    # Heartbeat
+    p.add_argument("--heartbeat-interval", type=float, default=60.0,
+                   help="Seconds between supervisor HEARTBEAT lines "
+                        "(pool size, step, candidates, accepted, latest). "
+                        "0 disables.")
 
 
 def main():
