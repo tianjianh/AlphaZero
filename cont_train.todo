@@ -373,8 +373,22 @@ Ownership rules:
   reads training.pt, broadcasts `{step, bucket_level, watermark_id}` to
   other ranks, and all ranks load model/optimizer state identically
   from the same file.
-- **Cold-start gate**: rank 0 decides, broadcasts. Same collective
-  pattern.
+- **Cold-start gate**: a two-part check, both must pass before any
+  rank runs `train_step`.
+    1. Disk-level readiness (only rank 0 has the scanner):
+       `scanner.window_games() >= MIN_WINDOW_GAMES`. Rank 0 broadcasts
+       this bool.
+    2. Per-rank ring readiness (each rank independently owns its ring
+       and its ingest thread; timing can drift): every rank reports
+       `window.ring_rows() >= MIN_RING_ROWS`, reduced across ranks with
+       `dist.all_reduce(MIN)`. The gate passes only if ALL ranks are
+       locally ready.
+  A rank-0-only gate is **not sufficient** — rank 0's scanner can see
+  plenty of files on disk while a slower rank's ingest thread has yet
+  to populate its ring, and proceeding into `train_step` in that state
+  either blocks inside `sample_batch` or desyncs the DDP allreduce.
+  Implementers: match the pseudocode in the Train loop section below,
+  not a simpler summary.
 
 This keeps all bucket bookkeeping single-owner (no rank-drift possible)
 while still parallelizing the expensive decompression work across
@@ -468,7 +482,9 @@ ranks.
         batch = window.sample_batch(batch_size)
         lr    = lr_schedule(step)
         f_v   = value_ramp(step)              # value weight 1.0 → 2.0
-        f_s   = score_ramp(step)              # 0 → 1 multiplier for score knobs
+        f_s   = score_ramp(step)              # 0 → 1; only scales mcts_score_weight
+                                              # and head_score_mean_weight (phased
+                                              # precedent); stdev/belief stay fixed.
         wts   = head_weights_with_ramps(f_v, f_s)
         loss  = train_step(batch, lr=lr, head_weights=wts)  # DDP allreduce inside
 
@@ -734,43 +750,62 @@ on a noise signal. To avoid this:
   At conservative throughput (~0.3 steps/s), the ramp completes around
   28 hours in — early enough that most of the run is at the full weight.
 
-### Score-confidence ramp (fresh-start only)
+### Score ramp (fresh-start only; 2 knobs, not 4)
 
 The score head (scoreMean, scoreStdev, scoreBelief) and the MCTS score
 utility are untrustworthy on a random-init network: the model outputs
 arbitrary point estimates, which (a) generate noisy gradients in the
 score heads themselves, and (b) actively distort MCTS search by
-biasing the Q values toward a meaningless score prediction. The phased
-pipeline sidesteps this by explicitly holding `mcts_score_weight = 0.0`
-and `head_score_mean_weight = 0.004` through bootstrap and warmup
-stages (`run_loop.py:215`, `_EXPLORE[0:2]`), and even has a comment
-noting that KataGo's 0.30 score weight drove our setup to divergence.
+biasing the Q values toward a meaningless score prediction.
 
-Rather than introduce stages, use a second step-driven ramp. All four
-score-related knobs scale together via a single `score_ramp(step)`
-factor:
+The phased pipeline handles this with TWO per-stage overrides, not
+four:
+
+- `mcts_score_weight` is held at 0.0 in `_EXPLORE[0:2]` (bootstrap +
+  warm up) and ramps to 0.08 by the overnight stage (`run_loop.py:215`,
+  `_EXPLORE` tuples position 0). There's an explicit comment that
+  KataGo's 0.30 value drove our setup to divergence.
+- `score_mean_weight` is lowered to 0.004 in `_EXPLORE[0:2]` and raised
+  to 0.010 from early-gated onward.
+
+Crucially, `score_stdev_weight` and `score_belief_weight` are **NOT**
+overridden per stage — `training/plan.json` keeps them fixed at 0.006
+and 0.035 through every stage. So the phased precedent applies only to
+`mcts_score_weight` and `score_mean_weight`.
+
+Accordingly this plan ramps those two, matching phased precedent:
 
     score_ramp(step) = min(step / SCORE_RAMP_STEPS, 1.0)
 
-- `mcts_score_weight(step)`        = 0.00  + 0.06  × ramp
+- `mcts_score_weight(step)`        = 0.00  + 0.06  × ramp   (= 0.00  → 0.06)
 - `head_score_mean_weight(step)`   = 0.004 + 0.006 × ramp   (= 0.004 → 0.010)
-- `head_score_stdev_weight(step)`  = 0.002 + 0.004 × ramp   (= 0.002 → 0.006)
-- `head_score_belief_weight(step)` = 0.010 + 0.025 × ramp   (= 0.010 → 0.035)
+
+And leaves these fixed, matching phased precedent:
+
+- `head_score_stdev_weight`   = 0.006    (phased: fixed across all stages)
+- `head_score_belief_weight`  = 0.035    (phased: fixed across all stages)
+- `head_ownership_weight`     = 0.85     (phased: fixed across all stages)
+
+Rationale for not ramping stdev and belief: the phased pipeline has
+been tuned empirically (including the loss-weight rebalance in commit
+`b2962bf` and divergence fix in `2b451a9`), and it has not found the
+stdev or belief heads needing special treatment at fresh start. At a
+guess: their raw-loss magnitudes stay bounded enough at their small
+weights (0.006 and 0.035) that they don't poison other heads the way
+an unweighted mean head would. Introducing new ramps there would be
+speculative tuning, not precedent-backed.
 
 SCORE_RAMP_STEPS = 50k (default). At conservative throughput, completes
 around day 2 — matches the phased pipeline's "early gated / consolidate"
-transition point (around iter 9-14), where the staged rationale already
-said the score head is usable.
+transition point (around iter 9-14) where the staged rationale already
+said the score mean head is usable.
 
-Starting floors are from the phased bootstrap values (not zero for the
-training heads — a small positive weight still supplies gradient and
-keeps the heads from drifting to degenerate outputs, while being quiet
-enough to not poison other heads). MCTS score_weight specifically
-starts at zero because its damage (biasing search) is qualitatively
-different from a noisy gradient.
-
-Ownership head is NOT ramped — per-point BCE converges quickly even
-from random init, and the phased pipeline doesn't ramp it either.
+`mcts_score_weight` specifically starts at zero (not a small floor)
+because its damage is qualitatively different from a noisy gradient:
+it biases MCTS search tree shape, compounding over each simulation.
+`score_mean_weight` starts at 0.004 rather than 0 because the phased
+bootstrap stage runs it there — some gradient keeps the head from
+drifting to a degenerate collapsed output.
 
 ### Fixed MCTS params (from late-stage `_EXPLORE` tuple)
 
@@ -787,15 +822,19 @@ to avoid premature exploitation across the full run:
   mcts_komi             7.5       (9×9 area scoring, half-integer → no draws)
   mcts_score_weight     0.0 → 0.06 ramp over SCORE_RAMP_STEPS  (see above)
 
-### Fixed head weights (from `run_loop.py:419-425`, with two ramps)
+### Head weights (from `run_loop.py:419-425` + `training/plan.json`)
 
-  head_policy_weight        1.0
-  head_value_weight         1.0   → 2.0   ramp over VALUE_RAMP_STEPS
-  head_score_mean_weight    0.004 → 0.010 ramp over SCORE_RAMP_STEPS
-  head_score_stdev_weight   0.002 → 0.006 ramp over SCORE_RAMP_STEPS
-  head_score_belief_weight  0.010 → 0.035 ramp over SCORE_RAMP_STEPS
-  head_ownership_weight     0.85   (fixed; per-point BCE stable from step 0)
-  head_opp_policy_weight    0.1   (fixed; small contribution)
+Two ramps (both have phased precedent), rest fixed:
+
+  head_policy_weight         1.0
+  head_value_weight          1.0   → 2.0   ramp over VALUE_RAMP_STEPS
+  head_score_mean_weight     0.004 → 0.010 ramp over SCORE_RAMP_STEPS
+                                           (phased: _EXPLORE[0:2]=0.004,
+                                            _EXPLORE[2:]=0.010)
+  head_score_stdev_weight    0.006  (fixed; phased: no per-stage override)
+  head_score_belief_weight   0.035  (fixed; phased: no per-stage override)
+  head_ownership_weight      0.85   (fixed; phased: no per-stage override)
+  head_opp_policy_weight     0.1    (fixed; phased: no per-stage override)
 
 If experiments show a specific head is under/over-trained in continuous
 mode, override individual weights via CLI — do not reintroduce stages.
@@ -872,14 +911,14 @@ to ~1 week. Scale up only after the first run proves the pipeline.
   mcts_score_scale         18.0
   mcts_komi                7.5
 
-**Head weights** (two ramps; see MCTS section)
+**Head weights** (two ramps with phased precedent; rest fixed. See MCTS section)
   head_policy_weight         1.0
   head_value_weight          1.0   → 2.0   over value_ramp_steps
   head_score_mean_weight     0.004 → 0.010 over score_ramp_steps
-  head_score_stdev_weight    0.002 → 0.006 over score_ramp_steps
-  head_score_belief_weight   0.010 → 0.035 over score_ramp_steps
-  head_ownership_weight      0.85  (fixed)
-  head_opp_policy_weight     0.1   (fixed)
+  head_score_stdev_weight    0.006  (fixed)
+  head_score_belief_weight   0.035  (fixed)
+  head_ownership_weight      0.85   (fixed)
+  head_opp_policy_weight     0.1    (fixed)
 
 **Rating (optional — GPU-time-intensive, defer if uncertain)**
   rating_games             80 per pair      (~47 Elo SE; enough signal for monitoring)
@@ -1134,11 +1173,13 @@ path-based).
      bucket. Bucket maintained by a background scanner thread that tails
      `training/selfplay/*.bin.zst` (sorted by filename — monotonic).
    - Fixed step-based LR schedule with warmup + milestone halvings.
-   - Two step-driven ramps: `value_weight` 1.0 → 2.0 over
-     VALUE_RAMP_STEPS, and a single `score_ramp(step)` factor that
-     scales `mcts_score_weight`, `head_score_mean_weight`,
-     `head_score_stdev_weight`, and `head_score_belief_weight` over
-     SCORE_RAMP_STEPS. Rank 0 publishes both factors to
+   - Two step-driven ramps (both have phased-pipeline precedent):
+     `value_weight` 1.0 → 2.0 over VALUE_RAMP_STEPS, and a single
+     `score_ramp(step)` factor that scales `mcts_score_weight`
+     (0 → 0.06) and `head_score_mean_weight` (0.004 → 0.010) over
+     SCORE_RAMP_STEPS. The stdev/belief/ownership/opp-policy heads
+     stay at their fixed values from step 0 (phased doesn't ramp them
+     either). Rank 0 publishes both factors to
      `training/status.json` atomically every STATUS_PUBLISH_EVERY steps
      (default: 100 steps ≈ every ~5 min at conservative throughput),
      not just at export. This gives selfplay a smooth ramp signal
