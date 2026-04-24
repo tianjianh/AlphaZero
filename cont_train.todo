@@ -288,7 +288,7 @@ Persistence (at each EXPORT step, and on clean shutdown):
         rng_state               # for reproducible sampling
 
 On resume: restore all fields. Scanner thread starts its loop from the
-saved `watermark_id` — any rows that arrived during the outage are
+saved `watermark_id`. Rows that arrived **and still exist on disk** are
 picked up on the first scan tick and properly credited, without
 double-crediting rows that were already counted. Without this, a
 restart would either (a) re-credit the entire existing pool (burst of
@@ -296,6 +296,28 @@ training) or (b) start empty and BUDGET_SLEEP for hours until fresh
 rows arrive. KataGo persists both `train_bucket_level` and the
 last-read row index for the same reason; we use last-credited filename
 ID rather than row index because our pool is pruned.
+
+**Retention-bound caveat on long trainer outages**: the selfplay driver
+runs independently and keeps pruning oldest files beyond `window_games`
+even while the trainer is down. Files that aged out during an outage
+are gone before resume; their rows never contribute bucket credit.
+Effectively, a long trainer outage caps credit recovery at what's
+still on disk: if `outage_duration × selfplay_rate < window_games`, no
+data is lost; if it exceeds that, only the most-recent `window_games`
+worth of files get credited on resume, and the rest is "spent" as lost
+training. This is the correct behavior — those rows would have been
+consumed by training had the trainer been up — but the effect is: a
+very long outage linearly reduces total training done over the run,
+rather than producing a catch-up burst at resume. For typical
+supervisor-driven restarts (<1 min outage), nothing is lost. For a
+day-long outage with default `window_games=80000` (~15h retention),
+expect to lose bucket credit for roughly the first 9 hours of the
+outage.
+
+If zero data loss across long outages is required later, the clean fix
+is to pause selfplay whenever `training/status.json` is stale (e.g.
+`now - status.wall_time > 10 × STATUS_PUBLISH_INTERVAL_S`). Not added
+to this plan — accept the bound instead.
 
 Key properties:
 
@@ -399,19 +421,37 @@ ranks.
     score_ramp  = LinearRamp(start=0.0, end=1.0, end_step=SCORE_RAMP_STEPS)
 
     while True:
-        # Cold-start gate: rank 0 checks window size, broadcasts.
-        go = torch.tensor(0, device=device)
+        # Cold-start gate: BOTH conditions must hold before any rank
+        # calls train_step, otherwise collective allreduce can desync.
+        #   (a) Rank 0 has seen enough FILES on disk (MIN_WINDOW_GAMES).
+        #   (b) EVERY rank has enough ROWS in its local ring
+        #       (MIN_RING_ROWS). Ingest threads run independently per
+        #       rank and can drift; we gate on the minimum across ranks.
         if rank == 0:
-            go.fill_(1 if scanner.window_games() >= MIN_WINDOW_GAMES else 0)
-        dist.broadcast(go, src=0)
-        if go.item() == 0:
+            disk_ok = 1 if scanner.window_games() >= MIN_WINDOW_GAMES else 0
+        else:
+            disk_ok = 1                                      # only rank 0 has scanner
+        disk_t = torch.tensor(disk_ok, device=device)
+        dist.broadcast(disk_t, src=0)
+
+        local_ready = 1 if window.ring_rows() >= MIN_RING_ROWS else 0
+        local_t = torch.tensor(local_ready, device=device)
+        dist.all_reduce(local_t, op=dist.ReduceOp.MIN)       # AND across ranks
+
+        if disk_t.item() == 0 or local_t.item() == 0:
             if rank == 0:
-                log_event("COLD_START_WAIT", window_games=scanner.window_games())
+                log_event("COLD_START_WAIT",
+                          window_games=scanner.window_games(),
+                          min_rank_ring_rows=local_t.item() * MIN_RING_ROWS
+                              if local_t.item() else 0)
             sleep(30); continue
 
         # Bucket gate: rank 0 checks, broadcasts.
         if rank == 0:
-            go.fill_(1 if bucket.available() >= batch_size * world_size else 0)
+            go = torch.tensor(1 if bucket.available() >= batch_size * world_size else 0,
+                              device=device)
+        else:
+            go = torch.tensor(0, device=device)
         dist.broadcast(go, src=0)
         if go.item() == 0:
             if rank == 0:
@@ -420,6 +460,11 @@ ranks.
             sleep(5); continue
 
         # All ranks: local sample + DDP step.
+        # sample_batch is defined as BLOCKING on the local ring: if
+        # ring_rows < batch_size it waits (with SAMPLE_BATCH_TIMEOUT_S
+        # as a safety — if exceeded, raise and let supervisor restart).
+        # In steady state after the cold-start gate passes, ingest
+        # runs faster than consumption so this never actually blocks.
         batch = window.sample_batch(batch_size)
         lr    = lr_schedule(step)
         f_v   = value_ramp(step)              # value weight 1.0 → 2.0
@@ -774,7 +819,14 @@ to ~1 week. Scale up only after the first run proves the pipeline.
                                             (~1.6M rows × 6KB ≈ 10 GB per rank).
                                             This is the effective sampling window
                                             (~22 min at 1.5 games/s).
-  min_window_games         2000             cold-start gate — no training until reached
+  min_window_games         2000             cold-start gate (disk files) — rank 0 scanner
+  min_ring_rows            10240            cold-start gate (per-rank ring). Each rank's
+                                            ingest must have this many rows before any rank
+                                            trains. Default = 10 × batch_size; takes ~9s
+                                            to accumulate at conservative fill rate.
+  sample_batch_timeout_s   30               sample_batch raises after this long waiting
+                                            for ring to refill (should never hit at steady
+                                            state; guards against ingest-thread deadlock)
   bucket_cap_mult          64               max_bucket = 64 × batch × world_size (~4 min catch-up)
   export_every             5000 steps       candidate every ~4.8h at conservative throughput
   status_publish_every     100 steps        rank 0 writes training/status.json
@@ -1110,6 +1162,16 @@ path-based).
          sustained (compatible with a few percent of one CPU core).
        * Trainer samples uniformly from its local ring. No pick-file-
          per-batch decompress cost.
+       * `sample_batch(k)` contract: **blocks** until `ring_rows >= k`
+         (or `SAMPLE_BATCH_TIMEOUT_S` elapses, which raises and lets
+         the supervisor restart the trainer). After the cold-start
+         gate this is a fast path — ingest runs faster than
+         consumption at steady state.
+       * `ring_rows()` is reported to rank 0 each step via
+         `dist.all_reduce(MIN)` so the cold-start gate can wait until
+         every rank's local ring has at least `MIN_RING_ROWS` rows.
+         This prevents the case where rank 0 proceeds on a well-
+         populated scanner while rank 1's ingest is still warming up.
      **Freshness math**: at 1.5 games/s × 800 rows/game = 1200 rows/s
      fill rate (same per rank, since each rank ingests the same files
      independently), a 1.6M-row ring evicts a row in 1.6M / 1200 ≈
