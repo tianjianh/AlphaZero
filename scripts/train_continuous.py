@@ -252,6 +252,13 @@ class WindowScanner(threading.Thread):
         self._window_games = 0
         self._window_rows = 0
         self._stop = threading.Event()
+        # Guards the (bucket.credit, watermark) pair so checkpoint_snapshot
+        # cannot observe a torn write where the watermark moved forward
+        # but the credit for the newly watermarked files hasn't yet
+        # landed in the bucket (or vice versa).  Every write to
+        # _watermark and every bucket.credit() in _tick() is done under
+        # this lock; the public snapshot method takes the same lock.
+        self._credit_lock = threading.Lock()
 
     def watermark(self):
         return self._watermark
@@ -261,6 +268,17 @@ class WindowScanner(threading.Thread):
 
     def window_rows(self):
         return self._window_rows
+
+    def checkpoint_snapshot(self):
+        """Return (bucket_level, watermark_id) captured atomically with
+        respect to the scanner's credit+advance-watermark step.  Without
+        this lock, a checkpoint taken between scanner._tick's
+        `bucket.credit(credit)` and `_watermark = new_max_id` would
+        persist a newer watermark with an older bucket level — on
+        resume, files at or below the saved watermark are never re-
+        credited, so that credit is lost permanently."""
+        with self._credit_lock:
+            return self.bucket.available(), self._watermark
 
     def stop(self):
         self._stop.set()
@@ -298,9 +316,12 @@ class WindowScanner(threading.Thread):
             # replay_target is per unique position; each disk row is
             # one of N_AUGMENTATIONS views of a position, so credit
             # replay_target rows of budget per N_AUGMENTATIONS rows seen.
+            # Hold the credit lock so checkpoint_snapshot sees these two
+            # writes atomically.
             credit = (self.replay_target * new_rows) // self.n_aug
-            self.bucket.credit(credit)
-            self._watermark = new_max_id
+            with self._credit_lock:
+                self.bucket.credit(credit)
+                self._watermark = new_max_id
 
         self._window_rows = sum(self._row_counts.values())
 
@@ -1208,12 +1229,15 @@ def main():
                                board_size=args.board, arch=args.arch)
                 os.replace(tmp_path, out_path)
 
+                # Atomic (bucket_level, watermark_id) snapshot — see
+                # WindowScanner.checkpoint_snapshot for why this matters.
+                bucket_level, watermark_id = scanner.checkpoint_snapshot()
                 ckpt = {
                     "model_state_dict": base_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "step": step,
-                    "bucket_level": bucket.available(),
-                    "watermark_id": scanner.watermark(),
+                    "bucket_level": bucket_level,
+                    "watermark_id": watermark_id,
                     "arch": args.arch,
                     "board_size": args.board,
                     "num_filters": args.filters,
@@ -1227,7 +1251,7 @@ def main():
                 _atomic_save_torch(args.checkpoint, ckpt)
                 events.log("EXPORT", step=step, path=out_path,
                            loss_ema=f"{loss_ema:.4f}" if loss_ema is not None else "-",
-                           bucket=bucket.available(),
+                           bucket=bucket_level,
                            window_games=scanner.window_games())
             if use_ddp:
                 dist.barrier()
@@ -1254,12 +1278,18 @@ def main():
     if is_main:
         try:
             base_model = model.module if use_ddp else model
+            # Atomic snapshot — see WindowScanner.checkpoint_snapshot.
+            if scanner is not None:
+                bucket_level, watermark_id = scanner.checkpoint_snapshot()
+            else:
+                bucket_level = bucket.available() if bucket else 0
+                watermark_id = 0
             final_ckpt = {
                 "model_state_dict": base_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "step": step,
-                "bucket_level": bucket.available() if bucket else 0,
-                "watermark_id": scanner.watermark() if scanner else 0,
+                "bucket_level": bucket_level,
+                "watermark_id": watermark_id,
                 "arch": args.arch,
                 "board_size": args.board,
                 "num_filters": args.filters,
@@ -1273,8 +1303,8 @@ def main():
             _atomic_save_torch(args.checkpoint, final_ckpt)
             events.log("FINAL_CHECKPOINT", step=step,
                        reason=shutdown_reason or "loop_exit",
-                       bucket=bucket.available() if bucket else 0,
-                       watermark=scanner.watermark() if scanner else 0)
+                       bucket=bucket_level,
+                       watermark=watermark_id)
         except Exception as e:
             events.log("FINAL_CHECKPOINT_FAIL", step=step, err=str(e))
     if use_ddp:

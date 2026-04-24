@@ -367,6 +367,11 @@ only what you need.
 --value-weight-end   2.0
 --score-mean-weight-start 0.004
 --score-mean-weight-end   0.010
+--policy-weight 1.0          # fixed head weights (no ramp, but overridable)
+--score-stdev-weight 0.006
+--score-belief-weight 0.035
+--ownership-weight 0.85
+--opp-policy-weight 0.1
 ```
 
 **Selfplay:**
@@ -498,8 +503,14 @@ steps_per_sec, gpu_mem_mb
 ```
 batch_id, wall_time_start, wall_time_end, model_in_use, games_played,
 positions_written, duration_s, selfplay_duration_s, score_weight,
-pool_size
+pool_size, publish_failures
 ```
+
+The `publish_failures` column counts games in a batch whose zstd
+compression / atomic-rename step failed; source `.bin` files for those
+games are preserved in `training/selfplay/staging/batch_<id>.failed-<ts>/`
+for postmortem. Nonzero values on a long unattended run usually point
+at disk-full conditions or a flaky filesystem.
 
 **`gate_decisions.csv`**:
 ```

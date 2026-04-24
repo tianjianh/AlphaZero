@@ -269,6 +269,11 @@ def train_cmd(args, log_dir):
            "--value-weight-end", str(args.value_weight_end),
            "--score-mean-weight-start", str(args.score_mean_weight_start),
            "--score-mean-weight-end", str(args.score_mean_weight_end),
+           "--policy-weight", str(args.policy_weight),
+           "--score-stdev-weight", str(args.score_stdev_weight),
+           "--score-belief-weight", str(args.score_belief_weight),
+           "--ownership-weight", str(args.ownership_weight),
+           "--opp-policy-weight", str(args.opp_policy_weight),
            ]
     if args.fp8:
         cmd.append("--fp8")
@@ -471,23 +476,32 @@ def cmd_run(args):
                 break
             time.sleep(2.0)
     finally:
-        # Give each worker up to graceful_timeout to exit cleanly, then
-        # hard-kill anything still running.  The supervisor never exits
-        # while a wrapper is still alive, so there are no orphans on
-        # normal termination paths.
-        deadline = time.time() + args.graceful_timeout
-        for w in workers:
-            remaining = max(0.1, deadline - time.time())
-            if w.wait(timeout=remaining):
-                sup_log("CLEAN_EXIT", proc=w.name,
-                        rc=(w.proc.returncode if w.proc else None))
-            else:
-                sup_log("KILL_GROUP", proc=w.name,
-                        reason="graceful timeout exceeded")
-                w.kill_group()
-                # Give the kill 5 s to take effect before giving up.
-                w.wait(timeout=5.0)
-            w.close_log()
+        # Every worker gets its OWN graceful_timeout window — not a
+        # shared budget that the first slow worker eats up.  We wait
+        # for all of them in parallel on a thread pool so a long
+        # gatekeeper match doesn't starve rate's grace period.
+        def _wait_then_kill(w):
+            if w.wait(timeout=args.graceful_timeout):
+                return ("CLEAN_EXIT",
+                        {"rc": w.proc.returncode if w.proc else None})
+            w.kill_group()
+            w.wait(timeout=5.0)
+            return ("KILL_GROUP",
+                    {"reason": f"graceful timeout ({args.graceful_timeout}s) exceeded"})
+
+        import concurrent.futures
+        alive_workers = [w for w in workers if w.proc is not None]
+        if alive_workers:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=len(alive_workers),
+                    thread_name_prefix="shutdown") as ex:
+                futures = {ex.submit(_wait_then_kill, w): w for w in alive_workers}
+                for fut in concurrent.futures.as_completed(futures):
+                    w = futures[fut]
+                    tag, fields = fut.result()
+                    sup_log(tag, proc=w.name, **fields)
+                    w.close_log()
+
         # Belt-and-braces: anything still alive (e.g., SIGKILL race)
         # gets one more group kill before we exit.
         for w in workers:
@@ -613,6 +627,12 @@ def add_run_args(p):
     p.add_argument("--value-weight-end", type=float, default=2.0)
     p.add_argument("--score-mean-weight-start", type=float, default=0.004)
     p.add_argument("--score-mean-weight-end", type=float, default=0.010)
+    # Fixed head weights (no ramp, but overridable per-run via CLI).
+    p.add_argument("--policy-weight", type=float, default=1.0)
+    p.add_argument("--score-stdev-weight", type=float, default=0.006)
+    p.add_argument("--score-belief-weight", type=float, default=0.035)
+    p.add_argument("--ownership-weight", type=float, default=0.85)
+    p.add_argument("--opp-policy-weight", type=float, default=0.1)
 
     # Selfplay
     p.add_argument("--selfplay-batch-games", type=int, default=300)
