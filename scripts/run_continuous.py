@@ -280,7 +280,25 @@ def train_cmd(args, log_dir):
     return cmd
 
 
+def _resolve_nn_server_threads(proc_name, device_ids_str, explicit):
+    """Derive nn-server-threads: if --<proc>-nn-server-threads is unset,
+    default to len(--<proc>-nn-device-ids).  If set, validate it matches.
+    The underlying C++ binary also enforces this; we fail early with a
+    clearer message."""
+    n_ids = len([x for x in device_ids_str.split(",") if x.strip()])
+    if explicit is None:
+        return n_ids
+    if explicit != n_ids:
+        raise SystemExit(
+            f"ERROR: --{proc_name}-nn-server-threads={explicit} must equal "
+            f"len(--{proc_name}-nn-device-ids)={n_ids} "
+            f"(device_ids='{device_ids_str}')")
+    return explicit
+
+
 def selfplay_cmd(args, log_dir):
+    nn_st = _resolve_nn_server_threads(
+        "selfplay", args.selfplay_nn_device_ids, args.selfplay_nn_server_threads)
     return [sys.executable, str(SCRIPTS_DIR / "selfplay_driver.py"),
             "--pool-dir", str(TRAINING_DIR / "selfplay"),
             "--accepted-dir", str(MODELS_DIR / "accepted"),
@@ -292,8 +310,8 @@ def selfplay_cmd(args, log_dir):
             "--sims", str(args.selfplay_sims),
             "--threads", str(args.selfplay_threads),
             "--search-threads", str(args.selfplay_search_threads),
-            "--nn-server-threads", str(len(args.nn_device_ids_selfplay.split(","))),
-            "--nn-device-ids", args.nn_device_ids_selfplay,
+            "--nn-server-threads", str(nn_st),
+            "--nn-device-ids", args.selfplay_nn_device_ids,
             "--max-batch", str(args.max_batch),
             "--c-puct", str(args.c_puct),
             "--dirichlet-alpha", str(args.dirichlet_alpha),
@@ -306,6 +324,8 @@ def selfplay_cmd(args, log_dir):
 
 
 def gate_cmd(args, log_dir):
+    nn_st = _resolve_nn_server_threads(
+        "gate", args.gate_nn_device_ids, args.gate_nn_server_threads)
     return [sys.executable, str(SCRIPTS_DIR / "gatekeeper.py"),
             "--candidates-dir", str(MODELS_DIR / "candidates"),
             "--accepted-dir", str(MODELS_DIR / "accepted"),
@@ -318,8 +338,8 @@ def gate_cmd(args, log_dir):
             "--poll-interval", str(args.gate_poll_interval),
             "--threads", str(args.gate_threads),
             "--search-threads", str(args.gate_search_threads),
-            "--nn-server-threads", str(len(args.nn_device_ids_gate.split(","))),
-            "--nn-device-ids", args.nn_device_ids_gate,
+            "--nn-server-threads", str(nn_st),
+            "--nn-device-ids", args.gate_nn_device_ids,
             "--max-batch", str(args.max_batch),
             "--c-puct", str(args.c_puct),
             "--komi", str(args.komi),
@@ -328,6 +348,8 @@ def gate_cmd(args, log_dir):
 
 
 def rate_cmd(args, log_dir):
+    nn_st = _resolve_nn_server_threads(
+        "rate", args.rate_nn_device_ids, args.rate_nn_server_threads)
     return [sys.executable, str(SCRIPTS_DIR / "rate.py"),
             "--accepted-dir", str(MODELS_DIR / "accepted"),
             "--ratings-dir", str(RATINGS_DIR),
@@ -339,8 +361,8 @@ def rate_cmd(args, log_dir):
             "--interval", str(args.rating_interval),
             "--threads", str(args.rate_threads),
             "--search-threads", str(args.rate_search_threads),
-            "--nn-server-threads", str(len(args.nn_device_ids_rate.split(","))),
-            "--nn-device-ids", args.nn_device_ids_rate,
+            "--nn-server-threads", str(nn_st),
+            "--nn-device-ids", args.rate_nn_device_ids,
             "--max-batch", str(args.max_batch),
             "--c-puct", str(args.c_puct),
             "--komi", str(args.komi),
@@ -588,14 +610,33 @@ def cmd_status(args):
 # ═══════════════════════════════════════════════════════════
 
 def add_run_args(p):
-    # GPU assignment — defaults single-GPU (everything on 0)
+    # Per-worker GPU + NN assignment.  Naming convention: every
+    # per-worker flag is prefixed with the worker name (--selfplay-*,
+    # --train-*, --gate-*, --rate-*) so `--help | grep ^--selfplay-`
+    # enumerates everything tied to one worker.
+    #
+    # For a given worker:
+    #   --<proc>-gpus                set as CUDA_VISIBLE_DEVICES
+    #   --<proc>-nn-device-ids       passed to the C++ binary; 0-indexed
+    #                                against the VISIBLE set (not physical)
+    #   --<proc>-nn-server-threads   count of NN batching threads; must
+    #                                equal len(--<proc>-nn-device-ids)
     p.add_argument("--selfplay-gpus", default="0")
     p.add_argument("--train-gpus", default="0")
     p.add_argument("--gate-gpus", default="0")
     p.add_argument("--rate-gpus", default="0")
-    p.add_argument("--nn-device-ids-selfplay", default="0,0")
-    p.add_argument("--nn-device-ids-gate", default="0")
-    p.add_argument("--nn-device-ids-rate", default="0")
+    p.add_argument("--selfplay-nn-device-ids", default="0,0")
+    p.add_argument("--gate-nn-device-ids", default="0")
+    p.add_argument("--rate-nn-device-ids", default="0")
+    p.add_argument("--selfplay-nn-server-threads", type=int, default=None,
+                   help="NN server threads for selfplay; defaults to "
+                        "len(--selfplay-nn-device-ids) if unset")
+    p.add_argument("--gate-nn-server-threads", type=int, default=None,
+                   help="NN server threads for gatekeeper; defaults to "
+                        "len(--gate-nn-device-ids) if unset")
+    p.add_argument("--rate-nn-server-threads", type=int, default=None,
+                   help="NN server threads for rate; defaults to "
+                        "len(--rate-nn-device-ids) if unset")
 
     # Model
     p.add_argument("--arch", default="resnet", choices=["resnet", "vit"])

@@ -38,15 +38,41 @@ python scripts/run_continuous.py init -y
 # Launch the four workers.  Single-GPU (everything on GPU 0) is the default:
 python scripts/run_continuous.py run
 
-# 2x4090 recommended split:
+# 2x4090 recommended split (fully explicit — all tunable knobs shown):
 python scripts/run_continuous.py run \
+  \
+  `# GPU assignment (CUDA_VISIBLE_DEVICES per worker)` \
   --train-gpus 0,1 \
   --selfplay-gpus 0,1 \
   --gate-gpus 0 \
   --rate-gpus 1 \
-  --nn-device-ids-selfplay 0,0,1,1 \
-  --nn-device-ids-gate 0 \
-  --nn-device-ids-rate 0 \
+  \
+  `# NN device IDs (0-indexed against the VISIBLE set above)` \
+  --selfplay-nn-device-ids 0,0,1,1 \
+  --gate-nn-device-ids 0 \
+  --rate-nn-device-ids 0 \
+  \
+  `# NN server thread count (must equal len of --<proc>-nn-device-ids)` \
+  --selfplay-nn-server-threads 4 \
+  --gate-nn-server-threads 1 \
+  --rate-nn-server-threads 1 \
+  \
+  `# CPU worker threads (0 = os.cpu_count())` \
+  --selfplay-threads 0 \
+  --gate-threads 0 \
+  --rate-threads 0 \
+  \
+  `# MCTS search threads per move, per worker` \
+  --selfplay-search-threads 16 \
+  --gate-search-threads 16 \
+  --rate-search-threads 16 \
+  \
+  `# Batch size — shared across selfplay + evaluate for TRT cache reuse` \
+  --max-batch 256 \
+  \
+  `# Training-side DDP batch (per rank; global batch = batch-size × world_size)` \
+  --batch-size 1024 \
+  \
   --rating
 ```
 
@@ -278,28 +304,37 @@ prematurely.
 ### CPU-side parallelism
 
 Each C++ worker binary (`build/selfplay`, `build/evaluate`) has three
-layers of concurrency that the supervisor exposes separately:
+layers of concurrency, all exposed as explicit per-worker flags on
+the supervisor (the `proc` below is one of `selfplay`, `gate`, `rate`):
 
-- **`--<proc>-threads`** (default `0` → `os.cpu_count()`): number of
-  parallel game / match / pair workers. Each worker runs one
-  simulation at a time on the CPU side and sends NN requests to the
-  batching layer. Raise to saturate the GPU; lower to reduce
-  oversubscription when workers share a GPU.
-- **`--<proc>-search-threads`** (default `16`): MCTS search threads
-  per worker, per move. These split the 500-simulation tree-search
-  budget inside one position. Higher values trade wall-time per move
-  for parallelism within the search. 16 is a good starting point for
-  9×9; don't exceed the number of physical cores divided by game
-  workers or you just thrash.
-- **`--nn-server-threads`** (derived from `--nn-device-ids-<proc>`
-  length): independent NN server threads that batch up requests from
-  all search threads and ship them to one or more GPUs. `0,0,1,1`
-  means four server threads — two on each of two GPUs.
+- **`--<proc>-threads`** — parallel game / match / pair workers.
+  One worker runs one simulation at a time on the CPU side and
+  dispatches NN requests to the batching layer. Default `0` =
+  `os.cpu_count()`. The three concrete flags: `--selfplay-threads`,
+  `--gate-threads`, `--rate-threads`.
+
+- **`--<proc>-search-threads`** — MCTS search threads per worker,
+  per move. These split the per-move simulation budget (e.g.
+  500 sims) inside one position. Default `16`. The three concrete
+  flags: `--selfplay-search-threads`, `--gate-search-threads`,
+  `--rate-search-threads`.
+
+- **`--<proc>-nn-server-threads`** — NN batching threads that collect
+  requests from every search thread and ship them to the GPU. Must
+  equal `len(--<proc>-nn-device-ids)`. Defaults: 2 for selfplay
+  (matches `--selfplay-nn-device-ids 0,0`), 1 for gate and rate.
+  The three concrete flags: `--selfplay-nn-server-threads`,
+  `--gate-nn-server-threads`, `--rate-nn-server-threads`.
 
 Rule of thumb for a 2×4090 selfplay run: 64 game workers × 16 search
-threads × 4 NN server threads (`0,0,1,1`). One game worker stays busy
-waiting for NN replies while others queue up, keeping the batcher
-near its `--max-batch` size.
+threads × 4 NN server threads (`--selfplay-nn-device-ids 0,0,1,1`).
+One game worker stays busy waiting for NN replies while others queue
+up, keeping the batcher near its `--max-batch` size.
+
+**`--max-batch`** (default `256`) is intentionally a single shared
+flag — not per-worker — because the TRT engine cache key includes it.
+Selfplay and gate must use the same value for the cache to be
+shared between them.
 
 ### TRT engine cache sharing
 
@@ -350,16 +385,34 @@ builds the C++ binaries if needed, and seeds
 Launches all workers. All CLI flags have sensible defaults; override
 only what you need.
 
-**GPU assignment:**
+**Per-worker GPU + NN assignment** (naming convention: every flag
+tied to one worker is prefixed with that worker's name, so `--help
+| grep ^--selfplay-` enumerates every selfplay knob):
 ```
---selfplay-gpus 0,1           # CUDA_VISIBLE_DEVICES for selfplay
+# CUDA_VISIBLE_DEVICES for each worker
+--selfplay-gpus 0,1
 --train-gpus 0,1              # torchrun --nproc_per_node = list length
 --gate-gpus 0
 --rate-gpus 1
---nn-device-ids-selfplay 0,0,1,1   # passed to build/selfplay; 0-indexed
-                                   #   against the visible set
---nn-device-ids-gate 0
---nn-device-ids-rate 0
+
+# NN device ids passed to the C++ binary; 0-indexed against the visible set
+--selfplay-nn-device-ids 0,0,1,1
+--gate-nn-device-ids 0
+--rate-nn-device-ids 0
+
+# NN server thread count; must equal len of --<proc>-nn-device-ids
+# (defaults to that length if unset)
+--selfplay-nn-server-threads 4
+--gate-nn-server-threads 1
+--rate-nn-server-threads 1
+
+# CPU-side parallelism (see "CPU-side parallelism" concept section)
+--selfplay-threads 0          # 0 = os.cpu_count()
+--gate-threads 0
+--rate-threads 0
+--selfplay-search-threads 16
+--gate-search-threads 16
+--rate-search-threads 16
 ```
 
 **Model:**
@@ -400,38 +453,36 @@ only what you need.
 --opp-policy-weight 0.1
 ```
 
-**Selfplay:**
+(Per-worker thread / GPU / NN-server knobs are in the "Per-worker
+GPU + NN assignment" block above. These per-section blocks are just
+the workload-shape knobs.)
+
+**Selfplay workload:**
 ```
 --selfplay-batch-games 300    # games per build/selfplay invocation
---selfplay-sims 500
+--selfplay-sims 500           # MCTS simulations per move
 --window-games 80000          # disk retention cap
 --score-weight-max 0.06       # MCTS score weight at full ramp
---selfplay-threads 0          # parallel game workers; 0 = os.cpu_count()
---selfplay-search-threads 16  # MCTS search threads per move
 ```
 
-**Gatekeeper:**
+**Gatekeeper workload:**
 ```
---gate-games 200
---gate-sims 150
---gate-threshold 0.5
---gate-poll-interval 30       # seconds
---gate-threads 0              # parallel match workers; 0 = os.cpu_count()
---gate-search-threads 16
+--gate-games 200              # games per match
+--gate-sims 150               # MCTS simulations per move
+--gate-threshold 0.5          # accept if wins/total > this
+--gate-poll-interval 30       # seconds between candidate polls
 ```
 
-**Rating (optional):**
+**Rating workload (optional):**
 ```
 --rating                      # off by default
 --rating-games 80             # games per pair
 --rating-sims 200
---rating-pool-size 5          # most-recent accepted
+--rating-pool-size 5          # rate the k most-recent accepted models
 --rating-interval 7200        # seconds between rounds
---rate-threads 0              # parallel pair workers; 0 = os.cpu_count()
---rate-search-threads 16
 ```
 
-**MCTS / game (shared):**
+**MCTS / game (shared across all workers):**
 ```
 --c-puct 1.25
 --dirichlet-alpha 0.15
@@ -439,7 +490,9 @@ only what you need.
 --temp-threshold 12
 --komi 7.5
 --score-scale 18.0
---max-batch 256
+--max-batch 256               # SHARED, not per-worker — part of the TRT
+                              # engine cache key, so selfplay + gate must
+                              # use the same value to share plans
 ```
 
 **Shutdown:**
