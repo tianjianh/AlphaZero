@@ -171,28 +171,41 @@ def extract_games_from_bin(records, board_size):
 
 
 def replay_game_from_bin(game, board_size):
-    """Extract the move sequence from binary state data by diffing boards."""
+    """Recover moves from recorded board states (state-diff), not argmax(policy).
+
+    State plane layout (game.cpp:260-287, history_length=8):
+      ch 0..7   current player's stones, t-0 (now) .. t-7
+      ch 8..15  opponent's stones,       t-0 (now) .. t-7
+      ch 16     color plane (1.0 if BLACK to play)
+
+    Move at step i = the new stone in record[i+1]'s ch 8 vs record[i]'s ch 0
+    (captures don't change this — the moving side adds exactly one stone).
+    For the final step there is no record[i+1]; fall back to
+    record[i-1].opp_action, which equals trajectory[i].action by construction
+    (mcts.cpp:740-744).
+    """
     hw = board_size * board_size
     moves = []
+    n = len(game)
 
     for i, rec in enumerate(game):
         state, policy, value, score = rec[0], rec[1], rec[2], rec[3]
         ownership = rec[4] if len(rec) > 4 else None
-        # State layout: [ch0..ch16] where ch0 = current player's stones,
-        # ch1 = opponent's stones (current frame)
-        # The color plane (ch16) tells us who is playing: 1.0 = black
-        color_plane = state[16 * hw]
-        is_black = (color_plane > 0.5)
-        current = BLACK if is_black else WHITE
+        current = BLACK if state[16 * hw] > 0.5 else WHITE
 
-        # Find the action from policy (highest probability)
-        action_size = board_size * board_size + 1
-        best_action = max(range(action_size), key=lambda a: policy[a])
+        if i + 1 < n:
+            next_state = game[i + 1][0]
+            cur_set = {p for p in range(hw) if state[p] > 0.5}
+            new_stones = [p for p in range(hw)
+                          if next_state[8 * hw + p] > 0.5 and p not in cur_set]
+            action = new_stones[0] if len(new_stones) == 1 else hw
+        else:
+            action = game[i - 1][5] if i >= 1 and len(game[i - 1]) > 5 else hw
 
-        if best_action == board_size * board_size:
+        if action == hw or action < 0:
             moves.append((current, None, None, policy, value, score, ownership))
         else:
-            r, c = best_action // board_size, best_action % board_size
+            r, c = action // board_size, action % board_size
             moves.append((current, r, c, policy, value, score, ownership))
 
     return moves
