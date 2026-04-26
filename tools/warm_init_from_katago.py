@@ -31,8 +31,14 @@ What gets transferred (with `large` preset, 128f/10b):
     - MiniGo's 5 SE residual blocks (positions 0,2,4,6,8) get their
       conv1+conv2 weights from KataGo's regular (non-gpool) blocks,
       paired closest-depth-first.
-    - Everything else stays at MiniGo's default init (stem, heads,
-      GPool blocks, BN stats, SE attention modules).
+    - All four MiniGo GPoolHead-style heads (value, score_mean,
+      score_stdev, score_belief) get their first stage (conv [32,128,1,1]
+      + BN on 32 channels) from KataGo's value-head v1Conv + v1BN.
+      KataGo learned what features matter for evaluation; reusing that
+      summary projection is the bulk of the head-side prior.
+    - Everything else stays at MiniGo's default init (stem, GPool block
+      conv weights, trunk BN stats, SE attention modules, head FCs,
+      ownership conv, policy head).
 
 Why the rest is skipped:
     - Stem:    17 input channels (MG) vs 22 spatial + 19 global (KG).
@@ -352,12 +358,30 @@ class Trunk:
 
 
 @dataclass
+class ValueHead:
+    """Just enough of KataGo's value head to warm-init MiniGo's GPoolHeads.
+
+    For warm init we only need the trunk-to-pool stage:
+      v1Conv  : 1x1 conv c_trunk -> c_v1
+      v1BN    : BN/bias-mask on c_v1
+    The downstream FCs (v2Mul / v3Mul / sv3Mul / linear_miscvaluehead /
+    score-belief MoG) all have shapes that don't match MiniGo's heads.
+    The full layer set is parsed to keep the stream position correct,
+    but we only retain v1Conv and v1BN.
+    """
+    name: str
+    v1_conv: ConvLayer
+    v1_bn: BatchNormLayer
+
+
+@dataclass
 class KataGoModel:
     name: str
     model_version: int
     num_input_channels: int
     num_input_global_channels: int
     trunk: Trunk
+    value_head: Union[ValueHead, None] = None
 
 
 def _parse_model_header(r: TokenStream) -> tuple:
@@ -442,12 +466,56 @@ def _parse_trunk(r: TokenStream, model_version: int, binary: bool) -> Trunk:
     )
 
 
+def _skip_policy_head(r: TokenStream, model_version: int, binary: bool) -> None:
+    """Parse and discard the policy head (we don't transfer from it).
+
+    We have to walk the stream to reach the value head, since file
+    order is trunk -> policy_head -> value_head. Mirrors desc.cpp's
+    PolicyHeadDesc constructor.
+    """
+    r.read_token()  # name
+    ConvLayer.parse(r, binary)            # p1Conv
+    ConvLayer.parse(r, binary)            # g1Conv
+    BatchNormLayer.parse(r, binary)       # g1BN
+    ActivationLayer.parse(r, model_version)  # g1Activation
+    MatMulLayer.parse(r, binary)          # gpoolToBiasMul
+    BatchNormLayer.parse(r, binary)       # p1BN
+    ActivationLayer.parse(r, model_version)  # p1Activation
+    ConvLayer.parse(r, binary)            # p2Conv
+    MatMulLayer.parse(r, binary)          # gpoolToPassMul
+    if model_version >= 15:
+        MatBiasLayer.parse(r, binary)     # gpoolToPassBias
+        ActivationLayer.parse(r, model_version)  # passActivation
+        MatMulLayer.parse(r, binary)      # gpoolToPassMul2
+
+
+def _parse_value_head(r: TokenStream, model_version: int, binary: bool) -> ValueHead:
+    """Parse the value head, retaining only v1Conv and v1BN.
+
+    The remaining layers (v2Mul/v2Bias/v2Act/v3Mul/v3Bias/sv3Mul/sv3Bias/
+    vOwnershipConv) are read for stream-position consistency and discarded.
+    """
+    name = r.read_token()
+    v1_conv = ConvLayer.parse(r, binary)
+    v1_bn = BatchNormLayer.parse(r, binary)
+    ActivationLayer.parse(r, model_version)  # v1Activation
+    MatMulLayer.parse(r, binary)             # v2Mul
+    MatBiasLayer.parse(r, binary)            # v2Bias
+    ActivationLayer.parse(r, model_version)  # v2Activation
+    MatMulLayer.parse(r, binary)             # v3Mul
+    MatBiasLayer.parse(r, binary)            # v3Bias
+    MatMulLayer.parse(r, binary)             # sv3Mul
+    MatBiasLayer.parse(r, binary)            # sv3Bias
+    ConvLayer.parse(r, binary)               # vOwnershipConv
+    return ValueHead(name=name, v1_conv=v1_conv, v1_bn=v1_bn)
+
+
 def parse_katago_model(path: str, force_binary: bool = None) -> KataGoModel:
     """Parse a KataGo model file (.bin.gz / .txt.gz / .bin / .txt).
 
-    Returns the trunk only — heads are not parsed, to keep the script
-    short. Adding head parsing is straightforward by following
-    desc.cpp's PolicyHeadDesc / ValueHeadDesc constructors.
+    Returns trunk + value-head's v1Conv/v1BN. Policy head and the rest
+    of the value head are walked over but not retained — see
+    _skip_policy_head and _parse_value_head.
     """
     if force_binary is None:
         binary = ".bin" in os.path.basename(path)
@@ -466,10 +534,19 @@ def parse_katago_model(path: str, force_binary: bool = None) -> KataGoModel:
     name, model_version, num_in, num_global = _parse_model_header(r)
     trunk = _parse_trunk(r, model_version, binary)
 
+    # Parse heads. If anything goes wrong (e.g. unsupported version),
+    # warn and continue with trunk-only — head transfer is optional.
+    value_head = None
+    try:
+        _skip_policy_head(r, model_version, binary)
+        value_head = _parse_value_head(r, model_version, binary)
+    except (ValueError, NotImplementedError) as e:
+        print(f"WARN: head parse failed ({e}); continuing with trunk-only transfer")
+
     return KataGoModel(
         name=name, model_version=model_version,
         num_input_channels=num_in, num_input_global_channels=num_global,
-        trunk=trunk,
+        trunk=trunk, value_head=value_head,
     )
 
 
@@ -596,10 +673,82 @@ def warm_init(sd: dict, kg: KataGoModel, verbose: bool = True) -> dict:
                 f"conv1+conv2 = {kw1.numel() + kw2.numel():,} params"
             )
 
+    # ── Value-side head transfer ────────────────────────────
+    #
+    # MiniGo has 4 GPoolHead-style heads (value, score_mean, score_stdev,
+    # score_belief), each with the same shape:
+    #     conv: [head_ch, num_filters, 1, 1]
+    #     bn:   BN on head_ch
+    # KataGo b10c128's value pathway starts the same way:
+    #     v1Conv: [c_v1, c_trunk, 1, 1]    (= [32, 128, 1, 1] for b10c128)
+    #     v1BN:   BN on c_v1
+    # When c_v1 == head_ch (32 == 32 for default config), this is a clean
+    # transfer. KataGo's v1Conv is what extracts "what features matter for
+    # game evaluation" from the trunk; reusing it on all four MG value-side
+    # heads gives them a sensible shared starting point. The downstream FCs
+    # don't transfer (KataGo v2Mul is 96->80, MiniGo fc1 is 96->128).
+    heads_paired: List[str] = []
+    if kg.value_head is not None:
+        kg_v1_w = torch.from_numpy(kg.value_head.v1_conv.weights)
+        kg_v1_c_in = kg.value_head.v1_conv.in_ch
+        kg_v1_c_out = kg.value_head.v1_conv.out_ch
+        kg_bn_c = kg.value_head.v1_bn.num_channels
+
+        # All four MG GPoolHead-style heads share the same conv shape.
+        gpool_head_keys = [
+            "value_head", "score_mean_head",
+            "score_stdev_head", "score_belief_head",
+        ]
+        if verbose:
+            print()
+            print(f"  Head transfer (KG value-head v1Conv/v1BN → MG GPoolHeads, "
+                  f"shape [{kg_v1_c_out}, {kg_v1_c_in}, 1, 1]):")
+        for head in gpool_head_keys:
+            mg_conv_key = f"{head}.conv.weight"
+            if mg_conv_key not in sd:
+                if verbose:
+                    print(f"    {head}: skip (key not present)")
+                continue
+            mg_conv = sd[mg_conv_key]
+            if tuple(mg_conv.shape) != tuple(kg_v1_w.shape):
+                if verbose:
+                    print(f"    {head}: skip (shape MG {tuple(mg_conv.shape)} "
+                          f"vs KG {tuple(kg_v1_w.shape)})")
+                continue
+            sd[mg_conv_key] = kg_v1_w.to(mg_conv.dtype).clone()
+            params_transferred += kg_v1_w.numel()
+
+            # Transfer BN: PyTorch BN computes (x-mean)/sqrt(var+eps)*scale+bias
+            # KataGo writes (mean, variance, scale, bias); same semantics.
+            # For fixup-mode KataGo files, mean=0 and variance=1 are written,
+            # which yields the correct (x*scale+bias) behaviour through the
+            # PyTorch BN layer on inference.
+            mg_bn_w_key = f"{head}.bn.weight"
+            if mg_bn_w_key in sd and sd[mg_bn_w_key].shape[0] == kg_bn_c:
+                sd[mg_bn_w_key] = torch.from_numpy(
+                    kg.value_head.v1_bn.scale).to(sd[mg_bn_w_key].dtype).clone()
+                sd[f"{head}.bn.bias"] = torch.from_numpy(
+                    kg.value_head.v1_bn.bias).to(sd[mg_bn_w_key].dtype).clone()
+                sd[f"{head}.bn.running_mean"] = torch.from_numpy(
+                    kg.value_head.v1_bn.mean).clone()
+                sd[f"{head}.bn.running_var"] = torch.from_numpy(
+                    kg.value_head.v1_bn.variance).clone()
+                if f"{head}.bn.num_batches_tracked" in sd:
+                    sd[f"{head}.bn.num_batches_tracked"] = torch.tensor(0, dtype=torch.long)
+                params_transferred += 2 * kg_bn_c  # weight + bias
+            heads_paired.append(head)
+            if verbose:
+                print(f"    {head}: ← v1Conv+v1BN ({kg_v1_w.numel() + 2 * kg_bn_c:,} params)")
+    else:
+        if verbose:
+            print()
+            print("  Head transfer: skipped (value head not parsed)")
+
     return {
         "blocks_paired": blocks_paired,
         "params_transferred": params_transferred,
         "pairs_used": pairs_used,
+        "heads_paired": heads_paired,
     }
 
 
@@ -716,7 +865,9 @@ def main():
 
     print()
     print("Summary:")
-    print(f"  Blocks paired:        {summary['blocks_paired']}")
+    print(f"  Trunk blocks paired:  {summary['blocks_paired']}")
+    print(f"  Heads paired:         {len(summary.get('heads_paired', []))}"
+          f" {summary.get('heads_paired', [])}")
     print(f"  Params transferred:   {summary['params_transferred']:,}")
     print(f"  Coverage of model:    {100.0 * summary['params_transferred'] / sd_total:.1f}%")
 

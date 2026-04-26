@@ -821,10 +821,12 @@ exists, or you can pass `--log-dir <path>` explicitly.
 
 `tools/warm_init_from_katago.py` seeds the run with weights borrowed
 from a KataGo b10c128 network, instead of the random init that
-`run_continuous.py init` produces. About 44% of the model's float
-params get initialized from KataGo (5 of 10 trunk blocks — the
-SE-style residuals); the rest (stem, heads, GPool blocks, BN stats,
-SE attention modules) remain at default init.
+`run_continuous.py init` produces. About 45% of the model's float
+params get initialized from KataGo: 5 of 10 trunk blocks (the
+SE-style residuals) plus the trunk-to-pool stage of all four
+GPoolHead-style heads (value, score_mean, score_stdev, score_belief).
+The rest (stem, GPool blocks, trunk BN stats, SE attention modules,
+head FCs, ownership conv, policy head) remain at default init.
 
 This only makes sense for the `large` preset (10 blocks × 128
 filters) since that's the size that matches b10c128. Smaller / larger
@@ -840,13 +842,21 @@ presets have a channel mismatch and the script will refuse.
   floats) from the filename; either works. If you only see a `.zip` /
   `.ckpt` for a given net, those are PyTorch raw checkpoints and won't
   parse — use the `.txt.gz` or `.bin.gz`.
-- **What gets transferred.** Conv kernels in 5 SE residual blocks,
-  paired closest-depth-first with KataGo's regular blocks.
-- **What does not.** Input stem (17 vs 22+19 channels), heads
-  (KataGo has more outputs and a different policy structure), GPool
-  blocks (channel layout differs — MG keeps 128 mid-block, KG narrows
-  to 96), BN running stats (pre-act vs post-act semantics differ),
-  and SE attention modules (KataGo has none).
+- **What gets transferred.**
+  - Conv kernels in 5 SE residual blocks, paired closest-depth-first
+    with KataGo's regular blocks.
+  - The first stage (1×1 conv [32,128,1,1] + BN) of all four MiniGo
+    GPoolHead-style heads, copied from KataGo's value-head v1Conv +
+    v1BN. KataGo's value pathway extracts "what features matter for
+    game evaluation" — same starting projection seeds value, score
+    mean / stdev, and score belief in MiniGo.
+- **What does not.** Input stem (17 vs 22+19 channels), GPool blocks
+  (channel layout differs — MG keeps 128 mid-block, KG narrows to 96),
+  trunk BN running stats (pre-act vs post-act semantics differ), SE
+  attention modules (KataGo has none), head FC layers (KG hidden dim
+  is 80, MG is 128), ownership conv (KG reads from v1=32-channel,
+  MG reads directly from trunk=128-channel), policy head (different
+  topology entirely).
 - **Optimizer state** in any pre-existing checkpoint is dropped, since
   the conv weights changed and Adam moments would be paired with the
   wrong tensors.
@@ -875,8 +885,9 @@ python scripts/run_continuous.py run --filters 128 --blocks 10 [...]
 ```
 
 The script prints the per-block pairing it chose (e.g.
-`MG[0] se ← KG[0] blk0`, `MG[4] se ← KG[3] blk3`, etc.) and a coverage
-percentage. Use `--dry-run` to plan without writing outputs.
+`MG[0] se ← KG[0] blk0`, `MG[4] se ← KG[3] blk3`, etc.), the four
+head transfers, and a coverage percentage. Use `--dry-run` to plan
+without writing outputs.
 
 ### Caveats
 
