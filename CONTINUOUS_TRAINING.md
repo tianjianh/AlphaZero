@@ -22,6 +22,7 @@ does, where logs land, and how to diagnose common problems.
 7. [Sanity checkpoints](#sanity-checkpoints)
 8. [Tuning knobs](#tuning-knobs)
 9. [Operations](#operations)
+10. [Warm-init from KataGo](#warm-init-from-katago)
 
 ---
 
@@ -813,6 +814,102 @@ python scripts/gatekeeper.py
 
 Each script writes to `logs/current/<worker>.log` when that symlink
 exists, or you can pass `--log-dir <path>` explicitly.
+
+---
+
+## Warm-init from KataGo
+
+`tools/warm_init_from_katago.py` seeds the run with weights borrowed
+from a KataGo b10c128 network, instead of the random init that
+`run_continuous.py init` produces. About 44% of the model's float
+params get initialized from KataGo (5 of 10 trunk blocks — the
+SE-style residuals); the rest (stem, heads, GPool blocks, BN stats,
+SE attention modules) remain at default init.
+
+This only makes sense for the `large` preset (10 blocks × 128
+filters) since that's the size that matches b10c128. Smaller / larger
+presets have a channel mismatch and the script will refuse.
+
+### What and where
+
+- **Source net.** Download a `model.bin.gz` from
+  [katagoarchive.org/g170/neuralnets](https://katagoarchive.org/g170/neuralnets/).
+  The strongest g170 b10c128 is
+  `g170e-b10c128-s1141046784-d204142634`; the directory's `model.bin.gz`
+  (NOT the `.zip`, which is a TensorFlow checkpoint) is what the
+  script reads.
+- **What gets transferred.** Conv kernels in 5 SE residual blocks,
+  paired closest-depth-first with KataGo's regular blocks.
+- **What does not.** Input stem (17 vs 22+19 channels), heads
+  (KataGo has more outputs and a different policy structure), GPool
+  blocks (channel layout differs — MG keeps 128 mid-block, KG narrows
+  to 96), BN running stats (pre-act vs post-act semantics differ),
+  and SE attention modules (KataGo has none).
+- **Optimizer state** in any pre-existing checkpoint is dropped, since
+  the conv weights changed and Adam moments would be paired with the
+  wrong tensors.
+
+### Workflow (replaces step "init seed model" with "init seed model from KataGo")
+
+```bash
+# 1. Standard init: archive previous run, build C++ binaries.
+#    This still creates models/accepted/v000000000.onnx with random
+#    weights; the next step overwrites it.
+python scripts/run_continuous.py init --filters 128 --blocks 10 -y
+
+# 2. Replace the seed ONNX with KataGo-warm weights.
+#    --onnx replaces the seed used by selfplay/gate.
+#    --checkpoint also seeds training.pt so the train worker resumes
+#    warm too (skip if you're OK letting train start fresh — selfplay
+#    games are KataGo-quality either way and train will catch up).
+python tools/warm_init_from_katago.py \
+  --katago-bin path/to/g170e-b10c128-.../model.bin.gz \
+  --filters 128 --blocks 10 \
+  --onnx       models/accepted/v000000000.onnx \
+  --checkpoint training/checkpoints/training.pt
+
+# 3. Run as usual.
+python scripts/run_continuous.py run --filters 128 --blocks 10 [...]
+```
+
+The script prints the per-block pairing it chose (e.g.
+`MG[0] se ← KG[0] blk0`, `MG[4] se ← KG[3] blk3`, etc.) and a coverage
+percentage. Use `--dry-run` to plan without writing outputs.
+
+### Caveats
+
+- **Architectural mismatch underneath.** MiniGo uses post-activation
+  residual blocks with BN; KataGo b10c128 uses pre-activation with
+  fixup (or BN, in g170-era nets). The conv kernels make sense as a
+  warm init but won't behave identically — early loss may be noisier
+  than a from-scratch run for the first hundred steps while BN
+  statistics catch up.
+- **No transfer of priors over MCTS / value scale.** The transferred
+  weights describe filter responses, not strategic preferences.
+  Expect modest sample-efficiency gains, not a free pre-trained model.
+- **g170 era only.** kata1 (the current main run) does not include
+  any b10c128 networks — only b18c384 and larger. If you need a
+  smaller pretrained net, use g170 archives or `b6c64` from the
+  `extra_networks/` page (note: b6c64 only matches MiniGo's `small`
+  preset, not `large`).
+
+### Standalone usage (without run_continuous)
+
+The same script works with `run_loop.sh` (single-process phased
+pipeline). It uses different output paths — `models/v0000.onnx` for
+the initial versioned model and `models/best.onnx` as the
+selfplay-target copy:
+
+```bash
+./run_loop.sh init large
+python tools/warm_init_from_katago.py \
+  --katago-bin path/to/g170e-b10c128-.../model.bin.gz \
+  --filters 128 --blocks 10 \
+  --onnx       models/v0000.onnx \
+  --checkpoint training/checkpoints/training.pt
+cp models/v0000.onnx models/best.onnx
+./run_loop.sh train
+```
 
 ---
 
