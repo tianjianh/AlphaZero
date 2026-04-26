@@ -832,12 +832,14 @@ presets have a channel mismatch and the script will refuse.
 
 ### What and where
 
-- **Source net.** Download a `model.bin.gz` from
-  [katagoarchive.org/g170/neuralnets](https://katagoarchive.org/g170/neuralnets/).
-  The strongest g170 b10c128 is
-  `g170e-b10c128-s1141046784-d204142634`; the directory's `model.bin.gz`
-  (NOT the `.zip`, which is a TensorFlow checkpoint) is what the
-  script reads.
+- **Source net.** Download from KataGo's training media bucket:
+  ```
+  https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b10c128-s1141046784-d204142634.txt.gz
+  ```
+  The script auto-detects `.txt.gz` (text floats) vs `.bin.gz` (binary
+  floats) from the filename; either works. If you only see a `.zip` /
+  `.ckpt` for a given net, those are PyTorch raw checkpoints and won't
+  parse — use the `.txt.gz` or `.bin.gz`.
 - **What gets transferred.** Conv kernels in 5 SE residual blocks,
   paired closest-depth-first with KataGo's regular blocks.
 - **What does not.** Input stem (17 vs 22+19 channels), heads
@@ -863,7 +865,7 @@ python scripts/run_continuous.py init --filters 128 --blocks 10 -y
 #    warm too (skip if you're OK letting train start fresh — selfplay
 #    games are KataGo-quality either way and train will catch up).
 python tools/warm_init_from_katago.py \
-  --katago-bin path/to/g170e-b10c128-.../model.bin.gz \
+  --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
   --filters 128 --blocks 10 \
   --onnx       models/accepted/v000000000.onnx \
   --checkpoint training/checkpoints/training.pt
@@ -879,19 +881,19 @@ percentage. Use `--dry-run` to plan without writing outputs.
 ### Caveats
 
 - **Architectural mismatch underneath.** MiniGo uses post-activation
-  residual blocks with BN; KataGo b10c128 uses pre-activation with
-  fixup (or BN, in g170-era nets). The conv kernels make sense as a
-  warm init but won't behave identically — early loss may be noisier
-  than a from-scratch run for the first hundred steps while BN
-  statistics catch up.
+  residual blocks with BN; KataGo b10c128 uses pre-activation BN
+  (older nets) or fixup (newer configs). The conv kernels make sense
+  as a warm init but won't behave identically — early loss may be
+  noisier than a from-scratch run for the first hundred steps while
+  BN statistics catch up.
 - **No transfer of priors over MCTS / value scale.** The transferred
   weights describe filter responses, not strategic preferences.
   Expect modest sample-efficiency gains, not a free pre-trained model.
-- **g170 era only.** kata1 (the current main run) does not include
-  any b10c128 networks — only b18c384 and larger. If you need a
-  smaller pretrained net, use g170 archives or `b6c64` from the
-  `extra_networks/` page (note: b6c64 only matches MiniGo's `small`
-  preset, not `large`).
+- **No public b10c128 catalog entry.** kata1's main networks page
+  only lists b18c384 and larger; b10c128 isn't in the catalog UI but
+  the file exists at the URL above. If you want a different size,
+  `b6c64` is on the [extra_networks](https://katagotraining.org/extra_networks/)
+  page (note: b6c64 only matches MiniGo's `small` preset, not `large`).
 
 ### Standalone usage (without run_continuous)
 
@@ -903,7 +905,7 @@ selfplay-target copy:
 ```bash
 ./run_loop.sh init large
 python tools/warm_init_from_katago.py \
-  --katago-bin path/to/g170e-b10c128-.../model.bin.gz \
+  --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
   --filters 128 --blocks 10 \
   --onnx       models/v0000.onnx \
   --checkpoint training/checkpoints/training.pt

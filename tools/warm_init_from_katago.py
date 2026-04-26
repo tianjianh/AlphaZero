@@ -9,9 +9,10 @@ PyTorch checkpoint and/or ONNX file. At least one of --checkpoint /
 Workflow with run_continuous.py (replaces the random-init seed ONNX,
 optionally also seeds training.pt so the train worker resumes warm):
 
+    wget https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b10c128-s1141046784-d204142634.txt.gz
     python scripts/run_continuous.py init --filters 128 --blocks 10 -y
     python tools/warm_init_from_katago.py \
-        --katago-bin path/to/g170e-b10c128-.../model.bin.gz \
+        --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
         --arch resnet --filters 128 --blocks 10 \
         --onnx       models/accepted/v000000000.onnx \
         --checkpoint training/checkpoints/training.pt
@@ -21,7 +22,7 @@ Workflow with run_loop.py (single-process, simpler):
 
     python run_loop.py init large
     python tools/warm_init_from_katago.py \
-        --katago-bin path/to/g170e-b10c128-.../model.bin.gz \
+        --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
         --arch resnet --filters 128 --blocks 10 \
         --checkpoint training/checkpoints/training.pt
     python run_loop.py train
@@ -364,8 +365,8 @@ def _parse_model_header(r: TokenStream) -> tuple:
     model_version = r.read_int()
     if model_version < 8:
         raise ValueError(
-            f"Model version {model_version} is older than g170-era; "
-            f"this script targets v8-v15 (script tested against g170 b10c128)."
+            f"Model version {model_version} is too old for this script "
+            f"(targets v8-v15, tested against kata1 b10c128 v10)."
         )
     if model_version > 15:
         print(
@@ -422,7 +423,7 @@ def _parse_trunk(r: TokenStream, model_version: int, binary: bool) -> Trunk:
         elif kind == "nested_bottleneck_block":
             raise NotImplementedError(
                 "Nested bottleneck blocks are not supported "
-                "(b10c128 from g170 should not contain them)."
+                "(b10c128 should not contain them)."
             )
         else:
             raise ValueError(f"Unknown block kind: {kind}")
@@ -633,14 +634,15 @@ def _save_onnx(model, path: str, board_size: int, arch: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Warm-initialize MiniGo from a KataGo b10c128 .bin.gz",
+        description="Warm-initialize MiniGo from a KataGo b10c128 network",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Recommended source: g170e-b10c128-s1141046784-d204142634 from\n"
-            "https://katagoarchive.org/g170/neuralnets/ — the strongest g170\n"
-            "b10c128 (Extended Training Net). Download the per-network\n"
-            "directory's model.bin.gz (NOT the .zip — that's a TensorFlow\n"
-            "checkpoint).\n"
+            "Recommended source (b10c128, ~204M training rows):\n"
+            "  https://media.katagotraining.org/uploaded/networks/models/kata1/\n"
+            "  kata1-b10c128-s1141046784-d204142634.txt.gz\n"
+            "\n"
+            "The script auto-detects .txt.gz (text floats) vs .bin.gz (binary)\n"
+            "from the filename; force with --txt or --bin if needed.\n"
             "\n"
             "At least one of --onnx / --checkpoint must be given. Both are\n"
             "the same warm-initialized weights — pick whichever the consumer\n"
