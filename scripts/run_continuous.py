@@ -34,6 +34,7 @@ TRAINING_DIR = PROJECT_ROOT / "training"
 MODELS_DIR = PROJECT_ROOT / "models"
 RATINGS_DIR = PROJECT_ROOT / "ratings"
 LOGS_ROOT = PROJECT_ROOT / "logs"
+ARCHIVE_ROOT = PROJECT_ROOT / "archive"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -45,21 +46,24 @@ def timestamp():
 
 
 def archive_previous():
-    """Archive training/, models/, ratings/, logs/* from a prior run.
-    Move (don't delete) into archive-<ts>/ sibling dirs under each parent
-    so nothing is lost."""
+    """Archive training/, models/, ratings/, logs/ from a prior run.
+    Move (don't delete) into archive/<ts>/<name>/ so nothing is lost
+    and the project root doesn't get littered with sibling archive
+    folders. Only creates archive/<ts>/ if at least one source dir is
+    non-empty."""
+    sources = [TRAINING_DIR, MODELS_DIR, RATINGS_DIR, LOGS_ROOT]
+    non_empty = [s for s in sources if s.is_dir() and any(s.iterdir())]
+    if not non_empty:
+        return []
+
     ts = timestamp()
+    bundle = ARCHIVE_ROOT / ts
+    bundle.mkdir(parents=True, exist_ok=False)
     moved = []
-    for src in [TRAINING_DIR, MODELS_DIR, RATINGS_DIR]:
-        if src.is_dir() and any(src.iterdir()):
-            dst = src.parent / f"{src.name}.archive-{ts}"
-            shutil.move(str(src), str(dst))
-            moved.append(f"{src.name} -> {dst.name}")
-    # Archive logs/ contents (not logs itself)
-    if LOGS_ROOT.is_dir() and any(LOGS_ROOT.iterdir()):
-        dst = LOGS_ROOT.parent / f"logs.archive-{ts}"
-        shutil.move(str(LOGS_ROOT), str(dst))
-        moved.append(f"logs -> {dst.name}")
+    for src in non_empty:
+        dst = bundle / src.name
+        shutil.move(str(src), str(dst))
+        moved.append(f"{src.name} -> {dst.relative_to(PROJECT_ROOT)}")
     return moved
 
 
@@ -629,7 +633,7 @@ def cmd_init(args):
         print("About to archive previous run artifacts:")
         for d in [TRAINING_DIR, MODELS_DIR, RATINGS_DIR, LOGS_ROOT]:
             if d.exists() and any(d.iterdir()):
-                print(f"  {d} -> archive-<ts>")
+                print(f"  {d.name}/ -> archive/<ts>/{d.name}/")
         ans = input("Proceed? [y/N] ").strip().lower()
         if ans not in ("y", "yes"):
             print("Cancelled.")
