@@ -850,13 +850,21 @@ presets have a channel mismatch and the script will refuse.
     v1BN. KataGo's value pathway extracts "what features matter for
     game evaluation" — same starting projection seeds value, score
     mean / stdev, and score belief in MiniGo.
+  - **Speculative slice** for policy and opponent-policy: 2 rows of
+    KataGo's `p1Conv [32, 128, 1, 1]` and `p1BN [32]` are sliced into
+    MiniGo's `policy_conv [2, 128, 1, 1]` (rows 0, 1) and
+    `opp_policy_conv` (rows 2, 3). MiniGo's policy uses a flatten+FC
+    design while KataGo uses spatial-conv + gpool injection, so the
+    first-stage 1×1 conv is the only piece with matching input
+    dimensions. Two specific rows out of 32 is arbitrary — this is
+    "better-than-random in expectation," not a principled match.
 - **What does not.** Input stem (17 vs 22+19 channels), GPool blocks
   (channel layout differs — MG keeps 128 mid-block, KG narrows to 96),
   trunk BN running stats (pre-act vs post-act semantics differ), SE
   attention modules (KataGo has none), head FC layers (KG hidden dim
   is 80, MG is 128), ownership conv (KG reads from v1=32-channel,
-  MG reads directly from trunk=128-channel), policy head (different
-  topology entirely).
+  MG reads directly from trunk=128-channel), policy_fc / opp_policy_fc
+  (KG has no flatten+FC equivalent).
 - **Optimizer state** in any pre-existing checkpoint is dropped, since
   the conv weights changed and Adam moments would be paired with the
   wrong tensors.

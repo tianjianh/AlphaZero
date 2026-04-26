@@ -36,9 +36,14 @@ What gets transferred (with `large` preset, 128f/10b):
       + BN on 32 channels) from KataGo's value-head v1Conv + v1BN.
       KataGo learned what features matter for evaluation; reusing that
       summary projection is the bulk of the head-side prior.
+    - Speculative slice: MiniGo's policy_conv [2, 128, 1, 1] gets rows
+      0,1 of KataGo's p1Conv [32, 128, 1, 1]; opp_policy_conv gets
+      rows 2,3. p1BN slices similarly. Better-than-random in
+      expectation but arbitrary about which rows — both heads share
+      KataGo's "policy-relevant trunk projection" idea.
     - Everything else stays at MiniGo's default init (stem, GPool block
       conv weights, trunk BN stats, SE attention modules, head FCs,
-      ownership conv, policy head).
+      ownership conv, p1BN running stats for unsliced rows).
 
 Why the rest is skipped:
     - Stem:    17 input channels (MG) vs 22 spatial + 19 global (KG).
@@ -358,6 +363,22 @@ class Trunk:
 
 
 @dataclass
+class PolicyHead:
+    """Just enough of KataGo's policy head to do speculative slice transfer.
+
+    KataGo's p1Conv [c_p1, c_trunk, 1, 1] is a learned 1x1 projection
+    from the trunk to c_p1=32 "policy-relevant" channels. MiniGo's
+    policy_conv [2, c_trunk, 1, 1] is also a 1x1 projection from the
+    trunk, just narrower (only 2 channels). Slicing 2 rows of p1Conv
+    into MG's policy_conv is better-than-random in expectation but
+    arbitrary about which 2 rows.
+    """
+    name: str
+    p1_conv: ConvLayer
+    p1_bn: BatchNormLayer
+
+
+@dataclass
 class ValueHead:
     """Just enough of KataGo's value head to warm-init MiniGo's GPoolHeads.
 
@@ -381,6 +402,7 @@ class KataGoModel:
     num_input_channels: int
     num_input_global_channels: int
     trunk: Trunk
+    policy_head: Union[PolicyHead, None] = None
     value_head: Union[ValueHead, None] = None
 
 
@@ -466,20 +488,21 @@ def _parse_trunk(r: TokenStream, model_version: int, binary: bool) -> Trunk:
     )
 
 
-def _skip_policy_head(r: TokenStream, model_version: int, binary: bool) -> None:
-    """Parse and discard the policy head (we don't transfer from it).
+def _parse_policy_head(r: TokenStream, model_version: int, binary: bool) -> PolicyHead:
+    """Parse the policy head, retaining only p1Conv and p1BN.
 
-    We have to walk the stream to reach the value head, since file
-    order is trunk -> policy_head -> value_head. Mirrors desc.cpp's
-    PolicyHeadDesc constructor.
+    Mirrors desc.cpp's PolicyHeadDesc constructor; remaining layers
+    (g1Conv/g1BN, gpoolToBiasMul, p1BN/Act, p2Conv, gpoolToPassMul,
+    plus v15+ extras) are read for stream-position consistency and
+    discarded.
     """
-    r.read_token()  # name
-    ConvLayer.parse(r, binary)            # p1Conv
+    name = r.read_token()
+    p1_conv = ConvLayer.parse(r, binary)
     ConvLayer.parse(r, binary)            # g1Conv
     BatchNormLayer.parse(r, binary)       # g1BN
     ActivationLayer.parse(r, model_version)  # g1Activation
     MatMulLayer.parse(r, binary)          # gpoolToBiasMul
-    BatchNormLayer.parse(r, binary)       # p1BN
+    p1_bn = BatchNormLayer.parse(r, binary)
     ActivationLayer.parse(r, model_version)  # p1Activation
     ConvLayer.parse(r, binary)            # p2Conv
     MatMulLayer.parse(r, binary)          # gpoolToPassMul
@@ -487,6 +510,7 @@ def _skip_policy_head(r: TokenStream, model_version: int, binary: bool) -> None:
         MatBiasLayer.parse(r, binary)     # gpoolToPassBias
         ActivationLayer.parse(r, model_version)  # passActivation
         MatMulLayer.parse(r, binary)      # gpoolToPassMul2
+    return PolicyHead(name=name, p1_conv=p1_conv, p1_bn=p1_bn)
 
 
 def _parse_value_head(r: TokenStream, model_version: int, binary: bool) -> ValueHead:
@@ -536,9 +560,10 @@ def parse_katago_model(path: str, force_binary: bool = None) -> KataGoModel:
 
     # Parse heads. If anything goes wrong (e.g. unsupported version),
     # warn and continue with trunk-only — head transfer is optional.
+    policy_head = None
     value_head = None
     try:
-        _skip_policy_head(r, model_version, binary)
+        policy_head = _parse_policy_head(r, model_version, binary)
         value_head = _parse_value_head(r, model_version, binary)
     except (ValueError, NotImplementedError) as e:
         print(f"WARN: head parse failed ({e}); continuing with trunk-only transfer")
@@ -546,7 +571,7 @@ def parse_katago_model(path: str, force_binary: bool = None) -> KataGoModel:
     return KataGoModel(
         name=name, model_version=model_version,
         num_input_channels=num_in, num_input_global_channels=num_global,
-        trunk=trunk, value_head=value_head,
+        trunk=trunk, policy_head=policy_head, value_head=value_head,
     )
 
 
@@ -743,6 +768,79 @@ def warm_init(sd: dict, kg: KataGoModel, verbose: bool = True) -> dict:
         if verbose:
             print()
             print("  Head transfer: skipped (value head not parsed)")
+
+    # ── Speculative policy / opp-policy slice transfer ──────
+    #
+    # MiniGo's policy_conv [2, 128, 1, 1] and opp_policy_conv [2, 128, 1, 1]
+    # have NO direct KataGo counterpart at this shape (KG's p2Conv is
+    # [policyOutChannels, c_p1=32, 1, 1] — wrong input channel count).
+    # KG's p1Conv [c_p1=32, 128, 1, 1] is a 1x1 trunk projection in
+    # the right direction (input=128) but produces 32 channels of
+    # intermediate features for KG's spatial+gpool policy pipeline,
+    # not 2 channels of "spatial features ready to flatten into action
+    # logits" (which is MG's design).
+    #
+    # We slice 2 rows of p1Conv as MG's policy_conv weights — better
+    # than random init *in expectation* (both are "policy-relevant
+    # trunk projections") but arbitrary about which 2 rows.
+    # Take rows [0, 1] for policy_conv, rows [2, 3] for opp_policy_conv
+    # so the two heads don't start identical. Same idea for p1BN slices.
+    if kg.policy_head is not None:
+        kg_p1_w = torch.from_numpy(kg.policy_head.p1_conv.weights)  # [c_p1, 128, 1, 1]
+        kg_p1_c_out = kg.policy_head.p1_conv.out_ch
+        if verbose:
+            print()
+            print(f"  Speculative policy slice (rows of KG p1Conv "
+                  f"[{kg_p1_c_out}, ..] -> MG policy_conv [2, ..]):")
+
+        for mg_head, slice_rows in [("policy", (0, 1)), ("opp_policy", (2, 3))]:
+            mg_conv_key = f"{mg_head}_conv.weight"
+            if mg_conv_key not in sd:
+                if verbose:
+                    print(f"    {mg_head}: skip (key not present)")
+                continue
+            mg_conv = sd[mg_conv_key]
+            r0, r1 = slice_rows
+            if r1 >= kg_p1_c_out:
+                # Fallback for narrow KG configs where c_p1 < 4
+                r0, r1 = 0, min(1, kg_p1_c_out - 1)
+            if mg_conv.shape[1:] != kg_p1_w.shape[1:]:
+                if verbose:
+                    print(f"    {mg_head}: skip (input shape MG {tuple(mg_conv.shape[1:])} "
+                          f"vs KG {tuple(kg_p1_w.shape[1:])})")
+                continue
+            sliced = kg_p1_w[[r0, r1]].to(mg_conv.dtype).clone()
+            if sliced.shape != mg_conv.shape:
+                # Shouldn't happen given the input-shape check above, but be defensive
+                if verbose:
+                    print(f"    {mg_head}: skip (sliced shape {tuple(sliced.shape)} "
+                          f"!= MG {tuple(mg_conv.shape)})")
+                continue
+            sd[mg_conv_key] = sliced
+            params_transferred += sliced.numel()
+
+            # Slice corresponding rows of p1BN scale/bias into MG's *_bn
+            mg_bn_w_key = f"{mg_head}_bn.weight"
+            if mg_bn_w_key in sd and sd[mg_bn_w_key].numel() == 2:
+                p1_scale = torch.from_numpy(kg.policy_head.p1_bn.scale)
+                p1_bias = torch.from_numpy(kg.policy_head.p1_bn.bias)
+                p1_mean = torch.from_numpy(kg.policy_head.p1_bn.mean)
+                p1_var = torch.from_numpy(kg.policy_head.p1_bn.variance)
+                sd[mg_bn_w_key] = p1_scale[[r0, r1]].to(sd[mg_bn_w_key].dtype).clone()
+                sd[f"{mg_head}_bn.bias"] = p1_bias[[r0, r1]].to(sd[mg_bn_w_key].dtype).clone()
+                sd[f"{mg_head}_bn.running_mean"] = p1_mean[[r0, r1]].clone()
+                sd[f"{mg_head}_bn.running_var"] = p1_var[[r0, r1]].clone()
+                if f"{mg_head}_bn.num_batches_tracked" in sd:
+                    sd[f"{mg_head}_bn.num_batches_tracked"] = torch.tensor(0, dtype=torch.long)
+                params_transferred += 2 + 2  # weight + bias
+            heads_paired.append(f"{mg_head}_conv (speculative, rows [{r0},{r1}])")
+            if verbose:
+                print(f"    {mg_head}_conv: ← p1Conv rows [{r0},{r1}] "
+                      f"({sliced.numel() + 4:,} params)")
+    else:
+        if verbose:
+            print()
+            print("  Policy slice transfer: skipped (policy head not parsed)")
 
     return {
         "blocks_paired": blocks_paired,
