@@ -721,7 +721,7 @@ python -c "import onnx; from onnxsim import simplify; \
 python tools/rknn_calibration.py \
     --onnx models/kata1.rknn.onnx --output calib/kata1 --num-positions 200
 
-# 4) Convert: fp16, int8, hybrid for both targets
+# 4) Convert: fp16, int8, tuned-hybrid for both targets
 for tgt in rk3576 rk3588; do
     python tools/onnx_to_rknn.py --onnx models/kata1.rknn.onnx \
         --rknn models/kata1.${tgt}.fp16.rknn --mode fp16 --target $tgt
@@ -730,9 +730,15 @@ for tgt in rk3576 rk3588; do
         --dataset calib/kata1/dataset.txt
     python tools/onnx_to_rknn.py --onnx models/kata1.rknn.onnx \
         --rknn models/kata1.${tgt}.hybrid.rknn --mode hybrid --target $tgt \
-        --dataset calib/kata1/dataset.txt
+        --dataset calib/kata1/dataset.txt --preset kata1   # ← +6% top-1
 done
 ```
+
+**Use `--preset kata1` for hybrid** — it pins 9 sensitivity-tuned Convs
+(stem, blocks.0/9 first/final, 4 head Convs) and lifts hybrid top-1
+agreement from 81% (plain int8 / unpinned hybrid) to 87%, while keeping
+~75% of FLOPs in int8 → ~1.7× fp16 NPU speedup.  See §11.4 for the
+sweep that tuned this preset.
 
 Build times on x86_64 host (cold cache):
 
@@ -807,9 +813,46 @@ is more reliable, w8a8 may be acceptable.
   slower than `normal` but sometimes 10-20% better on policy logits.
   Worth trying if you're committed to a quantised path.
 
----
+### 11.4 Tuning hybrid: where to pin fp16
 
-## 12. End-to-end validation
+Plain hybrid (just our auto-traced 4 head Convs in fp16) gives the
+same 81% top-1 as int8 — the trunk is the dominant precision sink and
+head-only fp16 doesn't help.  We swept 12 progressively-larger pin
+sets across 100 kata1 positions; results:
+
+| set                                       | layers fp16 | top-1 | top-3 | top-5 | val_max | KL p50  |
+|-------------------------------------------|------------:|------:|------:|------:|--------:|--------:|
+| baseline: fp16                            | all (36)    | 100.0%| 99.3% | 99.8% | 2.2e-3  | 1.6e-6  |
+| baseline: int8 (no pin)                   |  0          | 81.0% | 91.3% | 91.2% | 3.2e-1  | 1.4e-2  |
+| auto head only                            |  4          | 81.0% | 91.3% | 91.6% | 4.2e-1  | 1.3e-2  |
+| + stem                                    |  5          | 84.0% | 89.3% | 91.4% | 4.0e-1  | 1.2e-2  |
+| + stem + gpool path                       |  7          | 84.0% | 90.0% | 91.2% | 4.4e-1  | 1.4e-2  |
+| + stem + headBig + gpool                  |  8          | 85.0% | 91.3% | 91.0% | 4.4e-1  | 1.4e-2  |
+| **`--preset kata1`** (stem + 1st/last block first/final + heads) |  **9** | **87.0%** | 90.0% | **92.6%** | **2.1e-1**  | 1.3e-2  |
+| stem + every block's regular_conv (S4)    | 18          | 87.0% | 89.0% | 92.2% | 2.0e-1  | 1.2e-2  |
+| stem + every block's regular AND final    | 28          | 84.0% | 89.3% | 92.4% | 3.0e-1  | 1.4e-2  |
+
+(Numbers are vs ORT on a fixed 100-position calibration sample.)
+
+**Two findings worth noting:**
+
+1. **87% top-1 is the ceiling** for kata1 hybrid — many strategies
+   reach it, none cross it.  The remaining 13% gap to fp16 only closes
+   when ~all Convs are fp16, which defeats the speedup.
+2. **More pinning beyond ~18 layers regresses** (the 28-layer S5 set
+   drops back to 84%).  Likely the toolkit's scale-propagation across
+   many fp16↔int8 boundaries accumulates rounding noise that
+   outweighs the precision benefit.
+
+The `kata1` preset is the **Pareto-optimal** point: 9 layers in fp16,
+matching the best top-1 (87%) and the best top-5 (92.6%) seen in the
+sweep, with the smallest fp16 budget — leaving ~75% of FLOPs in int8
+for the NPU's fast path.
+
+For other networks, you can roll your own with
+`--keep-fp16-pattern '<regex>'` (repeatable) — a regex that matches
+ONNX node names.  The matched nodes' outputs are added to the auto
+head set.
 
 Run inference on three things and compare:
 

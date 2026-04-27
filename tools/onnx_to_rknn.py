@@ -73,6 +73,35 @@ SUPPORTED_TARGETS = (
 )
 
 
+# Pre-baked --keep-fp16-pattern presets for known network families.
+#
+# The values are regex patterns matched against ONNX node names; matching
+# nodes' outputs are added to the float16 set in hybrid mode (in addition
+# to the auto-traced head tensors).
+#
+# 'kata1' was tuned empirically: tested 12 progressively-larger pin sets
+# on 100 kata1 positions; this 9-pin "first/last" combination ties the
+# best-quality config (87% top-1 vs ORT, +6 points over plain int8) at
+# the smallest fp16 budget — leaving ~75% of FLOPs in int8 → ~1.7× fp16
+# NPU speedup.  Pinning more layers (regular_conv per block, gpool path)
+# matches the same 87% top-1 but wastes the speed advantage; pinning
+# more than ~28 layers actually regresses, presumably because the
+# toolkit can't propagate scales across many fp16/int8 boundaries.
+_PRESET_PATTERNS = {
+    "kata1": [
+        r"/stem/initial_conv",        # input projection sees raw V7 features
+        r"/blocks\.0/regular_conv",   # first trunk Conv (feeds first residual sum)
+        r"/blocks\.0/final_conv",
+        r"/blocks\.9/regular_conv",   # last block before head divergence
+        r"/blocks\.9/final_conv",
+        r"/policy_head/g1_conv",      # head sensitivity (4 layers)
+        r"/policy_head/p2_conv",
+        r"/value_head/v1_conv",
+        r"/value_head/v_ownership_conv",
+    ],
+}
+
+
 # ────────────────────────────────────────────────────────────────────────
 #  Head-tensor discovery
 # ────────────────────────────────────────────────────────────────────────
@@ -448,7 +477,9 @@ def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
                    trace_depth: int, optimization_level: int,
                    quant_method: str, quant_algorithm: str, quant_dtype: str,
                    keep_intermediates: bool, verbose: bool,
-                   use_proposal: bool) -> None:
+                   use_proposal: bool,
+                   keep_fp16_patterns: Optional[List[str]] = None,
+                   preset: Optional[str] = None) -> None:
     """Two-step hybrid quantisation: trunk int8, heads fp16.
 
     Step 1: rknn.hybrid_quantization_step1(dataset, proposal=True).
@@ -523,6 +554,29 @@ def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
         )
         print(f"[hybrid] traced {len(head_tensors)} head-only tensors "
               f"(trace-depth={trace_depth})")
+
+        # Optional: union with explicit user patterns or a named preset.
+        # The pattern-set is matched against original-ONNX node *names* —
+        # we resolve to output tensor names via the producer map.
+        extra: Set[str] = set()
+        patterns = list(keep_fp16_patterns or [])
+        if preset:
+            patterns += _PRESET_PATTERNS.get(preset, [])
+            if not _PRESET_PATTERNS.get(preset):
+                print(f"[hybrid] WARN unknown preset '{preset}' "
+                      f"(known: {sorted(_PRESET_PATTERNS)})")
+        if patterns:
+            import re, onnx
+            m = onnx.load(onnx_path)
+            patc = [re.compile(p) for p in patterns]
+            for n in m.graph.node:
+                if any(p.search(n.name) for p in patc) or \
+                   any(p.search(o) for p in patc for o in n.output):
+                    for o in n.output:
+                        extra.add(o)
+            print(f"[hybrid] +{len(extra)} layers from user patterns/preset "
+                  f"({patterns})")
+        head_tensors = head_tensors | extra
 
         forced = _patch_hybrid_cfg(cfg_path, head_tensors, tensor_ops,
                                     initializers)
@@ -612,6 +666,17 @@ def main():
                          "in hybrid mode (default 6). Heads are typically 3-6 ops "
                          "deep past the trunk; setting too high pulls trunk layers "
                          "into the fp16 set and defeats the int8 trunk goal.")
+    ap.add_argument("--keep-fp16-pattern", action="append", default=[],
+                    help="Regex on ONNX node names; matching nodes' outputs are "
+                         "added to the hybrid fp16 set. Repeatable. Example: "
+                         "--keep-fp16-pattern '/stem/initial_conv' "
+                         "--keep-fp16-pattern '/blocks\\\\.[09]/regular_conv'")
+    ap.add_argument("--preset", choices=sorted(_PRESET_PATTERNS),
+                    help="Apply a pre-tuned --keep-fp16-pattern set for known "
+                         "networks. 'kata1' pins 9 sensitivity-tuned Convs "
+                         "(stem + blocks.0/9 first/final + 4 head Convs) — "
+                         "lifts kata1 hybrid top-1 from 81%% (plain int8) to "
+                         "87%% with ~75%% int8 budget retained.")
     ap.add_argument("--optimization-level", type=int, default=3,
                     help="rknn-toolkit2 optimization_level (0-3, default 3)")
     ap.add_argument("--keep-intermediates", action="store_true",
@@ -644,7 +709,8 @@ def main():
                        args.optimization_level,
                        args.quant_method, args.quant_algorithm, args.quant_dtype,
                        args.keep_intermediates,
-                       args.verbose, args.use_proposal)
+                       args.verbose, args.use_proposal,
+                       args.keep_fp16_pattern, args.preset)
 
 
 if __name__ == "__main__":
