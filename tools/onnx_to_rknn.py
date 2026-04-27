@@ -355,12 +355,20 @@ def _new_rknn(verbose: bool):
 
 def _config(rknn, target: str, optimization_level: int,
             quantized_method: str = "channel",
-            quantized_algorithm: str = "normal") -> None:
+            quantized_algorithm: str = "normal",
+            quantized_dtype: str = "w8a8") -> None:
     rknn.config(
         target_platform=target,
         mean_values=None,           # features are already normalised
         std_values=None,
         optimization_level=optimization_level,
+        # Quantisation dtype.  Trades off speed vs accuracy:
+        #   * w8a8   — ~2× fp16 NPU throughput, biggest accuracy hit
+        #   * w8a16  — int8 weights + int16 activations; ~1.3-1.5× fp16,
+        #              near-fp32 accuracy on most graphs
+        #   * w16a16i — int16 weights + int16 activations; minimal
+        #              accuracy loss, smaller speedup
+        quantized_dtype=quantized_dtype,
         # Per-channel quantisation is dramatically more accurate than
         # per-layer for Go networks where channel weight scales differ
         # by 5-10×. Default 'channel' here; expose --quant-method to
@@ -390,14 +398,14 @@ def _config(rknn, target: str, optimization_level: int,
 
 def convert_fp16(onnx_path: str, rknn_path: str, target: str,
                  batch: int, optimization_level: int,
-                 quant_method: str, quant_algorithm: str,
+                 quant_method: str, quant_algorithm: str, quant_dtype: str,
                  verbose: bool) -> None:
     info = _detect_format(onnx_path)
     inputs, shapes = _resolve_input_shapes(info, batch)
     print(f"[fp16] target={target} input_shapes={shapes}")
     rknn = _new_rknn(verbose)
     try:
-        _config(rknn, target, optimization_level, quant_method, quant_algorithm)
+        _config(rknn, target, optimization_level, quant_method, quant_algorithm, quant_dtype)
         if rknn.load_onnx(model=onnx_path, inputs=inputs, input_size_list=shapes) != 0:
             raise RuntimeError("load_onnx failed")
         if rknn.build(do_quantization=False) != 0:
@@ -412,7 +420,7 @@ def convert_fp16(onnx_path: str, rknn_path: str, target: str,
 
 def convert_int8(onnx_path: str, rknn_path: str, target: str,
                  batch: int, dataset: str, optimization_level: int,
-                 quant_method: str, quant_algorithm: str,
+                 quant_method: str, quant_algorithm: str, quant_dtype: str,
                  verbose: bool) -> None:
     if not os.path.exists(dataset):
         raise SystemExit(f"--dataset {dataset!r} does not exist")
@@ -422,7 +430,7 @@ def convert_int8(onnx_path: str, rknn_path: str, target: str,
           f"method={quant_method} algo={quant_algorithm}")
     rknn = _new_rknn(verbose)
     try:
-        _config(rknn, target, optimization_level, quant_method, quant_algorithm)
+        _config(rknn, target, optimization_level, quant_method, quant_algorithm, quant_dtype)
         if rknn.load_onnx(model=onnx_path, inputs=inputs, input_size_list=shapes) != 0:
             raise RuntimeError("load_onnx failed")
         if rknn.build(do_quantization=True, dataset=dataset) != 0:
@@ -438,7 +446,7 @@ def convert_int8(onnx_path: str, rknn_path: str, target: str,
 def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
                    batch: int, dataset: str, proposal_dataset_size: int,
                    trace_depth: int, optimization_level: int,
-                   quant_method: str, quant_algorithm: str,
+                   quant_method: str, quant_algorithm: str, quant_dtype: str,
                    keep_intermediates: bool, verbose: bool,
                    use_proposal: bool) -> None:
     """Two-step hybrid quantisation: trunk int8, heads fp16.
@@ -470,7 +478,7 @@ def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
 
     rknn = _new_rknn(verbose)
     try:
-        _config(rknn, target, optimization_level, quant_method, quant_algorithm)
+        _config(rknn, target, optimization_level, quant_method, quant_algorithm, quant_dtype)
         if rknn.load_onnx(model=onnx_path, inputs=inputs, input_size_list=shapes) != 0:
             raise RuntimeError("load_onnx failed")
 
@@ -575,6 +583,15 @@ def main():
                          "'mmse' minimises MSE between fp32 and int8 outputs "
                          "(slower, often slightly better). 'kl_divergence' "
                          "fits per-tensor distributions.")
+    ap.add_argument("--quant-dtype", default="w8a8",
+                    choices=["w8a8", "w8a16", "w16a16i", "w16a16i_dfp"],
+                    help="Quantisation precision (default 'w8a8'). "
+                         "w8a8 = int8 weights + int8 activations (~2x fp16 speed, "
+                         "biggest accuracy hit on logits). "
+                         "w8a16 = int8 weights + int16 activations (~1.3-1.5x "
+                         "fp16 speed, near-fp32 accuracy — recommended sweet "
+                         "spot for Go networks). "
+                         "w16a16i / w16a16i_dfp = int16 throughout, smaller speedup.")
     ap.add_argument("--batch", type=int, default=1,
                     help="Batch size baked into the .rknn (default 1). "
                          "Use 4 for self-play workloads to amortise per-call overhead.")
@@ -614,18 +631,18 @@ def main():
     if args.mode == "fp16":
         convert_fp16(args.onnx, args.rknn, args.target, args.batch,
                      args.optimization_level,
-                     args.quant_method, args.quant_algorithm,
+                     args.quant_method, args.quant_algorithm, args.quant_dtype,
                      args.verbose)
     elif args.mode == "int8":
         convert_int8(args.onnx, args.rknn, args.target, args.batch,
                      args.dataset, args.optimization_level,
-                     args.quant_method, args.quant_algorithm,
+                     args.quant_method, args.quant_algorithm, args.quant_dtype,
                      args.verbose)
     elif args.mode == "hybrid":
         convert_hybrid(args.onnx, args.rknn, args.target, args.batch,
                        args.dataset, args.proposal_size, args.trace_depth,
                        args.optimization_level,
-                       args.quant_method, args.quant_algorithm,
+                       args.quant_method, args.quant_algorithm, args.quant_dtype,
                        args.keep_intermediates,
                        args.verbose, args.use_proposal)
 
