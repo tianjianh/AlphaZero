@@ -109,6 +109,11 @@ Cross-reference of where each review finding is addressed:
 | P3: missing `Optional` import | Phase 0.1 prerequisite step adds `Optional` to `from typing import List, Union` → `List, Optional, Union`. | Phase 0.1 |
 | P2: early "What's untouched" still claims `mcts.cpp` / `NNResultBuf` unchanged | Section retitled "What's logically unchanged for MiniGo" and rewritten to describe behavior preservation, not file untouchedness. Authoritative file list lives in "Files to add/modify". | "What's logically unchanged for MiniGo" |
 | P3: component table row "warm_init_from_katago.py unchanged" | Row updated: "additive parser extension only; CLI behavior + warm-init output unchanged (validated by byte-diff `training.pt`)". | Component table |
+| P1: inline `encode_state` needs `GoGame` definition | `include/batch_evaluator.h` adds `#include "game.h"` so the inline default body `game.encode(out)` has the full type, not just a forward declaration. | "Where the dispatch lives" |
+| P2: `evaluate()` batch return drops new fields | Phase 2.5 now updates *both* buf-to-`NNOutput` reconstruction sites (`nn_evaluator.cpp:61` and `:96`) to include `score_sd` and `ownership`. | Phase 2.5 |
+| P2: ownership never reaches `AnalysisInfo::root_ownership` | New Phase 2.5 sub-step C: store `root_nn_ownership_` on the `MCTS` class (root only, not per-node), populate from root NN eval, copy into `AnalysisInfo` from `get_analysis()`. Pre-existing latent MiniGo bug too. | Phase 2.5 |
+| P2 (self-audit): stale `:699` and "all main_*.cpp" in dispatch example | "Where the dispatch lives" example code now lists only `:248, 340, 413` and explicitly excludes `:699` and `main_selfplay.cpp`. | "Where the dispatch lives" |
+| P2 (self-audit): stale "4 call-site renames" in files list | Files-to-modify list updated to "3 call-site renames" with line numbers and explicit `:699` exclusion. | "Files to add/modify" |
 
 
 ## Source-backed alignment with KataGo
@@ -326,6 +331,14 @@ naturally:
 
 ```cpp
 // include/batch_evaluator.h — additive change
+//
+// Add `#include "game.h"` to the existing includes (currently this
+// header includes only "compute_context.h"). The inline default
+// body of encode_state calls game.encode(out), which needs the full
+// GoGame definition, not a forward declaration.
+#include "compute_context.h"
+#include "game.h"   // NEW: needed for the inline default of encode_state
+
 class BatchEvaluator {
 public:
     virtual ~BatchEvaluator() = default;
@@ -354,15 +367,19 @@ void NNEvaluator::encode_state(const GoGame& game,
 }
 ```
 
-Search-side change is one rename per call site:
+Search-side change is one rename per inference call site
+(self-play and selfplay-record paths deliberately stay on
+`game.encode()` — see Phase 2 boundary):
 ```cpp
-// src/mcts.cpp:248, 340, 413, 699 (and same pattern in main_*.cpp)
+// src/mcts.cpp:248, 340, 413   (NOT :699 — that's self_play_game_impl)
 - game_copy_ptr->encode(state);
 + evaluator_->encode_state(*game_copy_ptr, state);
 ```
 
-This is ~10 changed lines total in MCTS + four `main_*.cpp` files.
-MCTS itself becomes format-agnostic — it doesn't import
+Total search-side edits: 3 renames in `mcts.cpp` + ~4 renames
+across `main_play.cpp` / `main_benchmark.cpp` (sections 2-3) /
+`main_evaluate.cpp`. `main_selfplay.cpp` gets a guard, not a
+rename. MCTS itself becomes format-agnostic — it doesn't import
 `loaded_model.h`, doesn't see `ModelFormat`, doesn't hold a model
 pointer. The evaluator hides the format question entirely.
 
@@ -923,10 +940,36 @@ for (auto* buf : batch) {
 }
 ```
 
-And update the `evaluate_with_buf` return at `nn_evaluator.cpp:61`
-to include all five fields. Any caller currently constructing an
-`NNOutput` from the buf gets the same fields it already got, plus
-two more — additive.
+**Both buf-to-NNOutput reconstruction sites need the new fields.**
+The buf is read back into an `NNOutput` in two places:
+
+1. `nn_evaluator.cpp:61` — `evaluate_with_buf()` return (per-leaf
+   blocking eval, the MCTS hot path).
+2. `nn_evaluator.cpp:96` — `evaluate()` batch return (used by root
+   eval, benchmark sections 2-3, and any single-shot caller).
+
+Both currently construct `NNOutput { policy, value, score }` and
+drop `score_sd` / `ownership` even though the buf now carries them.
+Update both to include all five fields:
+
+```cpp
+// nn_evaluator.cpp:61 (evaluate_with_buf return)
+return { std::move(buf.policy),
+         buf.value,
+         buf.score,
+         buf.score_sd,                          // NEW
+         std::move(buf.ownership) };            // NEW
+
+// nn_evaluator.cpp:96 (evaluate() batch return)
+results.push_back({ std::move(bufs[i]->policy),
+                    bufs[i]->value,
+                    bufs[i]->score,
+                    bufs[i]->score_sd,          // NEW
+                    std::move(bufs[i]->ownership) });  // NEW
+```
+
+Any caller currently constructing an `NNOutput` from the buf gets
+the same fields it already got, plus two more — additive.
 
 **B. `GoGame` records recent action locations.** V7's history planes
 encode *where* the last few moves were played, not what the board
@@ -986,6 +1029,52 @@ pass via the unnormalized `n*n` slot, a pass via the explicit
 `PASS_MOVE`, and a capture) and asserts `recent_action(0..4)`
 returns `PASS_MOVE` for both pass forms and the right board
 location for the capture. ~30 LoC.
+
+**C. Plumb root ownership into AnalysisInfo.**
+`include/mcts.h:117` already declares
+`std::vector<float> root_ownership;` inside `AnalysisInfo`, but
+nothing populates it. The MCTSNode struct currently stores
+`nn_score` and `nn_score_sd` (lines 30, 34) but no ownership field.
+For analysis to actually display ownership in `main_play`, the data
+needs a path from the NN result through the root node into
+`AnalysisInfo`. Pre-existing latent bug — `root_ownership` was
+declared aspirationally and never wired up.
+
+The minimum-touch fix is to store ownership at the root only (every
+node would be wasteful — only the root drives analysis):
+
+```cpp
+// include/mcts.h — additive: store root NN outputs that don't
+// otherwise have a home on MCTSNode.
+class MCTS {
+private:
+    /* existing private state */
+    std::vector<float> root_nn_ownership_;   // NEW: [board²] from root eval
+    // (root nn_score / nn_score_sd already stored on root MCTSNode)
+};
+```
+
+```cpp
+// src/mcts.cpp — wherever the root gets its first NN evaluation
+// (in expand_root() or equivalent — find the call site that
+// receives the root NNOutput and sets root_->nn_score):
+root_->nn_score    = nn_output.score;
+root_->nn_score_sd = nn_output.score_sd;
+root_nn_ownership_ = nn_output.ownership;     // NEW
+
+// src/mcts.cpp::get_analysis() — copy into AnalysisInfo:
+info.root_ownership = root_nn_ownership_;     // NEW
+```
+
+~5 LoC total. No edits to `MCTSNode` itself — keeps the per-node
+struct lean. `root_ownership` becomes populated for both MiniGo
+*and* KataGo runs (the field was always there; it's now actually
+useful).
+
+If a future use case needs per-node ownership (e.g., displaying
+ownership for any visited move during analysis), promote it to
+`MCTSNode` then. For now, root-only is enough for the play UI
+overlay and analysis info.
 
 ### Phase 3: port `fillRowV7` (the long pole)
 
@@ -1445,9 +1534,14 @@ unchanged for MiniGo runs):
   array + `recent_action(int)` accessor; `play()`, `reset()`,
   `copy()` extended to maintain it. No public API change beyond
   the new accessor. MiniGo encoder unchanged.
-- `src/mcts.cpp` — 4 call-site renames `game.encode(state)` →
-  `evaluator_->encode_state(game, state)`. No format awareness in
-  MCTS itself.
+- `src/mcts.cpp` — 3 call-site renames `game.encode(state)` →
+  `evaluator_->encode_state(game, state)` at lines 248, 340, 413
+  (search-thread inference paths). Line 699 (inside
+  `self_play_game_impl`) deliberately stays `game.encode(state)` —
+  see Phase 2's defense-in-depth rationale. Plus root-only ownership
+  storage `root_nn_ownership_` populated at root expansion and
+  copied into `AnalysisInfo::root_ownership` from `get_analysis()`.
+  No format awareness in MCTS itself.
 - `src/main_play.cpp`, `src/main_benchmark.cpp`,
   `src/main_evaluate.cpp` — same call-site rename for root-eval
   paths; CLI `--komi` flag plumb-through if not already there.
