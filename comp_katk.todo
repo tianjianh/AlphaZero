@@ -95,8 +95,12 @@ Cross-reference of where each review finding is addressed:
 | P1: parser data discarded | Phase 0.1: extend `PolicyHead`/`ValueHead` dataclasses with `Optional` fields, populate in parsers (additive). Byte-diff `training.pt` to validate. | Phase 0.1 |
 | P1: MCTS has no model handle | Encode dispatch moves to `BatchEvaluator::encode_state()` virtual; `NNEvaluator` overrides with format check; MCTS just calls the evaluator. | "Where the dispatch lives" + Phase 2 |
 | P2: V7 history needs moves | Add `recent_actions_` private array + `recent_action()` accessor to `GoGame`. Maintained in `play()` / `reset()` / `copy()`. Strictly additive. | Phase 2.5 |
-| P2: NNEvaluator drops score_sd / ownership | Add fields to `NNResultBuf`; copy through at server-thread writeback. Strictly additive (also a pre-existing latent MiniGo bug). | Phase 2.5 |
+| P2: NNEvaluator drops score_sd / ownership (success path) | Add fields to `NNResultBuf`; copy through at server-thread writeback. Strictly additive (also a pre-existing latent MiniGo bug). | Phase 2.5 |
+| P2: NNEvaluator catch path leaves new fields stale | Catch-path reset in `nn_evaluator.cpp:151-159` also clears `score_sd` and `ownership`. | Phase 2.5 |
 | P2: selfplay dispatch contradicts non-goal | Drop `main_selfplay.cpp` from encoder-rename list; add early-error guard rejecting `format == KataGo`. | Phase 6 |
+| P1: benchmark section 5 also crosses the boundary | Same boundary, finer guard: `main_benchmark.cpp` sections 1-4 are KataGo-aware; section 5 (self-play, builds TrainingRecords) is wrapped in a `format == MiniGo` `if/else` and skipped for KataGo. | Phase 6 |
+| P1: TRT branch references missing `I.format` | Add `ModelFormat format` field to `TensorRTComputeHandle::Impl`; set from `model->format` in the ctor alongside existing `board_size`/`input_channels` assignments. | Phase 4 |
+| P3: verification commands use wrong CLI flags | Phase 5 commands now match the actual `argv` parsing in each binary (`--sims`, `--max-batch`/`--nn-iters`, `--model1`/`--model2`). | Phase 5 |
 
 
 ## Source-backed alignment with KataGo
@@ -809,12 +813,35 @@ struct NNResultBuf {
 ```
 
 ```cpp
-// src/nn_evaluator.cpp:169-170 — add 2 lines
+// src/nn_evaluator.cpp:169-170 — add 2 lines on the success path
 buf->policy    = std::move(all_results[i].policy);
 buf->value     = all_results[i].value;
 buf->score     = all_results[i].score;     // NEW (currently dropped)
 buf->score_sd  = all_results[i].score_sd;  // NEW
 buf->ownership = std::move(all_results[i].ownership);  // NEW
+```
+
+**Also clear the new fields on the failure path.**
+`src/nn_evaluator.cpp:151-159` catches `predict_batch` exceptions
+and resets `policy`/`value`/`score` on the affected bufs so search
+threads don't deadlock or read garbage. Once `score_sd` and
+`ownership` exist, the same catch path must clear them too —
+otherwise a buf that had a successful eval, then a failed one,
+would return stale ownership/uncertainty from the prior call:
+
+```cpp
+// src/nn_evaluator.cpp catch path — add 2 lines
+int board_area = model_->board_size * model_->board_size;
+for (auto* buf : batch) {
+    std::lock_guard<std::mutex> lock(buf->mu);
+    buf->policy.assign(action_size, 0.0f);
+    buf->value     = 0.0f;
+    buf->score     = 0.0f;
+    buf->score_sd  = 0.0f;                            // NEW
+    buf->ownership.assign(board_area, 0.0f);          // NEW
+    buf->done      = true;
+    buf->cv.notify_one();
+}
 ```
 
 And update the `evaluate_with_buf` return at `nn_evaluator.cpp:61`
@@ -991,11 +1018,24 @@ If both `input_spatial_name` and `input_global_name` are set after
 the loop, this is a KataGo engine; if `input_name` is set, it's
 MiniGo. Cross-check against `model->format` and throw on mismatch.
 
-Extend `TensorRTComputeHandle::Impl` with two KataGo input device
-buffers (only allocated when format is KataGo):
+Extend `TensorRTComputeHandle::Impl` with the format flag (so the
+hot path branch in `predict_batch` knows which path to take) and
+two KataGo input device buffers (only allocated when format is
+KataGo):
 ```cpp
-float* d_input_spatial = nullptr;  // [max_batch, 22, H, W]
-float* d_input_global  = nullptr;  // [max_batch, 19]
+ModelFormat format = ModelFormat::MiniGo;  // copied from model in ctor
+float* d_input_spatial = nullptr;          // KataGo: [max_batch, 22, H, W]
+float* d_input_global  = nullptr;          // KataGo: [max_batch, 19]
+```
+
+The `format` field is set in `TensorRTComputeHandle`'s constructor
+alongside the existing `board_size` / `input_channels` /
+`max_batch_size` assignments (`tensorrt_compute.cpp:543-545`):
+```cpp
+I.format          = model->format;   // NEW
+I.board_size      = model->board_size;
+I.input_channels  = model->input_channels;
+I.max_batch_size  = max_batch_size;
 ```
 
 The output device buffers (`d_policy`, `d_value`, `d_score`,
@@ -1065,20 +1105,21 @@ input upload, not the model.
 
 ### Phase 5: integration + main_play / main_evaluate
 
-At this point a KataGo ONNX should run end-to-end. Verify:
+At this point a KataGo ONNX should run end-to-end. Verify (CLI flags
+match the actual binaries — see `main_*.cpp` argv parsing):
 
-1. `build/main_play --model kata1.onnx --visits 800` — interactive
-   GTP-ish play. Check that legal moves are selected (rule out
-   off-by-one in policy slot ordering), passes happen at end of
-   game, and reported value tracks the expected sign.
+1. `build/main_play --model kata1.onnx --sims 800 --komi 7.0`
+   — interactive GTP-ish play. Check that legal moves are selected
+   (rule out off-by-one in policy slot ordering), passes happen at
+   end of game, and reported value tracks the expected sign.
 
-2. `build/main_benchmark --model kata1.onnx --batch 256 --warmup 10`
-   — measure throughput. Expect ≥ 70% of MiniGo's b10c128 rate on
-   the same hardware (KataGo's net is the same nominal compute as
-   MiniGo's `large` preset; minor TRT-tuning differences may eat
-   ~30%).
+2. `build/main_benchmark --model kata1.onnx --max-batch 256
+   --nn-iters 1000 --games 4` — measure throughput. Section 5
+   (self-play) is skipped automatically for KataGo (see Phase 6
+   benchmark guard); sections 1-4 run normally. Expect ≥ 70% of
+   MiniGo's b10c128 rate on the same hardware.
 
-3. `build/main_evaluate --model-a kata1.onnx --model-b
+3. `build/main_evaluate --model1 kata1.onnx --model2
    minigo_v123.onnx --games 50` — match. The whole point. Both nets
    in one process, same MCTS, same search-thread count, same
    batching. Asymmetric only in the format-dispatch branch.
@@ -1114,6 +1155,32 @@ untouched — the guard prevents any KataGo state from ever reaching
 them. **Note:** `main_selfplay.cpp` is *not* in the encoder-rename
 list from Phase 2 — its `game.encode()` calls stay exactly as they
 are, because the guard ensures they only ever run on MiniGo models.
+
+**Benchmark partial rejection (P1 review finding).**
+`src/main_benchmark.cpp` runs five sections: 1-4 measure pure NN
+inference / MCTS / batched-eval throughput (KataGo-compatible), but
+section 5 (`main_benchmark.cpp:234-256`) runs multi-threaded
+self-play via `self_play_game(...)` which builds `TrainingRecord`s
+and goes through the augmentation path (`mcts.cpp:608-668`). That
+augmentation assumes `state.size() == input_channels * board_area`
+and would silently truncate or run past KataGo's 19-float global
+tail. Don't run section 5 for KataGo:
+
+```cpp
+// src/main_benchmark.cpp — at the top of section 5's block (~line 234):
+if (model->format == ModelFormat::KataGo) {
+    std::cout << "5. Self-play: SKIPPED for KataGo-format model "
+              << "(KataGo runs inference only; selfplay generates "
+              << "MiniGo training records).\n";
+} else {
+    /* existing section 5 body unchanged */
+}
+```
+
+~5 LoC of `if/else` wrapping. Sections 1-4 (the parts users
+actually want for KataGo throughput measurement) keep working.
+The encode-dispatch rename in `main_benchmark.cpp` from Phase 2
+still applies to the eval path used by sections 1-4.
 
 **Backend rejection (other backends).** Eigen / CUDA / OpenCL /
 Metal / RKNN all need an early check in `create_handle` that errors
@@ -1299,11 +1366,18 @@ unchanged for MiniGo runs):
 - `src/main_selfplay.cpp` — **only** an early-error guard rejecting
   `format == KataGo`. No encoder rename, no augmentation change, no
   V2-record-format change.
+- `src/main_benchmark.cpp` — encode-rename for sections 1-4
+  (inference / MCTS / batched-eval throughput), plus a
+  format-guarded `if/else` around section 5 (self-play) to skip it
+  for KataGo. Sections 1-4 work for both formats; section 5 is
+  MiniGo-only.
 - `src/tensorrt_compute.cpp` — input-side KataGo branch in
-  `predict_batch`, two extra input-tensor name fields in
-  `TRTDeviceState`, two extra input device buffers in `Impl`,
-  two-input optimization profile in `build_or_load_engine`. Output
-  side unchanged. Existing MiniGo path byte-identical.
+  `predict_batch`, `ModelFormat format` field in
+  `TensorRTComputeHandle::Impl` (set from `model->format` in the
+  ctor), two extra input-tensor name fields in `TRTDeviceState`,
+  two extra input device buffers in `Impl`, two-input optimization
+  profile in `build_or_load_engine`. Output side unchanged.
+  Existing MiniGo path byte-identical.
 - `src/eigen_compute.cpp`, `src/cuda_compute.cu`,
   `src/opencl_compute.cpp`, `src/metal_compute.mm`,
   `src/rknn_compute.cpp` — early "unsupported format" check.
@@ -1312,9 +1386,15 @@ unchanged for MiniGo runs):
 - `README.md` — short section pointing at `KATAGO_INFERENCE.md`.
 
 Untouched (verify):
-- `src/nn_evaluator.cpp`, `src/nn_request_queue.h`,
-  `include/batch_evaluator.h` — request protocol unchanged.
-- `src/async_bot.cpp` — no NN-format awareness.
+- `src/nn_request_queue.h`, `include/compute_context.h` — queue
+  protocol and ComputeHandle interface unchanged.
+- `src/async_bot.cpp` — no NN-format awareness; consumes the
+  evaluator polymorphically.
+- `src/mcts.cpp` augmentation block (`mcts.cpp:608-668`) and
+  `self_play_game_impl` — never reached on the KataGo path
+  because `main_selfplay` and benchmark section 5 are guarded
+  out. Augmentation's `state.size() == input_channels * board_area`
+  assumption stays valid.
 - `scripts/*` — no Python changes (training pipeline untouched).
 - `training/*` — no training-side changes.
 
