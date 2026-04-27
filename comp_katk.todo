@@ -15,10 +15,12 @@ Scope is intentionally narrow:
   touched and will throw "unsupported model format" if pointed at a
   KataGo ONNX. They keep working unmodified for MiniGo ONNX.
 - **One binary, one build.** Same `cmake -DMINIGO_BACKEND=tensorrt ..`
-  produces `minigo_play`, `minigo_benchmark`, `minigo_evaluate`
-  binaries that handle either format. The format is detected when the
-  ONNX is loaded; no `#ifdef KATAGO`, no second build target, no
-  duplicate engine cache directory.
+  produces `play`, `benchmark`, `evaluate` binaries (built from
+  `src/main_play.cpp`, `src/main_benchmark.cpp`,
+  `src/main_evaluate.cpp` per `CMakeLists.txt:349-352`) that handle
+  either format. The format is detected when the ONNX is loaded; no
+  `#ifdef KATAGO`, no second build target, no duplicate engine cache
+  directory.
 - **No new dependencies.** Runtime needs only what MiniGo already
   links: TensorRT, CUDA, the in-tree minimal ONNX parser. KataGo's
   C++ source tree is read for reference (input encoder port) but not
@@ -139,10 +141,11 @@ Design references KataGo's public source
   exported ONNX graph (phase 0) so the C++ side never has to
   replicate it.
 - KataGo binary format versions v8-v15: the existing
-  `tools/warm_init_from_katago.py` already parses these. The phase 0
-  refactor extracts that parser; no new format-version work needed.
-  Newer v16+ formats would require updating the parser; tracked as a
-  follow-up if/when needed.
+  `tools/warm_init_from_katago.py` already parses these. Phase 0.1
+  extends that parser additively (retain previously-discarded head
+  layers); no new format-version work needed. Newer v16+ formats
+  would require updating the parser; tracked as a follow-up
+  if/when needed.
 - We deliberately do NOT depend on upstream KataGo's
   `python/export_onnx.py`. Our converter is self-contained in this
   repo's Python env. See "ONNX conversion" section below for
@@ -299,8 +302,10 @@ Justification:
    `predict_batch` call (i.e. once per ~256-state GPU batch). Cost is
    unmeasurable.
 5. **The KataGo-only code is bounded.** ~700 LoC encoder (cold during
-   MiniGo runs) plus ~80 LoC of TRT branching. Carrying that in the
-   MiniGo build costs nothing.
+   MiniGo runs) plus ~30 LoC of TRT branching (the converter bakes
+   output post-processing into the graph, so the C++ branch is
+   input-side only). Carrying that in the MiniGo build costs
+   nothing.
 
 `#ifdef` would only be the right call if KataGo support pulled in heavy
 new dependencies. It does not — both paths use the same TRT, CUDA, and
@@ -433,7 +438,9 @@ this with our own tool rather than upstream KataGo's
    `BatchNormLayer`, `ActivationLayer`, `MatMulLayer`,
    `ResidualBlock`, `GPoolBlock`, `PolicyHead`, `ValueHead`. This code
    is currently used only by the warm-init flow; reusing it for ONNX
-   conversion costs one refactor and zero new parser code.
+   conversion needs only an additive parser extension (Phase 0.1) to
+   retain the head layers that warm-init currently discards. No
+   net-new parser code.
 
 2. **Self-contained Python env.** Upstream's `export_onnx.py` requires
    cloning the KataGo repo, installing its `requirements.txt`
@@ -1280,26 +1287,27 @@ FP16/BF16 noise (~1e-3 absolute on policy logits, ~1e-3 on value).
 If TRT diverges from ORT, the bug is in TRT precision config or
 input upload, not the model.
 
-### Phase 5: integration + main_play / main_evaluate
+### Phase 5: integration + play / evaluate
 
-At this point a KataGo ONNX should run end-to-end. Verify (CLI flags
-match the actual binaries — see `main_*.cpp` argv parsing):
+At this point a KataGo ONNX should run end-to-end. Binaries are
+`play`, `benchmark`, `evaluate` (per `CMakeLists.txt:349-352`).
+CLI flags match the actual `argv` parsing in each `src/main_*.cpp`:
 
-1. `build/main_play --model kata1.onnx --sims 800 --komi 7.0`
+1. `build/play --model kata1.onnx --sims 800 --komi 7.0`
    — interactive GTP-ish play. Check that legal moves are selected
    (rule out off-by-one in policy slot ordering), passes happen at
    end of game, and reported value tracks the expected sign.
 
-2. `build/main_benchmark --model kata1.onnx --max-batch 256
+2. `build/benchmark --model kata1.onnx --max-batch 256
    --nn-iters 1000 --games 4` — measure throughput. Section 5
    (self-play) is skipped automatically for KataGo (see Phase 6
    benchmark guard); sections 1-4 run normally. Expect ≥ 70% of
    MiniGo's b10c128 rate on the same hardware.
 
-3. `build/main_evaluate --model1 kata1.onnx --model2
-   minigo_v123.onnx --games 50` — match. The whole point. Both nets
-   in one process, same MCTS, same search-thread count, same
-   batching. Asymmetric only in the format-dispatch branch.
+3. `build/evaluate --model1 kata1.onnx --model2 minigo_v123.onnx
+   --games 50` — match. The whole point. Both nets in one process,
+   same MCTS, same search-thread count, same batching. Asymmetric
+   only in the format-dispatch branch.
 
 If any of these fail, the failure mode tells you which phase to
 revisit:
@@ -1317,11 +1325,11 @@ inference-only) at every entry point that should reject it.
 top of `src/main_selfplay.cpp`, immediately after `LoadedModel::load()`:
 
 ```cpp
-auto model = LoadedModel::load(model_path);
+auto model = LoadedModel::load(model_path);   // src/main_selfplay.cpp:131
 if (model->format == ModelFormat::KataGo) {
-    std::cerr << "ERROR: main_selfplay does not support KataGo-format models.\n"
+    std::cerr << "ERROR: selfplay does not support KataGo-format models.\n"
               << "  KataGo weights are inference-only in this build.\n"
-              << "  Use main_play or main_evaluate for KataGo runs.\n";
+              << "  Use the play or evaluate binary for KataGo runs.\n";
     return 2;
 }
 ```
@@ -1388,9 +1396,8 @@ zeros).
 **Documentation.** Add `KATAGO_INFERENCE.md` describing:
 - The principle: KataGo weights drive inference only.
 - The converter workflow (`tools/katago_to_onnx.py`).
-- The supported binaries (`main_play`, `main_benchmark`,
-  `main_evaluate`) and the rejected ones (`main_selfplay`,
-  Python training pipeline).
+- The supported binaries (`play`, `benchmark`, `evaluate`) and the
+  rejected ones (`selfplay`, Python training pipeline).
 - Supported rules and known limitations.
 
 `README.md`: short pointer at `KATAGO_INFERENCE.md`. No prose
@@ -1426,15 +1433,15 @@ Sanity checkpoints during implementation, in order:
   upstream byte-for-byte.
 
 **Phase 4 done**:
-- `main_benchmark` reports throughput for the KataGo ONNX. Numerical
-  outputs match KataGo's own benchmark on the same position to
-  within ~1e-3.
+- `build/benchmark --model kata1.onnx ...` reports throughput for
+  the KataGo ONNX. Numerical outputs match KataGo's own benchmark
+  on the same position to within ~1e-3.
 
 **Phase 5 done**:
-- `main_evaluate kata1 minigo_v123 --games 200` finishes, prints a
-  win-rate. Direction sanity: kata1 should crush a randomly-init or
-  early MiniGo. If we ever beat kata1 with a small MiniGo, suspect
-  bug, not strength.
+- `build/evaluate --model1 kata1.onnx --model2 minigo_v123.onnx
+  --games 200` finishes, prints a win-rate. Direction sanity: kata1
+  should crush a randomly-init or early MiniGo. If we ever beat
+  kata1 with a small MiniGo, suspect bug, not strength.
 
 **Phase 6 done**:
 - README updated. Wrong komi reported as a clear error, not silent
@@ -1527,9 +1534,14 @@ unchanged for MiniGo runs):
   `ownership` fields; `BatchEvaluator` gains `encode_state` virtual
   with default body `game.encode(out)`. Both additive — existing
   fields and methods unchanged.
-- `src/nn_evaluator.cpp` — copy `score_sd` and `ownership` through
-  to `NNResultBuf` (was being dropped); override `encode_state` to
-  dispatch on `model_->format`. ~6 LoC of additions.
+- `src/nn_evaluator.cpp` — four additive edits per Phase 2.5:
+  (a) success-path writeback at `:169-170` copies `score`,
+  `score_sd`, `ownership` through to the buf; (b) catch-path reset
+  at `:151-159` clears `score_sd` and `ownership`; (c)
+  `evaluate_with_buf()` return at `:61` includes all five fields;
+  (d) `evaluate()` batch return at `:96` includes all five fields.
+  Plus a single `encode_state` override that dispatches on
+  `model_->format`. ~12 LoC total.
 - `include/game.h` / `src/game.cpp` — `recent_actions_` private
   array + `recent_action(int)` accessor; `play()`, `reset()`,
   `copy()` extended to maintain it. No public API change beyond
