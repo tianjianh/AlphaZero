@@ -101,6 +101,11 @@ Cross-reference of where each review finding is addressed:
 | P1: benchmark section 5 also crosses the boundary | Same boundary, finer guard: `main_benchmark.cpp` sections 1-4 are KataGo-aware; section 5 (self-play, builds TrainingRecords) is wrapped in a `format == MiniGo` `if/else` and skipped for KataGo. | Phase 6 |
 | P1: TRT branch references missing `I.format` | Add `ModelFormat format` field to `TensorRTComputeHandle::Impl`; set from `model->format` in the ctor alongside existing `board_size`/`input_channels` assignments. | Phase 4 |
 | P3: verification commands use wrong CLI flags | Phase 5 commands now match the actual `argv` parsing in each binary (`--sims`, `--max-batch`/`--nn-iters`, `--model1`/`--model2`). | Phase 5 |
+| P1: benchmark sections 2-3 also encode | Rename `game.encode(state)` → `evaluator_->encode_state(...)` at `main_benchmark.cpp:165, 188` (direct + batched inference paths). Section 5 stays guarded. | Phase 2 |
+| P2: selfplay rename weakens boundary | Drop `mcts.cpp:699` from rename list. Selfplay's encode stays as `game.encode()` so a KataGo evaluator cannot produce KataGo-shaped training records even if entry guards are bypassed. | Phase 2 |
+| P2: pass normalization order | Insert recent-action push *after* `if (action == n*n) action = PASS_MOVE;` so passes record as `PASS_MOVE` (-1), not the pre-normalized `n*n` slot. | Phase 2.5 |
+| P2: stale "byte-for-byte unchanged" parser claim | Updated `tools/katago_to_onnx.py` design section to say "additive parser extension" with reference to Phase 0.1 byte-diff verification. | "ONNX conversion" |
+| P3: missing `Optional` import | Phase 0.1 prerequisite step adds `Optional` to `from typing import List, Union` → `List, Optional, Union`. | Phase 0.1 |
 
 
 ## Source-backed alignment with KataGo
@@ -422,9 +427,11 @@ top.
 
 ### `tools/katago_to_onnx.py` — design
 
-**No refactor needed.** `tools/warm_init_from_katago.py`'s CLI is
-gated by `if __name__ == "__main__": main()` — top level is purely
-class/function definitions. We import the parser directly:
+**No refactor; additive parser extension only.**
+`tools/warm_init_from_katago.py`'s CLI is gated by
+`if __name__ == "__main__": main()`, so importing the module is
+side-effect-free. We import the parser directly rather than splitting
+it into a new file:
 
 ```python
 # tools/katago_to_onnx.py
@@ -433,16 +440,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from warm_init_from_katago import (
     KataGoModel, parse_katago_model,
-    ConvLayer, BatchNormLayer, ResidualBlock, GPoolBlock,
-    PolicyHead, ValueHead, Trunk,
+    ConvLayer, BatchNormLayer, ActivationLayer,
+    MatMulLayer, MatBiasLayer,
+    ResidualBlock, GPoolBlock, PolicyHead, ValueHead, Trunk,
 )
 ```
 
-Importing the module defines the classes; the `main()` CLI does not
-run. `warm_init_from_katago.py` stays **byte-for-byte unchanged**.
-This eliminates the risk of regressing the warm-init flow — there's
-nothing to regress because we didn't edit it. (Risk #4 dropped from
-the list below.)
+The file is **not** byte-for-byte unchanged — Phase 0.1 extends its
+`PolicyHead` and `ValueHead` dataclasses to retain the
+previously-discarded head layers we need to build the inference
+graph. The change is strictly additive (`Optional[...] = None`
+fields plus a few populating lines in the parser bodies). The
+warm-init code paths read only the original required fields, so a
+byte-diff of `training.pt` validates equivalence (Phase 0
+verification milestone).
 
 Stylistic note: the file becomes both a CLI tool and a parser
 library. That's a normal Python convention for any `.py` with a
@@ -562,7 +573,20 @@ Everything else is `parse()`'d for stream-position consistency and
 discarded. Warm-init only needs those four layers; the full inference
 graph needs all of them.
 
-The fix is purely additive to the dataclasses and parsers:
+The fix is purely additive to the dataclasses and parsers.
+
+**Prerequisite: typing import.**
+`warm_init_from_katago.py:79` currently has `from typing import List,
+Union`. The new `Optional[...]` annotations need:
+```python
+from typing import List, Optional, Union   # add Optional
+```
+A one-token addition. Without it, the module fails at import time
+with `NameError: name 'Optional' is not defined` — caught immediately
+by the warm-init byte-diff test, but worth doing first to keep the
+diff clean.
+
+Then the dataclass extensions:
 
 ```python
 # PolicyHead dataclass — add Optional fields for everything currently
@@ -759,16 +783,42 @@ format-agnostic; format awareness is contained inside `NNEvaluator`.
 - Override `encode_state` to call `encode_for_katago(...)` when
   `model_->format == ModelFormat::KataGo`, else `game.encode(out)`.
 
-Call-site rename (4 LoC in mcts, 4 LoC across main_*.cpp):
-- `src/mcts.cpp:248, 340, 413, 699`:
+Call-site rename — only paths that the KataGo entry points
+(`main_play`, `main_benchmark` sections 1-4, `main_evaluate`) can
+actually reach. **Anything that builds training records or runs
+self-play stays on `game.encode()`** as defense-in-depth: the entry
+guards already reject KataGo, but leaving those call sites unchanged
+ensures no future caller accidentally feeds a KataGo flat state into
+augmentation or the V2 record writer.
+
+- `src/mcts.cpp:248, 340, 413` — search-thread leaf evaluation paths
+  reachable from `mcts.get_action()`. Rename
   `game_copy_ptr->encode(state)` → `evaluator_->encode_state(*game_copy_ptr, state)`.
-  (Same pattern for `game.encode(state_enc)` at line 413.)
-- `src/main_play.cpp`, `src/main_benchmark.cpp`,
-  `src/main_evaluate.cpp` root-eval call sites: same rename.
-- `src/main_selfplay.cpp`: **no rename** — selfplay does not run on
-  KataGo (see Phase 6 selfplay guard). Leave the existing
-  `game.encode()` calls untouched, since the guard rejects KataGo
-  before any encoding happens.
+- `src/mcts.cpp:699` — **no rename**. This is inside
+  `self_play_game_impl`, building a per-step `state` for the V2
+  training record. Augmentation (`mcts.cpp:608-668`) and the V2
+  record writer assume `state.size() == input_channels * board_area`
+  — a layout that exists only for MiniGo. The selfplay entry guard
+  in `main_selfplay.cpp` (Phase 6) already prevents KataGo from
+  reaching this function, but leaving `game.encode(step.state)` as
+  hardcoded MiniGo encoding is a second layer of safety.
+- `src/main_play.cpp`, `src/main_evaluate.cpp` root-eval call sites:
+  rename. Both are inference paths.
+- `src/main_benchmark.cpp` — multiple call sites need attention:
+  - **Sections 2 & 3** (direct inference + batched eval throughput):
+    `game.encode(state)` at lines 165 and 188 → rename. These feed
+    `eval_single->evaluate_single` / `eval_single->evaluate`, which
+    are inference paths and must work on KataGo.
+  - **Section 4** (MCTS root eval): rename if a `game.encode()` call
+    is present.
+  - **Section 5** (multi-threaded self-play via `self_play_game()`):
+    do not rename anything inside this section. The Phase 6
+    benchmark guard skips section 5 entirely for KataGo, mirroring
+    the selfplay guard.
+- `src/main_selfplay.cpp`: **no rename**. The Phase 6 selfplay guard
+  rejects `format == KataGo` before any encoding happens, and
+  leaving the calls as `game.encode()` keeps the MiniGo-only
+  invariant explicit at the call site.
 
 `include/katago_inputs.h` (new file):
 - Declare `void encode_for_katago(const GoGame& game, const LoadedModel* model, std::vector<float>& out);`
@@ -875,10 +925,17 @@ private:
 ```
 
 ```cpp
-// src/game.cpp::play() — add at the top, before any board mutation:
+// src/game.cpp::play() — insert AFTER pass normalization, BEFORE
+// any board mutation. The existing first line of play() is:
+//     if (action == n * n) action = PASS_MOVE;
+// We must record the *normalized* action so recent_action(i) returns
+// PASS_MOVE (-1) for passes, not the pre-normalized n*n slot.
+//
+// Insert this block immediately after that normalization line and
+// before `std::memcpy(prev_board, board, ...)`:
 for (int i = RECENT_ACTIONS_CAP - 1; i > 0; --i)
     recent_actions_[i] = recent_actions_[i - 1];
-recent_actions_[0] = action;
+recent_actions_[0] = action;   // already normalized to PASS_MOVE for passes
 if (recent_actions_count_ < RECENT_ACTIONS_CAP) ++recent_actions_count_;
 
 // src/game.cpp::reset() — clear:
@@ -896,8 +953,10 @@ code paths never touch `recent_actions_`, so behavior is byte-identical
 for MiniGo runs.
 
 Test: a unit test that plays a fixed move sequence (including a
-pass and a capture) and asserts `recent_action(0..4)` returns the
-expected locations. ~30 LoC.
+pass via the unnormalized `n*n` slot, a pass via the explicit
+`PASS_MOVE`, and a capture) and asserts `recent_action(0..4)`
+returns `PASS_MOVE` for both pass forms and the right board
+location for the capture. ~30 LoC.
 
 ### Phase 3: port `fillRowV7` (the long pole)
 
