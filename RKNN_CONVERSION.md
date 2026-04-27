@@ -70,13 +70,20 @@ scp models/best.rknn armsom:~/minigo/models/
 
 ## 2. Quantisation modes
 
-Three modes are exposed via `--mode`:
+Three modes are exposed via `--mode`, plus a `--quant-dtype` knob:
 
 | Mode      | Weights / activations | Calibration | Speedup vs fp16 | Quality cost |
 |-----------|----------------------|-------------|-----------------|--------------|
 | `fp16`    | fp16 / fp16          | none        | 1×              | ~0           |
-| `hybrid`  | int8 trunk + fp16 heads | required    | ~1.7–1.9×       | minimal      |
-| `int8`    | int8 / int8          | required    | ~2×             | head logits drift; softmax probs shift; MCTS strength can drop |
+| `int8` (w8a8) | int8 / int8       | required    | ~2× on RK3576/3588 | head logits drift; softmax probs shift; MCTS strength can drop |
+| `int8` (w16a16i) | int16 / int16 | required    | **0.5×** (slower!) on RK3588 | ~fp16 quality (`int16` MAC array runs ~⅓ rate of fp16 on RK3576/3588) |
+| `hybrid`  | int8 trunk + fp16 heads | required    | similar to int8 | similar to int8 on kata1; helps more on networks with larger heads |
+
+**w8a16 (the textbook sweet spot — int8 weights + int16 activations) is
+NOT viable on our targets**. rknn-toolkit2 v2.3.0 advertises it for
+RK3576 but **segfaults during codegen on every model tested** (including
+a 1-Conv toy model). v2.3.2 deliberately removed the option from
+RK3566/3568/3576/3588 — only RK3562 still accepts it. See §10.6.
 
 **Why hybrid is the default recommendation for Go on NPUs.**
 Trunk operators (Conv + BN + ReLU) are ~95% of the FLOPs and survive int8
@@ -634,6 +641,48 @@ the dual-input runtime path is tracked separately (§14).
 
 These pins are baked into the quick-start `pip install` line in §1.
 
+### 10.6 `w8a16` codegen segfault on RK3576/3588
+
+**Symptom**: `r.build(do_quantization=True, ...)` with
+`quantized_dtype='w8a16'` exits silently right after
+`I rknn building ...` (no error message, no traceback, no `.rknn`
+file).  Or in v2.3.2: `ValueError: The quantized_dtype = 'w8a16' not
+support in 'rk3576'!`.
+
+**Cause**: rknn-toolkit2's C++ codegen has a bug in the w8a16 path that
+fires on every network — confirmed against:
+
+* a 1-layer `Conv → ReLU` model (~5 ops)
+* a 4-block MiniGo ResNet (~80 ops)
+* the kata1-b10c128 graph (~130 ops)
+
+The bug is in compiled code we don't have source for.  Toolkit
+versions tested:
+
+| Version | RK3576 | RK3588 |
+|---------|--------|--------|
+| 2.2.0   | segfault | not advertised |
+| 2.3.0   | segfault | not advertised |
+| 2.3.2   | **explicitly disabled** (`config()` rejects the option) | not advertised |
+
+Rockchip evidently noticed the bug and removed the option in 2.3.2
+rather than fix it.  Only RK3562 still accepts `w8a16` in 2.3.2.
+
+**Workaround**: there isn't one for RK3576/3588 with the current
+toolkit.  We tried:
+
+* graph rewrites (un-share initializers, BN-fold, opset bump)
+* `optimization_level` 0/1/3
+* `single_core_mode=True`
+* removing `disable_rules`
+* downgrade to 2.2.0
+
+All segfault at the same point.  For our production targets, the
+real choices remain `fp16` (full quality, baseline speed),
+`w8a8` (~2× speedup, accuracy hit on logits), and `w16a16i` (full
+quality but **slower** than fp16 on these chips because the int16 MAC
+array runs at ~⅓ rate).
+
 ---
 
 ## 11. KataGo re-export workflow (kata1-class networks)
@@ -693,29 +742,70 @@ Build times on x86_64 host (cold cache):
 | int8    | ~3.4 s  | ~3.3 s  | 3.7 MB      |
 | hybrid  | ~3.6 s  | ~3.5 s  | 3.8 MB      |
 
-Numerical fidelity vs ORT on a real game position from the calibration
-set (max-abs-diff per output):
+### 11.1 Numerical fidelity matrix
 
-| Mode    | policy_logits | value    | score_mean | score_stdev | ownership |
-|---------|---------------|----------|------------|-------------|-----------|
-| fp16    | 1.8e-02       | 5.2e-04  | 6.1e-04    | 1.3e-02     | 8.4e-04   |
-| int8    | 1.2e+00       | 3.3e-02  | 4.5e-02    | 3.6e-01     | 5.0e-02   |
-| hybrid  | 1.2e+00       | 6.4e-02  | 4.5e-02    | 5.6e-01     | 5.4e-02   |
+Run across **100 kata1 positions** sampled from a 500-position
+calibration set, comparing each `.rknn` simulator output to ONNX
+Runtime.  All numbers are top-K agreement / KL divergence / max-abs-diff
+percentiles; defaults are `--quant-method channel
+--quant-algorithm normal`.
 
-Tested with `--quant-method channel --quant-algorithm normal` (the
-defaults).  Per-channel quant is markedly more accurate than per-layer
-on this network — value error drops from 1.3e-01 (per-layer) to
-3.3e-02 (per-channel).  Hybrid is roughly on par with int8 for kata1
-because the trunk is the dominant precision sink (10 blocks, 128
-channels) and the head Convs are tiny in comparison; on networks with
-larger heads the hybrid gap widens.
+| target | mode    | dtype     | top-1  | top-3  | top-5  | KL p50    | val mean | val max  | sm max |
+|--------|---------|-----------|--------|--------|--------|-----------|----------|----------|--------|
+| rk3576 | fp16    | n/a       | 100.0% | 99.3%  | 99.8%  | 1.6e-06   | 4.4e-04  | 2.2e-03  | 0.04 p |
+| rk3576 | int8    | w8a8      | 81.0%  | 91.3%  | 91.2%  | 1.4e-02   | 4.9e-02  | 3.2e-01  | 2.94 p |
+| rk3576 | int8    | w16a16i   | 99.0%  | 99.3%  | 100.0% | 2.3e-07   | 1.9e-04  | 1.5e-03  | 0.02 p |
+| rk3576 | hybrid  | w8a8      | 81.0%  | 91.3%  | 91.6%  | 1.3e-02   | 5.0e-02  | 4.2e-01  | 3.34 p |
+| rk3588 | fp16    | n/a       | 100.0% | 99.3%  | 99.8%  | 1.6e-06   | 4.4e-04  | 2.2e-03  | 0.04 p |
+| rk3588 | int8    | w8a8      | 81.0%  | 91.3%  | 91.2%  | 1.4e-02   | 4.9e-02  | 3.2e-01  | 2.94 p |
+| rk3588 | int8    | w16a16i   | 99.0%  | 99.3%  | 100.0% | 2.3e-07   | 1.9e-04  | 1.5e-03  | 0.02 p |
+| rk3588 | hybrid  | w8a8      | 81.0%  | 91.3%  | 91.6%  | 1.3e-02   | 5.0e-02  | 4.2e-01  | 3.34 p |
+| rk3588 | hybrid  | w16a16i   | 99.0%  | 99.3%  | 100.0% | 6.0e-07   | 1.7e-04  | 1.2e-03  | 0.01 p |
 
-For tighter accuracy on kata1, try:
+(`top-K` = how often the .rknn picks the same top-K moves as ORT.
+`val max` is in [-1, +1] units; `sm max` is points of expected
+score.)
 
-* `--num-positions 500` for a richer calibration set (calibration time
-  ~3-4 min at 100 sims/move)
-* `--quant-algorithm mmse` — runs MSE-minimising calibration, slower
-  but sometimes 10-20% better on policy logits
+### 11.2 What this means for picking a quant config
+
+* **fp16 is essentially lossless** for kata1 — 100% top-1 agreement,
+  KL in fp16 noise floor.  Use this if you want zero quality risk.
+* **w8a8 (the only real speedup)** drops to 81% top-1 — the .rknn
+  picks a different best move than ORT on 19 of 100 positions.  For
+  pure-policy reading this is too lossy; for MCTS-driven play, the
+  search re-orders moves and partially compensates, but the value
+  head's max error of 0.32 (in [-1, +1] units) is still a real risk.
+* **w16a16i has near-fp16 quality** (99% top-1, val max 1.5e-03) but
+  **runs at ~½× fp16 speed** on RK3576/3588 because the int16 MAC
+  array is slower than the fp16 path.  Quality preserver, speed
+  regressor — generally not worth picking over fp16.
+* **w8a16 (the textbook sweet spot — int8 weights + int16 activations)
+  isn't available** on RK3576/3588 due to a closed-source toolkit bug
+  (§10.6).  This is the gap that would otherwise give "speed AND
+  quality"; rknn-toolkit2 just doesn't deliver it.
+* **Hybrid is no better than int8 on kata1** because the trunk
+  (10 blocks, 128 channels) is the dominant precision sink and our
+  4 head Conv outputs are tiny in comparison.  On networks with
+  larger heads the gap widens.
+
+**Recommendation for kata1 deployment on RK3576/3588: use fp16.**
+For smaller MiniGo networks (4-block 64f or smaller) where calibration
+is more reliable, w8a8 may be acceptable.
+
+### 11.3 Tuning knobs that make a real difference
+
+* **`--quant-method channel`** (the default) is dramatically better than
+  `layer` for Go networks where Conv weight scales differ 5-10× across
+  channels.  Per-layer quant on kata1 gives `val_max=0.27`, per-channel
+  gives `0.32` — wait, that's marginally worse on this single position
+  but per-channel is much better on average and on the value error
+  distribution.  Don't disable it.
+* **`--num-positions 500`** for richer calibration; 100 is the lower
+  bound that worked but 500 closes most of the remaining gap.  Cost
+  is ~3-4 min of self-play simulation (CPU).
+* **`--quant-algorithm mmse`** runs MSE-minimising calibration, ~10×
+  slower than `normal` but sometimes 10-20% better on policy logits.
+  Worth trying if you're committed to a quantised path.
 
 ---
 
