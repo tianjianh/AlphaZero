@@ -1,0 +1,951 @@
+# KataGo Inference Compatibility — Plan
+
+## Goal
+
+Add a runtime-dispatched code path so MiniGo's existing C++ runtime
+(MCTS + NNEvaluator + AsyncBot + main_play / main_benchmark / main_evaluate)
+can run an exported KataGo neural network at full strength on the
+**TensorRT backend only**, while leaving the existing MiniGo `.onnx`
+pipeline byte-for-byte unchanged.
+
+Scope is intentionally narrow:
+- **Inference only.** No training on KataGo weights. No selfplay-data
+  format change. No Python-side changes to `scripts/`.
+- **TensorRT backend only.** Eigen / CUDA / OpenCL / Metal / RKNN are not
+  touched and will throw "unsupported model format" if pointed at a
+  KataGo ONNX. They keep working unmodified for MiniGo ONNX.
+- **One binary, one build.** Same `cmake -DMINIGO_BACKEND=tensorrt ..`
+  produces `minigo_play`, `minigo_benchmark`, `minigo_evaluate`
+  binaries that handle either format. The format is detected when the
+  ONNX is loaded; no `#ifdef KATAGO`, no second build target, no
+  duplicate engine cache directory.
+- **No new dependencies.** Runtime needs only what MiniGo already
+  links: TensorRT, CUDA, the in-tree minimal ONNX parser. KataGo's
+  C++ source tree is read for reference (input encoder port) but not
+  linked.
+
+The driving use case is "play kata1 b10c128 (or any KataGo network) in
+MiniGo's MCTS so we can run apples-to-apples evaluation matches against
+MiniGo candidates without launching two engines and shuttling JSON over
+GTP."
+
+
+## Source-backed alignment with KataGo
+
+Design references KataGo's public source
+(`github.com/lightvector/KataGo`).  The reference points are:
+
+- Input encoding (V7): `cpp/neuralnet/nninputs.cpp`, `fillRowV7()`. 22
+  spatial planes + 19 global features, documented in `nninputs.h`. This
+  is the spec we port into `src/katago_inputs.cpp`. Treat KataGo's code
+  as the authoritative reference; differences in our port are bugs.
+- Network architecture: `cpp/neuralnet/desc.cpp` (binary format) +
+  `cpp/neuralnet/openclbackend.cpp` / `cudabackend.cpp` (forward
+  graph). The PyTorch `KataGoNet` (phase 0) mirrors this. Pre-act BN,
+  gpool block channel split (`trunk_c=128 = regular_c=96 +
+  gpool_c=32`), policy head's gpool injection into pass logit, value
+  head pool order (mean+max+std).
+- Output post-processing: `cpp/neuralnet/nninterface.cpp` /
+  `cpp/neuralnet/nneval.cpp` show how the raw graph outputs map to
+  `NNOutput` fields (softmax over value logits, tanh→[0,1] for
+  ownership, `softplus` and `× 20` scaling on score mean/stdev,
+  selecting policy channel 0 of 2). We bake all of this into our
+  exported ONNX graph (phase 0) so the C++ side never has to
+  replicate it.
+- KataGo binary format versions v8-v15: the existing
+  `tools/warm_init_from_katago.py` already parses these. The phase 0
+  refactor extracts that parser; no new format-version work needed.
+  Newer v16+ formats would require updating the parser; tracked as a
+  follow-up if/when needed.
+- We deliberately do NOT depend on upstream KataGo's
+  `python/export_onnx.py`. Our converter is self-contained in this
+  repo's Python env. See "ONNX conversion" section below for
+  rationale.
+
+Where we deliberately deviate from KataGo it is because we are running
+KataGo's network inside MiniGo's *MCTS*, not KataGo's. Details inline.
+
+
+## Motivation
+
+The existing `tools/warm_init_from_katago.py` solves a different
+problem: warm-init MiniGo's randomly-init trunk from KataGo's trained
+weights so MiniGo's training converges faster. That tool transfers
+~50% of params and discards the rest because MiniGo's architecture
+differs (post-act BN, no gpool, simpler heads, 17-channel input vs
+22+19, no per-position scoring or pass-via-gpool, etc.). The result is
+a *MiniGo* model with a partial KataGo prior; it must still be trained.
+
+What we want here is the opposite: take a fully trained KataGo network
+and use it *unchanged* for inference. No training. No retraining. The
+weights stay exactly as KataGo trained them. Only the runtime needs to
+adapt.
+
+Why bother:
+1. **Reference strength.** kata1 b10c128 is publicly available and
+   stronger than anything MiniGo can self-train in a week. Using it as
+   the reference opponent in `main_evaluate` gives a stable Elo anchor
+   independent of MiniGo's own training curve.
+2. **Apples-to-apples MCTS.** Running KataGo's net through MiniGo's
+   MCTS removes search-config differences when comparing nets head to
+   head. A loss tells you "the net is weaker," not "the search was
+   tuned differently."
+3. **Debugging.** When MiniGo plays terribly, having a known-good net
+   in the same C++ runtime lets you isolate "is it the search?" from
+   "is it the net?" with a single binary swap.
+4. **Future feature flag for distillation.** If we later choose
+   option 3 (distillation, see initial discussion), we'll need to run
+   KataGo as the teacher in-process anyway. This work is a strict
+   prerequisite.
+
+
+## Architecture: what differs, what doesn't
+
+### Inputs
+
+| | MiniGo | KataGo (V7) | Action |
+|---|---|---|---|
+| # of input tensors | 1 | 2 | new branch in TRT bind |
+| Spatial input | `state [N, 17, H, W]` | `input_spatial [N, 22, H, W]` | new encoder |
+| Global input | n/a | `input_global [N, 19]` | new encoder |
+| Spatial planes | 8 history × 2 colors + 1 color | stones, liberties (1/2/3+), ko, area, ladder, pass-alive, history | port `fillRowV7` |
+| Global features | n/a | komi, rules, ko/scoring/encore state, suicide flag | port `fillRowV7` |
+
+### Outputs
+
+KataGo emits more heads than MiniGo. We only need the five MiniGo MCTS
+already consumes: policy, value, scoreMean, scoreStdev, ownership.
+Other KataGo heads (futurepos, seki, scoring, lead, vTime,
+moremiscvalue, scorebelief logits) we **don't even include in the
+exported ONNX** — our converter (see "ONNX conversion" below) only
+builds the graph nodes for the heads we care about. No dummy bindings
+needed in C++.
+
+Because we own the converter, post-processing math is baked into the
+ONNX graph. KataGo and MiniGo ONNX produce identically-shaped,
+identically-scaled outputs:
+
+| Output | MiniGo ONNX | KataGo ONNX (our export) |
+|---|---|---|
+| Policy | `policy_logits [N, action_size]` | `policy_logits [N, action_size]` (channel-0 slice baked in) |
+| Value | `value [N, 1]` (P(W) − P(L)) | `value [N, 1]` (softmax → diff baked in) |
+| Score mean | `score_mean [N, 1]` (raw points) | `score_mean [N, 1]` (`× 20` baked in) |
+| Score stdev | `score_stdev [N, 1]` (positive) | `score_stdev [N, 1]` (softplus + `× 20` baked in) |
+| Ownership | `ownership [N, H*W]` (sigmoid → [0,1]) | `ownership [N, H*W]` (`(tanh+1)/2` baked in) |
+| Pass slot | last index | last index |
+
+Net effect: the C++ TRT branch differs from the MiniGo path only on
+the input side (split flat state into 2 device buffers, set 2 input
+shapes, bind 2 input addresses). Output binding and result unpacking
+is identical to MiniGo's path — same tensor names, same shapes, same
+post-processing (none, because the graph already did it).
+
+The policy ordering — board² spatial entries followed by 1 pass entry
+— is the same in both formats, by convention. Verify on the first run
+by checking that an empty-board pass logit is sensibly low; if it's
+the largest entry, the slot ordering is reversed and we adjust at
+export time (slice differently in `KataGoPolicyHead.forward`).
+
+### Action ordering inside the spatial portion of policy
+
+MiniGo: row-major `[r * W + c]`, top-to-bottom, left-to-right.
+KataGo: same — verified by reading `nnoutput.cpp:posToLoc`. ✓
+
+### What's untouched
+
+MCTS, NNEvaluator (server threads, queue, condvar pattern, batch
+draining), AsyncBot, NNRequestQueue, all of `mcts.cpp`, all of
+`async_bot.cpp`, all of `compute_context.cpp`, the request protocol
+(`NNResultBuf { state_data, state_size, policy, value, score, ... }`).
+The KataGo path packs both spatial and global into the same flat
+`state` byte array; the TRT handle splits them back at `predict_batch`
+time. This keeps the search-thread interface identical.
+
+
+## Design choice: runtime dispatch, not compile-time
+
+We dispatch on `model->format` — a field set when `LoadedModel::load()`
+parses the ONNX — rather than `#ifdef KATAGO_FORMAT`.
+
+Justification:
+
+1. **The TRT backend already does runtime dispatch by another name.**
+   `src/tensorrt_compute.cpp:484-509` walks the engine's I/O tensors
+   and matches them by string name (`"policy_logits"`, `"value"`,
+   `"score_mean"`, `"ownership"`, …) to assign device buffer
+   pointers. It even has a shape-based fallback for unknown names.
+   Adding KataGo's tensor names to the same match table is the same
+   pattern, not a new one.
+2. **Same binary handles both formats.** `main_evaluate model_a.onnx
+   model_b.onnx` can match KataGo against MiniGo in one process. With
+   `#ifdef` you would need IPC.
+3. **No build matrix doubling.** No `_katago` / `_minigo` binary
+   suffix proliferation. CI doesn't double. Engine cache key already
+   includes the model path, so KataGo and MiniGo engines never
+   collide.
+4. **The branch is cold.** One `if (model->format == KataGo)` per
+   `predict_batch` call (i.e. once per ~256-state GPU batch). Cost is
+   unmeasurable.
+5. **The KataGo-only code is bounded.** ~700 LoC encoder (cold during
+   MiniGo runs) plus ~80 LoC of TRT branching. Carrying that in the
+   MiniGo build costs nothing.
+
+`#ifdef` would only be the right call if KataGo support pulled in heavy
+new dependencies. It does not — both paths use the same TRT, CUDA, and
+in-tree ONNX parser.
+
+
+## Out of scope (explicit non-goals)
+
+- Training on KataGo weights, fine-tuning KataGo, or producing
+  KataGo-format checkpoints from MiniGo selfplay. Use
+  `tools/warm_init_from_katago.py` if you want the warm-init flow.
+- Backends other than TensorRT. Eigen / CUDA / OpenCL / Metal / RKNN
+  remain MiniGo-only. They will report "unsupported model format" if
+  given a KataGo ONNX and exit cleanly.
+- Selfplay using KataGo's net to write MiniGo selfplay records. The
+  selfplay binary is pointed at MiniGo's ONNX as today; if anyone
+  later wants KataGo as the teacher for distillation, that's a
+  follow-up that needs target-format work too.
+- KataGo configuration knobs that change the input encoding
+  (different rules sets beyond Tromp-Taylor / Japanese, encore
+  phases, button go, handicap, multi-stone-suicide). The port covers
+  the most-common case (area scoring, fixed komi, no encore). Other
+  modes hit `assert(false)` until someone needs them.
+- Loading KataGo's native `.bin.gz` / `.txt.gz` directly without ONNX
+  conversion. We require an exported ONNX as input, produced once
+  externally by upstream KataGo's `python/export_onnx.py`. Reusing
+  the in-tree parser in `tools/warm_init_from_katago.py` to build a
+  PyTorch KataGo-arch model and re-export to ONNX is a viable
+  fallback plan if upstream ONNX export breaks; tracked as a risk
+  but not an immediate task.
+- BFloat16 / FP8 calibration tuning specific to KataGo. The existing
+  TRT precision auto-detection (BF16 on SM 8.0+, FP16 on Volta/Turing,
+  FP32 on older) just works. If KataGo's score head needs different
+  precision it's a follow-up.
+
+
+## ONNX conversion: in-tree tool, not upstream's export
+
+Step zero is converting KataGo's `.bin.gz` / `.txt.gz` to ONNX. We do
+this with our own tool rather than upstream KataGo's
+`python/export_onnx.py`. Three reasons:
+
+1. **The binary parser already lives in this repo.**
+   `tools/warm_init_from_katago.py` contains ~600 lines of pure-Python
+   `.bin.gz` / `.txt.gz` parser (port of KataGo's
+   `cpp/neuralnet/desc.cpp`). It already reads `ConvLayer`,
+   `BatchNormLayer`, `ActivationLayer`, `MatMulLayer`,
+   `ResidualBlock`, `GPoolBlock`, `PolicyHead`, `ValueHead`. This code
+   is currently used only by the warm-init flow; reusing it for ONNX
+   conversion costs one refactor and zero new parser code.
+
+2. **Self-contained Python env.** Upstream's `export_onnx.py` requires
+   cloning the KataGo repo, installing its `requirements.txt`
+   (different torch versions, occasionally incompatible CUDA pins),
+   and tracking upstream API churn. An in-tree converter uses
+   MiniGo's existing Python env — no extra setup, no version drift,
+   reproducible alongside the rest of `scripts/`.
+
+3. **We own the ONNX shape, which collapses C++ divergence.** Because
+   we control the export, we choose I/O names and bake post-processing
+   into the graph. We make the KataGo ONNX *look almost identical* to
+   MiniGo's ONNX on the output side. This is the big win:
+
+   | Output | Upstream export (we'd post-process in C++) | Our export (post-processing baked into graph) |
+   |---|---|---|
+   | Policy | `output_policy [N, 2, A]` — take ch 0 in C++ | `policy_logits [N, A]` — slice in graph |
+   | Value | `output_value [N, 3]` — softmax+diff in C++ | `value [N, 1]` — softmax+diff in graph |
+   | ScoreMean | `output_miscvalue [N, ~10]` — slice idx 0, `×20` in C++ | `score_mean [N, 1]` — `Mul ×20` in graph |
+   | ScoreStdev | same — slice idx 1, softplus, `×20` | `score_stdev [N, 1]` — softplus + `Mul` in graph |
+   | Ownership | `output_ownership [N,1,H,W]` — tanh→sigmoid in C++ | `ownership [N, H*W]` — `(tanh+1)/2` in graph |
+
+   The right column reduces the C++ TRT branch dramatically. The
+   *only* divergence between MiniGo and KataGo paths in
+   `tensorrt_compute.cpp` is "2 inputs vs 1." All output
+   post-processing is identical.  The C++ "KataGo branch" shrinks
+   from ~80 LoC to ~30 LoC. We also get to skip allocating
+   `d_policy_2ch`, `d_value_3ch`, `d_miscvalue`, and the
+   unused-output trash buffer entirely — those graph ops fold into
+   TRT's optimized kernels at engine-build time.
+
+The cost: ~400-600 LoC of PyTorch-side `KataGoNet` mirroring KataGo's
+trunk + heads. We only implement the heads we consume (policy, value,
+scoreMean, scoreStdev, ownership) — futurepos / seki / scoring / lead
+/ scorebelief / vTime are skipped because MCTS doesn't read them.
+Adding `torch.onnx.export` with the chosen I/O names is ~50 LoC on
+top.
+
+### `tools/katago_to_onnx.py` — design
+
+**No refactor needed.** `tools/warm_init_from_katago.py`'s CLI is
+gated by `if __name__ == "__main__": main()` — top level is purely
+class/function definitions. We import the parser directly:
+
+```python
+# tools/katago_to_onnx.py
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from warm_init_from_katago import (
+    KataGoModel, parse_katago_model,
+    ConvLayer, BatchNormLayer, ResidualBlock, GPoolBlock,
+    PolicyHead, ValueHead, Trunk,
+)
+```
+
+Importing the module defines the classes; the `main()` CLI does not
+run. `warm_init_from_katago.py` stays **byte-for-byte unchanged**.
+This eliminates the risk of regressing the warm-init flow — there's
+nothing to regress because we didn't edit it. (Risk #4 dropped from
+the list below.)
+
+Stylistic note: the file becomes both a CLI tool and a parser
+library. That's a normal Python convention for any `.py` with a
+`__main__` guard; a separate `katago_parser.py` would be marginally
+cleaner but adds risk for no functional gain.
+
+New `tools/katago_arch.py`: a PyTorch `nn.Module` that mirrors KataGo's
+architecture **for inference only**. Components:
+
+- `KataGoStem`: spatial input conv + global-input matmul (per
+  upstream `Trunk::forward`, the global features get projected and
+  added as a bias to the trunk channels at the input).
+- `KataGoOrdinaryBlock`: pre-activation BN → conv → BN → conv +
+  residual. Two BNs are pre-act (gamma/beta + running stats); we use
+  `nn.BatchNorm2d` with `affine=True, track_running_stats=True` and
+  load the running stats from KataGo's parsed values directly (no
+  fold).
+- `KataGoGPoolBlock`: regular branch (96 channels) + gpool branch (32
+  channels mean+max → matmul → broadcast add to regular). All from
+  upstream `cpp/neuralnet/openclbackend.cpp`'s description; the
+  `warm_init_from_katago.py` already groks the layout.
+- `KataGoPolicyHead`: g1Conv (gpool features) + p1Conv (spatial
+  features) → spatial output + pass via FC. Output reshaped to `[N,
+  H*W + 1]` matching MiniGo's policy slot ordering.
+- `KataGoValueHead`: v1Conv → global mean+max+std pool → 3 FC layers
+  → split outputs.
+  - `value_logits → softmax → P(W) − P(L) → [N, 1]`: same shape as
+    MiniGo's `value`.
+  - `score_mean_raw → × 20 → [N, 1]`.
+  - `score_stdev_raw → softplus → × 20 → [N, 1]`.
+- `KataGoOwnershipHead`: separate conv from pre-pool features → tanh
+  → `(x + 1) * 0.5` → reshape `[N, H*W]`.
+
+Inputs:
+- `state_spatial [N, 22, H, W]` (named to differ from MiniGo's
+  `state` to avoid name collisions; the C++ side's two-input check
+  works on count regardless).
+- `state_global  [N, 19]`.
+
+Outputs (chosen to mirror MiniGo names):
+- `policy_logits [N, H*W + 1]`
+- `value         [N, 1]`         already P(W) − P(L)
+- `score_mean    [N, 1]`         already `× 20`
+- `score_stdev   [N, 1]`         already softplus + `× 20`, positive
+- `ownership     [N, H*W]`       already in `[0, 1]`
+
+This matches MiniGo's existing tensor names exactly except for the
+input names and the existence of a second input. The TRT name-match
+table needs only one new entry per format-deciding input
+(`state_spatial` / `state_global`).
+
+`tools/katago_to_onnx.py` (~150 LoC): glue. CLI: `--katago-bin`,
+`--board`, `--output`. Loads the binary, instantiates `KataGoNet`,
+copies weights from parsed dataclasses to nn.Module parameters,
+runs a forward pass for shape validation, calls `torch.onnx.export`
+with `dynamic_axes={state_spatial: {0: "batch"}, state_global: {0:
+"batch"}, ...}` so TRT can build a dynamic-batch engine.
+
+Workflow:
+```
+wget https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b10c128-s1141046784-d204142634.bin.gz
+python tools/katago_to_onnx.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.bin.gz \
+    --board 19 --output models/kata1-b10c128.onnx
+```
+
+Verification: load the ONNX with `onnx.checker.check_model()`, then
+run a single forward pass through both the PyTorch nn.Module and
+ONNX Runtime on the same dummy input; assert outputs match within
+1e-5. If they don't, the export has a bug — fail loudly.
+
+### Architecture validation: parity test
+
+Once the converter exists, we need a one-shot test that the
+PyTorch-side `KataGoNet` is a faithful translation of KataGo's
+runtime. Without this, all downstream debugging (encoder bugs vs net
+bugs) becomes guesswork.
+
+Add `tools/katago_parity_test.py`: takes a small set of board
+positions in SGF or plain text, runs them through:
+1. Upstream KataGo's `katago benchmark` or `katago analyze` (called
+   as a subprocess if available; skip with a warning if not),
+2. Our converted ONNX via ONNX Runtime,
+
+and compares policy + value + score outputs. Tolerances ~1e-3
+(post-softmax for value, top-N cosine for policy). Disagreement is a
+bug in our PyTorch architecture or weight copy — fix before
+proceeding.
+
+If upstream KataGo isn't installed, the parity test reduces to
+"PyTorch nn.Module vs ONNX Runtime self-consistency", which catches
+ONNX export bugs but not architecture bugs. That's still useful as a
+smoke test.
+
+
+## Implementation phases
+
+Each phase is independently testable. After each phase the existing
+MiniGo `.onnx` flow still works exactly as before. Order matters:
+phases 0-4 are sequential dependencies; phase 5 is integration; phase
+6 is hardening.
+
+### Phase 0: ONNX converter (Python only, no C++ touched)
+
+Goal: produce a working KataGo ONNX file using only this repo's
+Python env. Decouples the C++ work from "is upstream's exporter
+available."
+
+Steps:
+
+0.1. **No refactor of `tools/warm_init_from_katago.py`.** Its CLI is
+gated by `if __name__ == "__main__":`, so importing the module is
+side-effect-free. `katago_to_onnx.py` imports parser classes directly
+from `warm_init_from_katago` (see the design section above).
+`warm_init_from_katago.py` stays byte-for-byte unchanged. Skip
+straight to 0.2.
+
+0.2. New file `tools/katago_arch.py`: PyTorch nn.Module mirroring
+KataGo's runtime, inference-only. Components (per "ONNX conversion"
+section above): `KataGoStem`, `KataGoOrdinaryBlock`,
+`KataGoGPoolBlock`, `KataGoPolicyHead`, `KataGoValueHead`,
+`KataGoOwnershipHead`, top-level `KataGoNet`.
+- Pre-activation BN: `nn.BatchNorm2d` placed *before* each conv in
+  the residual block (opposite of MiniGo's post-act). Running stats
+  loaded directly from KataGo's parsed mean/var; gamma/beta from
+  parsed scale/bias.
+- GPool block channel split: the block input is `trunk_c=128`; it
+  splits into a `regular_c=96` branch (3×3 conv) and a
+  `gpool_c=32` branch (3×3 conv → mean+max global pool → matmul →
+  per-channel bias added to regular branch). Combined output goes
+  through a final 3×3 conv back to `trunk_c=128`. Layout per
+  upstream `cpp/neuralnet/desc.cpp`.
+- Heads bake post-processing: see "ONNX conversion" section.
+
+0.3. New file `tools/katago_to_onnx.py` (~150 LoC):
+- CLI: `--katago-bin <path>`, `--board <int>`, `--output <path>`,
+  `--max-batch <int default 256>` (used only as a hint for the
+  optimization profile — TRT side overrides anyway).
+- Calls `parse_katago_binary` to get a `KataGoModel`, instantiates
+  `KataGoNet` with matching `(filters, blocks, board)`, copies
+  weights from the parsed dataclasses to the nn.Module's
+  `state_dict`, runs one forward pass on dummy input
+  (`state_spatial = torch.zeros(1, 22, B, B); state_global =
+  torch.zeros(1, 19)`), then `torch.onnx.export` with
+  `input_names=["state_spatial", "state_global"]`,
+  `output_names=["policy_logits", "value", "score_mean",
+  "score_stdev", "ownership"]`, `dynamic_axes={...: {0: "batch"}}`.
+- Asserts each named output's shape matches the table in "Outputs"
+  above.
+
+0.4. New file `tools/katago_parity_test.py` (~100 LoC):
+- Runs the converted ONNX through ONNX Runtime on a small set of
+  hand-picked positions (empty board, mid-game, near-endgame).
+- If `katago` binary is on PATH: also runs `katago benchmark` or
+  similar against the same positions and compares policy top-5
+  cosine similarity (≥ 0.999) and value (`|Δ| ≤ 1e-3`).
+- If `katago` is unavailable: reduces to a self-consistency check
+  (PyTorch nn.Module vs ONNX Runtime); still catches export bugs.
+
+Phase 0 result: `models/kata1-b10c128.onnx` exists. Loading it via
+ONNX Runtime gives sensible policy + value on a few test positions.
+No C++ changes yet. The MiniGo binary still has no idea KataGo
+exists.
+
+### Phase 1: format detection and metadata
+
+`include/loaded_model.h`:
+- Add `enum class ModelFormat { MiniGo, KataGo }` with default `MiniGo`.
+- Add to `LoadedModel`:
+  - `ModelFormat format = ModelFormat::MiniGo;`
+  - `int input_global_channels = 0;`     // 0 for MiniGo, 19 for KataGo
+
+That's it. No `policy_num_channels`, no `miscvalue_channels`, no
+score-index fields — those don't exist in our exported KataGo ONNX
+because the heads come out already in MiniGo shape.
+
+`src/loaded_model.cpp`:
+- Open the ONNX once, read graph **inputs** (not just initializers).
+  If graph inputs include `state_spatial` and `state_global`, set
+  `format = KataGo`. Else continue with the existing detection
+  (`is_vit`, `is_new_resnet`).
+- KataGo arm:
+  - `input_channels = 22` (read from `state_spatial` shape dim 1)
+  - `input_global_channels = 19` (read from `state_global` shape dim 1)
+  - `board_size` from `state_spatial` H/W
+  - Skip `load_conv` / `load_bn` / `load_fc` — TRT parses ONNX
+    directly, no per-op weight extraction needed.
+- Print line: `Model loaded: type=katago board=N channels=22+19`.
+
+`include/onnx_loader.h` / `src/onnx_loader.cpp`:
+- Add a helper to enumerate graph inputs:
+  `std::vector<std::pair<std::string,std::vector<int64_t>>> parse_onnx_graph_inputs(const std::string& path);`
+  (Currently the parser only enumerates initializers.)
+- Implementation: extend the minimal protobuf parser to walk the
+  `graph.input[]` field as well. ~30 LoC. Don't pull in the real
+  protobuf library.
+
+Test: load a MiniGo ONNX and a KataGo ONNX, assert
+`model->format` is set correctly for each. Existing MiniGo loads
+remain unchanged in observable output.
+
+### Phase 2: encoder dispatch at the call site (placeholder OK)
+
+Goal: thread the format through to the place where states get encoded
+*without* yet implementing the V7 encoder (phase 3).
+
+Find every call to `GoGame::encode(state)`. Currently:
+- `src/mcts.cpp` (search threads, evaluate_with_buf path)
+- `src/main_play.cpp`, `src/main_benchmark.cpp`, `src/main_selfplay.cpp`,
+  `src/main_evaluate.cpp` (root evaluation)
+
+Wrap each call site:
+
+```cpp
+if (model->format == ModelFormat::KataGo) {
+    encode_for_katago(game, model.get(), state);   // phase 3 fills this in
+} else {
+    game.encode(state);                            // existing path
+}
+```
+
+`include/katago_inputs.h` (new file):
+- Declare `void encode_for_katago(const GoGame& game, const LoadedModel* model, std::vector<float>& out);`
+- Layout contract: `out` is sized to `(22 * H * W) + 19` floats; first
+  block is spatial in row-major `[C, H, W]`; second block is global
+  vector. The TRT handle assumes this layout when it splits the input
+  back into the two TRT inputs.
+
+`src/katago_inputs.cpp` (new file, phase 2 stub):
+- Implements `encode_for_katago` as a stub that throws
+  `std::runtime_error("KataGo encoder not yet implemented")`. Phase 3
+  replaces it.
+
+Phase 2 result: a MiniGo run still works. A KataGo run loads the
+model and crashes at the first `encode_for_katago` call — which is
+expected and signals "phase 3 is the next gate."
+
+`CMakeLists.txt`: add `src/katago_inputs.cpp` to the source list.
+
+### Phase 3: port `fillRowV7` (the long pole)
+
+This is the bulk of the work. ~700 LoC of careful C++.
+
+Reference: `KataGo/cpp/neuralnet/nninputs.cpp::NNInputs::fillRowV7`,
+plus `nninputs.h` for plane numbering and `boardLogic.cpp` for
+liberty / pass-alive / ladder helpers.
+
+What `encode_for_katago` must compute, plane by plane:
+
+Spatial (22 planes, all `[H, W]` float):
+- `0`: on board (always 1 — for irregular boards it would mark valid)
+- `1`: own stones at current move
+- `2`: opp stones at current move
+- `3`: own stones with 1 liberty
+- `4`: own stones with 2 liberties
+- `5`: own stones with 3+ liberties
+- `6`: opp stones with 1 liberty
+- `7`: opp stones with 2 liberties
+- `8`: opp stones with 3+ liberties
+- `9`: ko-banned point (simple ko, last move) — for our rules this is
+  `last_move`'s recapture position if it would create immediate
+  recapture
+- `10`: own pass-alive areas (Benson)
+- `11`: opp pass-alive areas
+- `12`: ladder-escape moves (own; per upstream)
+- `13`: ladder-capture moves (opp; per upstream)
+- `14`-`16`: history (1, 2, 3 moves ago; binary "this point was just
+  played by the player whose move it was at the time")
+- `17`-`20`: more history / area / etc per upstream V7 layout
+- `21`: misc / encore-specific (zeros for non-encore)
+
+Confirm exact plane assignment from upstream — versions of `fillRowV7`
+have shuffled planes 14-21 across releases. Use upstream's naming
+constants as the source of truth. Don't trust this list.
+
+Global (19 floats):
+- `0`: komi (raw, often `7.5`)
+- `1`-`4`: ko / suicide / scoring / encore-phase rule flags
+- `5`-`12`: encoded bucketed komi, scoring, etc per upstream
+- `13`-`18`: more rule flags / scoring policy
+
+Confirm against upstream. Most flags are zero for area-scoring +
+half-komi + Tromp-Taylor — our default rules.
+
+What we need from `GoGame` to implement this that isn't already
+exposed:
+- Stones with N liberties: requires running `get_group()` /
+  `get_group_on()` for every stone and grouping by liberty count.
+  Expose internally; don't change the public `GoGame` API. Add a
+  helper inside `katago_inputs.cpp` that takes
+  `const GoGame&` and uses `game.board[][]` directly (already public).
+- Pass-alive (Benson): port `nnboard.cpp::computePassAliveArea`. ~100
+  LoC. This is the longest helper.
+- Ladder detection: port `boardLogic.cpp::searchIsLadderCapturedAttackerFirst`.
+  ~80 LoC, recursive with depth cap.
+- History planes: `GoGame` already keeps a ring buffer
+  (`ring_buf_`). Use the same data via a friendlier accessor —
+  add `const std::array<int8_t, MAX_BOARD*MAX_BOARD>& history_at(int
+  steps_back) const;` to `GoGame` (returns a reference into
+  `ring_buf_`).
+
+Optimizations:
+- The encoder runs once per leaf node in MCTS. At ~256 states/batch,
+  ~10k nodes/sec, encoder must be sub-100µs. The inner loops are
+  O(H*W) for most planes, O(H*W*α) for liberties (small constant α
+  via Union-Find or a per-call flood-fill cache), and O(H*W) for
+  pass-alive (Benson is iterative). Total should be ~30-50µs on a 9×9
+  board.
+- Pre-allocate scratch buffers per-thread. The `NNResultBuf` already
+  owns per-thread state; extend it with a scratch arena (or use
+  `thread_local` inside the encoder file — simpler, still safe given
+  one search thread per logical worker).
+
+Tests (phase 3 alone, before TRT integration):
+- `test_katago_inputs.cpp` — unit test that loads a known board
+  position, encodes it, and compares the result byte-for-byte against
+  a JSON dump produced by upstream KataGo's `python/encode_test.py`
+  (or the C++ `runtests inputtest`). Use a handful of positions:
+  empty board, mid-game, ladder, ko, pass-alive corner, near-end
+  endgame. Save expected outputs as `tests/katago_v7_*.json`.
+- A diff > 0.01 on any plane is a bug. Iterate until all positions
+  match.
+
+Phase 3 result: KataGo run still crashes at `predict_batch` (because
+the TRT path isn't there yet) but the encoder is correct.
+
+### Phase 4: TensorRT dual-input branch
+
+The big win from owning the converter (phase 0) shows up here: the
+output side is identical to MiniGo, so the only TRT divergence is
+two inputs vs one. ~30 LoC of new code in `tensorrt_compute.cpp`.
+
+`src/tensorrt_compute.cpp`:
+
+Extend `TRTDeviceState` with the two KataGo input-tensor name fields:
+```cpp
+std::string input_spatial_name;      // KataGo: state_spatial
+std::string input_global_name;       // KataGo: state_global
+```
+
+Extend the name-match loop (currently
+`tensorrt_compute.cpp:484-509`) — but only the **input** half. The
+output name set is unchanged (`policy_logits`, `value`, `score_mean`,
+`score_stdev`, `ownership`):
+
+```cpp
+if (mode == nvinfer1::TensorIOMode::kINPUT) {
+    if      (sname == "state_spatial") dev.input_spatial_name = name;
+    else if (sname == "state_global")  dev.input_global_name  = name;
+    else                                dev.input_name        = name;
+}
+```
+
+If both `input_spatial_name` and `input_global_name` are set after
+the loop, this is a KataGo engine; if `input_name` is set, it's
+MiniGo. Cross-check against `model->format` and throw on mismatch.
+
+Extend `TensorRTComputeHandle::Impl` with two KataGo input device
+buffers (only allocated when format is KataGo):
+```cpp
+float* d_input_spatial = nullptr;  // [max_batch, 22, H, W]
+float* d_input_global  = nullptr;  // [max_batch, 19]
+```
+
+The output device buffers (`d_policy`, `d_value`, `d_score`,
+`d_score_sd`, `d_ownership`) keep their existing semantics, sizes,
+and code paths. Same shapes for both formats.
+
+In `predict_batch`, the only KataGo-specific block is the input
+section. The output read-back and `NNOutput` packing is unchanged
+from the MiniGo path:
+
+```cpp
+if (I.format == ModelFormat::KataGo) {
+    // Split each state vector into spatial + global parts.
+    // Per encoder contract: each state is [22*H*W floats][19 floats].
+    int sp_per = 22 * HW;
+    int gl_per = 19;
+    flat_spatial.assign(N * sp_per, 0.0f);
+    flat_global.assign (N * gl_per, 0.0f);
+    for (int n = 0; n < N; n++) {
+        std::memcpy(&flat_spatial[n * sp_per], states[n].data(),         sp_per * 4);
+        std::memcpy(&flat_global [n * gl_per], states[n].data() + sp_per, gl_per * 4);
+    }
+    cudaMemcpyAsync(I.d_input_spatial, flat_spatial.data(), ..., cudaStreamPerThread);
+    cudaMemcpyAsync(I.d_input_global,  flat_global.data(),  ..., cudaStreamPerThread);
+
+    exec_ctx->setInputShape(I.input_spatial_name.c_str(), Dims4(N, 22, H, W));
+    exec_ctx->setInputShape(I.input_global_name.c_str(),  Dims2(N, 19));
+    exec_ctx->setTensorAddress(I.input_spatial_name.c_str(), I.d_input_spatial);
+    exec_ctx->setTensorAddress(I.input_global_name.c_str(),  I.d_input_global);
+} else {
+    // existing MiniGo upload + setInputShape + setTensorAddress
+}
+
+// Output binding: identical for both formats — same names, same shapes.
+exec_ctx->setTensorAddress(I.policy_name.c_str(),    I.d_policy);
+exec_ctx->setTensorAddress(I.value_name.c_str(),     I.d_value);
+if (!I.score_name.empty())
+    exec_ctx->setTensorAddress(I.score_name.c_str(), I.d_score);
+// ... etc, same as MiniGo
+
+// enqueueV3 + read-back + NNOutput packing: identical for both formats.
+```
+
+Details:
+- Because we baked post-processing into the ONNX graph (phase 0),
+  there's no special unpacking math here. `d_value` already holds
+  P(W) − P(L) for both formats. `d_score` already holds raw points.
+  `d_ownership` already holds [0, 1] sigmoid-equivalent values.
+- The optimization profile in `build_or_load_engine` currently calls
+  `setDimensions` for input 0 only. Extend it: when there are two
+  inputs (detected via `network->getNbInputs() == 2`), set min/opt/
+  max dims for both. ~10 LoC at the end of the existing profile
+  block.
+- Engine cache key already includes the model path, so KataGo and
+  MiniGo engines never collide. No cache-key changes needed.
+
+`include/tensorrt_compute.h`: no public API change. All KataGo state
+lives in the `Impl` struct.
+
+Test (phase 4 alone): point `main_benchmark` at the KataGo ONNX with
+a hand-crafted 9×9 starting board. Compare `policy[0..81]`,
+`value`, `score_mean` against the same ONNX run through
+ONNX Runtime (already validated in phase 0). Expect agreement within
+FP16/BF16 noise (~1e-3 absolute on policy logits, ~1e-3 on value).
+If TRT diverges from ORT, the bug is in TRT precision config or
+input upload, not the model.
+
+### Phase 5: integration + main_play / main_evaluate
+
+At this point a KataGo ONNX should run end-to-end. Verify:
+
+1. `build/main_play --model kata1.onnx --visits 800` — interactive
+   GTP-ish play. Check that legal moves are selected (rule out
+   off-by-one in policy slot ordering), passes happen at end of
+   game, and reported value tracks the expected sign.
+
+2. `build/main_benchmark --model kata1.onnx --batch 256 --warmup 10`
+   — measure throughput. Expect ≥ 70% of MiniGo's b10c128 rate on
+   the same hardware (KataGo's net is the same nominal compute as
+   MiniGo's `large` preset; minor TRT-tuning differences may eat
+   ~30%).
+
+3. `build/main_evaluate --model-a kata1.onnx --model-b
+   minigo_v123.onnx --games 50` — match. The whole point. Both nets
+   in one process, same MCTS, same search-thread count, same
+   batching. Asymmetric only in the format-dispatch branch.
+
+If any of these fail, the failure mode tells you which phase to
+revisit:
+- Crashes inside TRT setup → phase 4 (binding / naming).
+- Garbage policy / value → phase 3 (encoder bug).
+- Loads but says "format not detected" → phase 1 (loader regex).
+- Slow → phase 4 (extra cudaMemcpy or under-batched).
+
+### Phase 6: hardening
+
+- Plumb `--komi` from `main_play` / `main_evaluate` / `main_benchmark`
+  flags into `Config::komi` and through to the encoder. Currently
+  config has `komi = 6.5f`; KataGo's most common 9×9 setting is `7.0`
+  or `7.5`. Mismatch in komi gives the wrong global feature and
+  silently degrades strength.
+- Make the rules globals adjustable: support at least Tromp-Taylor
+  area scoring with half-komi (our default) and KataGo-default rules
+  (Tromp-Taylor area, no encore, suicide=disallowed). Encore phases
+  remain unsupported.
+- Eigen / CUDA / OpenCL / Metal / RKNN: add an early check in their
+  `create_handle` that errors cleanly if `model->format == KataGo`
+  with message "KataGo format requires TensorRT backend; rebuild
+  with `cmake -DMINIGO_BACKEND=tensorrt`."
+- Document the new flag set + workflow in `README.md` ("Running
+  KataGo networks") and in a new `KATAGO_INFERENCE.md`.
+
+
+## Verification milestones
+
+Sanity checkpoints during implementation, in order:
+
+**Phase 0 done**:
+- `tools/katago_to_onnx.py --katago-bin kata1-b10c128-...bin.gz
+  --board 19 --output models/kata1.onnx` produces a valid ONNX file.
+- `onnx.checker.check_model("models/kata1.onnx")` passes.
+- `tools/katago_parity_test.py` passes: outputs match upstream KataGo
+  to within ~1e-3 on at least one reference position (or
+  self-consistency check passes if upstream isn't installed).
+- `tools/warm_init_from_katago.py` is unchanged on disk
+  (`git diff tools/warm_init_from_katago.py` is empty). No
+  warm-init regression test needed.
+
+**Phase 1 done**:
+- `LoadedModel::load()` on `kata1.onnx` prints `type=katago board=9
+  channels=22+19`.
+- `LoadedModel::load()` on an existing MiniGo ONNX still prints the
+  identical line it printed before this change.
+
+**Phase 3 done**:
+- Unit test `test_katago_inputs` passes for ≥ 5 reference positions
+  (empty, mid-game, ladder, ko, near-endgame). Each plane matches
+  upstream byte-for-byte.
+
+**Phase 4 done**:
+- `main_benchmark` reports throughput for the KataGo ONNX. Numerical
+  outputs match KataGo's own benchmark on the same position to
+  within ~1e-3.
+
+**Phase 5 done**:
+- `main_evaluate kata1 minigo_v123 --games 200` finishes, prints a
+  win-rate. Direction sanity: kata1 should crush a randomly-init or
+  early MiniGo. If we ever beat kata1 with a small MiniGo, suspect
+  bug, not strength.
+
+**Phase 6 done**:
+- README updated. Wrong komi reported as a clear error, not silent
+  strength degradation. Wrong backend errors clearly.
+
+
+## Risks
+
+1. **KataGo architecture port has subtle bugs.** Pre-act vs post-act
+   BN, gpool channel split (96+32 of 128), policy head's gpool
+   injection into pass logit, value head's pool order (mean+max+std)
+   are easy to get wrong. Mitigation: phase 0 parity test against
+   upstream KataGo (`tools/katago_parity_test.py`). If `katago` is on
+   PATH, this is a hard check; if not, it's a softer consistency
+   check. Until parity passes on at least one reference position, do
+   not start phase 1.
+2. **V7 encoder bugs are silent.** A wrong plane permutation or a
+   wrong liberty count gives wrong policy/value but doesn't crash.
+   Mitigation: byte-for-byte regression tests against upstream
+   reference outputs (phase 3). Also: log a warning if the empty-board
+   policy doesn't put the highest probability near the center
+   3-3 / 4-4 points (a standard sanity check for any Go net).
+3. **Pass-alive and ladder are subtle.** Both are easy to almost-port
+   and miss edge cases. Mitigation: copy the algorithm structure
+   verbatim from KataGo's source rather than paraphrasing it. Extra
+   eyes on these two helpers in code review.
+4. **KataGo binary format version drift.** `warm_init_from_katago.py`
+   targets versions v8-v15. If kata1 ships v16+, the parser needs
+   updating. Mitigation: the parser already prints a warning for
+   newer versions and proceeds optimistically; track upstream when
+   needed.
+5. ~~**Refactoring `warm_init_from_katago.py` could regress warm-init.**~~
+   *Dropped.* The original plan moved the parser into a new module;
+   the revised plan imports directly from `warm_init_from_katago.py`
+   without editing it. The file is byte-for-byte unchanged, so there
+   is nothing to regress.
+6. **TRT engine build time on large boards.** kata1 b10c128 at 19×19
+   builds in ~30-90 s per (GPU, batch, precision) combo on a 4090.
+   Fine for one-off; engine cache (already in place) handles
+   subsequent runs. Document in README.
+7. **No upstream-export fallback documented.** We deliberately don't
+   support running upstream-exported KataGo ONNX files (different
+   I/O names + shapes). If our converter has a bug on some kata1
+   variant, the user is stuck until we fix it. Mitigation: the
+   parity test must pass on the canonical kata1 b10c128 before we
+   ship; ongoing kata-version compatibility is a follow-up.
+
+
+## Files to add/modify
+
+New files (Python — phase 0):
+- `tools/katago_arch.py` — PyTorch nn.Module mirroring KataGo's
+  inference graph (heads we use only). ~400-600 LoC.
+- `tools/katago_to_onnx.py` — CLI tool: `.bin.gz` / `.txt.gz` → ONNX
+  with MiniGo-compatible output names. Imports parser classes
+  directly from `warm_init_from_katago.py` (no parser refactor).
+  ~150 LoC.
+- `tools/katago_parity_test.py` — converter validation. ~100 LoC.
+
+New files (C++ — phases 2-3):
+- `include/katago_inputs.h` — encoder declaration + layout contract.
+- `src/katago_inputs.cpp` — V7 spatial + global encoder. ~700 LoC.
+- `tests/test_katago_inputs.cpp` — encoder regression tests.
+- `tests/katago_v7_*.json` — reference encoder outputs (5+ positions
+  generated once via the converter or upstream KataGo).
+- `KATAGO_INFERENCE.md` — workflow doc: converter usage, supported
+  rules, example invocations, known limitations.
+
+Modified files:
+- `include/loaded_model.h` — `ModelFormat` enum +
+  `input_global_channels` field.
+- `src/loaded_model.cpp` — KataGo arm of format detection.
+- `include/onnx_loader.h` / `src/onnx_loader.cpp` — graph-input
+  enumeration helper.
+- `include/game.h` / `src/game.cpp` — public history accessor for
+  encoder.
+- `src/mcts.cpp` — encoder dispatch at search-thread eval.
+- `src/main_play.cpp` / `src/main_benchmark.cpp` /
+  `src/main_selfplay.cpp` / `src/main_evaluate.cpp` — encoder
+  dispatch at root-eval call sites; CLI flags for `--komi` if not
+  already there.
+- `src/tensorrt_compute.cpp` — input-side KataGo branch in
+  `predict_batch`, two extra input-tensor name fields in
+  `TRTDeviceState`, two extra input device buffers in `Impl`,
+  two-input optimization profile in `build_or_load_engine`. Output
+  side unchanged.
+- `src/eigen_compute.cpp`, `src/cuda_compute.cu`,
+  `src/opencl_compute.cpp`, `src/metal_compute.mm`,
+  `src/rknn_compute.cpp` — early "unsupported format" check.
+- `CMakeLists.txt` — add `src/katago_inputs.cpp`, add
+  `tests/test_katago_inputs.cpp` to the test target.
+- `README.md` — short section pointing at `KATAGO_INFERENCE.md`.
+
+Untouched (verify):
+- `src/nn_evaluator.cpp`, `src/nn_request_queue.h`,
+  `include/batch_evaluator.h` — request protocol unchanged.
+- `src/async_bot.cpp` — no NN-format awareness.
+- `scripts/*` — no Python changes (training pipeline untouched).
+- `training/*` — no training-side changes.
+
+
+## Open choices / things to verify before coding
+
+These are now mostly **internal to the converter** (phase 0). Once
+phase 0 produces an ONNX with the I/O names + shapes promised in
+"Outputs" above, the C++ side has no more open questions about ONNX
+shape — it just consumes what we ship. Items below are for the
+converter author to lock in:
+
+- KataGo trunk channel layout: confirm `trunk_c=128, regular_c=96,
+  gpool_c=32` for kata1 b10c128. `warm_init_from_katago.py`'s parser
+  already reads these; print and verify before building `KataGoNet`.
+- Pre-activation BN in residual blocks: order is `BN → act → conv →
+  BN → act → conv` per upstream `cpp/neuralnet/desc.cpp`. PyTorch
+  module must mirror this exactly; warm-init script's docstring
+  confirms ("KG is pre-activation BN (norm before conv); MG is
+  post-activation").
+- Value head pooling: KataGo uses mean+max pool (some heads add
+  std). Confirm per-head against upstream
+  `cpp/neuralnet/desc.cpp::ValueHeadDesc`.
+- ScoreMean / scoreStdev scale: upstream stores `scoreMean / 20` in
+  the graph for numerical range. Bake `× 20` into our exporter so the
+  user-facing `score_mean` output is in raw points.
+- Ownership activation: upstream uses tanh. Bake `(tanh+1)/2` into
+  the exporter so the user-facing `ownership` output matches MiniGo's
+  [0, 1] sigmoid convention.
+- Policy `pass` slot: upstream produces `[..., spatial(0..H*W-1),
+  pass(H*W)]`. Verify by checking that early-game pass logit is
+  small. If reversed, change the slice in `KataGoPolicyHead.forward`.
+- Komi sign convention in `state_global`: KataGo encodes komi from
+  the perspective of the side to move. `nninputs.cpp` confirms; our
+  V7 encoder (phase 3) must match.
+- Rules-globals defaults: for area-scoring + half-komi + Tromp-Taylor
+  (our default), most rule flags are 0/1. Confirm the exact pattern
+  against `nninputs.cpp::fillRowV7` and bake into the encoder.
+- Whether kata1 b10c128 expects rules globals identical at 9×9 vs
+  19×19 (it should — rules are board-size-independent — but the V7
+  encoder's `boardArea` term in some global slots scales with board
+  size). Verify per upstream.
