@@ -535,15 +535,15 @@ residuals.
 **Workaround**: as of toolkit v2.3.0/2.3.2 there is no fix.  Smaller
 networks (4-block ResNet-with-SE) convert fine.  KataGo `kata1-b10c128`
 (included in this repo at `models/kata1-b10c128.onnx`) is currently a
-known-failing case.  The repository's RKNN runtime
-([`src/rknn_compute.cpp`](src/rknn_compute.cpp)) anyway throws
-`"KataGo format requires the TensorRT backend"` for KataGo-format ONNX
-files at handle creation, so this conversion gap is consistent with the
-runtime's current scope: RKNN is the deployment target for **MiniGo**
-networks only.
+known-failing case.
 
-When the toolkit fix lands, our converter should work unchanged on
-kata1.
+Note that the runtime side has its own work to do too — at the moment
+[`src/rknn_compute.cpp`](src/rknn_compute.cpp) throws `"KataGo format
+requires the TensorRT backend"` at handle creation for dual-input ONNX
+files (the runtime expects 1 input tensor; KataGo has 2).  Both gaps
+are intended to close: this converter already produces valid
+dual-input `.rknn` artifacts on smaller graphs, and the runtime
+support is planned (see §14).
 
 ### 10.5 Toolkit/Python compatibility quirks
 
@@ -622,7 +622,7 @@ strong signal that the NPU run will be correct.
 | Symptom                                     | Likely cause / fix |
 |---------------------------------------------|-------------------|
 | `RKNN error -1 in rknn_init`                | `.rknn` was compiled for a different SoC.  Recompile with the right `--target`. |
-| `[rknn_compute] expected 1 input tensor, got 2` | KataGo dual-input model; the C++ runtime currently only supports MiniGo single-input.  Use TensorRT for kata1 inference. |
+| `[rknn_compute] expected 1 input tensor, got 2` | KataGo dual-input model; the C++ runtime currently expects single-input.  Until dual-input support lands in the runtime (see §14), run kata1 on TensorRT. |
 | `fp16 numbers look right but quantised diverges` | Calibration set is too small / not representative.  Try `--num-positions 500`, `--temperature 1.0`, `--every 1`. |
 | `proposal=True step1 fails with 'expand batch'` | Set `--use-proposal` off (it is by default in our tool); our trace+keyword head detection runs without proposal. |
 | `Custom layer name not found in cfg`        | Toolkit renamed the tensor during graph rewriting.  Run with `--keep-intermediates --verbose` and inspect `<workdir>/<base>.quantization.cfg` for the actual layer name; pass it to the keyword sweep. |
@@ -661,7 +661,13 @@ strong signal that the NPU run will be correct.
   place; pair with `build/benchmark` runs on real Rockchip hardware
   to populate the throughput tables in `README.md` for hybrid vs fp16
   vs int8 across SoCs.
-* **KataGo dual-input runtime path** — unrelated to conversion; the
-  current C++ runtime hard-rejects dual-input ONNX
-  (`expected 1 input tensor, got 2`).  Once that path lands, the
-  converter is already producing valid dual-input `.rknn` files.
+* **KataGo dual-input runtime path** — `src/rknn_compute.cpp`
+  currently rejects dual-input ONNX (`expected 1 input tensor, got 2`)
+  and throws `"KataGo format requires the TensorRT backend"` at
+  handle creation.  Adding dual-input support — bind both
+  `state_spatial` and `state_global` via `rknn_inputs_set`, demux the
+  KataGo encoder output into the two buffers — is planned and
+  separate from this conversion work.  The converter already emits
+  valid dual-input `.rknn` files (on smaller graphs; kata1 itself is
+  blocked on §10.4), so once the runtime lands the two pieces meet
+  at the file boundary.
