@@ -681,7 +681,7 @@ section above): `KataGoStem`, `KataGoOrdinaryBlock`,
 - CLI: `--katago-bin <path>`, `--board <int>`, `--output <path>`,
   `--max-batch <int default 256>` (used only as a hint for the
   optimization profile — TRT side overrides anyway).
-- Calls `parse_katago_binary` to get a `KataGoModel`, instantiates
+- Calls `parse_katago_model` to get a `KataGoModel`, instantiates
   `KataGoNet` with matching `(filters, blocks, board)`, copies
   weights from the parsed dataclasses to the nn.Module's
   `state_dict`, runs one forward pass on dummy input
