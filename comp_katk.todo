@@ -58,8 +58,9 @@ question by checking which side of the boundary X is on:
 | `main_evaluate` | yes | match games (the driving use case) |
 | `main_selfplay` | **no** — error early | writes training data; out of scope |
 | `scripts/train*.py`, `run_continuous.py` | **no** — unchanged | training pipeline |
-| `tools/warm_init_from_katago.py` | unchanged | warm-init source for MiniGo training |
-| MCTS, NNEvaluator queue, AsyncBot | format-agnostic | logic-only; doesn't see weights |
+| `tools/warm_init_from_katago.py` | additive parser extension only; CLI behavior + warm-init output unchanged (validated by byte-diff `training.pt`) | parser is shared with the converter |
+| MCTS | format-agnostic at the algorithm level; 3 call-site renames on inference paths, selfplay encode at `:699` deliberately left as `game.encode()` for defense-in-depth | logic doesn't see weights, but call sites are the dispatch boundary |
+| NNEvaluator queue, AsyncBot, ComputeContext | format-agnostic; no edits | true logic-only layers |
 | TensorRT backend | yes | the inference path |
 | Eigen / CUDA / OpenCL / Metal / RKNN | error early | unsupported, fail loudly |
 | Selfplay V2 record format | unchanged | can't be written by KataGo path |
@@ -106,6 +107,8 @@ Cross-reference of where each review finding is addressed:
 | P2: pass normalization order | Insert recent-action push *after* `if (action == n*n) action = PASS_MOVE;` so passes record as `PASS_MOVE` (-1), not the pre-normalized `n*n` slot. | Phase 2.5 |
 | P2: stale "byte-for-byte unchanged" parser claim | Updated `tools/katago_to_onnx.py` design section to say "additive parser extension" with reference to Phase 0.1 byte-diff verification. | "ONNX conversion" |
 | P3: missing `Optional` import | Phase 0.1 prerequisite step adds `Optional` to `from typing import List, Union` → `List, Optional, Union`. | Phase 0.1 |
+| P2: early "What's untouched" still claims `mcts.cpp` / `NNResultBuf` unchanged | Section retitled "What's logically unchanged for MiniGo" and rewritten to describe behavior preservation, not file untouchedness. Authoritative file list lives in "Files to add/modify". | "What's logically unchanged for MiniGo" |
+| P3: component table row "warm_init_from_katago.py unchanged" | Row updated: "additive parser extension only; CLI behavior + warm-init output unchanged (validated by byte-diff `training.pt`)". | Component table |
 
 
 ## Source-backed alignment with KataGo
@@ -229,15 +232,41 @@ export time (slice differently in `KataGoPolicyHead.forward`).
 MiniGo: row-major `[r * W + c]`, top-to-bottom, left-to-right.
 KataGo: same — verified by reading `nnoutput.cpp:posToLoc`. ✓
 
-### What's untouched
+### What's logically unchanged for MiniGo
 
-MCTS, NNEvaluator (server threads, queue, condvar pattern, batch
-draining), AsyncBot, NNRequestQueue, all of `mcts.cpp`, all of
-`async_bot.cpp`, all of `compute_context.cpp`, the request protocol
-(`NNResultBuf { state_data, state_size, policy, value, score, ... }`).
-The KataGo path packs both spatial and global into the same flat
-`state` byte array; the TRT handle splits them back at `predict_batch`
-time. This keeps the search-thread interface identical.
+This section describes which behaviors stay byte-identical for MiniGo
+runs, not which files stay untouched on disk. The authoritative
+file-by-file list is in "Files to add/modify" near the bottom of this
+plan.
+
+**Behaviors preserved verbatim for MiniGo:**
+- MCTS search algorithm: the descend / evaluate / expand / backprop
+  loop, virtual-loss handling, root noise, temperature, tree reuse —
+  all unchanged. The only edits to `mcts.cpp` are 3 call-site
+  renames (`game.encode(state)` → `evaluator_->encode_state(...)`)
+  on inference paths, plus *no* change to the `self_play_game_impl`
+  encode at line 699.
+- NNEvaluator server-thread loop, queue draining, condvar pattern,
+  shutdown semantics — unchanged. The only edits are additive: an
+  `encode_state` override and copy-through of two more fields in the
+  per-buf writeback (and matching reset on the catch path).
+- `NNResultBuf` request protocol: existing fields (`state_data`,
+  `state_size`, `policy`, `value`, `score`, `mu`, `cv`, `done`)
+  retain their meanings and lifetimes. Two additive fields
+  (`score_sd`, `ownership`) appear at the end of the struct;
+  existing callers don't read them. The KataGo path packs both
+  spatial and global into the same flat `state` byte array, so
+  `state_data` / `state_size` semantics are preserved.
+- AsyncBot, NNRequestQueue, ComputeContext interface — no edits
+  whatsoever.
+- Selfplay V2 record format, augmentation (`mcts.cpp:608-668`),
+  `self_play_game_impl` — no edits. Selfplay rejects KataGo at
+  `main_selfplay.cpp` entry, so these paths are MiniGo-only by
+  construction.
+
+The TRT handle splits the flat `state` back into the two TRT inputs
+at `predict_batch` time. The search-thread interface stays
+identical.
 
 
 ## Design choice: runtime dispatch, not compile-time
