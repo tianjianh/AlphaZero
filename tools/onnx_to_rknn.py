@@ -79,7 +79,7 @@ SUPPORTED_TARGETS = (
 
 
 def _trace_head_tensors(onnx_path: str, output_names: Sequence[str],
-                        depth: int) -> Tuple[Set[str], Dict[str, str]]:
+                        depth: int) -> Tuple[Set[str], Dict[str, str], Set[str]]:
     """For each output, walk back `depth` ops in the ONNX graph and collect
     every tensor name in the producer chain. Then **subtract the trunk**:
     tensors that appear in every output's chain are shared trunk layers,
@@ -106,6 +106,13 @@ def _trace_head_tensors(onnx_path: str, output_names: Sequence[str],
             producer[o] = n
             tensor_op_types[o] = n.op_type
 
+    # Initializer names are treated as constants by rknn-toolkit2 — their
+    # quantization scale is locked to the consuming op's input range.
+    # Marking them in custom_quantize_layers triggers
+    # "is not allowed to be modified" errors that propagate to upstream
+    # trunk constants (`/blocks.N/Constant_output_0`), so exclude them.
+    initializers = {init.name for init in m.graph.initializer}
+
     chains: Dict[str, Set[str]] = {}
     for out_name in output_names:
         seen: Set[str] = set()
@@ -123,17 +130,17 @@ def _trace_head_tensors(onnx_path: str, output_names: Sequence[str],
             for inp in n.input:
                 if inp in producer:
                     frontier.append((inp, d + 1))
-        chains[out_name] = seen
+        chains[out_name] = seen - initializers
 
     # Heads = union of per-output chains, minus shared trunk.
     if not chains:
-        return set(), tensor_op_types
+        return set(), tensor_op_types, initializers
     union: Set[str] = set()
     for s in chains.values():
         union |= s
     intersection = set.intersection(*chains.values()) if len(chains) >= 2 else set()
-    head = union - intersection
-    return head, tensor_op_types
+    head = (union - intersection) - initializers
+    return head, tensor_op_types, initializers
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -142,7 +149,8 @@ def _trace_head_tensors(onnx_path: str, output_names: Sequence[str],
 
 
 def _patch_hybrid_cfg(cfg_path: str, head_tensors: Set[str],
-                      tensor_op_types: Optional[Dict[str, str]] = None) -> List[str]:
+                      tensor_op_types: Optional[Dict[str, str]] = None,
+                      initializers: Optional[Set[str]] = None) -> List[str]:
     """Edit the rknn-toolkit-generated quantization.cfg to force `head_tensors`
     (and any pattern-matched extras) into float16.
 
@@ -215,21 +223,24 @@ def _patch_hybrid_cfg(cfg_path: str, head_tensors: Set[str],
             return True
         if "__" in name:                             # `getitem__cvt_*`
             return True
+        # Toolkit's hybrid-step2 internal patterns: `_2sp_invalid*`
+        # (split splits), `_2conv0` / `_2conv1` (avgpool→conv lowering),
+        # `_split` (bisected concat).
+        if "_invalid" in name or "_2sp" in name or "_split" in name:
+            return True
+        if name.endswith("_2conv0") or name.endswith("_2conv1"):
+            return True
         for suf in TOOLKIT_SUFFIXES:
             if name.endswith(suf):
                 return True
         return False
 
-    # Op types we won't try to override. The toolkit's hybrid_quantization_step2
-    # rejects modifying these layers' scale factors with "is not allowed to be
-    # modified" — they're either reduction ops (ReduceMean/Max) whose output
-    # scale is fixed by the quantization range, or shape ops that don't carry
-    # numeric precision info themselves.
-    UNMODIFIABLE_OP_TYPES = {
-        "ReduceMean", "ReduceMax", "ReduceSum", "GlobalAveragePool",
-        "GlobalMaxPool", "Reshape", "Squeeze", "Unsqueeze", "Transpose",
-        "Concat", "Slice", "Gather", "Split",
-    }
+    # Whitelist: only mark these op types as fp16. Conv/Gemm/MatMul are the
+    # only ops where int8 vs fp16 matters numerically — int8 quantises both
+    # the weight (large dynamic range) and the activation scale. For
+    # everything else (activations, broadcasts, reductions, shape ops) the
+    # toolkit either inherits scale from upstream or rejects scale edits.
+    PROMOTABLE_OP_TYPES = {"Conv", "Gemm", "MatMul", "ConvTranspose"}
 
     def _is_head_layer(name: str) -> bool:
         # Skip layers the toolkit already declared float32 / float16 — forcing
@@ -239,10 +250,25 @@ def _patch_hybrid_cfg(cfg_path: str, head_tensors: Set[str],
             return False
         if _is_toolkit_artifact(name):
             return False
-        # Skip op types whose scale parameter is locked.
+        # Skip ONNX initializers (constant tensors) — the toolkit locks
+        # their scale to the consuming op's input range.
+        if initializers is not None and name in initializers:
+            return False
+        # Skip toolkit-disambiguated initializer aliases (e.g. when the
+        # same initializer feeds 2+ consumers, the toolkit emits
+        # `<name>_1`, `<name>_2`, ...).  These are runtime tensors but
+        # not real "operand names" the toolkit's hybrid step accepts.
+        if initializers is not None:
+            for init in initializers:
+                if name.startswith(init + "_") and name[len(init) + 1:].isdigit():
+                    return False
+        # Op-type gate: only Conv / Gemm / MatMul / ConvTranspose can be
+        # promoted to fp16 by hybrid mode.  Other op types either get
+        # rejected with "Invalid operands name" or "is not allowed to be
+        # modified", or have their scale tied to a neighbour anyway.
         if tensor_op_types is not None:
             op = tensor_op_types.get(name, "")
-            if op in UNMODIFIABLE_OP_TYPES:
+            if op not in PROMOTABLE_OP_TYPES:
                 return False
         return True
 
@@ -263,9 +289,41 @@ def _patch_hybrid_cfg(cfg_path: str, head_tensors: Set[str],
             custom[name] = "float16"
             forced.add(str(name))
 
-    cfg["custom_quantize_layers"] = custom
+    # ── Write back via text-level surgery ─────────────────────────────
+    # The toolkit's apply_hybrid_cfg asserts byte-equality on every saved
+    # `quantize_parameters[*].scale`. ruamel.yaml's float round-trip
+    # quietly truncates `7.62951094834821e-06` → fewer digits, which fires
+    # "is not allowed to be modified" on cfg sections we never touched.
+    # Replace ONLY the `custom_quantize_layers:` block in the file's raw
+    # text; leave the rest byte-identical to step1's output.
+    with open(cfg_path, "r") as f:
+        raw = f.read()
+
+    new_block_lines = ["custom_quantize_layers:"]
+    for name in sorted(forced):
+        # Quote the key if it contains characters YAML would otherwise
+        # interpret (forward slash, hash, brackets — kata's `/value_head/...`
+        # paths). A safe always-quote keeps the loader unambiguous.
+        new_block_lines.append(f"  '{name}': float16")
+    new_block = "\n".join(new_block_lines)
+
+    # Locate the existing `custom_quantize_layers:` block. It either has
+    # an empty value (`custom_quantize_layers: {}`) or its own indented
+    # YAML mapping. Both are followed by a blank line or the next
+    # top-level key (`quantize_parameters:`).
+    import re
+    pattern = re.compile(
+        r"^custom_quantize_layers:.*?(?=^[A-Za-z_][\w.]*:|^\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    if pattern.search(raw):
+        new_raw = pattern.sub(new_block + "\n", raw, count=1)
+    else:
+        # Section absent — prepend.
+        new_raw = new_block + "\n" + raw
+
     with open(cfg_path, "w") as f:
-        yaml.dump(cfg, f)
+        f.write(new_raw)
     return sorted(forced)
 
 
@@ -295,12 +353,20 @@ def _new_rknn(verbose: bool):
     return RKNN(verbose=verbose)
 
 
-def _config(rknn, target: str, optimization_level: int) -> None:
+def _config(rknn, target: str, optimization_level: int,
+            quantized_method: str = "channel",
+            quantized_algorithm: str = "normal") -> None:
     rknn.config(
         target_platform=target,
         mean_values=None,           # features are already normalised
         std_values=None,
         optimization_level=optimization_level,
+        # Per-channel quantisation is dramatically more accurate than
+        # per-layer for Go networks where channel weight scales differ
+        # by 5-10×. Default 'channel' here; expose --quant-method to
+        # override.
+        quantized_method=quantized_method,
+        quantized_algorithm=quantized_algorithm,
         # Toolkit rule-disables.
         #   * unsqueeze_to_4d_reshape_with_elementwise_op:
         #       The dual-input KataGo graph contains an unsqueeze→reshape
@@ -323,13 +389,15 @@ def _config(rknn, target: str, optimization_level: int) -> None:
 
 
 def convert_fp16(onnx_path: str, rknn_path: str, target: str,
-                 batch: int, optimization_level: int, verbose: bool) -> None:
+                 batch: int, optimization_level: int,
+                 quant_method: str, quant_algorithm: str,
+                 verbose: bool) -> None:
     info = _detect_format(onnx_path)
     inputs, shapes = _resolve_input_shapes(info, batch)
     print(f"[fp16] target={target} input_shapes={shapes}")
     rknn = _new_rknn(verbose)
     try:
-        _config(rknn, target, optimization_level)
+        _config(rknn, target, optimization_level, quant_method, quant_algorithm)
         if rknn.load_onnx(model=onnx_path, inputs=inputs, input_size_list=shapes) != 0:
             raise RuntimeError("load_onnx failed")
         if rknn.build(do_quantization=False) != 0:
@@ -344,15 +412,17 @@ def convert_fp16(onnx_path: str, rknn_path: str, target: str,
 
 def convert_int8(onnx_path: str, rknn_path: str, target: str,
                  batch: int, dataset: str, optimization_level: int,
+                 quant_method: str, quant_algorithm: str,
                  verbose: bool) -> None:
     if not os.path.exists(dataset):
         raise SystemExit(f"--dataset {dataset!r} does not exist")
     info = _detect_format(onnx_path)
     inputs, shapes = _resolve_input_shapes(info, batch)
-    print(f"[int8] target={target} input_shapes={shapes} dataset={dataset}")
+    print(f"[int8] target={target} input_shapes={shapes} dataset={dataset} "
+          f"method={quant_method} algo={quant_algorithm}")
     rknn = _new_rknn(verbose)
     try:
-        _config(rknn, target, optimization_level)
+        _config(rknn, target, optimization_level, quant_method, quant_algorithm)
         if rknn.load_onnx(model=onnx_path, inputs=inputs, input_size_list=shapes) != 0:
             raise RuntimeError("load_onnx failed")
         if rknn.build(do_quantization=True, dataset=dataset) != 0:
@@ -368,6 +438,7 @@ def convert_int8(onnx_path: str, rknn_path: str, target: str,
 def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
                    batch: int, dataset: str, proposal_dataset_size: int,
                    trace_depth: int, optimization_level: int,
+                   quant_method: str, quant_algorithm: str,
                    keep_intermediates: bool, verbose: bool,
                    use_proposal: bool) -> None:
     """Two-step hybrid quantisation: trunk int8, heads fp16.
@@ -399,7 +470,7 @@ def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
 
     rknn = _new_rknn(verbose)
     try:
-        _config(rknn, target, optimization_level)
+        _config(rknn, target, optimization_level, quant_method, quant_algorithm)
         if rknn.load_onnx(model=onnx_path, inputs=inputs, input_size_list=shapes) != 0:
             raise RuntimeError("load_onnx failed")
 
@@ -439,13 +510,14 @@ def convert_hybrid(onnx_path: str, rknn_path: str, target: str,
 
         # Trace heads through the ONNX graph (head = per-output chains minus
         # shared trunk) so we don't accidentally float16 the trunk layers.
-        head_tensors, tensor_ops = _trace_head_tensors(
+        head_tensors, tensor_ops, initializers = _trace_head_tensors(
             onnx_path, info["output_names"], depth=trace_depth
         )
         print(f"[hybrid] traced {len(head_tensors)} head-only tensors "
               f"(trace-depth={trace_depth})")
 
-        forced = _patch_hybrid_cfg(cfg_path, head_tensors, tensor_ops)
+        forced = _patch_hybrid_cfg(cfg_path, head_tensors, tensor_ops,
+                                    initializers)
         print(f"[hybrid] forced {len(forced)} layers to float16")
         if verbose:
             for name in forced:
@@ -486,7 +558,23 @@ def main():
     ap.add_argument("--mode", choices=["fp16", "hybrid", "int8"], default="fp16",
                     help="Quantisation mode (default fp16)")
     ap.add_argument("--target", default="rk3588", choices=SUPPORTED_TARGETS,
-                    help="Rockchip SoC name (default rk3588)")
+                    help="Rockchip SoC name (default rk3588). "
+                         "Production-targeted: rk3576 (2 NPU cores, 6 TOPS) "
+                         "and rk3588 (3 NPU cores, 6 TOPS). RK3562/3566/3568 "
+                         "(single core, 0.8-1 TOPS) are also accepted but "
+                         "haven't been tested on KataGo-class graphs.")
+    ap.add_argument("--quant-method", default="channel",
+                    choices=["channel", "layer"],
+                    help="int8 quantisation granularity (default 'channel'). "
+                         "Per-channel quant is dramatically more accurate on "
+                         "Go networks where Conv weight scales differ 5-10x "
+                         "across channels.")
+    ap.add_argument("--quant-algorithm", default="normal",
+                    choices=["normal", "mmse", "kl_divergence"],
+                    help="int8 calibration algorithm (default 'normal'). "
+                         "'mmse' minimises MSE between fp32 and int8 outputs "
+                         "(slower, often slightly better). 'kl_divergence' "
+                         "fits per-tensor distributions.")
     ap.add_argument("--batch", type=int, default=1,
                     help="Batch size baked into the .rknn (default 1). "
                          "Use 4 for self-play workloads to amortise per-call overhead.")
@@ -525,14 +613,20 @@ def main():
 
     if args.mode == "fp16":
         convert_fp16(args.onnx, args.rknn, args.target, args.batch,
-                     args.optimization_level, args.verbose)
+                     args.optimization_level,
+                     args.quant_method, args.quant_algorithm,
+                     args.verbose)
     elif args.mode == "int8":
         convert_int8(args.onnx, args.rknn, args.target, args.batch,
-                     args.dataset, args.optimization_level, args.verbose)
+                     args.dataset, args.optimization_level,
+                     args.quant_method, args.quant_algorithm,
+                     args.verbose)
     elif args.mode == "hybrid":
         convert_hybrid(args.onnx, args.rknn, args.target, args.batch,
                        args.dataset, args.proposal_size, args.trace_depth,
-                       args.optimization_level, args.keep_intermediates,
+                       args.optimization_level,
+                       args.quant_method, args.quant_algorithm,
+                       args.keep_intermediates,
                        args.verbose, args.use_proposal)
 
 

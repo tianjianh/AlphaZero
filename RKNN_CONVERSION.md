@@ -1,18 +1,23 @@
 # RKNN Conversion — ONNX → Rockchip NPU
 
 This doc covers converting MiniGo and KataGo ONNX models to Rockchip's
-`.rknn` format for inference on RK3562 / RK3566 / RK3568 / RK3576 / RK3588
-NPUs.  It pairs with the existing C++ `RKNNComputeHandle` (described in
+`.rknn` format for inference on **RK3576** and **RK3588** NPUs (the
+production targets — both have multi-core NPUs and 6 TOPS int8 peak).
+The toolkit also accepts RK3562/3566/3568, but those single-core SoCs
+are not validated here.
+
+It pairs with the existing C++ `RKNNComputeHandle` (described in
 [`README.md`](README.md#rknn-npu-backend-rockchip-aarch64-linux)); this
 document focuses **purely on the offline conversion pipeline** that
 produces the `.rknn` file.
 
 The conversion tools live in `tools/`:
 
-| Tool                         | Purpose |
-|------------------------------|---------|
-| `tools/onnx_to_rknn.py`      | ONNX → RKNN converter (fp16 / int8 / hybrid). |
-| `tools/rknn_calibration.py`  | Generate calibration `.npy` files for int8/hybrid via self-play. |
+| Tool                              | Purpose |
+|-----------------------------------|---------|
+| `tools/onnx_to_rknn.py`           | ONNX → RKNN converter (fp16 / int8 / hybrid). |
+| `tools/rknn_calibration.py`       | Generate calibration `.npy` files for int8/hybrid via self-play. |
+| `tools/kata_export_for_rknn.py`   | Re-export KataGo `.bin.gz` → ONNX with a toolkit-friendly gpool topology (only needed for kata1-class networks; see §11). |
 
 Neither tool modifies the inference code paths — they sit alongside the
 existing `tools/katago_to_onnx.py` / `scripts/export_onnx.py` flow and
@@ -30,26 +35,34 @@ only.  `librknnrt`-based inference happens on the aarch64 board.
 # 1) Set up an rknn-conversion conda env (~150 MB)
 conda create -n rknn python=3.10 -y
 conda activate rknn
-pip install 'rknn-toolkit2==2.3.0' 'setuptools<81' 'onnx<1.18'
+pip install 'rknn-toolkit2==2.3.0' 'setuptools<81' 'onnx<1.18' \
+            onnxsim onnxruntime
 
-# 2) Convert ONNX → fp16 .rknn (no calibration needed)
+# 2) MiniGo path: convert directly
 python tools/onnx_to_rknn.py \
-    --onnx models/best.onnx \
-    --rknn models/best.rknn \
+    --onnx models/best.onnx --rknn models/best.rknn \
     --mode fp16 --target rk3588
 
 # 3) Hybrid int8 (trunk int8, sensitive heads fp16) — needs calibration
 python tools/rknn_calibration.py \
-    --onnx models/best.onnx \
-    --output calib/best \
-    --num-positions 200
+    --onnx models/best.onnx --output calib/best --num-positions 200
 python tools/onnx_to_rknn.py \
-    --onnx models/best.onnx \
-    --rknn models/best.rknn \
-    --mode hybrid --target rk3588 \
-    --dataset calib/best/dataset.txt
+    --onnx models/best.onnx --rknn models/best.rknn \
+    --mode hybrid --target rk3588 --dataset calib/best/dataset.txt
 
-# 4) ship to board
+# 4) KataGo path: re-export from PyTorch first (toolkit-friendly gpool —
+#    see §11), then run steps 2/3 against the new .onnx.
+python tools/kata_export_for_rknn.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --board 9 --output models/kata1.rknn.onnx
+python -c "import onnx; from onnxsim import simplify; \
+    m, ok = simplify(onnx.load('models/kata1.rknn.onnx')); \
+    onnx.save(m, 'models/kata1.rknn.onnx')"
+python tools/onnx_to_rknn.py \
+    --onnx models/kata1.rknn.onnx --rknn models/kata1.rknn \
+    --mode fp16 --target rk3588
+
+# 5) ship to board
 scp models/best.rknn armsom:~/minigo/models/
 ```
 
@@ -334,24 +347,43 @@ Any match is added to the float16 set.
 
 ### 7.3 Stage 3 — exclusion filters
 
-Three filters drop layers we know the toolkit will reject:
+Several filters drop layers we know the toolkit will reject:
 
 1. **Already float**: skip layers whose `quantize_parameters[layer].dtype`
    is `float32` / `float16` — forcing fp16 is a no-op or a downgrade.
 2. **Toolkit artifacts**: skip names with toolkit-internal suffixes —
    `_sw`, `_mm`, `_rs`, `_expand`, `_int8`, `_to_int8`, `_to_float16`,
    `_float16`, names containing `#` (e.g. `_rs#1`), `__` (cvt
-   intermediates), or `-rs` / `rs-` (reshape variants).  These are
-   IR-level tensors that the rewriter materialised; their scales are
-   derived from neighbours and refusing modification is by design.
-3. **Frozen-op types**: skip outputs of `ReduceMean`, `ReduceMax`,
-   `ReduceSum`, `GlobalAveragePool`, `GlobalMaxPool`, `Reshape`,
-   `Squeeze`, `Unsqueeze`, `Transpose`, `Concat`, `Slice`, `Gather`,
-   `Split` — the toolkit hardcodes their scale to the producing
-   layer's scale.
+   intermediates), `-rs` / `rs-` (reshape variants), `_2sp_invalid*`,
+   `_2conv0` / `_2conv1`, or `_split`.  These are IR-level tensors
+   that the rewriter materialised; their scales are derived from
+   neighbours and refusing modification is by design.
+3. **Initializers**: ONNX initializer tensor names (constants embedded
+   in the model file).  The toolkit locks their scale to the consuming
+   op's input range, and modifying it propagates "is not allowed to be
+   modified" errors back to upstream trunk constants.  Toolkit-emitted
+   aliases (`<init>_1`, `<init>_2`, …, when one initializer feeds 2+
+   consumers) are also filtered.
+4. **Op-type whitelist**: only `Conv` / `Gemm` / `MatMul` /
+   `ConvTranspose` outputs survive.  These are the only ops where
+   int8 vs fp16 matters — they quantise both the weight (large dynamic
+   range) and the activation scale.  Activations / broadcasts /
+   reductions / shape ops inherit scale from upstream and are rejected
+   by the toolkit when promoted unilaterally.
 
-The filtered set goes into `custom_quantize_layers: float16` and is
-written back to the cfg.
+### 7.4 Stage 4 — text-level cfg surgery
+
+Once the float16 set is computed, write it back via **regex-replace on
+the raw cfg text** rather than re-saving the parsed YAML.  ruamel.yaml's
+float round-trip silently rounds `7.62951094834821e-06` → fewer
+significant digits, and the toolkit's `apply_hybrid_cfg` byte-compares
+every saved scale against its internal recomputation.  A semantic
+no-op YAML re-save still triggers
+"`is not allowed to be modified`" on layers we never touched.  Our
+patcher reads the cfg as text, matches just the
+`custom_quantize_layers:` block (`re.MULTILINE | re.DOTALL`,
+terminating at the next top-level YAML key), and writes the new block
+verbatim — leaving every saved scale byte-identical to step1's output.
 
 ```bash
 python tools/onnx_to_rknn.py \
@@ -369,7 +401,7 @@ Useful flags:
 | `--use-proposal`      | off     | Run rknn-toolkit2's auto-proposal during step1.  Off by default — proposal can incompatibly error with `does not support expand batch` on graphs whose batch is reshape-driven. |
 | `--keep-intermediates`| off     | Don't delete the temp dir — useful for inspecting the generated cfg. |
 
-### 7.4 Inspecting what the patcher did
+### 7.5 Inspecting what the patcher did
 
 ```bash
 python tools/onnx_to_rknn.py ... --keep-intermediates --verbose
@@ -431,15 +463,15 @@ batches, etc.).
 
 ## 9. Targets and SoC compatibility
 
-The conversion cross-compiles for any single SoC:
+The supported deployment targets are **RK3576** and **RK3588**:
 
-| `--target`   | NPU cores | TOPS (int8) |
-|--------------|----------:|------------:|
-| `rk3562`     | 1         | 1           |
-| `rk3566`     | 1         | 0.8         |
-| `rk3568`     | 1         | 0.8         |
-| `rk3576`     | 2         | 6           |
-| `rk3588`     | 3         | 6           |
+| `--target`   | NPU cores | TOPS (int8) | Tested with kata1 |
+|--------------|----------:|------------:|-------------------|
+| `rk3576`     | 2         | 6           | ✅ fp16 / int8 / hybrid all build & simulate |
+| `rk3588`     | 3         | 6           | ✅ fp16 / int8 / hybrid all build & simulate |
+| `rk3562`     | 1         | 1           | accepted by toolkit; not validated end-to-end here |
+| `rk3566`     | 1         | 0.8         | accepted by toolkit; not validated end-to-end here |
+| `rk3568`     | 1         | 0.8         | accepted by toolkit; not validated end-to-end here |
 
 The C++ runtime auto-detects the actual SoC at startup
 ([`src/rknn_compute.cpp::detect_soc`](src/rknn_compute.cpp)) and
@@ -482,31 +514,50 @@ input.
 pip install rknn-toolkit2==2.3.0 --force-reinstall --no-deps
 ```
 
-### 10.2 Hybrid quant `not allowed to be modified` (v2.3.0 and v2.3.2)
+### 10.2 Hybrid quant `not allowed to be modified`
 
-**Symptom**
+**Symptom 1 — YAML round-trip drift**
 
 ```
-ValueError: The quantize_parameters['/value_head/ReduceMean_2_output_0_rs_sw']['scale']
+ValueError: The quantize_parameters['/blocks.4/Constant_output_0']['scale']
             is not allowed to be modified!
   in hybrid_quantization_step2 → quant_utils.apply_hybrid_cfg
 ```
 
-**Trigger**: hybrid mode on any model with a softmax-bearing value head
-or an SE block (`Sigmoid` after `ReduceMean`).
+triggered on a layer the user **never marked**.
 
-**Cause**: the toolkit's `_sw` / `-rs` artifacts have scales derived
-from neighbours.  When step2 reloads the cfg and re-derives them, it
-asserts they're untouched — but the act of marking a parent layer
-fp16 propagates scale changes.
+**Cause**: ruamel.yaml's float round-trip rounds `7.62951094834821e-06` →
+fewer digits.  step2's `apply_hybrid_cfg` byte-compares every saved
+scale against its internal recomputation and rejects any mismatch — so
+even loading-and-re-saving the cfg with no semantic edits triggers the
+error.
 
-**Workaround**: our tool's `_patch_hybrid_cfg` filters out
-`ReduceMean` / `ReduceMax` / `Reshape` / `Concat` / `Slice` / `Gather`
-outputs and toolkit-suffixed names (see §7.3).  This works for
-truly-simple models.  For models with a softmax-bearing value head,
-hybrid mode currently fails — fall back to **fp16 mode** until
-Rockchip ships a fix, or use the fp16-keep flag carefully picked by
-hand.
+**Workaround**: our `_patch_hybrid_cfg` does **text-level surgery** —
+read the cfg as raw text, regex-replace only the
+`custom_quantize_layers:` block, leave every other byte untouched.  The
+ruamel.yaml load is used only to compute the *set* of layer names to
+mark; it never writes the file back.
+
+**Symptom 2 — propagating scale errors**
+
+```
+ValueError: Invalid operands name '/value_head/Constant_15_output_0_1'
+            in custom_quantize_layers!
+```
+
+**Cause**: marking certain op outputs (ReduceMean / Constant / Mul / Relu /
+softmax / etc.) propagates scale modifications back through the graph
+and trips a separate "frozen" assertion on neighbouring nodes.
+
+**Workaround**: our patcher uses an op-type whitelist —
+**only `Conv` / `Gemm` / `MatMul` / `ConvTranspose` outputs** are eligible
+for fp16 promotion in hybrid mode.  These are the only ops where the
+fp32 → int8 weight quantisation is large enough that fp16 makes a
+visible numerical difference; everything else (activations, broadcasts,
+reductions, shape ops) inherits its scale from upstream and rejects
+override anyway.  Initializer names (constants in the original ONNX
+graph) and toolkit-disambiguated aliases (`<init>_1`, `<init>_2`, …) are
+also filtered.
 
 ### 10.3 `fuse_conv_gather` `len() of unsized object`
 
@@ -528,22 +579,50 @@ measurable cost (it's <1% of FLOPs).
 ### 10.4 KataGo (kata1-class) full-graph codegen hang
 
 **Symptom**: `I rknn building ...` followed by ~indefinite spinning in
-`initComputeZoneMapByStepsVector` — the toolkit's C++ codegen layer
-gets stuck on KataGo's 10-block trunk with multiple parallel global-pool
-residuals.
+`initComputeZoneMapByStepsVector` and
+`LayoutMatchManager: recursion_depth=3, Logic is Dangerous, Will Force
+layout to native.` warnings.
 
-**Workaround**: as of toolkit v2.3.0/2.3.2 there is no fix.  Smaller
-networks (4-block ResNet-with-SE) convert fine.  KataGo `kata1-b10c128`
-(included in this repo at `models/kata1-b10c128.onnx`) is currently a
-known-failing case.
+**Cause**: the default `tools/katago_to_onnx.py` exports
+`_gpool_stats(x)` as
+`ReduceMean(axes=[2,3], keepdims=False) +
+ ReduceMax(axes=[2,3], keepdims=False) + Mul + Concat → Linear` —
+producing 2-D `[N, C]` tensors that fan out to multiple consumers.  The
+toolkit's `unsqueeze_to_4d_*` rules promote these to 4-D before each
+consumer, the layout matcher then tries to reconcile rank changes
+across the resulting fan-out, and on graphs with 4+ such gpool blocks
+(kata1 has one in every other trunk block + the policy / value heads)
+the match recursion explodes.
 
-Note that the runtime side has its own work to do too — at the moment
-[`src/rknn_compute.cpp`](src/rknn_compute.cpp) throws `"KataGo format
-requires the TensorRT backend"` at handle creation for dual-input ONNX
-files (the runtime expects 1 input tensor; KataGo has 2).  Both gaps
-are intended to close: this converter already produces valid
-dual-input `.rknn` artifacts on smaller graphs, and the runtime
-support is planned (see §14).
+**Workaround**: re-export from PyTorch with
+`tools/kata_export_for_rknn.py` — it monkey-patches `_gpool_stats` /
+`_vhpool_stats` to use
+`F.adaptive_avg_pool2d(x, 1) + F.adaptive_max_pool2d(x, 1)` instead.
+ONNX export turns those into `GlobalAveragePool` /
+`GlobalMaxPool → [N, C, 1, 1]`, the broadcasts and concats stay 4-D,
+and an explicit `Flatten(start_dim=1)` happens **once** right before
+each Linear.  The toolkit's layout matcher handles this pattern
+natively — kata1-b10c128 builds in ~1.6 s.
+
+```bash
+python tools/kata_export_for_rknn.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --board 9 --output models/kata1.rknn.onnx
+python tools/onnx_to_rknn.py \
+    --onnx models/kata1.rknn.onnx --rknn models/kata1.rknn \
+    --mode fp16 --target rk3588
+```
+
+**Forward-parity** of the re-export with the original is checked at the
+output names — `kata_export_for_rknn.py` emits the same five outputs
+(`policy_logits`, `value`, `score_mean`, `score_stdev`, `ownership`)
+with byte-equivalent semantics on representable positions.
+
+The runtime side still rejects KataGo dual-input ONNX
+([`src/rknn_compute.cpp`](src/rknn_compute.cpp)
+throws `"KataGo format requires the TensorRT backend"` at handle
+creation), so the conversion artifact isn't yet end-to-end runnable —
+the dual-input runtime path is tracked separately (§14).
 
 ### 10.5 Toolkit/Python compatibility quirks
 
@@ -557,7 +636,90 @@ These pins are baked into the quick-start `pip install` line in §1.
 
 ---
 
-## 11. End-to-end validation
+## 11. KataGo re-export workflow (kata1-class networks)
+
+`tools/katago_to_onnx.py` emits an ONNX that ONNX Runtime and TensorRT
+read fine, but the rknn-toolkit2 graph rewriter trips on the gpool
+topology (§10.4).  `tools/kata_export_for_rknn.py` produces the same
+network with a toolkit-friendly gpool — same five outputs, same weights,
+just a different op decomposition for the global-pool stats:
+
+| Default export                         | RKNN-friendly export                    |
+|----------------------------------------|------------------------------------------|
+| `x.mean(dim=[2,3])`                    | `F.adaptive_avg_pool2d(x, 1)`            |
+| `x.amax(dim=[2,3])`                    | `F.adaptive_max_pool2d(x, 1)`            |
+| → `ReduceMean / ReduceMax keepdims=0`  | → `GlobalAveragePool / GlobalMaxPool`    |
+| → 2-D `[N, C]` fanout                  | → 4-D `[N, C, 1, 1]` fanout              |
+| → toolkit promotes to 4-D, then back   | → stays 4-D until one explicit `Flatten` |
+| → layout matcher recurses → hang       | → builds in seconds                      |
+
+It also exports with **opset 13** (vs 17 in the original).  Newer opsets
+emit different tensor-name patterns the toolkit's substring-based
+rewrites mismatch on; opset 13 is in the toolkit's well-tested range.
+
+```bash
+# 1) Re-export
+python tools/kata_export_for_rknn.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --board 9 --output models/kata1.rknn.onnx --batch 1
+
+# 2) Simplify (compress the Identity/Constant chains the export leaves)
+python -c "import onnx; from onnxsim import simplify; \
+    m, ok = simplify(onnx.load('models/kata1.rknn.onnx')); \
+    onnx.save(m, 'models/kata1.rknn.onnx')"
+
+# 3) Generate calibration (uses the new ONNX as the policy oracle)
+python tools/rknn_calibration.py \
+    --onnx models/kata1.rknn.onnx --output calib/kata1 --num-positions 200
+
+# 4) Convert: fp16, int8, hybrid for both targets
+for tgt in rk3576 rk3588; do
+    python tools/onnx_to_rknn.py --onnx models/kata1.rknn.onnx \
+        --rknn models/kata1.${tgt}.fp16.rknn --mode fp16 --target $tgt
+    python tools/onnx_to_rknn.py --onnx models/kata1.rknn.onnx \
+        --rknn models/kata1.${tgt}.int8.rknn --mode int8 --target $tgt \
+        --dataset calib/kata1/dataset.txt
+    python tools/onnx_to_rknn.py --onnx models/kata1.rknn.onnx \
+        --rknn models/kata1.${tgt}.hybrid.rknn --mode hybrid --target $tgt \
+        --dataset calib/kata1/dataset.txt
+done
+```
+
+Build times on x86_64 host (cold cache):
+
+| Mode    | RK3576  | RK3588  | Output size |
+|---------|---------|---------|-------------|
+| fp16    | ~1.6 s  | ~1.4 s  | 6.5 MB      |
+| int8    | ~3.4 s  | ~3.3 s  | 3.7 MB      |
+| hybrid  | ~3.6 s  | ~3.5 s  | 3.8 MB      |
+
+Numerical fidelity vs ORT on a real game position from the calibration
+set (max-abs-diff per output):
+
+| Mode    | policy_logits | value    | score_mean | score_stdev | ownership |
+|---------|---------------|----------|------------|-------------|-----------|
+| fp16    | 1.8e-02       | 5.2e-04  | 6.1e-04    | 1.3e-02     | 8.4e-04   |
+| int8    | 1.2e+00       | 3.3e-02  | 4.5e-02    | 3.6e-01     | 5.0e-02   |
+| hybrid  | 1.2e+00       | 6.4e-02  | 4.5e-02    | 5.6e-01     | 5.4e-02   |
+
+Tested with `--quant-method channel --quant-algorithm normal` (the
+defaults).  Per-channel quant is markedly more accurate than per-layer
+on this network — value error drops from 1.3e-01 (per-layer) to
+3.3e-02 (per-channel).  Hybrid is roughly on par with int8 for kata1
+because the trunk is the dominant precision sink (10 blocks, 128
+channels) and the head Convs are tiny in comparison; on networks with
+larger heads the hybrid gap widens.
+
+For tighter accuracy on kata1, try:
+
+* `--num-positions 500` for a richer calibration set (calibration time
+  ~3-4 min at 100 sims/move)
+* `--quant-algorithm mmse` — runs MSE-minimising calibration, slower
+  but sometimes 10-20% better on policy logits
+
+---
+
+## 12. End-to-end validation
 
 Run inference on three things and compare:
 
@@ -617,28 +779,30 @@ strong signal that the NPU run will be correct.
 
 ---
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom                                     | Likely cause / fix |
 |---------------------------------------------|-------------------|
 | `RKNN error -1 in rknn_init`                | `.rknn` was compiled for a different SoC.  Recompile with the right `--target`. |
-| `[rknn_compute] expected 1 input tensor, got 2` | KataGo dual-input model; the C++ runtime currently expects single-input.  Until dual-input support lands in the runtime (see §14), run kata1 on TensorRT. |
-| `fp16 numbers look right but quantised diverges` | Calibration set is too small / not representative.  Try `--num-positions 500`, `--temperature 1.0`, `--every 1`. |
+| `[rknn_compute] expected 1 input tensor, got 2` | KataGo dual-input model; the C++ runtime currently expects single-input.  Until dual-input support lands in the runtime (see §15), run kata1 on TensorRT. |
+| `fp16 numbers look right but quantised diverges` | Calibration set is too small / not representative.  Try `--num-positions 500`, `--temperature 1.0`, `--every 1`.  Also confirm `--quant-method channel` (the default) — per-layer quant breaks Go networks. |
 | `proposal=True step1 fails with 'expand batch'` | Set `--use-proposal` off (it is by default in our tool); our trace+keyword head detection runs without proposal. |
 | `Custom layer name not found in cfg`        | Toolkit renamed the tensor during graph rewriting.  Run with `--keep-intermediates --verbose` and inspect `<workdir>/<base>.quantization.cfg` for the actual layer name; pass it to the keyword sweep. |
 | `pkg_resources` / `onnx.mapping` import errors | See §10.5 — pin `setuptools<81` and `onnx<1.18`. |
 | `Permission denied` writing `.rknn`         | Check the parent dir exists (`mkdir -p`); the converter creates only the file, not parent dirs. |
 | `Invalid rank for input: mean ...`          | Toolkit v2.3.2 fold_constant bug.  Downgrade to 2.3.0 (see §10.1). |
-| `quantize_parameters[...] is not allowed to be modified` | Toolkit hybrid mode rejects modifying frozen scales.  Falls back to fp16 mode for now (§10.2). |
+| `quantize_parameters[...] is not allowed to be modified` | Toolkit hybrid mode rejects modifying frozen scales — our patcher already filters them, but if you see this on a custom model, the affected op type needs to be added to the whitelist (§10.2).  For kata1, use `tools/kata_export_for_rknn.py` (§11). |
+| Build hangs on kata1 / KataGo network at `I rknn building ...` | gpool topology trips the toolkit's layout matcher (§10.4).  Re-export with `tools/kata_export_for_rknn.py`. |
 
 ---
 
-## 13. File reference
+## 14. File reference
 
 | File                                            | What it does |
 |-------------------------------------------------|--------------|
 | `tools/onnx_to_rknn.py`                         | Main converter; modes fp16/int8/hybrid; format auto-detect; cfg patcher. |
 | `tools/rknn_calibration.py`                     | Self-play position dumper; ports `katago_inputs.cpp` + `game.cpp` to Python. |
+| `tools/kata_export_for_rknn.py`                 | Re-export KataGo `.bin.gz` → ONNX with toolkit-friendly gpool (kata1 path). |
 | `models/*.onnx`                                 | Source ONNX models (KataGo or MiniGo). |
 | `models/*.rknn`                                 | Compiled RKNN; sits next to the .onnx, found by extension swap. |
 | `src/rknn_compute.cpp` / `include/rknn_compute.h` | Runtime backend (aarch64). |
@@ -646,17 +810,8 @@ strong signal that the NPU run will be correct.
 
 ---
 
-## 14. Future work
+## 15. Future work
 
-* **kata1 conversion** — blocked on Rockchip's codegen fix
-  (§10.4).  Workaround paths considered (graph rewriting to Conv-based
-  GlobalAvg/Max + Flatten, weight-slicing instead of channel Gather,
-  ORT pre-optimization) all clear `fold_constant` but still hang in
-  the toolkit's C++ codegen.  Test with each new toolkit release.
-* **Hybrid mode for SE/value-softmax models** — blocked on §10.2.
-  Once Rockchip relaxes the frozen-scale assertion, our existing
-  `_patch_hybrid_cfg` should produce working hybrid `.rknn` files for
-  the full MiniGo `AlphaZeroNet` family.
 * **Performance benchmarking on board** — the conversion side is in
   place; pair with `build/benchmark` runs on real Rockchip hardware
   to populate the throughput tables in `README.md` for hybrid vs fp16
@@ -667,7 +822,13 @@ strong signal that the NPU run will be correct.
   handle creation.  Adding dual-input support — bind both
   `state_spatial` and `state_global` via `rknn_inputs_set`, demux the
   KataGo encoder output into the two buffers — is planned and
-  separate from this conversion work.  The converter already emits
-  valid dual-input `.rknn` files (on smaller graphs; kata1 itself is
-  blocked on §10.4), so once the runtime lands the two pieces meet
-  at the file boundary.
+  separate from this conversion work.  This converter now emits
+  valid dual-input `.rknn` files for kata1-class networks (§11), so
+  once the runtime lands the two pieces meet at the file boundary.
+* **Hybrid mode tuning for kata1** — current hybrid output isn't
+  meaningfully better than int8 because we only mark 4 head Convs as
+  fp16 (~2% of FLOPs) while the trunk contributes the bulk of
+  quantisation error.  A wider whitelist (e.g. include `Add` outputs
+  feeding the policy spatial logits, `Tanh` before ownership) might
+  help on kata1 specifically — but requires per-op verification
+  against the toolkit's "frozen scale" rules.
