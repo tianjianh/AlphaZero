@@ -30,6 +30,75 @@ MiniGo candidates without launching two engines and shuttling JSON over
 GTP."
 
 
+## Core principle: KataGo weights are inference-only
+
+This is the spine of the plan. Every design decision and every diff
+should be measured against it.
+
+**KataGo weights enter the system through `main_play`,
+`main_benchmark`, and `main_evaluate` only.** They drive MCTS, they
+emit moves, they produce policy/value/score/ownership for analysis.
+Nothing else.
+
+**KataGo weights never become training data, never get fine-tuned,
+never write selfplay records, never feed the Python trainer.** The
+training pipeline (`scripts/train.py`, `scripts/train_continuous.py`,
+`scripts/run_continuous.py`, `tools/warm_init_from_katago.py` as a
+warm-init source) sees no KataGo runtime path. The selfplay binary
+rejects KataGo models with a clear error before any encoding work
+happens.
+
+This boundary lets us answer every "should X support KataGo?"
+question by checking which side of the boundary X is on:
+
+| Component | KataGo-aware? | Why |
+|---|---|---|
+| `main_play` | yes | inference for human/GTP play |
+| `main_benchmark` | yes | throughput measurement |
+| `main_evaluate` | yes | match games (the driving use case) |
+| `main_selfplay` | **no** — error early | writes training data; out of scope |
+| `scripts/train*.py`, `run_continuous.py` | **no** — unchanged | training pipeline |
+| `tools/warm_init_from_katago.py` | unchanged | warm-init source for MiniGo training |
+| MCTS, NNEvaluator queue, AsyncBot | format-agnostic | logic-only; doesn't see weights |
+| TensorRT backend | yes | the inference path |
+| Eigen / CUDA / OpenCL / Metal / RKNN | error early | unsupported, fail loudly |
+| Selfplay V2 record format | unchanged | can't be written by KataGo path |
+
+**Minimal-change discipline:** every edit to existing MiniGo files
+must be (a) strictly additive (new fields, new methods, new branches
+that only fire when `format == KataGo`) or (b) a five-line guard that
+errors out on KataGo input. The MiniGo code paths must stay logically
+identical — the same bytes flow through them whether or not KataGo
+support exists in the binary.
+
+Concrete consequences of this discipline:
+- No renaming existing types, methods, or fields.
+- No removing existing fields even if they look redundant.
+- No reorganizing `GoGame`'s state, `BatchEvaluator`'s interface, or
+  `NNResultBuf`'s layout — only additions.
+- No changing the V2 record format, selfplay augmentation, or the
+  Python trainer's input contract.
+- The MiniGo ONNX flow must produce **byte-identical** output before
+  vs. after this work — same ONNX, same engine cache hit, same
+  policy/value, same self-play game seeds, same training runs.
+
+Code review findings (P1/P2 from the recent review) fold into this
+principle: each one was either a missed boundary violation (selfplay
+shouldn't dispatch) or a missed minimal-change requirement (encode
+belongs to the evaluator, not the search; recent-actions storage is
+purely additive; `NNResultBuf` extension is purely additive).
+
+Cross-reference of where each review finding is addressed:
+
+| Finding | Resolution | Where in plan |
+|---|---|---|
+| P1: parser data discarded | Phase 0.1: extend `PolicyHead`/`ValueHead` dataclasses with `Optional` fields, populate in parsers (additive). Byte-diff `training.pt` to validate. | Phase 0.1 |
+| P1: MCTS has no model handle | Encode dispatch moves to `BatchEvaluator::encode_state()` virtual; `NNEvaluator` overrides with format check; MCTS just calls the evaluator. | "Where the dispatch lives" + Phase 2 |
+| P2: V7 history needs moves | Add `recent_actions_` private array + `recent_action()` accessor to `GoGame`. Maintained in `play()` / `reset()` / `copy()`. Strictly additive. | Phase 2.5 |
+| P2: NNEvaluator drops score_sd / ownership | Add fields to `NNResultBuf`; copy through at server-thread writeback. Strictly additive (also a pre-existing latent MiniGo bug). | Phase 2.5 |
+| P2: selfplay dispatch contradicts non-goal | Drop `main_selfplay.cpp` from encoder-rename list; add early-error guard rejecting `format == KataGo`. | Phase 6 |
+
+
 ## Source-backed alignment with KataGo
 
 Design references KataGo's public source
@@ -195,6 +264,80 @@ new dependencies. It does not — both paths use the same TRT, CUDA, and
 in-tree ONNX parser.
 
 
+## Where the dispatch lives: evaluator-side, not call-site
+
+The encode dispatch belongs to the evaluator, not the search. This is
+both the right OO answer and what minimal-change discipline forces.
+
+**Why not call-site dispatch.** An earlier draft of this plan put the
+`if (model->format == KataGo)` check at every `game.encode(state)`
+call site (`mcts.cpp:248, 340, 413, 699`, plus root-eval call sites
+in the four `main_*.cpp` files). That requires every caller to hold a
+`LoadedModel*`. MCTS doesn't hold one — `mcts.h:100,156` shows it
+owns `BatchEvaluator* evaluator_` and `const Config&`. Pushing
+`format` into `Config` doesn't work either: `main_evaluate.cpp:221`
+builds **one** `Config` from `model1->input_channels` and shares it
+across both MCTS instances, so a single `format` field would be
+ambiguous in cross-format matches. The whole approach is wrong.
+
+**Why evaluator-side dispatch is right.** The `BatchEvaluator`
+interface is exactly the layer that knows about the model — its
+`NNEvaluator` subclass already owns `std::shared_ptr<LoadedModel>`.
+Every MCTS instance gets its own evaluator. The dispatch fits there
+naturally:
+
+```cpp
+// include/batch_evaluator.h — additive change
+class BatchEvaluator {
+public:
+    virtual ~BatchEvaluator() = default;
+    using Result = NNOutput;
+
+    // NEW: encode a game position into the format this evaluator's
+    // model expects. Default: MiniGo's 17-channel encoder.
+    virtual void encode_state(const GoGame& game,
+                              std::vector<float>& out) const {
+        game.encode(out);
+    }
+
+    /* existing methods unchanged */
+};
+```
+
+```cpp
+// src/nn_evaluator.cpp — single override
+void NNEvaluator::encode_state(const GoGame& game,
+                               std::vector<float>& out) const {
+    if (model_->format == ModelFormat::KataGo) {
+        encode_for_katago(game, model_.get(), out);
+    } else {
+        game.encode(out);
+    }
+}
+```
+
+Search-side change is one rename per call site:
+```cpp
+// src/mcts.cpp:248, 340, 413, 699 (and same pattern in main_*.cpp)
+- game_copy_ptr->encode(state);
++ evaluator_->encode_state(*game_copy_ptr, state);
+```
+
+This is ~10 changed lines total in MCTS + four `main_*.cpp` files.
+MCTS itself becomes format-agnostic — it doesn't import
+`loaded_model.h`, doesn't see `ModelFormat`, doesn't hold a model
+pointer. The evaluator hides the format question entirely.
+
+**Bonus: this fixes a pre-existing latent bug.** `main_evaluate.cpp`
+currently uses one `Config.input_channels` (taken from `model1`) for
+both MCTS instances. If the two models had different `input_channels`
+(e.g., a future MiniGo with 19 channels vs the current 17), the
+encoded states for `mcts_2` would be sized wrong and crash. With
+evaluator-side dispatch each evaluator encodes for its own model.
+The `Config` field becomes architectural metadata only and can be
+deprecated.
+
+
 ## Out of scope (explicit non-goals)
 
 - Training on KataGo weights, fine-tuning KataGo, or producing
@@ -213,12 +356,9 @@ in-tree ONNX parser.
   the most-common case (area scoring, fixed komi, no encore). Other
   modes hit `assert(false)` until someone needs them.
 - Loading KataGo's native `.bin.gz` / `.txt.gz` directly without ONNX
-  conversion. We require an exported ONNX as input, produced once
-  externally by upstream KataGo's `python/export_onnx.py`. Reusing
-  the in-tree parser in `tools/warm_init_from_katago.py` to build a
-  PyTorch KataGo-arch model and re-export to ONNX is a viable
-  fallback plan if upstream ONNX export breaks; tracked as a risk
-  but not an immediate task.
+  conversion. We require an exported ONNX as input, produced once by
+  our in-tree `tools/katago_to_onnx.py` (see "ONNX conversion"
+  section).
 - BFloat16 / FP8 calibration tuning specific to KataGo. The existing
   TRT precision auto-detection (BF16 on SM 8.0+, FP16 on Volta/Turing,
   FP32 on older) just works. If KataGo's score head needs different
@@ -409,12 +549,112 @@ available."
 
 Steps:
 
-0.1. **No refactor of `tools/warm_init_from_katago.py`.** Its CLI is
-gated by `if __name__ == "__main__":`, so importing the module is
-side-effect-free. `katago_to_onnx.py` imports parser classes directly
-from `warm_init_from_katago` (see the design section above).
-`warm_init_from_katago.py` stays byte-for-byte unchanged. Skip
-straight to 0.2.
+0.1. **Extend the parser in `tools/warm_init_from_katago.py` to
+retain all head layers (additive only).** The existing parser
+intentionally drops most policy/value head layers — `_parse_policy_head`
+keeps only `p1_conv` and `p1_bn` (lines 491-513), and
+`_parse_value_head` keeps only `v1_conv` and `v1_bn` (lines 516-534).
+Everything else is `parse()`'d for stream-position consistency and
+discarded. Warm-init only needs those four layers; the full inference
+graph needs all of them.
+
+The fix is purely additive to the dataclasses and parsers:
+
+```python
+# PolicyHead dataclass — add Optional fields for everything currently
+# parsed-and-dropped. Defaults to None so existing call sites that only
+# touch p1_conv / p1_bn keep working unchanged.
+@dataclass
+class PolicyHead:
+    name: str
+    p1_conv: ConvLayer
+    p1_bn:   BatchNormLayer
+    g1_conv:        Optional[ConvLayer]      = None  # NEW
+    g1_bn:          Optional[BatchNormLayer] = None  # NEW
+    g1_act:         Optional[ActivationLayer] = None  # NEW
+    gpool_to_bias:  Optional[MatMulLayer]    = None  # NEW
+    p1_act:         Optional[ActivationLayer] = None  # NEW
+    p2_conv:        Optional[ConvLayer]      = None  # NEW
+    gpool_to_pass:  Optional[MatMulLayer]    = None  # NEW
+    # v15+ extras (still Optional):
+    gpool_to_pass_bias:  Optional[MatBiasLayer]    = None
+    pass_act:            Optional[ActivationLayer] = None
+    gpool_to_pass_mul2:  Optional[MatMulLayer]     = None
+
+@dataclass
+class ValueHead:
+    name: str
+    v1_conv: ConvLayer
+    v1_bn:   BatchNormLayer
+    v1_act:        Optional[ActivationLayer] = None  # NEW
+    v2_mul:        Optional[MatMulLayer]     = None  # NEW
+    v2_bias:       Optional[MatBiasLayer]    = None  # NEW
+    v2_act:        Optional[ActivationLayer] = None  # NEW
+    v3_mul:        Optional[MatMulLayer]     = None  # NEW
+    v3_bias:       Optional[MatBiasLayer]    = None  # NEW
+    sv3_mul:       Optional[MatMulLayer]     = None  # NEW
+    sv3_bias:      Optional[MatBiasLayer]    = None  # NEW
+    v_ownership_conv: Optional[ConvLayer]    = None  # NEW
+```
+
+Update `_parse_policy_head` and `_parse_value_head` to populate the
+new fields instead of discarding the parsed objects:
+
+```python
+def _parse_policy_head(r, model_version, binary):
+    name        = r.read_token()
+    p1_conv     = ConvLayer.parse(r, binary)
+    g1_conv     = ConvLayer.parse(r, binary)            # was discarded
+    g1_bn       = BatchNormLayer.parse(r, binary)       # was discarded
+    g1_act      = ActivationLayer.parse(r, model_version)
+    gpool_bias  = MatMulLayer.parse(r, binary)
+    p1_bn       = BatchNormLayer.parse(r, binary)
+    p1_act      = ActivationLayer.parse(r, model_version)
+    p2_conv     = ConvLayer.parse(r, binary)
+    gpool_pass  = MatMulLayer.parse(r, binary)
+    extras = {}
+    if model_version >= 15:
+        extras['gpool_to_pass_bias'] = MatBiasLayer.parse(r, binary)
+        extras['pass_act']           = ActivationLayer.parse(r, model_version)
+        extras['gpool_to_pass_mul2'] = MatMulLayer.parse(r, binary)
+    return PolicyHead(name=name, p1_conv=p1_conv, p1_bn=p1_bn,
+                      g1_conv=g1_conv, g1_bn=g1_bn, g1_act=g1_act,
+                      gpool_to_bias=gpool_bias, p1_act=p1_act,
+                      p2_conv=p2_conv, gpool_to_pass=gpool_pass, **extras)
+```
+
+(Same shape for `_parse_value_head`.)
+
+This change is **strictly additive**:
+- The required fields (`p1_conv`, `p1_bn`, `v1_conv`, `v1_bn`) remain
+  required and unchanged — warm-init uses them by name and gets the
+  same values it always got.
+- The new fields are all `Optional[...] = None` and default to filled
+  parsed values. Code that doesn't access them sees no difference.
+- The `KataGoModel` overall structure, the `parse_katago_model`
+  function signature, and warm-init call sites are unchanged.
+
+Verification (mandatory before phase 0.2):
+- Run warm-init on a known `.bin.gz` before this change → save
+  resulting `training.pt` as `training_pre.pt`.
+- Apply this change.
+- Run warm-init on the same `.bin.gz` → save as `training_post.pt`.
+- `python -c "import torch; a=torch.load('training_pre.pt'); b=torch.load('training_post.pt'); \
+   for k in a['model_state_dict']: assert torch.equal(a['model_state_dict'][k], b['model_state_dict'][k]), k; \
+   print('warm-init unchanged')"`
+- If any tensor differs, the parser change is not actually additive
+  — find why (likely an order-of-parse bug or accidental field
+  access) before continuing.
+
+Then `katago_to_onnx.py` imports the now-complete parser:
+```python
+from warm_init_from_katago import (
+    KataGoModel, parse_katago_model,
+    ConvLayer, BatchNormLayer, ActivationLayer,
+    MatMulLayer, MatBiasLayer,
+    ResidualBlock, GPoolBlock, PolicyHead, ValueHead, Trunk,
+)
+```
 
 0.2. New file `tools/katago_arch.py`: PyTorch nn.Module mirroring
 KataGo's runtime, inference-only. Components (per "ONNX conversion"
@@ -500,43 +740,137 @@ Test: load a MiniGo ONNX and a KataGo ONNX, assert
 `model->format` is set correctly for each. Existing MiniGo loads
 remain unchanged in observable output.
 
-### Phase 2: encoder dispatch at the call site (placeholder OK)
+### Phase 2: evaluator-side encode dispatch + scaffolding
 
-Goal: thread the format through to the place where states get encoded
-*without* yet implementing the V7 encoder (phase 3).
+Goal: route every encode through `BatchEvaluator::encode_state(...)`
+without yet implementing the V7 encoder (phase 3). MCTS becomes
+format-agnostic; format awareness is contained inside `NNEvaluator`.
 
-Find every call to `GoGame::encode(state)`. Currently:
-- `src/mcts.cpp` (search threads, evaluate_with_buf path)
-- `src/main_play.cpp`, `src/main_benchmark.cpp`, `src/main_selfplay.cpp`,
-  `src/main_evaluate.cpp` (root evaluation)
+`include/batch_evaluator.h` (additive):
+- Add `virtual void encode_state(const GoGame&, std::vector<float>&) const`
+  with default body `game.encode(out)` (preserves MiniGo behavior for
+  any subclass that doesn't override).
 
-Wrap each call site:
+`include/nn_evaluator.h` / `src/nn_evaluator.cpp` (additive):
+- Override `encode_state` to call `encode_for_katago(...)` when
+  `model_->format == ModelFormat::KataGo`, else `game.encode(out)`.
 
-```cpp
-if (model->format == ModelFormat::KataGo) {
-    encode_for_katago(game, model.get(), state);   // phase 3 fills this in
-} else {
-    game.encode(state);                            // existing path
-}
-```
+Call-site rename (4 LoC in mcts, 4 LoC across main_*.cpp):
+- `src/mcts.cpp:248, 340, 413, 699`:
+  `game_copy_ptr->encode(state)` → `evaluator_->encode_state(*game_copy_ptr, state)`.
+  (Same pattern for `game.encode(state_enc)` at line 413.)
+- `src/main_play.cpp`, `src/main_benchmark.cpp`,
+  `src/main_evaluate.cpp` root-eval call sites: same rename.
+- `src/main_selfplay.cpp`: **no rename** — selfplay does not run on
+  KataGo (see Phase 6 selfplay guard). Leave the existing
+  `game.encode()` calls untouched, since the guard rejects KataGo
+  before any encoding happens.
 
 `include/katago_inputs.h` (new file):
 - Declare `void encode_for_katago(const GoGame& game, const LoadedModel* model, std::vector<float>& out);`
-- Layout contract: `out` is sized to `(22 * H * W) + 19` floats; first
-  block is spatial in row-major `[C, H, W]`; second block is global
-  vector. The TRT handle assumes this layout when it splits the input
-  back into the two TRT inputs.
+- Layout contract: `out` is sized to `(22 * H * W) + 19` floats;
+  first block is spatial in row-major `[C, H, W]`; second block is
+  global vector. The TRT handle assumes this layout when it splits
+  the input back into the two TRT inputs.
 
 `src/katago_inputs.cpp` (new file, phase 2 stub):
 - Implements `encode_for_katago` as a stub that throws
   `std::runtime_error("KataGo encoder not yet implemented")`. Phase 3
   replaces it.
 
-Phase 2 result: a MiniGo run still works. A KataGo run loads the
-model and crashes at the first `encode_for_katago` call — which is
-expected and signals "phase 3 is the next gate."
+Phase 2 result: MiniGo runs still work (default
+`encode_state` → `game.encode(...)`, byte-identical). A KataGo run
+loads the model, dispatches into the override, and crashes at the
+stub — expected, signals "phase 3 is the next gate."
 
 `CMakeLists.txt`: add `src/katago_inputs.cpp` to the source list.
+
+### Phase 2.5: extend `NNResultBuf` and `GoGame` (additive only)
+
+Two small, strictly-additive changes that the V7 encoder and the
+KataGo path will need. Both also clean up pre-existing latent bugs
+in MiniGo.
+
+**A. `NNResultBuf` carries `score_sd` and `ownership` through the
+queue.** Today the buf has only `policy`/`value`/`score`
+(`include/batch_evaluator.h:18-34`); the server thread at
+`src/nn_evaluator.cpp:169-170` only copies `policy` and `value` from
+the `predict_batch` result, dropping `score_sd` and `ownership`
+before MCTS sees them. This is independently a bug for MiniGo —
+TRT computes those fields but they're discarded en route. Fix:
+
+```cpp
+// include/batch_evaluator.h — additive
+struct NNResultBuf {
+    /* existing fields */
+    float              score_sd = 0.0f;   // NEW
+    std::vector<float> ownership;          // NEW
+};
+```
+
+```cpp
+// src/nn_evaluator.cpp:169-170 — add 2 lines
+buf->policy    = std::move(all_results[i].policy);
+buf->value     = all_results[i].value;
+buf->score     = all_results[i].score;     // NEW (currently dropped)
+buf->score_sd  = all_results[i].score_sd;  // NEW
+buf->ownership = std::move(all_results[i].ownership);  // NEW
+```
+
+And update the `evaluate_with_buf` return at `nn_evaluator.cpp:61`
+to include all five fields. Any caller currently constructing an
+`NNOutput` from the buf gets the same fields it already got, plus
+two more — additive.
+
+**B. `GoGame` records recent action locations.** V7's history planes
+encode *where* the last few moves were played, not what the board
+looked like (`game.cpp:241,260` shows MiniGo stores only board
+snapshots in `ring_buf_`). Move locations cannot be reliably
+recovered from snapshot diffs because (a) captures change multiple
+cells, and (b) passes change zero cells. The fix is purely additive
+to `GoGame`:
+
+```cpp
+// include/game.h — additive
+class GoGame {
+    // ... existing public state ...
+
+    // NEW: most-recent action locations, [0] = 1 ply ago, ..., [4] = 5 plies ago.
+    // Value range: [0, board_size²) for board moves, PASS_MOVE for pass,
+    // -2 sentinel for "no move yet". Only used by the KataGo V7 encoder.
+    int recent_action(int steps_back) const;
+
+private:
+    static constexpr int RECENT_ACTIONS_CAP = 5;
+    std::array<int, RECENT_ACTIONS_CAP> recent_actions_;
+    int                                  recent_actions_count_ = 0;
+};
+```
+
+```cpp
+// src/game.cpp::play() — add at the top, before any board mutation:
+for (int i = RECENT_ACTIONS_CAP - 1; i > 0; --i)
+    recent_actions_[i] = recent_actions_[i - 1];
+recent_actions_[0] = action;
+if (recent_actions_count_ < RECENT_ACTIONS_CAP) ++recent_actions_count_;
+
+// src/game.cpp::reset() — clear:
+recent_actions_.fill(-2);
+recent_actions_count_ = 0;
+
+// src/game.cpp::copy() — propagate:
+g.recent_actions_       = recent_actions_;
+g.recent_actions_count_ = recent_actions_count_;
+```
+
+No public method changes, no existing field changes. Only `play()`,
+`reset()`, and `copy()` get one block of additive lines each. MiniGo
+code paths never touch `recent_actions_`, so behavior is byte-identical
+for MiniGo runs.
+
+Test: a unit test that plays a fixed move sequence (including a
+pass and a capture) and asserts `recent_action(0..4)` returns the
+expected locations. ~30 LoC.
 
 ### Phase 3: port `fillRowV7` (the long pole)
 
@@ -594,11 +928,12 @@ exposed:
   LoC. This is the longest helper.
 - Ladder detection: port `boardLogic.cpp::searchIsLadderCapturedAttackerFirst`.
   ~80 LoC, recursive with depth cap.
-- History planes: `GoGame` already keeps a ring buffer
-  (`ring_buf_`). Use the same data via a friendlier accessor —
-  add `const std::array<int8_t, MAX_BOARD*MAX_BOARD>& history_at(int
-  steps_back) const;` to `GoGame` (returns a reference into
-  `ring_buf_`).
+- History planes: use `recent_action(int steps_back)` from Phase
+  2.5. Each history plane is a one-hot map: write `1.0` at the
+  spatial index of `recent_action(i)` (or leave the plane all-zero
+  if the action is `PASS_MOVE` or `-2`). MiniGo's snapshot ring
+  buffer (`ring_buf_`) is **not** used by V7 — wrong representation
+  for what V7 needs.
 
 Optimizations:
 - The encoder runs once per leaf node in MCTS. At ~256 states/batch,
@@ -755,23 +1090,67 @@ revisit:
 - Loads but says "format not detected" → phase 1 (loader regex).
 - Slow → phase 4 (extra cudaMemcpy or under-batched).
 
-### Phase 6: hardening
+### Phase 6: hardening + boundary enforcement
 
-- Plumb `--komi` from `main_play` / `main_evaluate` / `main_benchmark`
-  flags into `Config::komi` and through to the encoder. Currently
-  config has `komi = 6.5f`; KataGo's most common 9×9 setting is `7.0`
-  or `7.5`. Mismatch in komi gives the wrong global feature and
-  silently degrades strength.
-- Make the rules globals adjustable: support at least Tromp-Taylor
-  area scoring with half-komi (our default) and KataGo-default rules
-  (Tromp-Taylor area, no encore, suicide=disallowed). Encore phases
-  remain unsupported.
-- Eigen / CUDA / OpenCL / Metal / RKNN: add an early check in their
-  `create_handle` that errors cleanly if `model->format == KataGo`
-  with message "KataGo format requires TensorRT backend; rebuild
-  with `cmake -DMINIGO_BACKEND=tensorrt`."
-- Document the new flag set + workflow in `README.md` ("Running
-  KataGo networks") and in a new `KATAGO_INFERENCE.md`.
+This phase is where we enforce the core principle (KataGo is
+inference-only) at every entry point that should reject it.
+
+**Selfplay rejection (P2 review finding).** Add an early guard at the
+top of `src/main_selfplay.cpp`, immediately after `LoadedModel::load()`:
+
+```cpp
+auto model = LoadedModel::load(model_path);
+if (model->format == ModelFormat::KataGo) {
+    std::cerr << "ERROR: main_selfplay does not support KataGo-format models.\n"
+              << "  KataGo weights are inference-only in this build.\n"
+              << "  Use main_play or main_evaluate for KataGo runs.\n";
+    return 2;
+}
+```
+
+~6 LoC. Selfplay's encoder dispatch, augmentation
+(`mcts.cpp:608-668`), and V2 record writer remain completely
+untouched — the guard prevents any KataGo state from ever reaching
+them. **Note:** `main_selfplay.cpp` is *not* in the encoder-rename
+list from Phase 2 — its `game.encode()` calls stay exactly as they
+are, because the guard ensures they only ever run on MiniGo models.
+
+**Backend rejection (other backends).** Eigen / CUDA / OpenCL /
+Metal / RKNN all need an early check in `create_handle` that errors
+cleanly if `model->format == ModelFormat::KataGo`:
+
+```cpp
+if (model->format == ModelFormat::KataGo)
+    throw std::runtime_error(
+        "KataGo format requires the TensorRT backend. "
+        "Rebuild with `cmake -DMINIGO_BACKEND=tensorrt`.");
+```
+
+~4 LoC per backend × 5 backends = ~20 LoC. No other change to those
+backends.
+
+**Komi plumbing.** `--komi` from `main_play` / `main_evaluate` /
+`main_benchmark` flags into `Config::komi` and through to the
+encoder. Currently config has `komi = 6.5f`; KataGo's most common
+9×9 setting is `7.0` or `7.5`. Mismatch in komi gives the wrong
+global feature and silently degrades strength.
+
+**Rules globals.** Support at least Tromp-Taylor area scoring with
+half-komi (our default) and KataGo-default rules (Tromp-Taylor
+area, no encore, suicide=disallowed). Encore phases remain
+unsupported (the V7 encoder fills those rule-flag globals with
+zeros).
+
+**Documentation.** Add `KATAGO_INFERENCE.md` describing:
+- The principle: KataGo weights drive inference only.
+- The converter workflow (`tools/katago_to_onnx.py`).
+- The supported binaries (`main_play`, `main_benchmark`,
+  `main_evaluate`) and the rejected ones (`main_selfplay`,
+  Python training pipeline).
+- Supported rules and known limitations.
+
+`README.md`: short pointer at `KATAGO_INFERENCE.md`. No prose
+duplication.
 
 
 ## Verification milestones
@@ -785,9 +1164,11 @@ Sanity checkpoints during implementation, in order:
 - `tools/katago_parity_test.py` passes: outputs match upstream KataGo
   to within ~1e-3 on at least one reference position (or
   self-consistency check passes if upstream isn't installed).
-- `tools/warm_init_from_katago.py` is unchanged on disk
-  (`git diff tools/warm_init_from_katago.py` is empty). No
-  warm-init regression test needed.
+- **Warm-init regression test** (mandatory): run warm-init on the
+  same `.bin.gz` before *and* after the parser-extension change in
+  Phase 0.1; assert every tensor in the resulting `training.pt` is
+  bit-equal. The parser change is strictly additive only if this
+  passes.
 
 **Phase 1 done**:
 - `LoadedModel::load()` on `kata1.onnx` prints `type=katago board=9
@@ -841,11 +1222,17 @@ Sanity checkpoints during implementation, in order:
    updating. Mitigation: the parser already prints a warning for
    newer versions and proceeds optimistically; track upstream when
    needed.
-5. ~~**Refactoring `warm_init_from_katago.py` could regress warm-init.**~~
-   *Dropped.* The original plan moved the parser into a new module;
-   the revised plan imports directly from `warm_init_from_katago.py`
-   without editing it. The file is byte-for-byte unchanged, so there
-   is nothing to regress.
+5. **Parser extension in `warm_init_from_katago.py` could regress
+   warm-init.** The plan now requires retaining the previously-
+   discarded head layers to feed `katago_arch.py` (P1 review finding).
+   This means `warm_init_from_katago.py` is no longer byte-for-byte
+   unchanged — we add `Optional` fields to dataclasses and populate
+   them in the parsers. Mitigation: the change is strictly additive
+   (required fields are unchanged, new fields default to None,
+   warm-init code reaches into none of them). Phase 0.1 mandates a
+   byte-diff of `training.pt` before vs. after the parser extension
+   on the same `.bin.gz` input. If any tensor differs, do not
+   continue — the change is not actually additive.
 6. **TRT engine build time on large boards.** kata1 b10c128 at 19×19
    builds in ~30-90 s per (GPU, batch, precision) combo on a 4090.
    Fine for one-off; engine cache (already in place) handles
@@ -865,8 +1252,7 @@ New files (Python — phase 0):
   inference graph (heads we use only). ~400-600 LoC.
 - `tools/katago_to_onnx.py` — CLI tool: `.bin.gz` / `.txt.gz` → ONNX
   with MiniGo-compatible output names. Imports parser classes
-  directly from `warm_init_from_katago.py` (no parser refactor).
-  ~150 LoC.
+  directly from `warm_init_from_katago.py`. ~150 LoC.
 - `tools/katago_parity_test.py` — converter validation. ~100 LoC.
 
 New files (C++ — phases 2-3):
@@ -878,24 +1264,46 @@ New files (C++ — phases 2-3):
 - `KATAGO_INFERENCE.md` — workflow doc: converter usage, supported
   rules, example invocations, known limitations.
 
-Modified files:
+Modified files (additive only — every existing code path is
+unchanged for MiniGo runs):
+- `tools/warm_init_from_katago.py` — extend `PolicyHead`,
+  `ValueHead` dataclasses with `Optional` fields for previously-
+  discarded layers; update `_parse_policy_head` /
+  `_parse_value_head` to populate them. Required fields and
+  warm-init call sites unchanged. Validate via byte-diff of
+  `training.pt`.
 - `include/loaded_model.h` — `ModelFormat` enum +
   `input_global_channels` field.
-- `src/loaded_model.cpp` — KataGo arm of format detection.
+- `src/loaded_model.cpp` — KataGo arm of format detection (added
+  before existing ResNet/ViT detection, doesn't alter that path).
 - `include/onnx_loader.h` / `src/onnx_loader.cpp` — graph-input
-  enumeration helper.
-- `include/game.h` / `src/game.cpp` — public history accessor for
-  encoder.
-- `src/mcts.cpp` — encoder dispatch at search-thread eval.
-- `src/main_play.cpp` / `src/main_benchmark.cpp` /
-  `src/main_selfplay.cpp` / `src/main_evaluate.cpp` — encoder
-  dispatch at root-eval call sites; CLI flags for `--komi` if not
-  already there.
+  enumeration helper (new function; existing initializer parser
+  unchanged).
+- `include/batch_evaluator.h` — `NNResultBuf` gains `score_sd` and
+  `ownership` fields; `BatchEvaluator` gains `encode_state` virtual
+  with default body `game.encode(out)`. Both additive — existing
+  fields and methods unchanged.
+- `src/nn_evaluator.cpp` — copy `score_sd` and `ownership` through
+  to `NNResultBuf` (was being dropped); override `encode_state` to
+  dispatch on `model_->format`. ~6 LoC of additions.
+- `include/game.h` / `src/game.cpp` — `recent_actions_` private
+  array + `recent_action(int)` accessor; `play()`, `reset()`,
+  `copy()` extended to maintain it. No public API change beyond
+  the new accessor. MiniGo encoder unchanged.
+- `src/mcts.cpp` — 4 call-site renames `game.encode(state)` →
+  `evaluator_->encode_state(game, state)`. No format awareness in
+  MCTS itself.
+- `src/main_play.cpp`, `src/main_benchmark.cpp`,
+  `src/main_evaluate.cpp` — same call-site rename for root-eval
+  paths; CLI `--komi` flag plumb-through if not already there.
+- `src/main_selfplay.cpp` — **only** an early-error guard rejecting
+  `format == KataGo`. No encoder rename, no augmentation change, no
+  V2-record-format change.
 - `src/tensorrt_compute.cpp` — input-side KataGo branch in
   `predict_batch`, two extra input-tensor name fields in
   `TRTDeviceState`, two extra input device buffers in `Impl`,
   two-input optimization profile in `build_or_load_engine`. Output
-  side unchanged.
+  side unchanged. Existing MiniGo path byte-identical.
 - `src/eigen_compute.cpp`, `src/cuda_compute.cu`,
   `src/opencl_compute.cpp`, `src/metal_compute.mm`,
   `src/rknn_compute.cpp` — early "unsupported format" check.
