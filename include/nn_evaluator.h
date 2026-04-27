@@ -47,6 +47,9 @@ public:
     // Convenience: creates a temporary buf (for root eval, once per move)
     Result evaluate_single(const std::vector<float>& state) override;
 
+    // Format-aware encoder dispatch (KataGo vs MiniGo).
+    void encode_state(const GoGame& game, std::vector<float>& out) const override;
+
     // Block until all server threads have created their ComputeHandles.
     // Call this after construction to ensure GPU resources are fully
     // initialized before starting another NNEvaluator on the same GPUs.

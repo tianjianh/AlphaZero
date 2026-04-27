@@ -1,9 +1,18 @@
 #include "nn_evaluator.h"
+#include "katago_inputs.h"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
 namespace minigo {
+
+void NNEvaluator::encode_state(const GoGame& game, std::vector<float>& out) const {
+    if (model_->format == ModelFormat::KataGo) {
+        encode_for_katago(game, model_.get(), out);
+    } else {
+        game.encode(out);
+    }
+}
 
 NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
                          std::shared_ptr<ComputeContext> context,
@@ -58,7 +67,8 @@ NNEvaluator::Result NNEvaluator::evaluate_with_buf(
         buf.cv.wait(lock, [&] { return buf.done; });
     }
 
-    return { std::move(buf.policy), buf.value, buf.score };
+    return { std::move(buf.policy), buf.value, buf.score,
+             buf.score_sd, std::move(buf.ownership) };
 }
 
 // Convenience wrapper — creates a temporary buf per call.
@@ -93,7 +103,9 @@ NNEvaluator::evaluate(const std::vector<std::vector<float>>& states) {
     for (int i = 0; i < n; i++) {
         std::unique_lock<std::mutex> lock(bufs[i]->mu);
         bufs[i]->cv.wait(lock, [&, i] { return bufs[i]->done; });
-        results.push_back({ std::move(bufs[i]->policy), bufs[i]->value, bufs[i]->score });
+        results.push_back({ std::move(bufs[i]->policy), bufs[i]->value,
+                            bufs[i]->score, bufs[i]->score_sd,
+                            std::move(bufs[i]->ownership) });
     }
     return results;
 }
@@ -149,11 +161,14 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
             // uniform priors over legal moves instead of crashing on an
             // empty vector.
             int action_size = model_->board_size * model_->board_size + 1;
+            int board_area = model_->board_size * model_->board_size;
             for (auto* buf : batch) {
                 std::lock_guard<std::mutex> lock(buf->mu);
                 buf->policy.assign(action_size, 0.0f);
-                buf->value = 0.0f;
-                buf->score = 0.0f;
+                buf->value    = 0.0f;
+                buf->score    = 0.0f;
+                buf->score_sd = 0.0f;
+                buf->ownership.assign(board_area, 0.0f);
                 buf->done = true;
                 buf->cv.notify_one();
             }
@@ -166,10 +181,12 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
             NNResultBuf* buf = batch[i];
             {
                 std::lock_guard<std::mutex> lock(buf->mu);
-                buf->policy = std::move(all_results[i].policy);
-                buf->value  = all_results[i].value;
-                buf->score  = all_results[i].score;
-                buf->done   = true;
+                buf->policy    = std::move(all_results[i].policy);
+                buf->value     = all_results[i].value;
+                buf->score     = all_results[i].score;
+                buf->score_sd  = all_results[i].score_sd;
+                buf->ownership = std::move(all_results[i].ownership);
+                buf->done      = true;
             }
             buf->cv.notify_one();
         }

@@ -26,6 +26,9 @@ Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching K
 
 **Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.
 
+This build can also load **KataGo** networks (`kata1` and similar) for inference.
+See [KataGo inference](#katago-inference-tensorrt-only) below for the conversion + run workflow.
+
 ### Neural network architecture
 
 KataGo-style 7-headed design.  Two architectures (ResNet, ViT) share the
@@ -696,6 +699,74 @@ cd ..
 ./build/benchmark --model models/bench_large.onnx \
     --games 10 --threads 10 --search-threads 16
 ```
+
+### KataGo inference (TensorRT only)
+
+You can run a stock **KataGo** network (`kata1` and similar) inside this engine's
+MCTS, for human play, benchmark, and match games. KataGo weights are
+**inference-only** in this build — they cannot be used to generate selfplay
+training records or fine-tuned. See `KATAGO_INFERENCE.md` for full details and
+known limitations (ladder features and a few encore-only signals are zeroed).
+
+#### What accepts KataGo weights
+
+| Tool | Input format | Purpose | KataGo accepted? |
+|---|---|---|---|
+| `tools/katago_to_onnx.py` | `.txt.gz` / `.bin.gz` | one-shot conversion to ONNX | yes — required first step |
+| `tools/katago_parity_test.py` | `.txt.gz` + `.onnx` | validate the converted ONNX | yes |
+| `tools/warm_init_from_katago.py` | `.txt.gz` / `.bin.gz` | warm-init MiniGo's trunk (training prep) | yes (existing tool — unrelated to inference) |
+| `build/play` | `.onnx` (KataGo or MiniGo) | interactive play | yes |
+| `build/evaluate` | `.onnx` × 2 | match games (kata1 vs MiniGo, kata1 vs kata1, …) | yes |
+| `build/benchmark` | `.onnx` (KataGo or MiniGo) | NN/MCTS throughput | yes (sections 1–4; section 5 selfplay is auto-skipped) |
+| `build/selfplay` | `.onnx` | generate training records | **no — refuses KataGo with `return 2`** |
+| `scripts/train*.py`, `run_continuous.py` | `.pt` / `.onnx` | training pipeline | no — KataGo never enters training |
+
+Backend support is restricted to **TensorRT**. Eigen / CUDA / OpenCL / Metal /
+RKNN throw `"KataGo format requires the TensorRT backend"` at handle creation.
+
+> ⚠ I tested `selfplay` to **confirm the rejection guard fires**, not to use it.
+> Selfplay refuses KataGo models on purpose — the V2 record format and the
+> 8-fold augmentation are MiniGo-shaped, so feeding KataGo states through them
+> would produce corrupt training data. Use `play` / `evaluate` / `benchmark`
+> for KataGo runs.
+
+#### How to use it (5 steps)
+
+```bash
+# 1.  Download a KataGo network (or any kata1 .bin.gz / .txt.gz).
+wget https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b10c128-s1141046784-d204142634.txt.gz
+
+# 2.  Convert to ONNX. The exporter bakes post-processing (softmax → P(W)−P(L),
+#     score × 20, ownership (tanh+1)/2) into the graph so the C++ side reads
+#     the same shapes whether the model is MiniGo or KataGo. Inputs differ:
+#     MiniGo has one input; KataGo has state_spatial [N,22,H,W] + state_global [N,19].
+#     Pick the board size you want to run at — the engine is per-board-size.
+python tools/katago_to_onnx.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --board 9 \
+    --output models/kata1-b10c128.onnx
+
+# 3.  (optional) Validate PyTorch ↔ ONNX Runtime parity.
+python tools/katago_parity_test.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --onnx models/kata1-b10c128.onnx --board 9
+
+# 4.  Build with the TensorRT backend (KataGo is TRT-only).
+cmake -B build -DMINIGO_BACKEND=tensorrt
+make -C build -j
+
+# 5.  Run.  First run on each (GPU × max-batch × precision) builds a TRT
+#     engine and caches it under trt_cache/; later runs reuse it.
+./build/play       --model models/kata1-b10c128.onnx --sims 800 --komi 7.0
+./build/benchmark  --model models/kata1-b10c128.onnx --max-batch 256 --sims 256 --komi 7.0
+./build/evaluate   --model1 models/kata1-b10c128.onnx \
+                   --model2 models/kata1-b10c128.onnx \
+                   --games 50 --sims 200 --komi 7.0
+```
+
+`--komi` matters: kata1's typical 9×9 komi is `7.0` or `7.5`, and the value
+flows into KataGo's global feature vector. A mismatched komi silently degrades
+strength rather than erroring.
 
 ## Architecture
 

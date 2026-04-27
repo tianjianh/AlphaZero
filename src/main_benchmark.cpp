@@ -162,7 +162,7 @@ int main(int argc, char* argv[]) {
 
         GoGame game(config.board_size, config.komi);
         std::vector<float> state;
-        game.encode(state);
+        eval_single->encode_state(game, state);
 
         // Warmup
         for (int i = 0; i < 10; i++) eval_single->evaluate_single(state);
@@ -185,7 +185,7 @@ int main(int argc, char* argv[]) {
 
         GoGame game(config.board_size, config.komi);
         std::vector<float> state;
-        game.encode(state);
+        eval_single->encode_state(game, state);
 
         for (int batch : {1, 8, 32, 64, 128}) {
             std::vector<std::vector<float>> batch_states(batch, state);
@@ -232,7 +232,11 @@ int main(int argc, char* argv[]) {
     eval_single.reset();
 
     // ── 5. Multi-threaded self-play ───────────────────────────────
-    {
+    if (model->format == ModelFormat::KataGo) {
+        std::cout << "5. Self-play: SKIPPED for KataGo-format model "
+                  << "(KataGo runs inference only; selfplay generates "
+                  << "MiniGo training records).\n";
+    } else {
         std::cout << "5. Self-play (" << num_games << " games, "
                   << num_threads << " threads, "
                   << nn_server_threads << " server(s))...\n";

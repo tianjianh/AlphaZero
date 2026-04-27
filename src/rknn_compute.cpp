@@ -469,6 +469,10 @@ RKNNComputeHandle::~RKNNComputeHandle() {
 std::unique_ptr<ComputeHandle>
 RKNNComputeContext::create_handle(const LoadedModel* model,
                                   int gpu_id, int max_batch_size) {
+    if (model->format == ModelFormat::KataGo)
+        throw std::runtime_error(
+            "KataGo format requires the TensorRT backend. "
+            "Rebuild with `cmake -DMINIGO_BACKEND=tensorrt`.");
     (void)gpu_id;
     int tid = impl_->next_thread_index.fetch_add(1);
     return std::make_unique<RKNNComputeHandle>(

@@ -36,6 +36,20 @@ public:
     // Neural network encoding: (input_channels, H, W) flattened row-major
     void encode(std::vector<float>& out) const;
 
+    // Most-recent action locations, used by the KataGo V7 history planes
+    // (which encode WHERE moves were played, not the resulting boards).
+    // steps_back=0 is the most recent action, 1 is the move before, etc.
+    // Values: a board action in [0, n*n), PASS_MOVE (-1) for a pass, or
+    // -2 sentinel meaning "no move that far back yet". MiniGo's ring_buf_
+    // (board snapshots) is used for the MiniGo encoder; this auxiliary
+    // array is purely additive and only consulted by katago_inputs.cpp.
+    int recent_action(int steps_back) const;
+
+    // True if `action` is a simple-ko-banned move (would replay the
+    // previous board). Empty-cell + non-suicide moves can be flagged.
+    // Used by the KataGo V7 encoder for plane 6.
+    bool is_ko_ban(int action) const;
+
     // Display
     std::string display() const;
     std::string action_to_str(int action) const;
@@ -66,6 +80,14 @@ private:
     std::array<std::array<int8_t, MAX_BOARD * MAX_BOARD>, RING_CAP> ring_buf_;
     int ring_head_ = 0;   // index of oldest valid slot
     int ring_size_ = 0;   // number of valid entries (0 … history_length)
+
+    // Recent move locations for KataGo V7 history planes. recent_actions_[0]
+    // is the most recent action (1 ply ago). KataGo V7 reads up to 5 plies
+    // of history. Only katago_inputs.cpp reads this; the MiniGo encoder
+    // ignores it.
+    static constexpr int RECENT_ACTIONS_CAP = 5;
+    std::array<int, RECENT_ACTIONS_CAP> recent_actions_;
+    int recent_actions_count_ = 0;
 
     struct Pos { int r, c; };
     // Stack-based group helpers — out_group is a caller-supplied buffer

@@ -33,5 +33,17 @@ struct OnnxTensor {
 // Parse an ONNX model file and return all initializer tensors (weight arrays).
 std::vector<OnnxTensor> parse_onnx_file(const std::string& path);
 
+// One graph-level input or output tensor descriptor (name + shape).
+// Symbolic shape entries (e.g. dynamic batch) are stored as -1.
+struct OnnxGraphIO {
+    std::string name;
+    std::vector<int64_t> dims;
+};
+
+// Enumerate the graph inputs of an ONNX model. Used by LoadedModel to
+// distinguish KataGo (two inputs: state_spatial + state_global) from
+// MiniGo (one input).
+std::vector<OnnxGraphIO> parse_onnx_graph_inputs(const std::string& path);
+
 }  // namespace onnx_parser
 }  // namespace minigo

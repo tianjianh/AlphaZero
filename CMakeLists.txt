@@ -271,6 +271,7 @@ set(CORE_SOURCES
     src/nn_evaluator.cpp
     src/mcts.cpp
     src/async_bot.cpp
+    src/katago_inputs.cpp
 )
 
 if(HAS_EIGEN)

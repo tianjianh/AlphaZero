@@ -245,7 +245,7 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
 
         // ── Evaluate (blocks until server processes batch) ──────
         std::vector<float> state;
-        game_copy_ptr->encode(state);
+        evaluator_->encode_state(*game_copy_ptr, state);
 
         auto result = evaluator_->evaluate_with_buf(result_buf, state);
 
@@ -337,7 +337,7 @@ void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
                 continue;
             }
 
-            game_copy_ptr->encode(leaf.state);
+            evaluator_->encode_state(*game_copy_ptr, leaf.state);
             game_copy_ptr->get_legal_moves(leaf.legal);
             pending.push_back(std::move(leaf));
         }
@@ -410,7 +410,7 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
         new_root = std::make_unique<MCTSNode>();
 
         std::vector<float> state_enc;
-        game.encode(state_enc);
+        evaluator_->encode_state(game, state_enc);
         auto root_results = evaluator_->evaluate({ state_enc });
         root_nn_output = std::move(root_results[0]);
 
@@ -420,6 +420,10 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
         expand(new_root.get(), root_nn_output.policy, legal);
         new_root->nn_score    = root_nn_output.score;
         new_root->nn_score_sd = root_nn_output.score_sd;
+        // Snapshot ownership at the root so AnalysisInfo can show it.
+        // (MCTSNode itself doesn't carry ownership — only the root needs
+        // it for the analysis HUD.)
+        root_nn_ownership_    = root_nn_output.ownership;
         new_root->state.store(NODE_EXPANDED, std::memory_order_release);
         new_root->visit_count.store(1, std::memory_order_relaxed);
         float root_utility = config_.win_loss_weight * root_nn_output.value;
@@ -573,6 +577,7 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
     // the analysis HUD always shows data for the current position.
     info.root_score    = root_->nn_score;
     info.root_score_sd = root_->nn_score_sd;
+    info.root_ownership = root_nn_ownership_;
 
     int vc = root_->visit_count.load(std::memory_order_relaxed);
     info.total_visits = vc;

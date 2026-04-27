@@ -33,6 +33,15 @@ struct FCWeights {
     int out_features = 0, in_features = 0;
 };
 
+// Detected at load time from the ONNX graph inputs. KataGo runs are
+// inference-only and only supported on the TensorRT backend; other
+// backends throw "unsupported model format" when given a KataGo ONNX.
+enum class ModelFormat {
+    MiniGo = 0,   // MiniGo's own ResNet/ViT (single state input)
+    KataGo = 1,   // KataGo network exported via tools/katago_to_onnx.py
+                  // (two inputs: state_spatial + state_global)
+};
+
 class LoadedModel {
 public:
     // Load and parse an ONNX model file.  Pre-fuses BN parameters.
@@ -42,9 +51,11 @@ public:
     std::string model_path;
 
     // Architecture metadata (all inferred from ONNX weights by load())
-    std::string model_type;   // "resnet" or "vit"
+    ModelFormat format = ModelFormat::MiniGo;
+    std::string model_type;   // "resnet", "vit", or "katago"
     int board_size = 0;
     int input_channels = 0;
+    int input_global_channels = 0;  // KataGo only (0 for MiniGo)
     int num_filters = 0;      // ResNet: conv filters; ViT: d_model
     int num_res_blocks = 0;   // ResNet only
     int vit_depth = 0;        // ViT: transformer blocks

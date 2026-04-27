@@ -166,6 +166,10 @@ private:
     bool  root_noise_added_ = false;  // set by search() when Dirichlet noise
                                       // is injected; reset by make_move() and
                                       // when a fresh root is built
+    // Root NN ownership for AnalysisInfo. Stored only at the root because
+    // only the root drives the analysis HUD; per-node ownership would
+    // bloat MCTSNode without a current consumer.
+    std::vector<float> root_nn_ownership_;
 
     // Stop flag — checked by search threads, set by request_stop()
     std::atomic<bool> should_stop_{false};

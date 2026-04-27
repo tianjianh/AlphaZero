@@ -178,6 +178,115 @@ static std::vector<OnnxTensor> parse_model(const uint8_t* data, size_t size) {
 }
 
 // ----------------------------------------------------------------
+// Graph-input enumeration
+// ----------------------------------------------------------------
+// ONNX wire format:
+//   GraphProto.input  is field 11 (repeated ValueInfoProto)
+//   ValueInfoProto.name  is field 1 (string)
+//   ValueInfoProto.type  is field 2 (TypeProto)
+//     TypeProto.tensor_type  is field 1 (TypeProto.Tensor)
+//       Tensor.shape  is field 2 (TensorShapeProto)
+//         Shape.dim   is field 1 (repeated Dimension)
+//           Dimension.dim_value  is field 1 (int64)
+//           Dimension.dim_param  is field 2 (string)  → -1
+static OnnxGraphIO parse_value_info(Reader r) {
+    OnnxGraphIO io;
+    while (r.has_data()) {
+        auto [field, wire] = r.read_tag();
+        if (field == 1 && wire == LENGTH_DELIMITED) {
+            // name
+            auto len = r.read_varint();
+            io.name = std::string((const char*)r.data, (size_t)len);
+            r.data += len;
+        } else if (field == 2 && wire == LENGTH_DELIMITED) {
+            // type → TypeProto
+            auto type_msg = r.read_submessage();
+            while (type_msg.has_data()) {
+                auto [tf, tw] = type_msg.read_tag();
+                if (tf == 1 && tw == LENGTH_DELIMITED) {
+                    // tensor_type → TypeProto.Tensor
+                    auto tensor_msg = type_msg.read_submessage();
+                    while (tensor_msg.has_data()) {
+                        auto [tf2, tw2] = tensor_msg.read_tag();
+                        if (tf2 == 2 && tw2 == LENGTH_DELIMITED) {
+                            // shape → TensorShapeProto
+                            auto shape_msg = tensor_msg.read_submessage();
+                            while (shape_msg.has_data()) {
+                                auto [sf, sw] = shape_msg.read_tag();
+                                if (sf == 1 && sw == LENGTH_DELIMITED) {
+                                    // dim → Dimension
+                                    auto dim_msg = shape_msg.read_submessage();
+                                    int64_t dim_value = -1;  // symbolic by default
+                                    while (dim_msg.has_data()) {
+                                        auto [df, dw] = dim_msg.read_tag();
+                                        if (df == 1 && dw == VARINT) {
+                                            dim_value = (int64_t)dim_msg.read_varint();
+                                        } else {
+                                            dim_msg.skip(dw);
+                                        }
+                                    }
+                                    io.dims.push_back(dim_value);
+                                } else {
+                                    shape_msg.skip(sw);
+                                }
+                            }
+                        } else {
+                            tensor_msg.skip(tw2);
+                        }
+                    }
+                } else {
+                    type_msg.skip(tw);
+                }
+            }
+        } else {
+            r.skip(wire);
+        }
+    }
+    return io;
+}
+
+static std::vector<OnnxGraphIO> parse_graph_inputs(Reader r) {
+    std::vector<OnnxGraphIO> inputs;
+    while (r.has_data()) {
+        auto [field, wire] = r.read_tag();
+        if (field == 11 && wire == LENGTH_DELIMITED) {
+            auto sub = r.read_submessage();
+            inputs.push_back(parse_value_info(sub));
+        } else {
+            r.skip(wire);
+        }
+    }
+    return inputs;
+}
+
+static std::vector<OnnxGraphIO> parse_model_inputs(const uint8_t* data, size_t size) {
+    Reader r(data, size);
+    std::vector<OnnxGraphIO> inputs;
+    while (r.has_data()) {
+        auto [field, wire] = r.read_tag();
+        if (field == 7 && wire == LENGTH_DELIMITED) {
+            auto sub = r.read_submessage();
+            inputs = parse_graph_inputs(sub);
+        } else {
+            r.skip(wire);
+        }
+    }
+    return inputs;
+}
+
+std::vector<OnnxGraphIO> parse_onnx_graph_inputs(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+        throw std::runtime_error("Cannot open model file: " + path);
+    size_t file_size = (size_t)file.tellg();
+    file.seekg(0);
+    std::vector<uint8_t> buf(file_size);
+    file.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)file_size);
+    file.close();
+    return parse_model_inputs(buf.data(), buf.size());
+}
+
+// ----------------------------------------------------------------
 // Public API
 // ----------------------------------------------------------------
 std::vector<OnnxTensor> parse_onnx_file(const std::string& path) {

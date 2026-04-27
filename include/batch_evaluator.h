@@ -1,6 +1,7 @@
 #pragma once
 
 #include "compute_context.h"
+#include "game.h"
 #include <condition_variable>
 #include <mutex>
 #include <vector>
@@ -27,8 +28,10 @@ struct NNResultBuf {
 
     // Output (filled by server thread)
     std::vector<float> policy;
-    float              value = 0.0f;
-    float              score = 0.0f;
+    float              value    = 0.0f;
+    float              score    = 0.0f;
+    float              score_sd = 0.0f;
+    std::vector<float> ownership;
 
     void reset() { done = false; }
 };
@@ -65,6 +68,16 @@ public:
     virtual Result evaluate_single(const std::vector<float>& state) {
         auto results = evaluate({state});
         return std::move(results[0]);
+    }
+
+    // Encode a game position into the format this evaluator's model
+    // expects. Default body is MiniGo's 17-channel encoder; the
+    // NNEvaluator override dispatches on model format and routes
+    // KataGo-format models to the V7 encoder. Routing the dispatch
+    // through the evaluator (rather than every call site) keeps MCTS
+    // format-agnostic.
+    virtual void encode_state(const GoGame& game, std::vector<float>& out) const {
+        game.encode(out);
     }
 };
 

@@ -81,7 +81,9 @@ struct TRTDeviceState {
     nvinfer1::IRuntime*                     runtime = nullptr;
 
     // Cached tensor names + sizes (populated after engine build)
-    std::string input_name;
+    std::string input_name;            // MiniGo: "state"
+    std::string input_spatial_name;    // KataGo: "state_spatial"
+    std::string input_global_name;     // KataGo: "state_global"
     std::string policy_name;
     std::string value_name;
     std::string score_name;       // "score_mean"
@@ -276,22 +278,27 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
 #pragma GCC diagnostic pop
     std::cout << "TensorRT: building with " << build_prec << " precision\n";
 
-    // Optimization profile for dynamic batch size [1, max_batch_size]
+    // Optimization profile for dynamic batch size [1, max_batch_size].
+    // KataGo networks have 2 inputs (spatial + global); MiniGo has 1.
+    // Set min/opt/max dims for every input.
     auto* profile = builder->createOptimizationProfile();
-    auto* input_tensor = network->getInput(0);
-    auto input_dims = input_tensor->getDimensions();
-    // input_dims is [N, C, H, W] — N is dynamic (-1)
-    nvinfer1::Dims4 min_dims(1, input_dims.d[1], input_dims.d[2], input_dims.d[3]);
-    nvinfer1::Dims4 opt_dims(std::max(1, max_batch_size / 2),
-                             input_dims.d[1], input_dims.d[2], input_dims.d[3]);
-    nvinfer1::Dims4 max_dims(max_batch_size,
-                             input_dims.d[1], input_dims.d[2], input_dims.d[3]);
-    profile->setDimensions(input_tensor->getName(),
-                           nvinfer1::OptProfileSelector::kMIN, min_dims);
-    profile->setDimensions(input_tensor->getName(),
-                           nvinfer1::OptProfileSelector::kOPT, opt_dims);
-    profile->setDimensions(input_tensor->getName(),
-                           nvinfer1::OptProfileSelector::kMAX, max_dims);
+    int nb_inputs = network->getNbInputs();
+    int opt_batch = std::max(1, max_batch_size / 2);
+    for (int i = 0; i < nb_inputs; ++i) {
+        auto* inp = network->getInput(i);
+        auto dims = inp->getDimensions();
+        // dims.d[0] is the dynamic batch (-1); rest are fixed.
+        nvinfer1::Dims min_dims = dims, opt_dims = dims, max_dims = dims;
+        min_dims.d[0] = 1;
+        opt_dims.d[0] = opt_batch;
+        max_dims.d[0] = max_batch_size;
+        profile->setDimensions(inp->getName(),
+                               nvinfer1::OptProfileSelector::kMIN, min_dims);
+        profile->setDimensions(inp->getName(),
+                               nvinfer1::OptProfileSelector::kOPT, opt_dims);
+        profile->setDimensions(inp->getName(),
+                               nvinfer1::OptProfileSelector::kMAX, max_dims);
+    }
     config->addOptimizationProfile(profile);
 
     // Build serialized engine
@@ -416,12 +423,16 @@ struct TensorRTComputeHandle::Impl {
     TRTDeviceState& dev;
     nvinfer1::IExecutionContext* exec_ctx = nullptr;
 
-    int board_size     = 0;
-    int input_channels = 0;
+    ModelFormat format = ModelFormat::MiniGo;
+    int board_size            = 0;
+    int input_channels        = 0;       // MiniGo: 17; KataGo: 22 (spatial)
+    int input_global_channels = 0;       // KataGo: 19
     int max_batch_size = 0;
 
     // I/O device buffers (256-byte aligned as required by TRT 10)
-    float* d_input     = nullptr;   // [max_batch, C, H, W]
+    float* d_input          = nullptr;   // MiniGo: [max_batch, C, H, W]
+    float* d_input_spatial  = nullptr;   // KataGo: [max_batch, 22, H, W]
+    float* d_input_global   = nullptr;   // KataGo: [max_batch, 19]
     float* d_policy    = nullptr;   // [max_batch, action_size]
     float* d_value     = nullptr;   // [max_batch, 1]
     float* d_score     = nullptr;   // [max_batch, 1]
@@ -430,6 +441,8 @@ struct TensorRTComputeHandle::Impl {
 
     // Tensor names from engine
     std::string input_name;
+    std::string input_spatial_name;
+    std::string input_global_name;
     std::string policy_name;
     std::string value_name;
     std::string score_name;
@@ -458,7 +471,9 @@ struct TensorRTComputeHandle::Impl {
             std::lock_guard<std::mutex> lock(dev.engine_mutex);
             delete exec_ctx;
         }
-        if (d_input)     cudaFree(d_input);
+        if (d_input)         cudaFree(d_input);
+        if (d_input_spatial) cudaFree(d_input_spatial);
+        if (d_input_global)  cudaFree(d_input_global);
         if (d_policy)    cudaFree(d_policy);
         if (d_value)     cudaFree(d_value);
         if (d_score)     cudaFree(d_score);
@@ -480,15 +495,19 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
         if (!dev.engine) {
             dev.engine = build_or_load_engine(dev, model, max_batch_size);
 
-            // Discover I/O tensor names by matching ONNX export names
+            // Discover I/O tensor names by matching ONNX export names.
+            // KataGo (two inputs): "state_spatial", "state_global".
+            // MiniGo (single input): single nameless / "state" tensor.
             int nb = dev.engine->getNbIOTensors();
             for (int i = 0; i < nb; i++) {
                 const char* name = dev.engine->getIOTensorName(i);
                 auto mode = dev.engine->getTensorIOMode(name);
+                std::string sname(name);
                 if (mode == nvinfer1::TensorIOMode::kINPUT) {
-                    dev.input_name = name;
+                    if      (sname == "state_spatial") dev.input_spatial_name = name;
+                    else if (sname == "state_global")  dev.input_global_name  = name;
+                    else                                dev.input_name         = name;
                 } else {
-                    std::string sname(name);
                     if (sname == "policy_logits")
                         dev.policy_name = name;
                     else if (sname == "value")
@@ -510,7 +529,21 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
                 }
             }
 
-            if (dev.input_name.empty() || dev.policy_name.empty() || dev.value_name.empty()) {
+            bool is_katago_engine =
+                !dev.input_spatial_name.empty() && !dev.input_global_name.empty();
+            bool is_minigo_engine = !dev.input_name.empty();
+
+            if (model->format == ModelFormat::KataGo && !is_katago_engine)
+                throw std::runtime_error(
+                    "TensorRT: KataGo model loaded but engine is missing "
+                    "state_spatial / state_global inputs.");
+            if (model->format == ModelFormat::MiniGo && !is_minigo_engine)
+                throw std::runtime_error(
+                    "TensorRT: MiniGo model loaded but engine has no "
+                    "single-input tensor.");
+
+            if (dev.policy_name.empty() || dev.value_name.empty()
+                || (!is_katago_engine && !is_minigo_engine)) {
                 std::ostringstream os;
                 os << "TensorRT: could not identify I/O tensors. Found " << nb << " tensors:";
                 for (int i = 0; i < nb; i++) {
@@ -528,27 +561,41 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
                 throw std::runtime_error(os.str());
             }
 
-            std::cout << "TensorRT I/O: input=\"" << dev.input_name
-                      << "\" policy=\"" << dev.policy_name
-                      << "\" value=\"" << dev.value_name
-                      << "\" score=\"" << dev.score_name
-                      << "\" score_sd=\"" << dev.score_sd_name
-                      << "\" ownership=\"" << dev.ownership_name << "\"\n";
+            if (is_katago_engine) {
+                std::cout << "TensorRT I/O: input_spatial=\"" << dev.input_spatial_name
+                          << "\" input_global=\"" << dev.input_global_name
+                          << "\" policy=\"" << dev.policy_name
+                          << "\" value=\"" << dev.value_name
+                          << "\" score=\"" << dev.score_name
+                          << "\" score_sd=\"" << dev.score_sd_name
+                          << "\" ownership=\"" << dev.ownership_name << "\"\n";
+            } else {
+                std::cout << "TensorRT I/O: input=\"" << dev.input_name
+                          << "\" policy=\"" << dev.policy_name
+                          << "\" value=\"" << dev.value_name
+                          << "\" score=\"" << dev.score_name
+                          << "\" score_sd=\"" << dev.score_sd_name
+                          << "\" ownership=\"" << dev.ownership_name << "\"\n";
+            }
         }
     }
 
     impl_ = new Impl(dev);
     auto& I = *impl_;
 
-    I.board_size     = model->board_size;
-    I.input_channels = model->input_channels;
-    I.max_batch_size = max_batch_size;
-    I.input_name      = dev.input_name;
-    I.policy_name     = dev.policy_name;
-    I.value_name      = dev.value_name;
-    I.score_name      = dev.score_name;
-    I.score_sd_name   = dev.score_sd_name;
-    I.ownership_name  = dev.ownership_name;
+    I.format                = model->format;
+    I.board_size            = model->board_size;
+    I.input_channels        = model->input_channels;
+    I.input_global_channels = model->input_global_channels;
+    I.max_batch_size        = max_batch_size;
+    I.input_name            = dev.input_name;
+    I.input_spatial_name    = dev.input_spatial_name;
+    I.input_global_name     = dev.input_global_name;
+    I.policy_name           = dev.policy_name;
+    I.value_name            = dev.value_name;
+    I.score_name            = dev.score_name;
+    I.score_sd_name         = dev.score_sd_name;
+    I.ownership_name        = dev.ownership_name;
 
     // Create per-thread execution context.  Serialized per engine via
     // dev.engine_mutex — see TRTDeviceState comment above for why.
@@ -563,11 +610,18 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     int HW = I.board_size * I.board_size;
     int action_size = HW + 1;
 
-    size_t input_bytes  = (size_t)max_batch_size * I.input_channels * HW * sizeof(float);
     size_t policy_bytes = (size_t)max_batch_size * action_size * sizeof(float);
     size_t value_bytes  = (size_t)max_batch_size * 1 * sizeof(float);
 
-    CUDA_CHECK(cudaMalloc(&I.d_input,  input_bytes));
+    if (I.format == ModelFormat::KataGo) {
+        size_t spatial_bytes = (size_t)max_batch_size * I.input_channels * HW * sizeof(float);
+        size_t global_bytes  = (size_t)max_batch_size * I.input_global_channels * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&I.d_input_spatial, spatial_bytes));
+        CUDA_CHECK(cudaMalloc(&I.d_input_global,  global_bytes));
+    } else {
+        size_t input_bytes  = (size_t)max_batch_size * I.input_channels * HW * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&I.d_input,  input_bytes));
+    }
     CUDA_CHECK(cudaMalloc(&I.d_policy, policy_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_value,  value_bytes));
     CUDA_CHECK(cudaMalloc(&I.d_score,     (size_t)max_batch_size * sizeof(float)));
@@ -614,24 +668,59 @@ TensorRTComputeHandle::predict_batch(
     int HW = H * W;
     int action_size = HW + 1;
 
-    // Flatten input states and upload
-    size_t input_floats = (size_t)N * I.input_channels * HW;
-    std::vector<float> flat_input;
-    flat_input.reserve(input_floats);
-    for (auto& s : states)
-        flat_input.insert(flat_input.end(), s.begin(), s.end());
+    if (I.format == ModelFormat::KataGo) {
+        // Encoder packs each state as: [22*H*W spatial floats][19 global floats].
+        const int sp_per = I.input_channels * HW;
+        const int gl_per = I.input_global_channels;
+        std::vector<float> flat_spatial((size_t)N * sp_per, 0.0f);
+        std::vector<float> flat_global ((size_t)N * gl_per, 0.0f);
+        for (int n = 0; n < N; ++n) {
+            const auto& s = states[n];
+            if ((int)s.size() != sp_per + gl_per)
+                throw std::runtime_error(
+                    "TensorRT KataGo: state size mismatch (" +
+                    std::to_string(s.size()) + " vs expected " +
+                    std::to_string(sp_per + gl_per) + ")");
+            std::memcpy(flat_spatial.data() + (size_t)n * sp_per,
+                        s.data(), sp_per * sizeof(float));
+            std::memcpy(flat_global.data() + (size_t)n * gl_per,
+                        s.data() + sp_per, gl_per * sizeof(float));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(I.d_input_spatial, flat_spatial.data(),
+            (size_t)N * sp_per * sizeof(float),
+            cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(I.d_input_global, flat_global.data(),
+            (size_t)N * gl_per * sizeof(float),
+            cudaMemcpyHostToDevice, cudaStreamPerThread));
 
-    CUDA_CHECK(cudaMemcpyAsync(I.d_input, flat_input.data(),
-        input_floats * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        nvinfer1::Dims4 sp_dims(N, I.input_channels, H, W);
+        nvinfer1::Dims2 gl_dims(N, I.input_global_channels);
+        if (!I.exec_ctx->setInputShape(I.input_spatial_name.c_str(), sp_dims))
+            throw std::runtime_error("TensorRT: setInputShape(state_spatial) failed");
+        if (!I.exec_ctx->setInputShape(I.input_global_name.c_str(), gl_dims))
+            throw std::runtime_error("TensorRT: setInputShape(state_global) failed");
+        if (!I.exec_ctx->setTensorAddress(I.input_spatial_name.c_str(), I.d_input_spatial))
+            throw std::runtime_error("TensorRT: setTensorAddress(state_spatial) failed");
+        if (!I.exec_ctx->setTensorAddress(I.input_global_name.c_str(), I.d_input_global))
+            throw std::runtime_error("TensorRT: setTensorAddress(state_global) failed");
+    } else {
+        // Flatten input states and upload (MiniGo single input)
+        size_t input_floats = (size_t)N * I.input_channels * HW;
+        std::vector<float> flat_input;
+        flat_input.reserve(input_floats);
+        for (auto& s : states)
+            flat_input.insert(flat_input.end(), s.begin(), s.end());
 
-    // Set dynamic input shape for this batch
-    nvinfer1::Dims4 input_dims(N, I.input_channels, H, W);
-    if (!I.exec_ctx->setInputShape(I.input_name.c_str(), input_dims))
-        throw std::runtime_error("TensorRT: setInputShape failed");
+        CUDA_CHECK(cudaMemcpyAsync(I.d_input, flat_input.data(),
+            input_floats * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
 
-    // Bind I/O tensor addresses
-    if (!I.exec_ctx->setTensorAddress(I.input_name.c_str(),  I.d_input))
-        throw std::runtime_error("TensorRT: setTensorAddress(input) failed");
+        nvinfer1::Dims4 input_dims(N, I.input_channels, H, W);
+        if (!I.exec_ctx->setInputShape(I.input_name.c_str(), input_dims))
+            throw std::runtime_error("TensorRT: setInputShape failed");
+        if (!I.exec_ctx->setTensorAddress(I.input_name.c_str(),  I.d_input))
+            throw std::runtime_error("TensorRT: setTensorAddress(input) failed");
+    }
+
     if (!I.exec_ctx->setTensorAddress(I.policy_name.c_str(), I.d_policy))
         throw std::runtime_error("TensorRT: setTensorAddress(policy) failed");
     if (!I.exec_ctx->setTensorAddress(I.value_name.c_str(),  I.d_value))

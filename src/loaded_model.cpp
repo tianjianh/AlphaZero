@@ -22,6 +22,48 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     auto model = std::make_shared<LoadedModel>();
     model->model_path = model_path;
 
+    // ── KataGo detection: graph has two named inputs ─────────────
+    // tools/katago_to_onnx.py exports with input names "state_spatial"
+    // and "state_global". Detected via the graph-input enumeration
+    // helper (initializers don't tell us about inputs).
+    {
+        auto inputs = onnx_parser::parse_onnx_graph_inputs(model_path);
+        const onnx_parser::OnnxGraphIO* sp = nullptr;
+        const onnx_parser::OnnxGraphIO* gl = nullptr;
+        for (auto& i : inputs) {
+            if (i.name == "state_spatial") sp = &i;
+            else if (i.name == "state_global") gl = &i;
+        }
+        if (sp && gl) {
+            model->format = ModelFormat::KataGo;
+            model->model_type = "katago";
+            // state_spatial: [batch, C, H, W]
+            if (sp->dims.size() != 4)
+                throw std::runtime_error(
+                    "KataGo state_spatial: expected 4D shape, got "
+                    + std::to_string(sp->dims.size()) + "D");
+            model->input_channels = (int)sp->dims[1];
+            int h = (int)sp->dims[2];
+            int w = (int)sp->dims[3];
+            if (h != w)
+                throw std::runtime_error(
+                    "KataGo non-square board not supported: H=" +
+                    std::to_string(h) + " W=" + std::to_string(w));
+            model->board_size = h;
+            // state_global: [batch, num_global]
+            if (gl->dims.size() != 2)
+                throw std::runtime_error(
+                    "KataGo state_global: expected 2D shape, got "
+                    + std::to_string(gl->dims.size()) + "D");
+            model->input_global_channels = (int)gl->dims[1];
+
+            std::cout << "Model loaded: type=katago board=" << model->board_size
+                      << " channels=" << model->input_channels
+                      << "+" << model->input_global_channels << "\n";
+            return model;
+        }
+    }
+
     // ── Detect model type and infer architecture ─────────────────
     bool is_vit = tm.count("token_proj.weight") > 0;
 

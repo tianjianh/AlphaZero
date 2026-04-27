@@ -25,7 +25,50 @@ void GoGame::reset() {
     final_black_score = 0.0f;
     ring_head_ = 0;
     ring_size_ = 0;
+    recent_actions_.fill(-2);
+    recent_actions_count_ = 0;
     update_history();
+}
+
+int GoGame::recent_action(int steps_back) const {
+    if (steps_back < 0 || steps_back >= RECENT_ACTIONS_CAP) return -2;
+    if (steps_back >= recent_actions_count_) return -2;
+    return recent_actions_[steps_back];
+}
+
+bool GoGame::is_ko_ban(int action) const {
+    int n = board_size;
+    if (!has_prev_board) return false;
+    if (action < 0 || action == PASS_MOVE || action >= n * n) return false;
+    int r = action / n, c = action % n;
+    if (board[r][c] != EMPTY) return false;
+    // Simulate playing here on a copy of the current board (without
+    // ko constraints) and compare to prev_board. If they match, this
+    // is the simple-ko location. We reuse is_legal_at_slow's structure
+    // but exclude the suicide/ko outcome — call play() on a copy and
+    // compare.
+    Stone test[MAX_BOARD][MAX_BOARD];
+    std::memcpy(test, board, sizeof(board));
+    test[r][c] = current_player;
+    Stone opp = opponent(current_player);
+    auto try_capture = [&](int nr, int nc) {
+        if (test[nr][nc] != opp) return;
+        Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
+        int gsize = get_group_on(test, nr, nc, grp, libs);
+        if (libs == 0)
+            for (int i = 0; i < gsize; i++) test[grp[i].r][grp[i].c] = EMPTY;
+    };
+    if (r > 0)     try_capture(r - 1, c);
+    if (r < n - 1) try_capture(r + 1, c);
+    if (c > 0)     try_capture(r, c - 1);
+    if (c < n - 1) try_capture(r, c + 1);
+
+    // Suicide check
+    Pos own_grp[MAX_BOARD * MAX_BOARD]; int own_libs;
+    get_group_on(test, r, c, own_grp, own_libs);
+    if (own_libs == 0) return false;  // suicide, not ko
+
+    return std::memcmp(test, prev_board, sizeof(board)) == 0;
 }
 
 GoGame GoGame::copy() const {
@@ -43,6 +86,8 @@ GoGame GoGame::copy() const {
     g.ring_buf_  = ring_buf_;
     g.ring_head_ = ring_head_;
     g.ring_size_ = ring_size_;
+    g.recent_actions_       = recent_actions_;
+    g.recent_actions_count_ = recent_actions_count_;
     return g;
 }
 
@@ -202,6 +247,14 @@ void GoGame::play(int action) {
 
     // Normalize pass
     if (action == n * n) action = PASS_MOVE;
+
+    // Record the (normalized) action so the KataGo V7 history planes can
+    // identify pass plies as PASS_MOVE rather than the pre-normalized
+    // n*n slot. Most-recent at index 0; older entries shift toward the tail.
+    for (int i = RECENT_ACTIONS_CAP - 1; i > 0; --i)
+        recent_actions_[i] = recent_actions_[i - 1];
+    recent_actions_[0] = action;
+    if (recent_actions_count_ < RECENT_ACTIONS_CAP) ++recent_actions_count_;
 
     std::memcpy(prev_board, board, sizeof(board));
     has_prev_board = true;

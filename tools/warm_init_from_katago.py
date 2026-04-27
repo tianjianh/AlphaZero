@@ -76,7 +76,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -360,39 +360,62 @@ class Trunk:
     initial_matmul: MatMulLayer
     blocks: List[Union[ResidualBlock, GPoolBlock]]
     block_kinds: List[str]  # 'regular' / 'gpool'
+    # Trunk-tip BN/activation applied after the last block before heads.
+    # Optional[...] = None so warm-init code that doesn't read these is unchanged.
+    trunk_tip_bn: Optional[BatchNormLayer] = None
+    trunk_tip_act: Optional[ActivationLayer] = None
 
 
 @dataclass
 class PolicyHead:
-    """Just enough of KataGo's policy head to do speculative slice transfer.
+    """KataGo's policy head.
 
-    KataGo's p1Conv [c_p1, c_trunk, 1, 1] is a learned 1x1 projection
-    from the trunk to c_p1=32 "policy-relevant" channels. MiniGo's
-    policy_conv [2, c_trunk, 1, 1] is also a 1x1 projection from the
-    trunk, just narrower (only 2 channels). Slicing 2 rows of p1Conv
-    into MG's policy_conv is better-than-random in expectation but
-    arbitrary about which 2 rows.
+    Required fields (used by warm-init): p1_conv, p1_bn.
+
+    Optional fields (Optional[...] = None) capture the previously-discarded
+    layers needed by the inference graph (katago_to_onnx.py). Warm-init
+    callers never read these, so existing behavior is byte-for-byte
+    preserved (validated by Phase 0.1 byte-diff of training.pt).
     """
     name: str
     p1_conv: ConvLayer
     p1_bn: BatchNormLayer
+    # Inference-only fields (filled by parser, ignored by warm-init):
+    g1_conv:        Optional[ConvLayer]       = None
+    g1_bn:          Optional[BatchNormLayer]  = None
+    g1_act:         Optional[ActivationLayer] = None
+    gpool_to_bias:  Optional[MatMulLayer]     = None
+    p1_act:         Optional[ActivationLayer] = None
+    p2_conv:        Optional[ConvLayer]       = None
+    gpool_to_pass:  Optional[MatMulLayer]     = None
+    # v15+ extras (still Optional):
+    gpool_to_pass_bias:  Optional[MatBiasLayer]    = None
+    pass_act:            Optional[ActivationLayer] = None
+    gpool_to_pass_mul2:  Optional[MatMulLayer]     = None
 
 
 @dataclass
 class ValueHead:
-    """Just enough of KataGo's value head to warm-init MiniGo's GPoolHeads.
+    """KataGo's value head.
 
-    For warm init we only need the trunk-to-pool stage:
-      v1Conv  : 1x1 conv c_trunk -> c_v1
-      v1BN    : BN/bias-mask on c_v1
-    The downstream FCs (v2Mul / v3Mul / sv3Mul / linear_miscvaluehead /
-    score-belief MoG) all have shapes that don't match MiniGo's heads.
-    The full layer set is parsed to keep the stream position correct,
-    but we only retain v1Conv and v1BN.
+    Required fields (used by warm-init): v1_conv, v1_bn.
+
+    Optional fields capture the previously-discarded layers needed by the
+    inference graph (katago_to_onnx.py).
     """
     name: str
     v1_conv: ConvLayer
     v1_bn: BatchNormLayer
+    # Inference-only fields (filled by parser, ignored by warm-init):
+    v1_act:           Optional[ActivationLayer] = None
+    v2_mul:           Optional[MatMulLayer]     = None
+    v2_bias:          Optional[MatBiasLayer]    = None
+    v2_act:           Optional[ActivationLayer] = None
+    v3_mul:           Optional[MatMulLayer]     = None
+    v3_bias:          Optional[MatBiasLayer]    = None
+    sv3_mul:          Optional[MatMulLayer]     = None
+    sv3_bias:         Optional[MatBiasLayer]    = None
+    v_ownership_conv: Optional[ConvLayer]       = None
 
 
 @dataclass
@@ -474,10 +497,11 @@ def _parse_trunk(r: TokenStream, model_version: int, binary: bool) -> Trunk:
         else:
             raise ValueError(f"Unknown block kind: {kind}")
 
-    # We don't need the trunk-tip BN/activation for warm init, but parse to
-    # keep the stream position consistent if anyone extends this later.
-    BatchNormLayer.parse(r, binary)
-    ActivationLayer.parse(r, model_version)
+    # Trunk-tip BN/activation: applied after the last block before heads.
+    # Warm-init doesn't read these; the inference graph (katago_to_onnx.py)
+    # does.
+    trunk_tip_bn = BatchNormLayer.parse(r, binary)
+    trunk_tip_act = ActivationLayer.parse(r, model_version)
 
     return Trunk(
         name=name, model_version=model_version, num_blocks=num_blocks,
@@ -485,53 +509,63 @@ def _parse_trunk(r: TokenStream, model_version: int, binary: bool) -> Trunk:
         regular_num_channels=regular_c, gpool_num_channels=gpool_c,
         initial_conv=initial_conv, initial_matmul=initial_matmul,
         blocks=blocks, block_kinds=block_kinds,
+        trunk_tip_bn=trunk_tip_bn, trunk_tip_act=trunk_tip_act,
     )
 
 
 def _parse_policy_head(r: TokenStream, model_version: int, binary: bool) -> PolicyHead:
-    """Parse the policy head, retaining only p1Conv and p1BN.
-
-    Mirrors desc.cpp's PolicyHeadDesc constructor; remaining layers
-    (g1Conv/g1BN, gpoolToBiasMul, p1BN/Act, p2Conv, gpoolToPassMul,
-    plus v15+ extras) are read for stream-position consistency and
-    discarded.
+    """Parse the policy head. All layers retained as Optional[...] fields
+    so katago_to_onnx.py can build a full inference graph; warm-init only
+    reads p1_conv and p1_bn.
     """
     name = r.read_token()
-    p1_conv = ConvLayer.parse(r, binary)
-    ConvLayer.parse(r, binary)            # g1Conv
-    BatchNormLayer.parse(r, binary)       # g1BN
-    ActivationLayer.parse(r, model_version)  # g1Activation
-    MatMulLayer.parse(r, binary)          # gpoolToBiasMul
-    p1_bn = BatchNormLayer.parse(r, binary)
-    ActivationLayer.parse(r, model_version)  # p1Activation
-    ConvLayer.parse(r, binary)            # p2Conv
-    MatMulLayer.parse(r, binary)          # gpoolToPassMul
+    p1_conv     = ConvLayer.parse(r, binary)
+    g1_conv     = ConvLayer.parse(r, binary)
+    g1_bn       = BatchNormLayer.parse(r, binary)
+    g1_act      = ActivationLayer.parse(r, model_version)
+    gpool_bias  = MatMulLayer.parse(r, binary)
+    p1_bn       = BatchNormLayer.parse(r, binary)
+    p1_act      = ActivationLayer.parse(r, model_version)
+    p2_conv     = ConvLayer.parse(r, binary)
+    gpool_pass  = MatMulLayer.parse(r, binary)
+    extras = {}
     if model_version >= 15:
-        MatBiasLayer.parse(r, binary)     # gpoolToPassBias
-        ActivationLayer.parse(r, model_version)  # passActivation
-        MatMulLayer.parse(r, binary)      # gpoolToPassMul2
-    return PolicyHead(name=name, p1_conv=p1_conv, p1_bn=p1_bn)
+        extras['gpool_to_pass_bias'] = MatBiasLayer.parse(r, binary)
+        extras['pass_act']           = ActivationLayer.parse(r, model_version)
+        extras['gpool_to_pass_mul2'] = MatMulLayer.parse(r, binary)
+    return PolicyHead(
+        name=name, p1_conv=p1_conv, p1_bn=p1_bn,
+        g1_conv=g1_conv, g1_bn=g1_bn, g1_act=g1_act,
+        gpool_to_bias=gpool_bias, p1_act=p1_act,
+        p2_conv=p2_conv, gpool_to_pass=gpool_pass, **extras,
+    )
 
 
 def _parse_value_head(r: TokenStream, model_version: int, binary: bool) -> ValueHead:
-    """Parse the value head, retaining only v1Conv and v1BN.
-
-    The remaining layers (v2Mul/v2Bias/v2Act/v3Mul/v3Bias/sv3Mul/sv3Bias/
-    vOwnershipConv) are read for stream-position consistency and discarded.
+    """Parse the value head. All layers retained as Optional[...] fields
+    so katago_to_onnx.py can build a full inference graph; warm-init only
+    reads v1_conv and v1_bn.
     """
     name = r.read_token()
-    v1_conv = ConvLayer.parse(r, binary)
-    v1_bn = BatchNormLayer.parse(r, binary)
-    ActivationLayer.parse(r, model_version)  # v1Activation
-    MatMulLayer.parse(r, binary)             # v2Mul
-    MatBiasLayer.parse(r, binary)            # v2Bias
-    ActivationLayer.parse(r, model_version)  # v2Activation
-    MatMulLayer.parse(r, binary)             # v3Mul
-    MatBiasLayer.parse(r, binary)            # v3Bias
-    MatMulLayer.parse(r, binary)             # sv3Mul
-    MatBiasLayer.parse(r, binary)            # sv3Bias
-    ConvLayer.parse(r, binary)               # vOwnershipConv
-    return ValueHead(name=name, v1_conv=v1_conv, v1_bn=v1_bn)
+    v1_conv          = ConvLayer.parse(r, binary)
+    v1_bn            = BatchNormLayer.parse(r, binary)
+    v1_act           = ActivationLayer.parse(r, model_version)
+    v2_mul           = MatMulLayer.parse(r, binary)
+    v2_bias          = MatBiasLayer.parse(r, binary)
+    v2_act           = ActivationLayer.parse(r, model_version)
+    v3_mul           = MatMulLayer.parse(r, binary)
+    v3_bias          = MatBiasLayer.parse(r, binary)
+    sv3_mul          = MatMulLayer.parse(r, binary)
+    sv3_bias         = MatBiasLayer.parse(r, binary)
+    v_ownership_conv = ConvLayer.parse(r, binary)
+    return ValueHead(
+        name=name, v1_conv=v1_conv, v1_bn=v1_bn,
+        v1_act=v1_act,
+        v2_mul=v2_mul, v2_bias=v2_bias, v2_act=v2_act,
+        v3_mul=v3_mul, v3_bias=v3_bias,
+        sv3_mul=sv3_mul, sv3_bias=sv3_bias,
+        v_ownership_conv=v_ownership_conv,
+    )
 
 
 def parse_katago_model(path: str, force_binary: bool = None) -> KataGoModel:

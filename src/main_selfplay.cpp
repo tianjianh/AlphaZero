@@ -130,6 +130,13 @@ int main(int argc, char* argv[]) {
     // Load model once (shared CPU weights — KataGo pattern)
     auto model = LoadedModel::load(model_path);
 
+    if (model->format == ModelFormat::KataGo) {
+        std::cerr << "ERROR: selfplay does not support KataGo-format models.\n"
+                  << "  KataGo weights are inference-only in this build.\n"
+                  << "  Use the play or evaluate binary for KataGo runs.\n";
+        return 2;
+    }
+
     config.model_type         = model->model_type;
     config.board_size         = model->board_size;
     config.input_channels     = model->input_channels;
