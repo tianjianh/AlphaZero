@@ -122,8 +122,11 @@ def _run_rknn(rknn_path: str):
         raise SystemExit(f"rknn_init_runtime failed: {rknn_path}")
 
     def run(*inputs):
-        # rknnlite expects a list. Use 'nchw' format for each spatial input.
-        fmts = ["nchw" if x.ndim == 4 else None for x in inputs]
+        # rknnlite rejects `data_format=None` for 2-D inputs even though
+        # the format string is meaningless for non-spatial buffers.
+        # Pass "nchw" for every input — the runtime takes 2-D buffers
+        # as-is regardless of the format tag.
+        fmts = ["nchw"] * len(inputs)
         out = r.inference(inputs=list(inputs), data_format=fmts)
         return out, None
     return run, r
@@ -142,24 +145,43 @@ def _detect_format(onnx_path: str):
     if "state_spatial" in inputs and "state_global" in inputs:
         sp_dims = inputs["state_spatial"]
         gl_dims = inputs["state_global"]
+        # Baked batch: integer if static, else 1 (dynamic).
+        baked_batch = sp_dims[0] if isinstance(sp_dims[0], int) else 1
         return dict(format="katago",
                     H=int(sp_dims[2]),
                     C=int(sp_dims[1]),
                     G=int(gl_dims[1]),
+                    baked_batch=int(baked_batch),
                     output_names=outs)
     if "state" in inputs:
         sp_dims = inputs["state"]
+        baked_batch = sp_dims[0] if isinstance(sp_dims[0], int) else 1
         return dict(format="minigo",
                     H=int(sp_dims[2]),
                     C=int(sp_dims[1]),
+                    baked_batch=int(baked_batch),
                     output_names=outs)
     raise SystemExit(f"unknown ONNX layout: {list(inputs)}")
+
+
+def _tile_to_batch(arr: np.ndarray, baked_batch: int) -> np.ndarray:
+    """Tile a [1, ...]-shaped array along axis 0 up to `baked_batch`."""
+    if arr.shape[0] == baked_batch:
+        return arr
+    if arr.shape[0] != 1:
+        raise SystemExit(f"can't tile {arr.shape} to batch {baked_batch}")
+    return np.broadcast_to(arr, (baked_batch,) + arr.shape[1:]).copy()
 
 
 # ── One pass of comparison ──────────────────────────────────────────────
 
 
-def compare_one(label: str, run_ort, run_rknn, inputs, output_names) -> bool:
+def compare_one(label: str, run_ort, run_rknn, inputs, output_names,
+                tiled_batch: int = 1) -> bool:
+    """tiled_batch>1 means we fed the same per-slot input replicated across
+    `tiled_batch` lanes; in that case slot 0 should equal slot k for any
+    deterministic NN. Slot-vs-slot disagreement on identical inputs is a
+    per-lane codegen bug (see rknnissue_next.md §3)."""
     ort_outs, _ = run_ort(*inputs)
     rk_outs, _ = run_rknn(*inputs)
 
@@ -190,6 +212,31 @@ def compare_one(label: str, run_ort, run_rknn, inputs, output_names) -> bool:
         print(f"  {name:16s}  {flag}  {ort_range:25s}  {rk_status:25s}  {diff:.3e}")
         if not ok:
             all_ok = False
+
+    # ── Per-slot consistency check ───────────────────────────────────
+    # If we tiled the same input across all batch lanes, slot 0 should
+    # equal slot k for any deterministic NN.  Disagreement here is the
+    # bs=4 per-lane codegen bug from rknnissue_next.md §3.
+    if tiled_batch > 1:
+        max_slot_diff = 0.0
+        worst_name = None
+        for name, rk_a in zip(output_names, rk_outs):
+            rk_a = np.asarray(rk_a, dtype=np.float32)
+            if rk_a.shape[0] != tiled_batch or not np.all(np.isfinite(rk_a)):
+                continue
+            slot0 = rk_a[0:1]
+            for k in range(1, tiled_batch):
+                d = float(np.abs(slot0 - rk_a[k:k+1]).max())
+                if d > max_slot_diff:
+                    max_slot_diff = d
+                    worst_name = name
+        consistent = max_slot_diff < 0.1
+        flag = "OK   " if consistent else "FAIL "
+        print(f"  per-slot:        {flag}  max slot-vs-slot diff = "
+              f"{max_slot_diff:.3e}  on '{worst_name}'")
+        if not consistent:
+            all_ok = False
+
     return all_ok
 
 
@@ -202,16 +249,16 @@ def main():
     args = ap.parse_args()
 
     info = _detect_format(args.onnx)
+    bb = info["baked_batch"]
     print(f"ONNX format: {info['format']}, H={info['H']}, "
-          f"outputs={info['output_names']}")
+          f"baked batch={bb}, outputs={info['output_names']}")
 
-    # Build fixtures
+    # Build fixtures (per-slot, batch-1 shapes — tiled below to baked_batch)
     if info["format"] == "katago":
         fixtures = [
             ("empty board (komi=6.5)", _katago_empty_board(info["H"], info["C"], info["G"], 6.5)),
             ("all-zero",                _katago_zero(info["H"], info["C"], info["G"])),
         ]
-        # Optional mid-game: use a calibration sample if available
         calib_dir = Path("calib/kata1")
         if (calib_dir / "state_spatial_0050.npy").exists():
             sp = np.load(calib_dir / "state_spatial_0050.npy").astype(np.float32)[None]
@@ -222,6 +269,14 @@ def main():
             ("empty board",  (_minigo_empty_board(info["H"], info["C"]),)),
             ("all-zero",     (_minigo_zero(info["H"], info["C"]),)),
         ]
+
+    # Tile each fixture's inputs along axis 0 to match the baked batch.
+    # If baked_batch > 1 we feed the same per-slot input to every lane;
+    # the per-slot consistency check then compares slot 0 vs slots 1..k.
+    if bb > 1:
+        fixtures = [(label, tuple(_tile_to_batch(a, bb) for a in ins))
+                    for label, ins in fixtures]
+        print(f"  tiling fixtures to batch={bb} (slot-consistency check enabled)")
 
     run_ort = _run_ort(args.onnx)
     overall_ok = True
@@ -238,7 +293,8 @@ def main():
         try:
             this_ok = True
             for label, ins in fixtures:
-                ok = compare_one(label, run_ort, run_rknn, ins, info["output_names"])
+                ok = compare_one(label, run_ort, run_rknn, ins,
+                                 info["output_names"], tiled_batch=bb)
                 this_ok &= ok
             print(f"\n  → {rknn_path}: {'PASS' if this_ok else 'FAIL'}")
             overall_ok &= this_ok

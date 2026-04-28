@@ -30,11 +30,21 @@ resolves the `.rknn` path by extension swap on `LoadedModel::model_path`).
 > internally and only rounds at op boundaries, so it does **not** see
 > true fp16 saturation events that the actual NPU MAC array does.
 >
-> A known-failing case: `kata1-b10c128 fp16` passes the simulator with
-> 100% top-1 vs ORT, but on real RK3576 hardware the value head
-> saturates at +1.0 and the score head at +inf.  See
-> [`rknnissue.md`](rknnissue.md) for the full report and §13.6 for the
-> on-board verification step.  Always run
+> Status from on-board testing (RK3576 / librknnrt 2.3.2):
+>
+> | variant | bs=1 | bs=4 | notes |
+> |---|---|---|---|
+> | plain `fp16` | FAIL | FAIL | head saturates (value=1, score=+inf) |
+> | `--input-scale 2`     | FAIL | FAIL | no-op for this bug, drop |
+> | **`--unshare-initializers`** | **✅ PASS** | partial — slot 0 OK, slots 1-3 saturate | per-slot codegen bug |
+> | `--auto-hybrid` (toolkit ≥ 2.3.2) | untested | untested | simulator-only overflow detector finds 0 layers; build is identical to plain fp16, but documented per Rockchip SDK §6.3.3 to fix this class on hardware |
+>
+> **`--unshare-initializers` is the production path for bs=1 today.**
+> bs=4 has a second, independent per-batch-lane bug that needs board
+> testing of `auto_hybrid` and possibly a Rockchip bug report.  See
+> [`rknnissue.md`](rknnissue.md) for the original report and
+> [`rknnissue_next.md`](rknnissue_next.md) for the post-mitigation
+> follow-up.  Always run
 > [`tools/rknn_onboard_test.py`](tools/rknn_onboard_test.py) on the
 > deployed `.rknn` before trusting any pre-built artifact.
 
@@ -1013,7 +1023,8 @@ runtime's extension-swap resolver to find the `.rknn`.
 | `Invalid rank for input: mean ...`          | Toolkit v2.3.2 fold_constant bug.  Downgrade to 2.3.0 (see §10.1). |
 | `quantize_parameters[...] is not allowed to be modified` | Toolkit hybrid mode rejects modifying frozen scales — our patcher already filters them, but if you see this on a custom model, the affected op type needs to be added to the whitelist (§10.2).  For kata1, use `tools/kata_export_for_rknn.py` (§11). |
 | Build hangs on kata1 / KataGo network at `I rknn building ...` | gpool topology trips the toolkit's layout matcher (§10.4).  Re-export with `tools/kata_export_for_rknn.py`. |
-| `value=1.0`, `score=+inf`, policy logits in the thousands on actual hardware | fp16 saturation on the real NPU MAC array (the simulator masks this — see top-of-doc warning).  Confirm with `tools/rknn_onboard_test.py`.  Try `tools/onnx_rknn_mitigations.py --input-scale 2 --unshare-initializers` and re-convert.  If still saturating, fall back to `--mode hybrid --preset kata1`.  Full report: [`rknnissue.md`](rknnissue.md). |
+| `value=1.0`, `score=+inf`, policy logits in the thousands on actual hardware | fp16 saturation on the real NPU MAC array (the simulator masks this — see top-of-doc warning).  Use the escalation in §13.6.  Reports: [`rknnissue.md`](rknnissue.md), [`rknnissue_next.md`](rknnissue_next.md). |
+| Per-batch-slot output divergence on `bs=4` (slot 0 sane, slots 1-3 saturated to different values on byte-identical inputs) | Independent toolkit bug at the per-batch-lane level.  `--unshare-initializers` doesn't fix it.  Try `--auto-hybrid`; if that doesn't either, file a Rockchip bug report with the artefact from `tools/rknn_accuracy_analysis.py --target rk3576`.  See [`rknnissue_next.md §3`](rknnissue_next.md). |
 
 ### 13.6 Verifying a `.rknn` on the board (recommended before any deploy)
 
@@ -1024,15 +1035,57 @@ be sanity-checked on the actual NPU before deployment:
 # On the aarch64 board, in the alphazero conda env with rknn-toolkit-lite2 installed:
 python tools/rknn_onboard_test.py \
     --onnx models/kata1-b10c128.rknn.bs1.onnx \
-    --rknn models/kata1-b10c128.rk3576.bs1.rknn
+    --rknn models/kata1-b10c128.rk3576.bs1.unshared.rknn   # ← known-good for bs=1
 ```
 
 The script feeds three canonical inputs (empty board, all-zero, mid-game)
 through both ONNX Runtime (CPU on the board) and `rknnlite`, prints a
 saturation report (whether `value`, `score_mean`, `ownership` are within
 sane ranges), and the per-output max-abs-diff between the two paths.
+For `bs > 1` it tiles each fixture to fill all batch slots and adds a
+**per-slot consistency check** (slot 0 vs slot k on identical inputs)
+which catches the bs=4 codegen bug from
+[`rknnissue_next.md §3`](rknnissue_next.md).
 A `.rknn` that passes this script will play correctly; one that doesn't
-(e.g. `value=1.0` constant, `score=+inf`) won't.
+(e.g. `value=1.0` constant, `score=+inf`, or per-slot disagreement) won't.
+
+### 13.7 Escalation when fp16 saturates on hardware
+
+In rough order:
+
+1. **Confirm with the on-board test** (§13.6).  Make sure the failure
+   reproduces against the exact `.rknn` you're about to deploy.
+
+2. **Try `--unshare-initializers`** via
+   `tools/onnx_rknn_mitigations.py`.  PyTorch's ONNX export dedupes
+   identical-value tensors (e.g. kata1's `BN.weight=1` and
+   `BN.running_var=1` are both the same all-ones initializer used by
+   22 BN nodes); the toolkit's fp16 codegen handles aliases
+   inconsistently, and giving each consumer its own copy fixes bs=1
+   on kata1 to the fp16 noise floor.
+
+3. **Try `--auto-hybrid`** on `--mode fp16`.  Per Rockchip SDK Guide
+   §6.3.3, this is the documented fix for "non-quantized fp16 model
+   overflow": auto-promote each layer that overflows fp16 to int16.
+   Requires toolkit ≥ 2.3.2 and a calibration manifest.
+
+4. **Run `tools/rknn_accuracy_analysis.py --target rk3576`** with a
+   board attached over USB-ADB.  Per SDK §7.1.1, the `simulator_error`
+   column shows fp16 simulator overflow; with `--target` set, the
+   `runtime_error` column shows on-device overflow.  Layers where
+   `runtime_error` ≫ `simulator_error` are the diagnostic Rockchip
+   wants in a bug report.
+
+5. **Fall back to `--mode hybrid --preset kata1`** as a workaround —
+   the int8 trunk explicitly bounds dynamic range and can't suffer
+   fp16 overflow.  87% top-1 vs ORT in the simulator (and likely
+   similar on hardware since int8 has no sim/hw split for this kind
+   of bug).  See §11.4.
+
+6. **File a Rockchip bug** at `airockchip/rknn-toolkit2` issues with
+   the §13.7-step-4 artefact attached.  Per SDK §7.2, Rockchip
+   acknowledges that simulator-vs-hardware divergence is a known
+   class of issue and asks for the analysis output.
 
 ---
 
@@ -1043,8 +1096,9 @@ A `.rknn` that passes this script will play correctly; one that doesn't
 | `tools/onnx_to_rknn.py`                         | Main converter; modes fp16/int8/hybrid; format auto-detect; cfg patcher. |
 | `tools/rknn_calibration.py`                     | Self-play position dumper; ports `katago_inputs.cpp` + `game.cpp` to Python. |
 | `tools/kata_export_for_rknn.py`                 | Re-export KataGo `.bin.gz` → ONNX with toolkit-friendly gpool (kata1 path). |
-| `tools/rknn_onboard_test.py`                    | **On-board** ORT vs rknnlite parity check; saturation report.  Run this on the board against every new `.rknn`. |
-| `tools/onnx_rknn_mitigations.py`                | Math-equivalent ONNX rewrites for fp16-on-hardware bug — `--input-scale N` and `--unshare-initializers`. |
+| `tools/rknn_onboard_test.py`                    | **On-board** ORT vs rknnlite parity check; saturation + per-slot consistency report.  Run this on the board against every new `.rknn`. |
+| `tools/rknn_accuracy_analysis.py`               | Wrapper around `rknn.accuracy_analysis()`; per-layer overflow / divergence report.  Use `--target rk3576` with USB-ADB to capture the runtime_error column for Rockchip bug reports. |
+| `tools/onnx_rknn_mitigations.py`                | Math-equivalent ONNX rewrites for fp16-on-hardware bug — `--input-scale N` (currently a no-op for kata1, kept as escape hatch) and `--unshare-initializers` (the bs=1 fix). |
 | `models/*.onnx`                                 | Source ONNX models (KataGo or MiniGo). |
 | `models/*.rknn`                                 | Compiled RKNN; sits next to the .onnx, found by extension swap. |
 | `src/rknn_compute.cpp` / `include/rknn_compute.h` | Runtime backend (aarch64). |
