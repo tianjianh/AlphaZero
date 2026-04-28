@@ -24,6 +24,20 @@ existing `tools/katago_to_onnx.py` / `scripts/export_onnx.py` flow and
 emit a `.rknn` that drops in next to the source `.onnx` (the C++ runtime
 resolves the `.rknn` path by extension swap on `LoadedModel::model_path`).
 
+> **⚠️ Simulator ≠ hardware.**  All fidelity numbers in this document
+> (`top-K`, `KL`, `max_abs_diff`) were measured on the rknn-toolkit2
+> **x86 simulator**.  The simulator stores fp16 values in fp32
+> internally and only rounds at op boundaries, so it does **not** see
+> true fp16 saturation events that the actual NPU MAC array does.
+>
+> A known-failing case: `kata1-b10c128 fp16` passes the simulator with
+> 100% top-1 vs ORT, but on real RK3576 hardware the value head
+> saturates at +1.0 and the score head at +inf.  See
+> [`rknnissue.md`](rknnissue.md) for the full report and §13.6 for the
+> on-board verification step.  Always run
+> [`tools/rknn_onboard_test.py`](tools/rknn_onboard_test.py) on the
+> deployed `.rknn` before trusting any pre-built artifact.
+
 ---
 
 ## 1. Quick start
@@ -999,6 +1013,26 @@ runtime's extension-swap resolver to find the `.rknn`.
 | `Invalid rank for input: mean ...`          | Toolkit v2.3.2 fold_constant bug.  Downgrade to 2.3.0 (see §10.1). |
 | `quantize_parameters[...] is not allowed to be modified` | Toolkit hybrid mode rejects modifying frozen scales — our patcher already filters them, but if you see this on a custom model, the affected op type needs to be added to the whitelist (§10.2).  For kata1, use `tools/kata_export_for_rknn.py` (§11). |
 | Build hangs on kata1 / KataGo network at `I rknn building ...` | gpool topology trips the toolkit's layout matcher (§10.4).  Re-export with `tools/kata_export_for_rknn.py`. |
+| `value=1.0`, `score=+inf`, policy logits in the thousands on actual hardware | fp16 saturation on the real NPU MAC array (the simulator masks this — see top-of-doc warning).  Confirm with `tools/rknn_onboard_test.py`.  Try `tools/onnx_rknn_mitigations.py --input-scale 2 --unshare-initializers` and re-convert.  If still saturating, fall back to `--mode hybrid --preset kata1`.  Full report: [`rknnissue.md`](rknnissue.md). |
+
+### 13.6 Verifying a `.rknn` on the board (recommended before any deploy)
+
+Because the simulator can hide hardware bugs, every new `.rknn` should
+be sanity-checked on the actual NPU before deployment:
+
+```bash
+# On the aarch64 board, in the alphazero conda env with rknn-toolkit-lite2 installed:
+python tools/rknn_onboard_test.py \
+    --onnx models/kata1-b10c128.rknn.bs1.onnx \
+    --rknn models/kata1-b10c128.rk3576.bs1.rknn
+```
+
+The script feeds three canonical inputs (empty board, all-zero, mid-game)
+through both ONNX Runtime (CPU on the board) and `rknnlite`, prints a
+saturation report (whether `value`, `score_mean`, `ownership` are within
+sane ranges), and the per-output max-abs-diff between the two paths.
+A `.rknn` that passes this script will play correctly; one that doesn't
+(e.g. `value=1.0` constant, `score=+inf`) won't.
 
 ---
 
@@ -1009,6 +1043,8 @@ runtime's extension-swap resolver to find the `.rknn`.
 | `tools/onnx_to_rknn.py`                         | Main converter; modes fp16/int8/hybrid; format auto-detect; cfg patcher. |
 | `tools/rknn_calibration.py`                     | Self-play position dumper; ports `katago_inputs.cpp` + `game.cpp` to Python. |
 | `tools/kata_export_for_rknn.py`                 | Re-export KataGo `.bin.gz` → ONNX with toolkit-friendly gpool (kata1 path). |
+| `tools/rknn_onboard_test.py`                    | **On-board** ORT vs rknnlite parity check; saturation report.  Run this on the board against every new `.rknn`. |
+| `tools/onnx_rknn_mitigations.py`                | Math-equivalent ONNX rewrites for fp16-on-hardware bug — `--input-scale N` and `--unshare-initializers`. |
 | `models/*.onnx`                                 | Source ONNX models (KataGo or MiniGo). |
 | `models/*.rknn`                                 | Compiled RKNN; sits next to the .onnx, found by extension swap. |
 | `src/rknn_compute.cpp` / `include/rknn_compute.h` | Runtime backend (aarch64). |
