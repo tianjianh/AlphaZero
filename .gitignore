@@ -23,3 +23,4 @@ third_party/*
 # …except the vendored RKNN runtime header used by the RKNN backend.
 !third_party/rknn/
 calib/
+*.zip
