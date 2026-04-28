@@ -30,23 +30,10 @@ resolves the `.rknn` path by extension swap on `LoadedModel::model_path`).
 > internally and only rounds at op boundaries, so it does **not** see
 > true fp16 saturation events that the actual NPU MAC array does.
 >
-> Status from on-board testing (RK3576 / librknnrt 2.3.2):
->
-> | variant | bs=1 | bs=4 | notes |
-> |---|---|---|---|
-> | plain `fp16` | FAIL | FAIL | head saturates (value=1, score=+inf) |
-> | `--input-scale 2`     | FAIL | FAIL | no-op for this bug, drop |
-> | **`--unshare-initializers`** | **✅ PASS** | partial — slot 0 OK, slots 1-3 saturate | per-slot codegen bug |
-> | `--auto-hybrid` (toolkit ≥ 2.3.2) | untested | untested | simulator-only overflow detector finds 0 layers; build is identical to plain fp16, but documented per Rockchip SDK §6.3.3 to fix this class on hardware |
->
-> **`--unshare-initializers` is the production path for bs=1 today.**
-> bs=4 has a second, independent per-batch-lane bug that needs board
-> testing of `auto_hybrid` and possibly a Rockchip bug report.  See
-> [`rknnissue.md`](rknnissue.md) for the original report and
-> [`rknnissue_next.md`](rknnissue_next.md) for the post-mitigation
-> follow-up.  Always run
-> [`tools/rknn_onboard_test.py`](tools/rknn_onboard_test.py) on the
-> deployed `.rknn` before trusting any pre-built artifact.
+> See **§16. kata1 on-board status** for the current state of what
+> works and what doesn't on real RK3576 hardware, and what to try
+> next.  TL;DR: only **`bs=1` with `--unshare-initializers`** is
+> validated; bs=4 is upstream-blocked.
 
 ---
 
@@ -1023,8 +1010,8 @@ runtime's extension-swap resolver to find the `.rknn`.
 | `Invalid rank for input: mean ...`          | Toolkit v2.3.2 fold_constant bug.  Downgrade to 2.3.0 (see §10.1). |
 | `quantize_parameters[...] is not allowed to be modified` | Toolkit hybrid mode rejects modifying frozen scales — our patcher already filters them, but if you see this on a custom model, the affected op type needs to be added to the whitelist (§10.2).  For kata1, use `tools/kata_export_for_rknn.py` (§11). |
 | Build hangs on kata1 / KataGo network at `I rknn building ...` | gpool topology trips the toolkit's layout matcher (§10.4).  Re-export with `tools/kata_export_for_rknn.py`. |
-| `value=1.0`, `score=+inf`, policy logits in the thousands on actual hardware | fp16 saturation on the real NPU MAC array (the simulator masks this — see top-of-doc warning).  Use the escalation in §13.6.  Reports: [`rknnissue.md`](rknnissue.md), [`rknnissue_next.md`](rknnissue_next.md). |
-| Per-batch-slot output divergence on `bs=4` (slot 0 sane, slots 1-3 saturated to different values on byte-identical inputs) | Independent toolkit bug at the per-batch-lane level.  `--unshare-initializers` doesn't fix it.  Try `--auto-hybrid`; if that doesn't either, file a Rockchip bug report with the artefact from `tools/rknn_accuracy_analysis.py --target rk3576`.  See [`rknnissue_next.md §3`](rknnissue_next.md). |
+| `value=1.0`, `score=+inf`, policy logits in the thousands on actual hardware | fp16 saturation on the real NPU MAC array (the simulator masks this — see top-of-doc warning).  Use the escalation in §13.6.  Full status / mitigations: §16. |
+| Per-batch-slot output divergence on `bs=4` (slot 0 sane, slots 1-3 saturated to different values on byte-identical inputs) | Independent toolkit bug at the per-batch-lane level.  Validated against `--unshare-initializers`, `--auto-hybrid`, and `--mode hybrid --preset kata1` — none fix it on bs=4.  See §16 for the next moves. |
 
 ### 13.6 Verifying a `.rknn` on the board (recommended before any deploy)
 
@@ -1044,8 +1031,7 @@ saturation report (whether `value`, `score_mean`, `ownership` are within
 sane ranges), and the per-output max-abs-diff between the two paths.
 For `bs > 1` it tiles each fixture to fill all batch slots and adds a
 **per-slot consistency check** (slot 0 vs slot k on identical inputs)
-which catches the bs=4 codegen bug from
-[`rknnissue_next.md §3`](rknnissue_next.md).
+which catches the bs=4 codegen bug described in §16.
 A `.rknn` that passes this script will play correctly; one that doesn't
 (e.g. `value=1.0` constant, `score=+inf`, or per-slot disagreement) won't.
 
@@ -1128,3 +1114,150 @@ In rough order:
   feeding the policy spatial logits, `Tanh` before ownership) might
   help on kata1 specifically — but requires per-op verification
   against the toolkit's "frozen scale" rules.
+
+---
+
+## 16. kata1 on-board status
+
+This section captures the actual on-board (RK3576, librknnrt 2.3.2)
+test results for kata1-b10c128.  Numbers in §11.1 are simulator-only
+and were misleading; this section is the ground truth.
+
+### 16.1 What works
+
+| variant                          | bs=1 | bs=4 | notes |
+|----------------------------------|:----:|:----:|-------|
+| plain `fp16`                     | FAIL | FAIL | head saturates: `value=1.0`, `score=+inf`, policy logits ~3000× ORT range |
+| `--input-scale 2`                | FAIL | FAIL | no-op for this bug; dropped from the recommended matrix |
+| **`--unshare-initializers`**     | **✅ PASS** | per-slot FAIL | bs=1 is at fp16 noise floor vs ORT; bs=4 has slot-0 correct, slots 1-3 saturated to different values on byte-identical inputs |
+| `--auto-hybrid` (toolkit ≥ 2.3.2) | FAIL | FAIL | simulator's overflow detector finds 0 layers (it can't see hardware overflow), so the build is identical to plain fp16 — no help on hardware |
+| `--mode hybrid --preset kata1`   | not tested as bs=1 | FAIL | int8 trunk should have bypassed the fp16-overflow class entirely, but bs=4 still fails — confirming the bs=4 bug is independent of the fp16 path |
+
+**Production deployment for kata1 today: `bs=1` with
+`--unshare-initializers`.**  `models/kata1-b10c128.rk3576.bs1.unshared.rknn`
+ships next to `models/kata1-b10c128.rknn.bs1.unshared.onnx`.
+
+```bash
+# Build the bs=1 unshared pair from scratch:
+python tools/kata_export_for_rknn.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --board 9 --output models/kata1-b10c128.rknn.bs1.onnx --batch 1
+python -c "import onnx; from onnxsim import simplify; \
+    m, ok = simplify(onnx.load('models/kata1-b10c128.rknn.bs1.onnx')); \
+    onnx.save(m, 'models/kata1-b10c128.rknn.bs1.onnx')"
+python tools/onnx_rknn_mitigations.py \
+    --input  models/kata1-b10c128.rknn.bs1.onnx \
+    --output models/kata1-b10c128.rknn.bs1.unshared.onnx \
+    --unshare-initializers
+python tools/onnx_to_rknn.py \
+    --onnx models/kata1-b10c128.rknn.bs1.unshared.onnx \
+    --rknn models/kata1-b10c128.rk3576.bs1.unshared.rknn \
+    --mode fp16 --target rk3576 --batch 1
+```
+
+Verify on the board with `tools/rknn_onboard_test.py` (§13.6).
+
+### 16.2 What's broken — the bs=4 per-batch-lane bug
+
+bs=4 fails across every mitigation we've tried (the four rows above).
+That means it isn't a fp16 issue (would have been fixed by hybrid_preset
+or auto_hybrid), it isn't an initializer-aliasing issue (would have been
+fixed by unshare), and it isn't input-scale.  The hallmark from
+on-board testing of `bs=4 unshared` is:
+
+```
+slot 0: value=0.06   score=0.37   ← matches ORT
+slot 1: value=1.00   score=5.25   ← saturated
+slot 2: value=1.00   score=7.05   ← saturated, different from slot 1
+slot 3: value=1.00   score=6.45   ← saturated, different from slots 1, 2
+```
+
+Identical inputs in every slot.  The slot-vs-slot disagreement on a
+deterministic NN means there's per-batch-lane state in the toolkit's
+codegen that only lane 0 initialises correctly.  This is independent
+of the fp16-overflow bug from rounds 1-2.
+
+### 16.3 Throughput strategy that works today
+
+Self-play workloads originally wanted `bs=4` to amortise per-call
+overhead.  With `bs=4` blocked, **use `bs=1` with multi-threading**:
+the runtime architecture (per `README.md`) supports running multiple
+bs=1 NPU contexts concurrently across NPU cores.
+
+| SoC    | NPU cores | Strategy                                          | Effective parallelism |
+|--------|----------:|---------------------------------------------------|----------------------:|
+| RK3576 | 2         | `--nn-server-threads 2 --nn-device-ids 0,0`        | ~2× single-thread    |
+| RK3588 | 3         | `--nn-server-threads 3 --nn-device-ids 0,0,0`     | ~3× single-thread    |
+
+Each server thread gets its own `rknn_dup_context` (shares weights,
+private inference state) and pins to a different NPU core via
+`rknn_set_core_mask`.  This recovers most of what bs=4 would have
+provided without depending on the broken codegen path.
+
+### 16.4 Three potential next moves
+
+In rough priority:
+
+#### (1) Bisect bs=4 → bs=2
+
+We know bs=1 works and bs=4 fails.  Build bs=2 and test:
+
+```bash
+python tools/kata_export_for_rknn.py \
+    --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+    --board 9 --output models/kata1-b10c128.rknn.bs2.onnx --batch 2
+python -c "import onnx; from onnxsim import simplify; \
+    m, ok = simplify(onnx.load('models/kata1-b10c128.rknn.bs2.onnx')); \
+    onnx.save(m, 'models/kata1-b10c128.rknn.bs2.onnx')"
+python tools/onnx_rknn_mitigations.py \
+    --input  models/kata1-b10c128.rknn.bs2.onnx \
+    --output models/kata1-b10c128.rknn.bs2.unshared.onnx \
+    --unshare-initializers
+python tools/onnx_to_rknn.py \
+    --onnx models/kata1-b10c128.rknn.bs2.unshared.onnx \
+    --rknn models/kata1-b10c128.rk3576.bs2.unshared.rknn \
+    --mode fp16 --target rk3576 --batch 2
+# Then on the board:
+python tools/rknn_onboard_test.py \
+    --onnx models/kata1-b10c128.rknn.bs2.unshared.onnx \
+    --rknn models/kata1-b10c128.rk3576.bs2.unshared.rknn
+```
+
+Outcomes:
+* bs=2 PASSES → bug is bs=4-specific; ship bs=2 unshared as a
+  middle-ground self-play artefact (1.7×ish over bs=1 at zero quality
+  cost vs the documented bs=1 unshared path).
+* bs=2 FAILS with the same per-slot signature → bug is "any batch > 1";
+  bs=1 + multi-threading is the only path until the toolkit ships a
+  fix.
+
+#### (2) Capture the diagnostic for a Rockchip bug report
+
+Per RKNN SDK Guide §7.2, when sim and hw diverge, file with Rockchip
+attaching the `accuracy_analysis(target=rk3576)` output.  Run on the
+**x86 host** with the board attached over USB-ADB:
+
+```bash
+python tools/rknn_accuracy_analysis.py \
+    --onnx  models/kata1-b10c128.rknn.bs4.onnx \
+    --inputs calib/kata1/state_spatial_0050.npy \
+             calib/kata1/state_global_0050.npy \
+    --target rk3576 --batch 4 \
+    --output-dir snapshot/kata1_bs4_hw
+```
+
+(needs `rknn-toolkit2==2.3.2` on the host).  The
+`snapshot/kata1_bs4_hw/snapshot.txt` per-layer table shows
+`simulator_error` vs `runtime_error`; layers where they diverge are
+the offending ops Rockchip's NPU team needs to debug their codegen.
+File at `https://github.com/airockchip/rknn-toolkit2/issues` with this
+attached + a copy of the slot-0-only reproduction in §16.2.
+
+#### (3) Ship today; revisit on the next toolkit release
+
+`bs=1 unshared` plus multi-threading is a working production path
+right now.  Track new rknn-toolkit2 releases (currently 2.3.2 is the
+latest) and re-run the board test matrix on each — when Rockchip ships
+either an `auto_hybrid` that actually fires on this network or a
+codegen fix for the per-batch-lane bug, drop the bs=4 build back into
+the deployment.
