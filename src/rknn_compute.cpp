@@ -161,13 +161,23 @@ struct RKNNDeviceState {
     std::vector<rknn_tensor_attr>   input_attrs;
     std::vector<rknn_tensor_attr>   output_attrs;
 
-    // Model shape (from input attr).
+    // Model shape (from spatial input attr).
     int board_size     = 0;
     int input_channels = 0;
     int action_size    = 0;
-    // true if input dim 1 is channels (NCHW), false if dim 3 is channels (NHWC).
+    // true if spatial input dim 1 is channels (NCHW), false if dim 3 is channels (NHWC).
     bool input_is_nchw = true;
     int  model_batch   = 1;   // fixed batch dim from the compiled model
+
+    // KataGo dual-input case: rknn graph has two inputs
+    // (state_spatial: 4-D NCHW/NHWC + state_global: 2-D [N, G]).
+    // The encoder packs each per-state buffer as a flat
+    // [22*H*W spatial][19 global] vector — predict_batch demuxes the
+    // two halves into the two rknn input slots before rknn_inputs_set.
+    bool is_katago_model        = false;
+    int  spatial_input_idx      = 0;
+    int  global_input_idx       = 1;
+    int  input_global_channels  = 0;
 
     // Output tensor indices, mapped by name.  -1 if not found.
     int policy_idx    = -1;   // policy_logits
@@ -278,19 +288,41 @@ static void init_master(RKNNDeviceState& dev, const LoadedModel* model) {
                    "RKNN_QUERY_OUTPUT_ATTR");
     }
 
-    if (dev.n_inputs != 1) {
+    if (dev.n_inputs != 1 && dev.n_inputs != 2) {
         std::ostringstream os;
-        os << "RKNN: expected 1 input tensor, got " << dev.n_inputs;
+        os << "RKNN: expected 1 (MiniGo) or 2 (KataGo) input tensors, got "
+           << dev.n_inputs;
         throw std::runtime_error(os.str());
     }
 
-    // Infer [batch, channels, board, board] from the input attr.  The RKNN
-    // compiler preserves the ONNX layout (NCHW in our case) but some
-    // toolchains reshape to NHWC internally — the `fmt` field tells us.
-    const rknn_tensor_attr& in = dev.input_attrs[0];
+    // Pick the spatial input.  MiniGo: input 0 is 4-D.  KataGo: graph has
+    // two inputs — state_spatial (4-D NCHW/NHWC) and state_global (2-D
+    // [N, G]).  Identify by name first, then fall back to dim count.
+    auto spatial_attr = [&]() -> const rknn_tensor_attr* {
+        if (dev.n_inputs == 1) return &dev.input_attrs[0];
+        for (uint32_t i = 0; i < dev.n_inputs; ++i) {
+            const auto& a = dev.input_attrs[i];
+            if (a.n_dims == 4 && std::strncmp(a.name, "state_spatial", 13) == 0) {
+                dev.spatial_input_idx = (int)i;
+                dev.global_input_idx  = (int)(1 - i);
+                return &a;
+            }
+        }
+        // Fall back: pick the 4-D input as spatial, the other as global.
+        for (uint32_t i = 0; i < dev.n_inputs; ++i) {
+            if (dev.input_attrs[i].n_dims == 4) {
+                dev.spatial_input_idx = (int)i;
+                dev.global_input_idx  = (int)(1 - i);
+                return &dev.input_attrs[i];
+            }
+        }
+        throw std::runtime_error("RKNN: no 4-D spatial input tensor found");
+    }();
+
+    const rknn_tensor_attr& in = *spatial_attr;
     if (in.n_dims != 4) {
         std::ostringstream os;
-        os << "RKNN: expected 4-D input, got " << in.n_dims << "-D";
+        os << "RKNN: expected 4-D spatial input, got " << in.n_dims << "-D";
         throw std::runtime_error(os.str());
     }
     if (in.fmt == RKNN_TENSOR_NHWC) {
@@ -307,6 +339,28 @@ static void init_master(RKNNDeviceState& dev, const LoadedModel* model) {
 
     // model_batch > 1 is fine — predict_batch chunks + pads accordingly.
 
+    // Validate the global input for KataGo dual-input models.  state_global
+    // is a 2-D [N, G] tensor where G matches model->input_global_channels
+    // (19 for kata1).  Format is RKNN_TENSOR_UNDEFINED at the boundary —
+    // 2-D tensors don't have a NCHW/NHWC ambiguity, the runtime takes
+    // the buffer as-is.
+    if (dev.n_inputs == 2) {
+        dev.is_katago_model = true;
+        const rknn_tensor_attr& gin = dev.input_attrs[dev.global_input_idx];
+        if (gin.n_dims != 2) {
+            std::ostringstream os;
+            os << "RKNN: expected 2-D global input, got " << gin.n_dims << "-D";
+            throw std::runtime_error(os.str());
+        }
+        if ((int)gin.dims[0] != dev.model_batch) {
+            std::ostringstream os;
+            os << "RKNN: global input batch " << gin.dims[0]
+               << " != spatial input batch " << dev.model_batch;
+            throw std::runtime_error(os.str());
+        }
+        dev.input_global_channels = (int)gin.dims[1];
+    }
+
     // Sanity-check against LoadedModel metadata (ONNX-derived).
     if (dev.board_size != model->board_size ||
         dev.input_channels != model->input_channels) {
@@ -318,16 +372,26 @@ static void init_master(RKNNDeviceState& dev, const LoadedModel* model) {
            << ".  Re-convert the ONNX to RKNN.";
         throw std::runtime_error(os.str());
     }
+    if (dev.is_katago_model &&
+        dev.input_global_channels != model->input_global_channels) {
+        std::ostringstream os;
+        os << "RKNN: KataGo global-channel mismatch — .rknn has "
+           << dev.input_global_channels << " but .onnx has "
+           << model->input_global_channels << ".  Re-convert the ONNX to RKNN.";
+        throw std::runtime_error(os.str());
+    }
     dev.action_size = dev.board_size * dev.board_size + 1;
 
     map_output_names(dev);
 
     std::cout << "RKNN model: " << dev.rknn_path
               << " batch=" << dev.model_batch
-              << " C=" << dev.input_channels
-              << " board=" << dev.board_size << "x" << dev.board_size
+              << " C=" << dev.input_channels;
+    if (dev.is_katago_model) std::cout << "+G" << dev.input_global_channels;
+    std::cout << " board=" << dev.board_size << "x" << dev.board_size
               << " input_fmt=" << (dev.input_is_nchw ? "NCHW" : "NHWC")
               << " input_type=" << tensor_type_name(in.type)
+              << " format=" << (dev.is_katago_model ? "katago" : "minigo")
               << "\n";
     std::cout << "RKNN outputs:";
     for (uint32_t i = 0; i < dev.n_outputs; i++) {
@@ -387,9 +451,14 @@ struct RKNNComputeHandle::Impl {
     rknn_context     ctx = 0;
     bool             ctx_owned = false;
 
-    // Staging buffer sized for one full compiled batch (model_batch × C × H × W),
-    // in model-native layout (NCHW or NHWC).  Filled by predict_batch per chunk.
+    // Staging buffer for the spatial input — sized for one full compiled
+    // batch (model_batch × C × H × W) in model-native layout (NCHW or NHWC).
+    // Filled by predict_batch per chunk.
     std::vector<float> input_stage;
+
+    // KataGo dual-input only: staging buffer for the 2-D global input
+    // (model_batch × input_global_channels).
+    std::vector<float> input_stage_global;
 
     Impl(RKNNDeviceState& d) : dev(d) {}
 
@@ -454,12 +523,17 @@ RKNNComputeHandle::RKNNComputeHandle(RKNNDeviceState& dev,
 
     int HW = dev.board_size * dev.board_size;
     I.input_stage.resize((size_t)dev.model_batch * dev.input_channels * HW);
+    if (dev.is_katago_model) {
+        I.input_stage_global.resize(
+            (size_t)dev.model_batch * dev.input_global_channels);
+    }
 
     std::cout << "RKNN handle ready: thread=" << thread_index
               << " core_mask=0x" << std::hex << (int)mask << std::dec
               << " board=" << dev.board_size
-              << " C=" << dev.input_channels
-              << " model_bs=" << dev.model_batch << "\n";
+              << " C=" << dev.input_channels;
+    if (dev.is_katago_model) std::cout << "+G" << dev.input_global_channels;
+    std::cout << " model_bs=" << dev.model_batch << "\n";
 }
 
 RKNNComputeHandle::~RKNNComputeHandle() {
@@ -469,10 +543,6 @@ RKNNComputeHandle::~RKNNComputeHandle() {
 std::unique_ptr<ComputeHandle>
 RKNNComputeContext::create_handle(const LoadedModel* model,
                                   int gpu_id, int max_batch_size) {
-    if (model->format == ModelFormat::KataGo)
-        throw std::runtime_error(
-            "KataGo format requires the TensorRT backend. "
-            "Rebuild with `cmake -DMINIGO_BACKEND=tensorrt`.");
     (void)gpu_id;
     int tid = impl_->next_thread_index.fetch_add(1);
     return std::make_unique<RKNNComputeHandle>(
@@ -504,9 +574,17 @@ RKNNComputeHandle::predict_batch(
     const int C  = dev.input_channels;
     const int B  = dev.board_size;
     const int K  = dev.model_batch;
+    const int G  = dev.input_global_channels;
     const int action_size = dev.action_size;
-    const size_t sample_floats = (size_t)C * HW;
-    const size_t chunk_bytes   = K * sample_floats * sizeof(float);
+    const size_t spatial_floats = (size_t)C * HW;
+    const size_t spatial_bytes  = K * spatial_floats * sizeof(float);
+    const size_t global_floats  = (size_t)G;
+    const size_t global_bytes   = K * global_floats * sizeof(float);
+    // Per-state encoder layout:
+    //   MiniGo: [C*H*W] flat
+    //   KataGo: [C*H*W spatial][G global]
+    const size_t per_state_floats =
+        spatial_floats + (dev.is_katago_model ? global_floats : 0);
 
     if (N > K) {
         std::ostringstream os;
@@ -517,43 +595,75 @@ RKNNComputeHandle::predict_batch(
         throw std::runtime_error(os.str());
     }
 
-    if (I.input_stage.size() < K * sample_floats)
-        I.input_stage.resize(K * sample_floats);
+    if (I.input_stage.size() < K * spatial_floats)
+        I.input_stage.resize(K * spatial_floats);
+    if (dev.is_katago_model && I.input_stage_global.size() < K * global_floats)
+        I.input_stage_global.resize(K * global_floats);
 
     // Fill slots [0..N) with real states; leave [N..K) as zeros.
-    std::memset(I.input_stage.data(), 0, chunk_bytes);
+    std::memset(I.input_stage.data(), 0, spatial_bytes);
+    if (dev.is_katago_model)
+        std::memset(I.input_stage_global.data(), 0, global_bytes);
+
     if (dev.input_is_nchw) {
         for (int n = 0; n < N; n++) {
             const auto& s = states[n];
-            if ((int)s.size() != C * HW)
-                throw std::runtime_error("RKNN: state size mismatch");
-            std::memcpy(I.input_stage.data() + n * sample_floats,
-                        s.data(), sample_floats * sizeof(float));
+            if (s.size() != per_state_floats) {
+                std::ostringstream os;
+                os << "RKNN: state size mismatch — got " << s.size()
+                   << " expected " << per_state_floats;
+                throw std::runtime_error(os.str());
+            }
+            std::memcpy(I.input_stage.data() + n * spatial_floats,
+                        s.data(), spatial_floats * sizeof(float));
         }
     } else {
         // NCHW (C,H,W) → NHWC (H,W,C) into each slot.
         for (int n = 0; n < N; n++) {
             const auto& s = states[n];
-            if ((int)s.size() != C * HW)
-                throw std::runtime_error("RKNN: state size mismatch");
+            if (s.size() != per_state_floats) {
+                std::ostringstream os;
+                os << "RKNN: state size mismatch — got " << s.size()
+                   << " expected " << per_state_floats;
+                throw std::runtime_error(os.str());
+            }
             const float* src = s.data();
-            float* dst = I.input_stage.data() + n * sample_floats;
+            float* dst = I.input_stage.data() + n * spatial_floats;
             for (int h = 0; h < B; h++)
                 for (int w = 0; w < B; w++)
                     for (int c = 0; c < C; c++)
                         dst[(h * B + w) * C + c] = src[c * HW + h * B + w];
         }
     }
+    if (dev.is_katago_model) {
+        // Global features sit right after the spatial block in the encoder
+        // output — copy them straight into the second input buffer.
+        for (int n = 0; n < N; n++) {
+            const float* gsrc = states[n].data() + spatial_floats;
+            std::memcpy(I.input_stage_global.data() + n * global_floats,
+                        gsrc, global_floats * sizeof(float));
+        }
+    }
 
-    rknn_input inputs[1];
+    rknn_input inputs[2];
     std::memset(inputs, 0, sizeof(inputs));
-    inputs[0].index        = 0;
-    inputs[0].buf          = I.input_stage.data();
-    inputs[0].size         = (uint32_t)chunk_bytes;
-    inputs[0].pass_through = 0;
-    inputs[0].type         = RKNN_TENSOR_FLOAT32;
-    inputs[0].fmt          = dev.input_is_nchw ? RKNN_TENSOR_NCHW
-                                               : RKNN_TENSOR_NHWC;
+    inputs[dev.spatial_input_idx].index        = (uint32_t)dev.spatial_input_idx;
+    inputs[dev.spatial_input_idx].buf          = I.input_stage.data();
+    inputs[dev.spatial_input_idx].size         = (uint32_t)spatial_bytes;
+    inputs[dev.spatial_input_idx].pass_through = 0;
+    inputs[dev.spatial_input_idx].type         = RKNN_TENSOR_FLOAT32;
+    inputs[dev.spatial_input_idx].fmt          =
+        dev.input_is_nchw ? RKNN_TENSOR_NCHW : RKNN_TENSOR_NHWC;
+    if (dev.is_katago_model) {
+        inputs[dev.global_input_idx].index        = (uint32_t)dev.global_input_idx;
+        inputs[dev.global_input_idx].buf          = I.input_stage_global.data();
+        inputs[dev.global_input_idx].size         = (uint32_t)global_bytes;
+        inputs[dev.global_input_idx].pass_through = 0;
+        inputs[dev.global_input_idx].type         = RKNN_TENSOR_FLOAT32;
+        // 2-D tensor: NCHW/NHWC are both ill-defined.  NCHW is the safe
+        // choice — the runtime takes the buffer as-is for non-spatial inputs.
+        inputs[dev.global_input_idx].fmt          = RKNN_TENSOR_NCHW;
+    }
 
     int rc = rknn_inputs_set(I.ctx, dev.n_inputs, inputs);
     if (rc != RKNN_SUCC)
