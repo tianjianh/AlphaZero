@@ -912,6 +912,79 @@ strong signal that the NPU run will be correct.
 
 ---
 
+## 12. Pre-built artifacts and deployment
+
+`.rknn` files are large binary artifacts (6.5–7 MB each for kata1) and
+are *not* checked into git — they're rebuildable from the
+`.bin.gz`/`.txt.gz` weights with the documented commands in seconds.
+The pre-build step lives in your local `models/` working tree.
+
+### 12.1 Naming convention
+
+For a source ONNX `models/<base>.onnx`, the convention is:
+
+| File                                  | Role                                        |
+|---------------------------------------|---------------------------------------------|
+| `models/<base>.onnx`                  | original ONNX (TensorRT path; not RKNN-friendly) |
+| `models/<base>.rknn.bs1.onnx`         | RKNN-friendly source ONNX, baked batch=1    |
+| `models/<base>.rknn.bs4.onnx`         | RKNN-friendly source ONNX, baked batch=4    |
+| `models/<base>.rk3576.bs1.rknn`       | RK3576, batch=1 — live play (latency)       |
+| `models/<base>.rk3576.bs4.rknn`       | RK3576, batch=4 — self-play (throughput)    |
+| `models/<base>.rk3588.bs1.rknn`       | RK3588, batch=1 — live play (latency)       |
+| `models/<base>.rk3588.bs4.rknn`       | RK3588, batch=4 — self-play (throughput)    |
+
+The C++ runtime resolves the `.rknn` from `LoadedModel::model_path` by
+extension swap on the loaded `.onnx`, so put the matching `.onnx` and
+`.rknn` next to each other on the board.
+
+### 12.2 Build all four kata1 .rknn files in one go
+
+```bash
+# 1) Re-export the source ONNX twice (one per batch size)
+for bs in 1 4; do
+    python tools/kata_export_for_rknn.py \
+        --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
+        --board 9 --opset 13 --batch $bs \
+        --output models/kata1-b10c128.rknn.bs${bs}.onnx
+    python -c "import onnx; from onnxsim import simplify; \
+        m, ok = simplify(onnx.load('models/kata1-b10c128.rknn.bs${bs}.onnx')); \
+        onnx.save(m, 'models/kata1-b10c128.rknn.bs${bs}.onnx')"
+done
+
+# 2) Build .rknn for both targets and both batch sizes (4 files total)
+for bs in 1 4; do
+    for tgt in rk3576 rk3588; do
+        python tools/onnx_to_rknn.py \
+            --onnx models/kata1-b10c128.rknn.bs${bs}.onnx \
+            --rknn models/kata1-b10c128.${tgt}.bs${bs}.rknn \
+            --mode fp16 --target $tgt --batch $bs
+    done
+done
+```
+
+Total host time: ~30 s for the export + simplify + four fp16 builds.
+Total disk: ~50 MB for the four `.rknn` plus two source `.onnx`.
+
+### 12.3 Deploying to the board
+
+```bash
+# Pick the right pair for your SoC and workload
+TGT=rk3588               # or rk3576
+BS=4                     # 1 for live play, 4 for self-play
+MODEL=models/kata1-b10c128
+
+scp ${MODEL}.rknn.bs${BS}.onnx armsom:~/minigo/models/
+scp ${MODEL}.${TGT}.bs${BS}.rknn armsom:~/minigo/models/
+
+# On the board: load the .onnx; the runtime will pick up the .rknn
+# via extension swap (`LoadedModel::model_path` → swap `.onnx` → `.rknn`).
+```
+
+Both files must sit next to each other under the same basename for the
+runtime's extension-swap resolver to find the `.rknn`.
+
+---
+
 ## 13. Troubleshooting
 
 | Symptom                                     | Likely cause / fix |
