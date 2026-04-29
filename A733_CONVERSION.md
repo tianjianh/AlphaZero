@@ -1,16 +1,24 @@
 # A733 Conversion — kata1 ONNX → Allwinner A733 NBG (Vivante VIP9000)
 
-> **STATUS (2026-04-29): The pip-`acuitylite` path checked into this repo
-> as `tools/onnx_to_a733.py` produces an NBG the on-board viplite v2.0.3
-> runtime REJECTS.** The header bytes come out as `target=0x15,
-> version=0x20005`; the on-board CID is `0x1000003B` and the runtime
-> wants format version `0x1001E`. Re-generation must use Allwinner's
-> official Acuity Toolkit (Docker image `ubuntu-npu:v2.0.10.1`,
-> internally Acuity v6.30.22). See §3 for the working pipeline.
+> **STATUS (2026-04-29): WORKING.** `tools/onnx_to_a733_docker.sh`
+> produces NBGs the on-board viplite v2.0.3.2 accepts at
+> `vip_create_network`. Both bs=1 and bs=4 verified on the Cubie A7A
+> via `vpm_run` smoke test — `create network 0` and `vpm run ret=0`
+> both return clean. Header signature: `target=0x1000003B,
+> version=0x20000` (NBG v2.0.0, same as Allwinner's own `yolact/v3`
+> sample).
 >
-> All on-board diagnostics that lead to this verdict are captured
-> in `vip9000.note` (in this repo, multi-gpu branch). This document
-> is the converter-side companion to that note.
+> The pip-`acuitylite` path at `tools/onnx_to_a733.py` does NOT work —
+> it produces NBGs with `target=0x15` because the bundled chip table
+> doesn't contain A733's PID. That script is kept for reference with a
+> deprecation banner; do not use it.
+>
+> The empirical hard requirement (validated by the on-board
+> `nbglk_valid_nbg_check`) is `target=0x1000003B`. The NBG format
+> version (bytes 4..7) is **not** strictly required to be `0x1001E` as
+> an earlier draft claimed: Allwinner's own ai-sdk v3 examples ship
+> NBGs in both v1 (`0x1001E` / `0x10020`) and v2 (`0x20000`) formats
+> against the same chip; viplite v2.0.3+ loads both.
 
 ---
 
@@ -22,7 +30,7 @@
 | Toolkit | **Allwinner's `ubuntu-npu:v2.0.10.1` Docker image** (2.9 GB). NOT pip `acuitylite==6.51.0` — its bundled chip table is missing A733's PID. |
 | Host requirement | **Real x86_64 Linux** with Docker. A nested container (Docker-in-Docker without `--privileged`) can compile `gen_nbg` but its VIP9000 simulator `vsi_nn_CreateGraph()` fails silently — see §6.3. |
 | `VSIMULATOR_CONFIG` | `VIP9000NANODI_PID0X1000003B` (NOT `_PLUS_` — Allwinner's `pegasus_setup.sh v3` says `_PLUS_` but the actual `.config` file shipped in the image has the no-`_PLUS_` name). |
-| Output check | `xxd network_binary.nb \| head -1` → bytes 0..3 must be `VPMN`, bytes 4..7 must be `1e 00 01 00` (version `0x1001E`), bytes 8..11 must be `3b 00 00 10` (target `0x1000003B`). |
+| Output check | `xxd network_binary.nb \| head -1` → bytes 0..3 must be `VPMN`, bytes 8..11 must be `3b 00 00 10` (target `0x1000003B`). Bytes 4..7 are the NBG format version: `00 00 02 00` (`0x20000` = NBG v2.0.0) is what v6.30.22 emits. |
 | On-board check | `vpm_run -s sample.txt -l 5 -b 1` should print `create network 0: NNN us` and `vpm run ret=0`, NOT `[…]nbglk_valid_nbg_check[920], binary target=…` (see §7). |
 
 **Bottom line for someone re-doing this on a real Linux host:**
@@ -31,7 +39,7 @@
 # On the real Linux host — Docker assumed already installed
 bash tools/onnx_to_a733_docker.sh   # produces models/kata1-b10c128.a733.bs1.fp16/network_binary.nb
 xxd models/kata1-b10c128.a733.bs1.fp16/network_binary.nb | head -1
-# Expect: 5650 4d4e 1e00 0100 3b00 0010 ...   (VPMN, ver 0x1001E, target 0x1000003B)
+# Expect: 5650 4d4e 0000 0200 3b00 0010 ...   (VPMN, ver 0x20000, target 0x1000003B)
 ```
 
 If those bytes match, ship the `.nb` to the Cubie A7A and run the §7
@@ -92,27 +100,71 @@ int16 runs at ⅓ rate and w8a16 has codegen bugs.
 ## 3. The working conversion pipeline
 
 Performed on a **real x86_64 Linux host with Docker** (NOT a nested
-container — see §6.3 for why).
+container — see §6.3 for why). The recipe below assumes Ubuntu 22.04
+with an empty home directory; adjust apt for other distros.
+
+### 3.0 Bring-up on a fresh box (one-time)
+
+If you're regenerating on a host that doesn't already have Docker /
+the right Python deps:
+
+```bash
+# Docker engine — official Ubuntu repo
+DEBIAN_FRONTEND=noninteractive apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates curl gnupg lsb-release python3-venv python3-pip unzip p7zip-full zip
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+    > /etc/apt/sources.list.d/docker.list
+DEBIAN_FRONTEND=noninteractive apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Python venv with just enough to drive the ONNX export.
+# The Acuity toolkit itself runs inside the Docker image — we don't
+# pip-install it here.
+cd /root/proj/AlphaZero
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/pip install --no-cache-dir onnx onnxsim onnxruntime numpy
+```
+
+Disk: the pipeline needs ~25 GB free during the Allwinner image fetch
+and load (2.9 GB compressed share, 7.4 GB tar, ~16 GB once Docker
+expands it). The ONNX export needs ~12 GB RAM peak (PyTorch CPU forward
+pass at bs=4); a 6 GB / 4 GB-swap box is enough. Total wall-clock from
+scratch on a residential connection: ~25 min, dominated by the image
+download.
 
 ### 3.1 Source ONNX (same as the RKNN path)
 
 This step is shared with the RKNN target — no A733-specific changes.
 
 ```bash
-# In the alphazero conda env on the same host where the kata1 .txt.gz lives
-conda activate alphazero
+# Get kata1 weights (one-time; ~14 MB)
+curl -L -o kata1-b10c128-s1141046784-d204142634.txt.gz \
+  https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b10c128-s1141046784-d204142634.txt.gz
+
+# Use the venv created in §3.0 (or your existing alphazero conda env —
+# either works as long as torch+onnx+onnxsim are importable)
+PY=.venv/bin/python   # or: PY=python   inside `conda activate alphazero`
 
 for bs in 1 4; do
-    python tools/kata_export_for_rknn.py \
+    $PY tools/kata_export_for_rknn.py \
         --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
         --board 9 --batch $bs --opset 13 \
         --output models/kata1-b10c128.a733.bs${bs}.onnx
 
-    python -c "import onnx; from onnxsim import simplify; \
+    $PY -c "import onnx; from onnxsim import simplify; \
         m,_=simplify(onnx.load('models/kata1-b10c128.a733.bs${bs}.onnx')); \
         onnx.save(m,'models/kata1-b10c128.a733.bs${bs}.onnx')"
 
-    python tools/onnx_rknn_mitigations.py \
+    $PY tools/onnx_rknn_mitigations.py \
         --input  models/kata1-b10c128.a733.bs${bs}.onnx \
         --output models/kata1-b10c128.a733.bs${bs}.unshared.onnx \
         --unshare-initializers
@@ -174,14 +226,21 @@ mkdir -p /tmp/aw && cd /tmp/aw
 curl -L "https://netstorage.allwinnertech.com:5001/fsdownload/Mh23BhPHq/share.zip" \
     -b "sharing_sid=$SID" -o share.zip --progress-bar
 
-# 3) Unwrap the nested archives
+# 3) Unwrap the nested archives. The outer share.zip contains
+#    docker_images_v2.0.x/ which has the inner tar.zip plus an
+#    ubuntu-npu_v2.0.10.1.tar.zip_md5sum.txt — verify the MD5 before
+#    loading (~13 minutes lost if the tar is corrupt).
 unzip -q share.zip                              # → docker_images_v2.0.x/
 cd docker_images_v2.0.x
+md5sum -c <(awk 'NF==2{print $1"  "$2}' ubuntu-npu_v2.0.10.1.tar.zip_md5sum.txt)
 unzip -q ubuntu-npu_v2.0.10.1.tar.zip          # → ubuntu-npu_v2.0.10.1.tar (7.4 GB)
 
 # 4) Load into Docker
-sudo docker load -i ubuntu-npu_v2.0.10.1.tar   # tags as ubuntu-npu:v2.0.10.1
-sudo docker images | grep ubuntu-npu           # verify
+docker load -i ubuntu-npu_v2.0.10.1.tar         # tags as ubuntu-npu:v2.0.10.1
+docker images | grep ubuntu-npu                 # verify (~16 GB on disk)
+
+# 5) Free the staging area — the tar/zip aren't needed after `docker load`
+rm -rf /tmp/aw
 ```
 
 The image bundles:
@@ -286,10 +345,18 @@ sudo docker run --rm \
             --output-path        wksp/${BASE}_fp16
 
         # ----- 4) collect NBG + meta -----
+        # Acuity v6.30.22 with --pack-nbg-unify writes the .nb to a
+        # *sibling* directory `<output-path>_nbg_unify/`, not under the
+        # `--output-path` itself.  Search both — early drafts of the
+        # script searched only `wksp/` and reported "ERROR: NBG not
+        # produced" while the .nb was actually sitting in
+        # `wksp_nbg_unify/`.
         OUT=/workspace/models/kata1-b10c128.a733.bs${BS}.fp16
         mkdir -p "${OUT}"
-        cp $(find wksp -name network_binary.nb | head -1) "${OUT}/network_binary.nb"
-        cp $(find wksp -name nbg_meta.json     | head -1) "${OUT}/nbg_meta.json"
+        NB=$(find wksp wksp_nbg_unify -name network_binary.nb -type f | head -1)
+        META=$(find wksp wksp_nbg_unify -name nbg_meta.json    -type f | head -1)
+        cp "$NB"   "${OUT}/network_binary.nb"
+        cp "$META" "${OUT}/nbg_meta.json"
     '
 ```
 
@@ -311,18 +378,21 @@ for p in ['models/kata1-b10c128.a733.bs1.fp16/network_binary.nb',
 "
 ```
 
-Expect:
+Expect (with v6.30.22 in `ubuntu-npu:v2.0.10.1`):
 
 ```
-models/kata1-b10c128.a733.bs1.fp16/network_binary.nb: magic=0x4e4d5056 version=0x1001e target=0x1000003b  OK
-models/kata1-b10c128.a733.bs4.fp16/network_binary.nb: magic=0x4e4d5056 version=0x1001e target=0x1000003b  OK
+models/kata1-b10c128.a733.bs1.fp16/network_binary.nb: magic=0x4e4d5056 version=0x20000 target=0x1000003b  OK
+models/kata1-b10c128.a733.bs4.fp16/network_binary.nb: magic=0x4e4d5056 version=0x20000 target=0x1000003b  OK
 ```
 
 If `target=0x15` you've used the pip-`acuitylite` path — read §6.1
-for what's wrong. If `version` differs from `0x1001e` you've got a
-non-Allwinner Acuity build whose codegen produces a format the
-on-board viplite v2.0.3 doesn't accept; only the bundled v6.30.22 in
-`ubuntu-npu:v2.0.10.1` is known to match.
+for what's wrong. The `version=0x20000` is the NBG v2.0.0 format that
+v6.30.22 produces; the toolkit's host-side `libOpenVX.so` advertises
+both `nbglk_create_v1_video_memory` and `nbglk_create_v2_video_memory`,
+and Allwinner's own ai-sdk ships v3 sample NBGs in both formats
+(`examples/vpm_run/operator/v3/network_binary.nb` is `0x1001E`,
+`examples/yolact/model/v3/yolact.nb` is `0x20000`). Both load fine on
+viplite v2.0.3+.
 
 ---
 
@@ -354,10 +424,17 @@ based on the byte check from §3.4.
 
 ## 5. Pre-built artifacts
 
-Once the §3 pipeline produces a header-validated NBG, repack and
-ship to the board exactly as the broken-pip path did before:
+Once the §3 pipeline produces a header-validated NBG, pack everything
+the on-board side needs in one archive (~32 MB combined):
 
 ```bash
+zip -r kata1-b10c128.a733.fp16.zip \
+    models/kata1-b10c128.a733.bs1.unshared.onnx \
+    models/kata1-b10c128.a733.bs1.fp16/ \
+    models/kata1-b10c128.a733.bs4.unshared.onnx \
+    models/kata1-b10c128.a733.bs4.fp16/
+
+# Or the smaller-but-slower 7z version (~24 MB):
 for bs in 1 4; do
     7za a -t7z -mx=9 -m0=lzma2 -ms=on \
         kata1-b10c128.a733.bs${bs}.fp16.7z \
@@ -366,12 +443,12 @@ for bs in 1 4; do
 done
 ```
 
-The `.7z` files are gitignored (`.gitignore: *.7z`). On the Cubie:
+The archives are gitignored (`.gitignore: *.zip`, `*.7z`). On the Cubie:
 
 ```bash
 # Cubie A7A side
-scp kata1-b10c128.a733.bs1.fp16.7z cubie:~/
-ssh cubie 'cd /root/proj/AlphaZero && 7za x ~/kata1-b10c128.a733.bs1.fp16.7z'
+scp kata1-b10c128.a733.fp16.zip cubie:~/
+ssh cubie 'cd /root/proj/AlphaZero && unzip -o ~/kata1-b10c128.a733.fp16.zip'
 # The .nb lands at models/kata1-b10c128.a733.bs1.fp16/network_binary.nb;
 # the C++ runtime (vip9000_compute.cpp) finds it via extension swap on
 # LoadedModel::model_path.  See vip9000.note §8.
@@ -416,12 +493,18 @@ none have A733 in their chip tables; verified by the same `strings`
 check on each).
 
 The pip path also writes NBG **format version `0x00020005`**, but
-on-board viplite v2.0.3 wants **`0x0001001E`** — even if you patched
-the chip ID, the underlying compiled command stream targets a
-different ISA generation that the kernel ioctl rejects independently.
-We confirmed this by rewriting bytes 8..11 of an emitted NBG to
-`3b 00 00 10` and watching `vip_create_network` still fail with
-`status=-4`.
+even after rewriting bytes 8..11 of the emitted NBG to `3b 00 00 10`
+(target patched), `vip_create_network` still fails with `status=-4`:
+the chip ID is just one of several encoded fields, and the underlying
+compiled command stream was generated for the wrong ISA variant. The
+header rewrite isn't a useful workaround.
+
+(NB: an earlier draft of this section claimed viplite v2.0.3 strictly
+needs format `0x0001001E`. That was wrong — Allwinner's own
+`yolact/v3` sample ships at `0x00020000` and loads fine. The Docker
+path's NBG is `0x20000` and was verified on-board with `vpm_run` ret=0
+on 2026-04-29. So both v1 and v2 NBGs work; the only true requirement
+is the right chip ID, which the pip path bungles.)
 
 `tools/onnx_to_a733.py` and `tools/a733_verify.py` are kept in the
 repo for reference but they should not be used for production
@@ -522,9 +605,11 @@ completeness, not because we recommend it for this project.
 
 Once you have a header-validated NBG, smoke-test on the Cubie before
 the full benchmark. This complements `vip9000.note §7` with the
-A733-converter-specific checks.
+A733-converter-specific checks. Both bs=1 and bs=4 NBGs from the
+Docker pipeline have been confirmed to pass §7.1 on the Cubie A7A as
+of 2026-04-29.
 
-### 7.1 `vpm_run` smoke test
+### 7.1 `vpm_run` smoke test — VERIFIED PASSING
 
 `vpm_run` is from the `ai-sdk` ([github.com/ZIFENG278/ai-sdk](https://github.com/ZIFENG278/ai-sdk)),
 prebuilt at `examples/vpm_run/install/etc/npu/vpm_run/vpm_run` on the
@@ -586,11 +671,11 @@ cd /root/proj/AlphaZero
     --max-batch 1 --nn-iters 100 --games 0 --threads 0
 ```
 
-The C++ backend (`src/vip9000_compute.cpp` on `multi-gpu`) prints
-its sanity check at startup:
+The C++ backend (`src/vip9000_compute.cpp` on `multi-gpu` — not yet
+checked in as of 2026-04-29) prints its sanity check at startup:
 
 ```
-VIP9000 NBG header: target=0x1000003b version=0x1001e bytes=6493872
+VIP9000 NBG header: target=0x1000003b version=0x20000 bytes=6336808
 NNEvaluator thread 0 (gpu 0): VIP9000 OK
 ```
 
@@ -622,6 +707,7 @@ later.
 | `pegasus export ovxlib --pack-nbg-unify` dies with `please set correct target name in config file` | Toolkit looks for `<viv-sdk>/../common/cfg/<VSIMULATOR_CONFIG>.config`; the file with `_PLUS_` doesn't exist | Use `VSIMULATOR_CONFIG=VIP9000NANODI_PID0X1000003B` (no `_PLUS_`); pass the matching string to `--optimize` |
 | `pegasus export ovxlib --pack-nbg-unify` dies with `Fatal model generation error: 32512` (or `127 << 8`) | gen_nbg can't find shared libs | `ldconfig` with `vsimulator/lib` AND `common/lib` paths added |
 | `pegasus export ovxlib --pack-nbg-unify` dies with `Fatal model generation error: 65280` | gen_nbg ran but `vsi_nn_CreateGraph()` returned NULL | Real Linux host with `/proc` accessible; nested-container chroots don't work (§6.3) |
+| `pegasus export ovxlib` finishes with `Error(0),Warning(0)` but the script reports "ERROR: NBG not produced" | Acuity v6.30.22 with `--pack-nbg-unify` writes the `.nb` to `wksp_nbg_unify/` (sibling), not under `--output-path`'s directory | Search both `wksp/` AND `wksp_nbg_unify/`; the current `tools/onnx_to_a733_docker.sh` does this |
 | `vpm_run` on the board prints `nbglk_valid_nbg_check[920], binary target=...` | NBG header chip ID doesn't match the actual NPU | Re-check §3.4 host-side header bytes; if those are right then the NBG was built against a different chip target — verify `--optimize` and `VSIMULATOR_CONFIG` both say `VIP9000NANODI_PID0X1000003B` |
 
 ---

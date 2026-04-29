@@ -19,6 +19,8 @@ Miniconda*.sh
 .DS_Store
 __pycache__/
 *.pyc
+.venv/
+*.txt.gz
 third_party/*
 # …except the vendored RKNN runtime header used by the RKNN backend.
 !third_party/rknn/
