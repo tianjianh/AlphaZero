@@ -24,3 +24,4 @@ third_party/*
 !third_party/rknn/
 calib/
 *.zip
+*.7z
