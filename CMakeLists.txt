@@ -64,8 +64,9 @@ endif()
 #   metal  — Metal/MPSGraph (macOS Apple Silicon only)
 #   cuda   — CUDA (NVIDIA GPUs)
 #   opencl — OpenCL 1.2+ (Linux NVIDIA/AMD/Intel, macOS)
-#   rknn   — Rockchip NPU (aarch64 Linux, RK3562/66/68/76/88)
-#   eigen  — CPU only (no GPU)
+#   rknn    — Rockchip NPU (aarch64 Linux, RK3562/66/68/76/88)
+#   vip9000 — VeriSilicon VIP9000 NPU (Allwinner A733 / V853 / etc., aarch64)
+#   eigen   — CPU only (no GPU)
 #
 # Usage:
 #   cmake .. -DMINIGO_BACKEND=auto     # (default)
@@ -74,10 +75,19 @@ endif()
 #   cmake .. -DMINIGO_BACKEND=cuda
 #   cmake .. -DMINIGO_BACKEND=opencl
 #   cmake .. -DMINIGO_BACKEND=rknn
+#   cmake .. -DMINIGO_BACKEND=vip9000
 #   cmake .. -DMINIGO_BACKEND=eigen
 #
-set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, rknn, eigen")
-set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "rknn" "eigen")
+set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, eigen")
+set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "rknn" "vip9000" "eigen")
+
+# ── VIPLite SDK location (override with -DVIPLITE_ROOT=/path) ─
+# Defaults to the bundled SDK at /root/proj/ai-sdk/viplite-tina/
+# (cloned from github.com/ZIFENG278/ai-sdk).  The aarch64 v2.0
+# libs and headers live under .../lib/aarch64-none-linux-gnu/v2.0/
+# {libNBGlinker.so, libVIPhal.so, inc/vip_lite.h}.
+set(VIPLITE_ROOT "/root/proj/ai-sdk/viplite-tina" CACHE PATH
+    "Path to viplite-tina SDK (contains lib/aarch64-none-linux-gnu/v2.0)")
 
 # ── Auto-detect best backend ────────────────────────────────
 if(MINIGO_BACKEND STREQUAL "auto")
@@ -162,8 +172,9 @@ if(MINIGO_BACKEND STREQUAL "auto")
         set(MINIGO_BACKEND "cuda")
       endif()
     else()
-      # No CUDA — on aarch64 Linux, prefer Rockchip NPU if librknnrt is present.
+      # No CUDA — on aarch64 Linux, prefer hardware NPU paths.
       set(_rknn_ok FALSE)
+      set(_vip9000_ok FALSE)
       if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
         find_library(LIBRKNNRT_LIB rknnrt
           PATHS /usr/lib /usr/lib/aarch64-linux-gnu /usr/local/lib
@@ -171,9 +182,18 @@ if(MINIGO_BACKEND STREQUAL "auto")
         if(LIBRKNNRT_LIB AND EXISTS ${CMAKE_SOURCE_DIR}/third_party/rknn/rknn_api.h)
           set(_rknn_ok TRUE)
         endif()
+        # VIP9000: bundled aarch64 v2.0 libs in VIPLITE_ROOT and
+        # /dev/vipcore present (kernel driver loaded).
+        if(EXISTS ${VIPLITE_ROOT}/lib/aarch64-none-linux-gnu/v2.0/libNBGlinker.so
+           AND EXISTS ${VIPLITE_ROOT}/lib/aarch64-none-linux-gnu/v2.0/libVIPhal.so
+           AND EXISTS /dev/vipcore)
+          set(_vip9000_ok TRUE)
+        endif()
       endif()
       if(_rknn_ok)
         set(MINIGO_BACKEND "rknn")
+      elseif(_vip9000_ok)
+        set(MINIGO_BACKEND "vip9000")
       else()
         find_package(OpenCL QUIET)
         if(OpenCL_FOUND)
@@ -201,6 +221,7 @@ set(HAS_METAL FALSE)
 set(HAS_CUDA FALSE)
 set(HAS_TENSORRT FALSE)
 set(HAS_RKNN FALSE)
+set(HAS_VIP9000 FALSE)
 set(HAS_EIGEN FALSE)
 
 if(MINIGO_BACKEND STREQUAL "metal")
@@ -255,11 +276,33 @@ elseif(MINIGO_BACKEND STREQUAL "rknn")
   endif()
   set(HAS_RKNN TRUE)
 
+elseif(MINIGO_BACKEND STREQUAL "vip9000")
+  set(_VIP_LIB_DIR "${VIPLITE_ROOT}/lib/aarch64-none-linux-gnu/v2.0")
+  set(_VIP_INC_DIR "${_VIP_LIB_DIR}/inc")
+  if(NOT EXISTS "${_VIP_LIB_DIR}/libNBGlinker.so"
+     OR NOT EXISTS "${_VIP_LIB_DIR}/libVIPhal.so"
+     OR NOT EXISTS "${_VIP_INC_DIR}/vip_lite.h")
+    message(FATAL_ERROR
+      "VIP9000 backend needs the VIPLite v2.0 aarch64 SDK. "
+      "Pass -DVIPLITE_ROOT=/path/to/viplite-tina (default "
+      "${VIPLITE_ROOT}). Expected files: "
+      "${_VIP_LIB_DIR}/{libNBGlinker.so,libVIPhal.so} and "
+      "${_VIP_INC_DIR}/vip_lite.h. "
+      "See A733_CONVERSION.md.")
+  endif()
+  find_library(VIP_NBGLINKER_LIB NBGlinker REQUIRED
+    PATHS "${_VIP_LIB_DIR}" NO_DEFAULT_PATH)
+  find_library(VIP_VIPHAL_LIB    VIPhal    REQUIRED
+    PATHS "${_VIP_LIB_DIR}" NO_DEFAULT_PATH)
+  set(VIP_INCLUDE_DIR "${_VIP_INC_DIR}")
+  set(VIP_LIB_DIR     "${_VIP_LIB_DIR}")
+  set(HAS_VIP9000 TRUE)
+
 elseif(MINIGO_BACKEND STREQUAL "eigen")
   set(HAS_EIGEN TRUE)
 
 else()
-  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, rknn, eigen")
+  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, eigen")
 endif()
 
 # ── Library: minigo core ────────────────────────────────────
@@ -296,6 +339,10 @@ endif()
 
 if(HAS_RKNN)
   list(APPEND CORE_SOURCES src/rknn_compute.cpp)
+endif()
+
+if(HAS_VIP9000)
+  list(APPEND CORE_SOURCES src/vip9000_compute.cpp)
 endif()
 
 add_library(minigo_core STATIC ${CORE_SOURCES})
@@ -346,11 +393,37 @@ if(HAS_RKNN)
   target_link_libraries(minigo_core PUBLIC ${LIBRKNNRT_LIB})
 endif()
 
+if(HAS_VIP9000)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_VIP9000=1)
+  target_include_directories(minigo_core PUBLIC ${VIP_INCLUDE_DIR})
+  # Wrap with --no-as-needed so the linker keeps libVIPhal in DT_NEEDED
+  # even though we only call its symbols transitively through
+  # libNBGlinker.  Otherwise the binary fails to start with
+  # "libVIPhal.so: cannot open shared object file" because DT_RUNPATH
+  # (modern dtag) is not propagated to indirect dependencies.
+  target_link_libraries(minigo_core PUBLIC
+    "-Wl,--no-as-needed" ${VIP_NBGLINKER_LIB} ${VIP_VIPHAL_LIB} "-Wl,--as-needed")
+  # Bake an RPATH so binaries find libNBGlinker.so / libVIPhal.so without
+  # needing LD_LIBRARY_PATH at runtime.  minigo_core is a STATIC archive
+  # so set_target_properties(BUILD_RPATH) is a no-op — propagate via the
+  # INTERFACE link options that every linked executable picks up.
+  # --disable-new-dtags emits the legacy DT_RPATH (transitive) so the
+  # path resolves indirect deps too, in addition to the direct
+  # NEEDED entries above.
+  target_link_options(minigo_core INTERFACE
+    "-Wl,--disable-new-dtags"
+    "-Wl,-rpath,${VIP_LIB_DIR}")
+endif()
+
 # ── Executables ─────────────────────────────────────────────
 add_executable(play      src/main_play.cpp)
 add_executable(selfplay  src/main_selfplay.cpp)
 add_executable(benchmark src/main_benchmark.cpp)
 add_executable(evaluate  src/main_evaluate.cpp)
+if(HAS_VIP9000)
+  add_executable(vip9000_smoke src/main_vip9000_smoke.cpp)
+  target_link_libraries(vip9000_smoke PRIVATE minigo_core)
+endif()
 
 # Prefer ncursesw for wide-character (Unicode) support
 find_library(NCURSESW_LIB ncursesw)

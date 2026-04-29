@@ -473,3 +473,103 @@ done and waiting.
 > hard requirement is the target byte. `vpm_run` smoke test on the
 > Cubie still pending — that's the next thing the converter side needs
 > to hand back to the on-board side to confirm.
+## 10. ADDENDUM (2026-04-29) — corrected NBGs verified end-to-end
+
+Replacement NBGs delivered as `kata1-b10c128.a733.fp16.zip` (bs=1 and
+bs=4) with header `target=0x1000003B, version=0x00020000`. Both load
+and run correctly. Format version varies among Allwinner-shipped
+NBGs (observed: `0x1001E`, `0x10020`, `0x20000`) — the runtime accepts
+any of them as long as `target` matches. **Only the chip ID matters**;
+ignore the version-mismatch wording in §1–§4 above.
+
+### What got verified on the Cubie A7A
+
+`./build/vip9000_smoke` is a tiny standalone test harness
+(`src/main_vip9000_smoke.cpp`) that drives `predict_batch` directly,
+bypassing MCTS / NNEvaluator. Invocation pattern:
+
+```bash
+./build/vip9000_smoke --model <onnx> --batch <N> --iters <I> --threads <T>
+```
+
+Results on a fresh Radxa Cubie A7A, NPU @ 1008 MHz, governor=performance:
+
+| NBG     | batch | threads | ms/call | states/s | notes                               |
+|---------|-------|---------|---------|----------|-------------------------------------|
+| bs=1    |   1   |    1    |  80.78  |    12    | single-stream                       |
+| bs=4    |   4   |    1    | 338.68  |    11    | full bs=4 — no batch amortization   |
+| bs=1    |   1   |    2    | 159.97  |    11    | 2 server threads on one NPU core    |
+
+Outputs are numerically reasonable for an empty 9×9 board (zero state):
+
+```
+policy[0..2]=-6.93359,-6.92188,-7.02344
+value=0.0625  score=0.375977  score_sd=10.0938
+ownership[0..1]=0.537109,0.510254
+```
+
+bs=1 and bs=4 produce *bit-identical* outputs for the same zero-state
+inputs (sanity-check: padding slots [1..4) with zeros doesn't perturb
+slot 0). fp16 round-trip is correct.
+
+### Performance observation — bs=4 currently has no throughput win
+
+With one Acuity-compiled NBG on this single-core NPU, bs=4 amortizes
+nothing: per-state throughput is identical (12 vs 11 states/s) and
+per-call latency goes up linearly (80 → 339 ms). Likely because:
+
+1. The NPU has one core; bs=4 just runs 4× the work in 4× the time.
+2. kata1-b10c128 at 9×9 is ~1 M params with many small convs; each
+   layer is short enough that per-call dispatch + DDR traffic dominates.
+
+Two server threads on one NPU also gives no aggregate speedup
+(11 states/s combined, vs 12 for one thread) — the driver serializes
+hardware command submission and adds context-switch latency. **For the
+A733 use `--nn-server-threads 1` only.** The two-thread option
+(`--nn-server-threads 2 --nn-device-ids 0,0`) is supported but isn't
+useful here; would only pay off on a multi-core variant.
+
+### Implication for self-play tuning
+
+Because bs=4 doesn't amortize, **bs=1 is the better default for both
+live play and self-play** on this NPU revision unless a future
+toolchain release improves the bs=4 NBG codegen. Translating to the
+existing CLI: `./build/selfplay --max-batch 1 --search-threads 1 ...`
+(MCTS still gets parallelism via multiple concurrent games — see
+`run_loop.sh --selfplay-instances`). If you do want to keep bs=4 around
+(e.g. for future kernels that *can* batch), it works correctly and
+returns the right answers — it just won't be faster.
+
+### Performance vs other backends on the same network
+
+For calibration: ResNet-50 (INT8) on this NPU clocked 8 ms/call (~1
+TOPS achieved). kata1-b10c128 (fp16) at 9×9 clocks 80 ms/call. Two
+explanations for the 10× gap:
+
+* fp16 vs int8 on VIP9000 NanoDI+: nominally same MAC rate, but the
+  fp pipeline tends to be more bandwidth-bound on small spatials.
+* kata1's small 9×9 spatials and skinny channels (128) under-utilise
+  the MAC array — VeriSilicon's tiler is happiest with ≥56×56 inputs.
+
+If 12 inf/s is too slow for the target use case, options are:
+
+* INT8-quantize the model (toolkit supports it via
+  `Quantization(model).quantize('uint8',...)` with calibration data).
+  Should land at ~25 ms/call, **~40 inf/s**, based on the int8/fp16
+  ratio observed in vendor benchmarks.
+* Use a smaller network (b6c96 or b8c96) — would scale ~linearly.
+* Stay on fp16 and just run longer self-play wall time. 12 inf/s × 64
+  parallel games × 1 thread/game ≈ 700 sims/s aggregate, which is
+  workable for a small network on a $50 SBC.
+
+Decision is yours / the training-loop owner's; the runtime side is
+neutral on it.
+
+### Test-harness binary now in the build
+
+`build/vip9000_smoke` (built only when `MINIGO_BACKEND=vip9000`) is the
+fastest way to A/B test a new NBG without going through the full
+benchmark harness's `1, 8, 32, 64, 128`-batch sweep (which trips the
+NN queue's capacity bound and makes the runtime crash look like an
+NBG bug — it isn't). Always run `vip9000_smoke` first when validating
+a re-converted NBG.

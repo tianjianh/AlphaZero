@@ -14,17 +14,20 @@ Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple
 - **Metal** (default on macOS Apple Silicon) — GPU inference via MPSGraph with FP16 compute; 2-3× faster than OpenCL on the same hardware
 - **OpenCL** — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
 - **RKNN** (aarch64 Linux with Rockchip NPU — RK3562/RK3566/RK3568/RK3576/RK3588) — NPU inference via Rockchip's `librknnrt`; fp16 or int8/hybrid quantisation, multi-core NPU support (auto-distributed across NPU cores). Requires offline ONNX → .rknn conversion on an x86_64 host with `rknn-toolkit2`.
+- **VIP9000** (aarch64 Linux with VeriSilicon Vivante VIP9000 NPU — Allwinner A733 / V853 / similar) — NPU inference via the VIPLite v2.0 runtime (`libNBGlinker.so` + `libVIPhal.so`); fp16-native, single core. Requires offline ONNX → `.nb` (Network Binary Graph) conversion on an x86_64 Linux host running Allwinner's official Acuity Toolkit Docker image (`ubuntu-npu:v2.0.10.1`); the pip `acuitylite` wheel is a dead end — its bundled chip table doesn't contain A733's PID `0x1000003B` (verified across 6.42–6.51).
 - **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS
 
 **Multi-GPU / Multi-core support**: KataGo-style architecture with N server threads, each owning
 a `ComputeHandle` on its assigned GPU (or NPU core).  All threads drain from a single shared queue
 — whichever device finishes first picks up the next batch (self-balancing).  On Rockchip NPUs, the
 single physical NPU exposes 1–3 cores (SoC-dependent); one server thread per core pins to each core
-via `rknn_set_core_mask`, giving the same topology as one-thread-per-GPU.
+via `rknn_set_core_mask`, giving the same topology as one-thread-per-GPU.  On Allwinner A733
+(VIP9000 NanoDI+) the NPU is single-core — the driver serializes hardware command submission, so
+`--nn-server-threads 1` is the right setting (extra threads add latency without adding throughput).
 
 Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching KataGo's pattern.
 
-**Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.
+**Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.  The VIP9000 backend consumes a pre-compiled `.nb` (Network Binary Graph) bundled in a sibling directory (e.g. `models/best.onnx` → `models/best.a733.bs1.fp16/network_binary.nb` for `--max-batch 1`, `models/best.a733.bs4.fp16/network_binary.nb` for `--max-batch ≤ 4`).
 
 This build can also load **KataGo** networks (`kata1` and similar) for inference.
 See [KataGo inference](#katago-inference-tensorrt-only) below for the conversion + run workflow.
@@ -235,6 +238,45 @@ pip install rknn-toolkit2/rknn-toolkit2/packages/x86_64/rknn_toolkit2-2.3.2-cp31
 `rknn-toolkit-lite2` runs on aarch64 but can only *execute* `.rknn` files, not
 compile ONNX → RKNN.  Conversion must happen on x86_64.
 
+### Linux (aarch64 — Allwinner A733 / VeriSilicon VIP9000 NPU board, e.g. Radxa Cubie A7A / A7Z)
+
+```bash
+sudo apt install cmake g++ libeigen3-dev libncurses-dev git
+
+# Runtime libs.  Not in any apt repo on Allwinner — fetch the bundled
+# viplite-tina SDK from the Allwinner-published ai-sdk repo:
+git clone https://github.com/ZIFENG278/ai-sdk.git /root/proj/ai-sdk
+
+# Verify the aarch64 v2.0 libs and header are present:
+ls /root/proj/ai-sdk/viplite-tina/lib/aarch64-none-linux-gnu/v2.0/
+#   debug/  inc/  libNBGlinker.so  libVIPhal.so
+
+# Verify the kernel driver is loaded (vipcore module + /dev/vipcore):
+ls /dev/vipcore && lsmod | grep vipcore
+```
+
+CMake auto-detects the NPU when both the bundled SDK and `/dev/vipcore` are
+present on aarch64; alternatively force it with `cmake .. -DMINIGO_BACKEND=vip9000`.
+If the SDK lives elsewhere, point CMake at it with
+`-DVIPLITE_ROOT=/path/to/viplite-tina` (default: `/root/proj/ai-sdk/viplite-tina`).
+
+**Conversion toolkit** (x86_64 host only — the converter does NOT run on aarch64).
+The only working path is Allwinner's official Acuity Toolkit v6.30.22 inside
+the `ubuntu-npu:v2.0.10.1` Docker image; pip `acuitylite` does NOT work (its
+bundled chip table is missing A733's PID `0x1000003B`).  Use the wrapper
+script in this repo:
+```bash
+# On a real x86_64 Linux host with Docker installed and ubuntu-npu:v2.0.10.1
+# loaded (image is hosted on Allwinner's Synology netdisk, not Docker Hub —
+# see A733_CONVERSION.md §3.2 for the retrieval recipe):
+bash tools/onnx_to_a733_docker.sh 1   # produces models/<...>.a733.bs1.fp16/network_binary.nb
+bash tools/onnx_to_a733_docker.sh 4   # produces models/<...>.a733.bs4.fp16/network_binary.nb
+```
+Conversion must happen on x86_64; aarch64 has no Acuity binaries.  See
+[A733_CONVERSION.md](A733_CONVERSION.md) for the full ONNX → `.nb` flow,
+and [vip9000.note](vip9000.note) for the chip-ID gotchas to verify after
+each re-conversion.
+
 ### Python (both platforms — only needed for training)
 
 ```bash
@@ -261,6 +303,8 @@ DistributedDataParallel via `torchrun` (included with PyTorch).
 | OpenCL | OpenCL backend | `ocl-icd-opencl-dev` |
 | librknnrt | RKNN backend (aarch64 Linux) | `/usr/lib/librknnrt.so` from [airockchip/rknn-toolkit2](https://github.com/airockchip/rknn-toolkit2) (`rknpu2/runtime/Linux/librknn_api/aarch64/`) |
 | rknn-toolkit2 | ONNX → .rknn conversion (x86_64 host only) | `pip install rknn-toolkit2==2.3.2` |
+| viplite-tina SDK | VIP9000 backend (aarch64 Linux) | `libNBGlinker.so` + `libVIPhal.so` from [ZIFENG278/ai-sdk](https://github.com/ZIFENG278/ai-sdk) (`viplite-tina/lib/aarch64-none-linux-gnu/v2.0/`) |
+| Acuity Toolkit v6.30.22 | ONNX → .nb conversion (x86_64 Linux + Docker only) | Allwinner's `ubuntu-npu:v2.0.10.1` Docker image (Synology netdisk — see A733_CONVERSION.md §3.2). pip `acuitylite` does NOT work — chip table missing A733 PID. |
 | PyTorch | Training | `pip install torch` |
 | Transformer Engine | FP8 training (optional) | `pip install transformer_engine` |
 
@@ -279,6 +323,7 @@ CMake auto-detects the best backend for your platform:
 -- Backend:    tensorrt   (Linux with NVIDIA GPU + CUDA + TensorRT)
 -- Backend:    cuda       (Linux with NVIDIA GPU + CUDA, no TensorRT)
 -- Backend:    rknn       (aarch64 Linux with librknnrt.so — Rockchip NPU)
+-- Backend:    vip9000    (aarch64 Linux with viplite-tina SDK — Allwinner A733 / VIP9000)
 -- Backend:    opencl     (Linux with GPU, no CUDA)
 -- Backend:    eigen      (no GPU available)
 ```
@@ -290,6 +335,7 @@ cmake .. -DMINIGO_BACKEND=cuda     # CUDA FP16 Tensor Cores (NVIDIA)
 cmake .. -DMINIGO_BACKEND=metal    # Metal/MPSGraph (macOS Apple Silicon)
 cmake .. -DMINIGO_BACKEND=opencl   # OpenCL (Linux, macOS)
 cmake .. -DMINIGO_BACKEND=rknn     # Rockchip NPU (aarch64 Linux — RK3562/66/68/76/88)
+cmake .. -DMINIGO_BACKEND=vip9000  # VeriSilicon VIP9000 NPU (aarch64 Linux — Allwinner A733)
 cmake .. -DMINIGO_BACKEND=eigen    # CPU only (no GPU)
 ```
 
@@ -721,8 +767,11 @@ known limitations (ladder features and a few encore-only signals are zeroed).
 | `build/selfplay` | `.onnx` | generate training records | **no — refuses KataGo with `return 2`** |
 | `scripts/train*.py`, `run_continuous.py` | `.pt` / `.onnx` | training pipeline | no — KataGo never enters training |
 
-Backend support is restricted to **TensorRT**. Eigen / CUDA / OpenCL / Metal /
-RKNN throw `"KataGo format requires the TensorRT backend"` at handle creation.
+Backend support: **TensorRT** (NVIDIA, x86_64), **RKNN** (Rockchip NPU,
+aarch64), **VIP9000** (VeriSilicon NPU on Allwinner A733, aarch64).
+Eigen / CUDA / OpenCL / Metal throw `"KataGo format requires the TensorRT
+backend"` at handle creation; the NPU backends consume their respective
+pre-compiled artifacts (`.rknn` / `.nb`) generated alongside the ONNX.
 
 > ⚠ I tested `selfplay` to **confirm the rejection guard fires**, not to use it.
 > Selfplay refuses KataGo models on purpose — the V2 record format and the
@@ -767,6 +816,62 @@ make -C build -j
 `--komi` matters: kata1's typical 9×9 komi is `7.0` or `7.5`, and the value
 flows into KataGo's global feature vector. A mismatched komi silently degrades
 strength rather than erroring.
+
+#### KataGo on the Allwinner A733 (VIP9000 backend)
+
+```bash
+# 1. Convert the kata1 weights once on an x86_64 host (see A733_CONVERSION.md).
+#    The result is a directory containing network_binary.nb + nbg_meta.json,
+#    paired with the un-shared.onnx from the same export run.
+#    For typical kata1-b10c128 you'll end up with:
+#      models/kata1-b10c128.a733.bs1.unshared.onnx
+#      models/kata1-b10c128.a733.bs1.fp16/network_binary.nb
+#      models/kata1-b10c128.a733.bs4.fp16/network_binary.nb       (for batched runs)
+
+# 2. Build with the VIP9000 backend (auto-detected on the Cubie A7A).
+cmake -B build -DMINIGO_BACKEND=vip9000
+make -C build -j
+
+# 3. Live play — the backend picks the bs=1 NBG when --max-batch 1.
+./build/play       --model models/kata1-b10c128.a733.bs1.unshared.onnx \
+                   --max-batch 1 --sims 800 --komi 7.0
+
+# 4. Benchmark (sections 1, 2, 4 work; section 3's batch sweep includes 8/32/...
+#    which exceed the compiled bs=4 — use vip9000_smoke for batch validation).
+./build/benchmark  --model models/kata1-b10c128.a733.bs1.unshared.onnx \
+                   --max-batch 1 --nn-iters 100 --sims 256 --komi 7.0
+
+# 5. Match games (kata1 vs kata1, etc.).
+./build/evaluate   --model1 models/kata1-b10c128.a733.bs1.unshared.onnx \
+                   --model2 models/kata1-b10c128.a733.bs1.unshared.onnx \
+                   --games 50 --sims 200 --komi 7.0 --max-batch 1
+```
+
+**Standalone smoke test** (`build/vip9000_smoke`, built only with this
+backend) drives `predict_batch` directly, bypassing MCTS — the fastest
+way to validate a freshly-converted NBG without the benchmark's wider
+batch sweep:
+
+```bash
+./build/vip9000_smoke --model models/kata1-b10c128.a733.bs1.unshared.onnx \
+                      --batch 1 --iters 100 --threads 1
+./build/vip9000_smoke --model models/kata1-b10c128.a733.bs4.unshared.onnx \
+                      --batch 4 --iters 50  --threads 1
+```
+
+The smoke tool prints `policy[0..2]`, `value`, `score`, `score_sd`,
+`ownership[0..1]` from the first call so you can eyeball numerical sanity,
+then times `iters` calls back-to-back.
+
+**A733-specific tuning** (single-core VIP9000 NanoDI+):
+- Use `--nn-server-threads 1` (extra threads serialize on the driver and
+  add latency without throughput).
+- `--max-batch 1` is the better default — bs=4 codegen on the current
+  Acuity toolchain doesn't amortize on 9×9 kata1 (per-state throughput is
+  the same, per-call latency is 4× higher).
+- Memory pool: kata1-b10c128 fp16 weighs ~6 MB; the prepare-time
+  workspace is allocated by the driver from kernel-managed CMA — no
+  user tuning needed.
 
 ## Architecture
 
@@ -1157,6 +1262,166 @@ rknn.export_rknn("v0000_hybrid.rknn")
 
 Heads are <1% of FLOPs, so keeping them fp16 costs almost nothing;
 expected throughput ≈ full int8, expected MCTS strength ≈ fp16.
+
+### VIP9000 NPU Backend (VeriSilicon, aarch64 Linux — Allwinner A733)
+
+`VIP9000ComputeHandle` (`src/vip9000_compute.cpp`) runs inference on the
+VeriSilicon Vivante VIP9000 NanoDI+ NPU embedded in the Allwinner A733
+SoC, via VIPLite v2.0 (`libNBGlinker.so` + `libVIPhal.so`).  Like RKNN,
+the runtime consumes a **pre-compiled `.nb` (Network Binary Graph)**
+produced by VeriSilicon's Acuity Toolkit (specifically v6.30.22 inside
+Allwinner's `ubuntu-npu:v2.0.10.1` Docker image — the pip `acuitylite`
+wheel is verified non-functional for the A733 PID, see
+[A733_CONVERSION.md](A733_CONVERSION.md)) on an x86_64 host.
+
+The design follows the Context/Handle pattern:
+- **`VIP9000ComputeContext`** (process-wide): refcounts `vip_init` /
+  `vip_destroy`, queries the hardware chip ID once
+  (`vip_query_hardware(VIP_QUERY_HW_PROP_CID)`), holds a master
+  `vip_network` created lazily on the first handle.  The master exists
+  primarily so the chip-ID validation has somewhere to cache the I/O
+  metadata (see "NBG header pre-flight" below); it is **not** dup'd.
+- **`VIP9000ComputeHandle`** (per server thread): creates its own
+  `vip_network` from the cached NBG bytes (`vip_create_network(...,
+  VIP_CREATE_NETWORK_FROM_MEMORY)`), allocates per-input/per-output
+  `vip_buffer`s via `vip_create_buffer`, then prepares + binds them
+  in this exact order:
+  ```
+  vip_create_network                (per-thread, from cached NBG bytes)
+  vip_create_buffer × n_inputs      (input buffer per input tensor)
+  vip_create_buffer × n_outputs     (output buffer per output tensor)
+  vip_prepare_network               (allocates command-buffer + memory pool)
+  vip_set_input  × n_inputs         (must come AFTER prepare — order matters)
+  vip_set_output × n_outputs
+  ```
+  Then per inference: map → fp32→fp16 convert + zero-pad → `vip_flush_buffer(FLUSH)`
+  → `vip_run_network` → `vip_flush_buffer(INVALIDATE)` → fp16→fp32 → unmap.
+
+Why one network per thread instead of `vip_dup_network(VIP_DUP_FOR_CMD_BY_NETWORK)`?
+The dup primitive shares weight memory across handles — useful on memory-tight
+embedded devices.  But it requires the master to be `vip_prepare_network`'d
+first (which means the master also needs its own input/output buffers
+attached), and on the A733 the duplicated weight memory is ~6 MB per
+thread — a rounding error against the hundreds of MB of CMA the kernel
+already reserves for NPU activations.  Per-thread `vip_create_network`
+is simpler and keeps lifecycles independent.
+
+**Single-core hardware, single-thread server**
+
+The A733 NPU has one VIP9000 NanoDI+ core.  The VIPLite kernel driver
+serializes hardware command submission internally, so multiple server
+threads don't run in parallel — they queue on the same core, each
+paying full inference latency.  Measured on a Cubie A7A with kata1-b10c128
+fp16 at 9×9:
+
+| Server threads | ms/call | states/s |
+|---:|---:|---:|
+| 1 | 80.78 | 12 |
+| 2 | 159.97 (each) | 11 (aggregate) |
+
+So **`--nn-server-threads 1` is correct on the A733**.  `--nn-server-threads 2
+--nn-device-ids 0,0` is supported and works (each thread gets its own
+network handle), but the only thing it buys is more latency.  This will
+change on multi-core VIP9000 variants if/when they show up.
+
+**Precision and quantisation**
+
+The `.nb` baked precision is whatever you compiled with.
+`tools/onnx_to_a733_docker.sh` drives Acuity v6.30.22's `pegasus.py`
+with `dtype="float"` (`OvxlibExporter`), which produces fp16 buffers
+throughout (the VIP9000 fp pipeline is fp16-native — full MAC rate, no
+fp32-fallback slowdown). The on-board runtime exposes input/output
+tensors as `VIP_BUFFER_FORMAT_FP16` and the C++ backend round-trips fp32
+↔ fp16 on host with vendored conversion routines (vendored from
+VeriSilicon's `vpm_run.c` to avoid linking the SDK's helper libs).
+
+INT8 quantisation is supported by the toolkit (`Quantization(model).quantize(
+'uint8',...)` with calibration data) and would land at roughly **3× fp16
+throughput** on this NPU; not currently used because kata1 is small
+enough that fp16 is already lossless.  The C++ backend handles either
+format transparently — it switches on `data_format` at every map/unmap.
+
+**Resolving the .nb file from the ONNX path**
+
+The VIP9000 backend uses `LoadedModel::load()` on the `.onnx` to get
+board size / channel count / model type (the ONNX is the architecture
+truth, same as RKNN).  It then derives the NBG path:
+
+| ONNX path                                      | Resolved NBG (with `--max-batch K`)                           |
+|------------------------------------------------|---------------------------------------------------------------|
+| `models/foo.onnx`                              | `models/foo.a733.bs<K>.fp16/network_binary.nb`                |
+| `models/foo.unshared.onnx`                     | `models/foo.a733.bs<K>.fp16/network_binary.nb`                |
+| `models/foo.a733.bs1.unshared.onnx`            | `models/foo.a733.bs<K>.fp16/network_binary.nb` (re-stripped)  |
+| `models/foo.a733.bs1.fp16/network_binary.nb`   | itself (explicit override)                                    |
+| `models/foo.a733.bs1.fp16/`                    | `<dir>/network_binary.nb`                                     |
+
+`K` is picked from `--max-batch`: 1 if `max-batch ≤ 1`, else 4.  Larger
+batches throw at create time — re-convert with the desired bs.
+
+**NBG header pre-flight**
+
+Before calling `vip_create_network`, the backend reads the first 12
+bytes of the `.nb` and validates:
+- magic == `VPMN`
+- target chip ID matches `vip_query_hardware(VIP_QUERY_HW_PROP_CID)`
+  (low byte must match — full PID match preferred)
+
+If the chip ID mismatches, the backend throws with a concrete
+remediation message *before* the VIPLite runtime would otherwise fail
+with a generic `status=-4` and the NN server thread would die — which
+in turn would hang `evaluate_*()` callers forever (the NNEvaluator's
+queue waits for a server that no longer exists).  This is a real
+failure mode: the very first batch of NBGs delivered for kata1-b10c128
+targeted chip `0x15` instead of the A733's `0x1000003B`, because the
+acuitylite version on the conversion host didn't recognize
+`VIP9000NANODI_PID0X1000003B` and silently fell back to a generic
+VIP9000 default (low byte `0x15`).  See [vip9000.note](vip9000.note)
+for the full diagnosis and the verification checklist when
+re-converting.
+
+#### ONNX → VIP9000 NBG conversion
+
+Run on a **real x86_64 Linux host with Docker** (not aarch64 — Acuity
+ships only x86_64 binaries; not a nested container — see
+A733_CONVERSION.md §6.3 for why Docker-in-Docker fails the
+simulator's `vsi_nn_CreateGraph()` call).
+
+**Step 1: install Docker + Allwinner's `ubuntu-npu:v2.0.10.1` image
+(one-time setup).**  The image is on Allwinner's Synology netdisk
+(not Docker Hub) — A733_CONVERSION.md §3.0/§3.2 has the retrieval
+recipe.  The pip `acuitylite` wheel is verified non-functional for
+this NPU (chip table missing PID `0x1000003B` in 6.42–6.51) and
+`tools/onnx_to_a733.py` is now a deprecation banner that exits 2.
+
+**Step 2: convert.**  `tools/onnx_to_a733_docker.sh` runs the full
+ONNX export → unshare-initializers → Acuity import → NBG export
+chain inside the Docker image.  Setting `VSIMULATOR_CONFIG=VIP9000NANODI_PID0X1000003B`
+(no `_PLUS_`, despite what `pegasus_setup.sh v3` claims — the actual
+shipped config file is named without `_PLUS_`):
+
+```bash
+# Both batches in one go.  Reads kata1-b10c128-*.txt.gz and writes
+# models/kata1-b10c128.a733.bs{1,4}.fp16/network_binary.nb.
+bash tools/onnx_to_a733_docker.sh 1
+bash tools/onnx_to_a733_docker.sh 4
+```
+
+**Step 3: verify before shipping.**  `xxd <nbg> | head -1` must show:
+- bytes 0..3: `5650 4d4e` (`VPMN` magic)
+- bytes 8..11: `3b00 0010` (target chip `0x1000003B`)
+
+Bytes 4..7 are the NBG format version (`00 00 02 00` = `0x20000` from
+v6.30.22, but v1 versions like `0x1001E` / `0x10020` also work — the
+runtime accepts both as long as the target byte is right).  Then
+sanity-check on the device with `build/vip9000_smoke`.  Full procedure
+with all gotchas — including the chip-ID mismatch failure mode and how
+to distinguish a real backend bug from a converter bug — in
+[vip9000.note](vip9000.note).
+
+See also [A733_CONVERSION.md](A733_CONVERSION.md) for the detailed
+rationale (why fp16, why Docker-only, why un-share initializers, why
+the `_PLUS_` config name doesn't exist in v6.30.22, host-side parity
+numbers).
 
 ### Modular Backend Design (KataGo pattern)
 
