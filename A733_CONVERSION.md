@@ -51,7 +51,7 @@ verification. If not, something regressed — read §6 to diagnose.
 
 | In scope | Out of scope |
 |---|---|
-| Converting kata1 ONNX → `.nb` on an x86_64 Linux host with Docker | The `awnn` / VIPLite runtime on the Cubie A7A board (`vip9000.note` covers that) |
+| Converting kata1 ONNX → `.nb` on an x86_64 Linux host with Docker | The `awnn` / VIPLite runtime on the Cubie A7A board (covered by README.md "VIP9000 NPU Backend" section) |
 | Producing an NBG that the on-board viplite v2.0.3.2-AW-2024-08-30 accepts at `vip_create_network` | The C++ `Vip9000ComputeHandle` backend in `src/vip9000_compute.cpp` (already merged on `multi-gpu`; works once the NBG header validates) |
 | Why pip `acuitylite==6.51.0` cannot do this | Quantisation paths (int8 / int16 / hybrid) — kata1 is fp16 only on this NPU and that's correct for it, see §2 |
 
@@ -451,7 +451,8 @@ scp kata1-b10c128.a733.fp16.zip cubie:~/
 ssh cubie 'cd /root/proj/AlphaZero && unzip -o ~/kata1-b10c128.a733.fp16.zip'
 # The .nb lands at models/kata1-b10c128.a733.bs1.fp16/network_binary.nb;
 # the C++ runtime (vip9000_compute.cpp) finds it via extension swap on
-# LoadedModel::model_path.  See vip9000.note §8.
+# LoadedModel::model_path.  See README.md "VIP9000 NPU Backend"
+# (path-resolution table) for the exact rules.
 ```
 
 ---
@@ -604,10 +605,10 @@ completeness, not because we recommend it for this project.
 ## 7. On-board verification
 
 Once you have a header-validated NBG, smoke-test on the Cubie before
-the full benchmark. This complements `vip9000.note §7` with the
-A733-converter-specific checks. Both bs=1 and bs=4 NBGs from the
-Docker pipeline have been confirmed to pass §7.1 on the Cubie A7A as
-of 2026-04-29.
+the full benchmark. The on-board side (build/vip9000_smoke + the C++
+backend) is documented in README.md's "VIP9000 NPU Backend" section.
+Both bs=1 and bs=4 NBGs from the Docker pipeline have been confirmed
+to pass §7.1 on the Cubie A7A as of 2026-04-29.
 
 ### 7.1 `vpm_run` smoke test — VERIFIED PASSING
 
@@ -724,7 +725,7 @@ later.
 | `models/<base>.a733.bs<N>.unshared.onnx` | Source ONNX (canonical reference for downstream parity). | — |
 | `models/<base>.a733.bs<N>.fp16/network_binary.nb` | Deployable NBG. Header bytes 8..11 must be `3b 00 00 10`. | — |
 | `models/<base>.a733.bs<N>.fp16/nbg_meta.json` | Per-NBG input/output names, shapes, dtypes. The on-board awnn loader can match its buffers by these names. | — |
-| `vip9000.note` | On-board runtime notes (the C++ backend side). Read this in tandem. | — |
+| README.md "VIP9000 NPU Backend" section | On-board runtime notes (the C++ backend side). Read in tandem with this doc. | — |
 
 ---
 
@@ -749,8 +750,8 @@ later.
 
 ## 11. Sources
 
-* On-board diagnostics that motivated this rewrite: `vip9000.note`
-  (this repo, `multi-gpu` branch).
+* On-board diagnostics that motivated this rewrite: README.md
+  "VIP9000 NPU Backend" section (this repo, `multi-gpu` branch).
 * Allwinner ai-sdk: <https://github.com/ZIFENG278/ai-sdk> (pegasus
   shell scripts in `scripts/`, viplite runtime libs in `viplite-tina/`).
 * Acuity Toolkit Docker image archive: Allwinner Synology netdisk

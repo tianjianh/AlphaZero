@@ -23,8 +23,8 @@
    `ubuntu-npu:v2.0.10.1` Docker image (its libEmulator.so chip
    table DOES contain `VIP9000NANODI_PID0X1000003B`, the right
    chip for the Cubie A7A's A733).  See A733_CONVERSION.md for the
-   full pipeline, including the `vip9000.note` on-board diagnostics
-   that demonstrated the rejection.
+   full pipeline and on-board diagnostics that demonstrated the
+   rejection.
 
    The original implementation that this banner replaced is preserved
    in the git history of this file (commits 827de13 and earlier on

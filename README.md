@@ -274,8 +274,8 @@ bash tools/onnx_to_a733_docker.sh 4   # produces models/<...>.a733.bs4.fp16/netw
 ```
 Conversion must happen on x86_64; aarch64 has no Acuity binaries.  See
 [A733_CONVERSION.md](A733_CONVERSION.md) for the full ONNX → `.nb` flow,
-and [vip9000.note](vip9000.note) for the chip-ID gotchas to verify after
-each re-conversion.
+and the verification checklist in [A733_CONVERSION.md §7](A733_CONVERSION.md)
+for the chip-ID gotchas to spot-check after each re-conversion.
 
 ### Python (both platforms — only needed for training)
 
@@ -1312,17 +1312,29 @@ The A733 NPU has one VIP9000 NanoDI+ core.  The VIPLite kernel driver
 serializes hardware command submission internally, so multiple server
 threads don't run in parallel — they queue on the same core, each
 paying full inference latency.  Measured on a Cubie A7A with kata1-b10c128
-fp16 at 9×9:
+fp16 at 9×9 (via `build/vip9000_smoke`):
 
-| Server threads | ms/call | states/s |
-|---:|---:|---:|
-| 1 | 80.78 | 12 |
-| 2 | 159.97 (each) | 11 (aggregate) |
+| NBG  | batch | server threads | ms/call          | states/s         | notes                         |
+|------|------:|---------------:|-----------------:|-----------------:|-------------------------------|
+| bs=1 |     1 |              1 |  80.78           | 12               | single stream                 |
+| bs=4 |     4 |              1 | 338.68           | 11               | full bs=4, no amortization    |
+| bs=1 |     1 |              2 | 159.97 (each)    | 11 (aggregate)   | 2 threads on one NPU core     |
 
 So **`--nn-server-threads 1` is correct on the A733**.  `--nn-server-threads 2
 --nn-device-ids 0,0` is supported and works (each thread gets its own
 network handle), but the only thing it buys is more latency.  This will
 change on multi-core VIP9000 variants if/when they show up.
+
+For calibration: ResNet-50 INT8 on the same NPU clocks ~8 ms/call
+(~1 TOPS achieved); kata1-b10c128 fp16 at 9×9 lands at ~80 ms/call
+because the small spatials and skinny channels (128) under-utilise
+the MAC array — VeriSilicon's tiler is happiest with ≥56×56 inputs.
+INT8-quantising kata1 (`Quantization(model).quantize('uint8',...)` at
+conversion time, with calibration data) would land roughly **~3× faster**
+based on the int8/fp16 ratio observed in vendor benchmarks; not currently
+used because fp16 is essentially lossless on this network and 12 inf/s ×
+64 parallel games × 1 thread/game ≈ 700 sims/s aggregate is workable for
+a small network on a $50 SBC.
 
 **Precision and quantisation**
 
@@ -1375,9 +1387,9 @@ failure mode: the very first batch of NBGs delivered for kata1-b10c128
 targeted chip `0x15` instead of the A733's `0x1000003B`, because the
 acuitylite version on the conversion host didn't recognize
 `VIP9000NANODI_PID0X1000003B` and silently fell back to a generic
-VIP9000 default (low byte `0x15`).  See [vip9000.note](vip9000.note)
-for the full diagnosis and the verification checklist when
-re-converting.
+VIP9000 default (low byte `0x15`).  See
+[A733_CONVERSION.md](A733_CONVERSION.md) for the full diagnosis and
+the verification checklist when re-converting.
 
 #### ONNX → VIP9000 NBG conversion
 
@@ -1416,7 +1428,7 @@ runtime accepts both as long as the target byte is right).  Then
 sanity-check on the device with `build/vip9000_smoke`.  Full procedure
 with all gotchas — including the chip-ID mismatch failure mode and how
 to distinguish a real backend bug from a converter bug — in
-[vip9000.note](vip9000.note).
+[A733_CONVERSION.md](A733_CONVERSION.md) §7.
 
 See also [A733_CONVERSION.md](A733_CONVERSION.md) for the detailed
 rationale (why fp16, why Docker-only, why un-share initializers, why
