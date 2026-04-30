@@ -432,8 +432,10 @@ add_executable(selfplay  src/main_selfplay.cpp)
 add_executable(benchmark src/main_benchmark.cpp)
 add_executable(evaluate  src/main_evaluate.cpp)
 if(HAS_VIP9000)
-  add_executable(vip9000_smoke src/main_vip9000_smoke.cpp)
-  target_link_libraries(vip9000_smoke PRIVATE minigo_core)
+  add_executable(vip9000_smoke    src/main_vip9000_smoke.cpp)
+  add_executable(vip9000_accuracy src/main_vip9000_accuracy.cpp)
+  target_link_libraries(vip9000_smoke    PRIVATE minigo_core)
+  target_link_libraries(vip9000_accuracy PRIVATE minigo_core)
 endif()
 
 # Prefer ncursesw for wide-character (Unicode) support

@@ -127,9 +127,18 @@ static std::string resolve_nbg_path(const std::string& model_path, int chosen_bs
 
     // Try INT8 first (faster on the VIP9000 fp pipeline when available),
     // fall back to FP16.  This matches the convention from the converter:
-    // models/<base>.a733.bs<K>.{int8,fp16}/network_binary.nb.
-    const char* candidates[] = { ".int8/network_binary.nb",
-                                 ".fp16/network_binary.nb" };
+    // models/<base>.a733.bs<K>.{int8,fp16}/network_binary.nb.  Override
+    // with VIP9000_FORCE_PRECISION=fp16|int8 to pin one or the other
+    // (used by the accuracy comparator to load both side-by-side).
+    const char* force = std::getenv("VIP9000_FORCE_PRECISION");
+    std::vector<const char*> candidates;
+    if (force && std::string(force) == "fp16") {
+        candidates = { ".fp16/network_binary.nb" };
+    } else if (force && std::string(force) == "int8") {
+        candidates = { ".int8/network_binary.nb" };
+    } else {
+        candidates = { ".int8/network_binary.nb", ".fp16/network_binary.nb" };
+    }
     for (const char* suffix : candidates) {
         std::string p = base + ".a733.bs" + std::to_string(chosen_bs) + suffix;
         if (file_exists(p)) return p;

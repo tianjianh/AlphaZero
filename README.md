@@ -1344,12 +1344,31 @@ Practical implications on the A733:
   states/s) while per-call latency is 4× higher, exactly matching the
   batch dimension.  On fp16 it doesn't, so bs=1 was better there.
 
-> ⚠️ The current bs=1 int8 NBG produces visibly off-calibration outputs
-> on an empty board (e.g. `score=-23.7` where fp16 reports `score=0.38`),
-> while the bs=4 int8 NBG calibrates closer to fp16 (`score=1.41`).
-> Likely a calibration-set mismatch on the converter side; numerical
-> parity isn't validated end-to-end yet.  See A733_CONVERSION.md for the
-> calibration data flow.
+**Numerical quality of the int8 NBGs** (200 random mid-game 9×9 positions,
+fp16 NBG treated as ground truth — `build/vip9000_accuracy --positions 200`):
+
+| precision | top-1 | top-3 | top-5 | value MAE | score MAE | score_sd MAE | own MAE |
+|-----------|------:|------:|------:|----------:|----------:|-------------:|--------:|
+| **int8 bs=1** | **3.0 %** | 7.5 % | 9.0 % | 0.7289 | **26.86 pts** | 21.62 | 0.2165 |
+| **int8 bs=4** | **22.5 %** | 58.5 % | 93.0 % | 0.0697 | 4.50 pts | 0.80 | 0.0223 |
+
+* **bs=1 int8 is broken** — top-1 of 3 % is barely above chance for
+  ~70-legal-move positions, value MAE 0.73 (range is [−1, 1]), and
+  score MAE 27 points means the score head is essentially noise.  The
+  calibration set used during conversion was likely too small or
+  unrepresentative.  Do not use for play / self-play / training until
+  re-calibrated.
+* **bs=4 int8 is degraded but usable** — top-5 inclusion of 93 %
+  means MCTS will explore the right moves; value MAE 0.07 and score
+  MAE 4.5 points are noticeable strength regressions but not
+  game-breaking.  Best treated as a draft until a fuller calibration
+  pass lands.
+* **Why the big gap** — both NBGs were quantised with
+  `Quantization(...).quantize('uint8', ...)` against the same source
+  ONNX, but the calibration-fixture batch fed at conversion time
+  determines the per-tensor min/max range.  The bs=1 calibration
+  apparently saw a much narrower activation distribution than bs=4.
+  See A733_CONVERSION.md §4 for the calibration plumbing.
 
 **Precision and quantisation**
 
