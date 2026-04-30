@@ -22,12 +22,14 @@ a `ComputeHandle` on its assigned GPU (or NPU core).  All threads drain from a s
 — whichever device finishes first picks up the next batch (self-balancing).  On Rockchip NPUs, the
 single physical NPU exposes 1–3 cores (SoC-dependent); one server thread per core pins to each core
 via `rknn_set_core_mask`, giving the same topology as one-thread-per-GPU.  On Allwinner A733
-(VIP9000 NanoDI+) the NPU is single-core — the driver serializes hardware command submission, so
-`--nn-server-threads 1` is the right setting (extra threads add latency without adding throughput).
+(VIP9000 NanoDI+) the NPU is single-core — the driver serializes hardware command submission.
+On fp16, `--nn-server-threads 1` is the right setting (extra threads add latency without
+throughput).  On the int8 path, `--nn-server-threads 2 --nn-device-ids 0,0` gives a small
+(~10 %) aggregate gain; 3+ threads hits driver serialisation and doesn't help.
 
 Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching KataGo's pattern.
 
-**Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.  The VIP9000 backend consumes a pre-compiled `.nb` (Network Binary Graph) bundled in a sibling directory (e.g. `models/best.onnx` → `models/best.a733.bs1.fp16/network_binary.nb` for `--max-batch 1`, `models/best.a733.bs4.fp16/network_binary.nb` for `--max-batch ≤ 4`).
+**Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.  The VIP9000 backend consumes a pre-compiled `.nb` (Network Binary Graph) bundled in a sibling directory; the resolver picks `.a733.bs<K>.int8/network_binary.nb` first and falls back to `.fp16/` (where `K = 1` for `--max-batch 1`, `4` for `--max-batch ≤ 4`).  Set `VIP9000_FORCE_PRECISION=fp16` (or `int8`) to pin one or the other; otherwise int8 wins when both directories exist.
 
 This build can also load **KataGo** networks (`kata1` and similar) for inference.
 See [KataGo inference](#katago-inference-tensorrt-only) below for the conversion + run workflow.
@@ -821,57 +823,86 @@ strength rather than erroring.
 
 ```bash
 # 1. Convert the kata1 weights once on an x86_64 host (see A733_CONVERSION.md).
-#    The result is a directory containing network_binary.nb + nbg_meta.json,
-#    paired with the un-shared.onnx from the same export run.
-#    For typical kata1-b10c128 you'll end up with:
-#      models/kata1-b10c128.a733.bs1.unshared.onnx
-#      models/kata1-b10c128.a733.bs1.fp16/network_binary.nb
-#      models/kata1-b10c128.a733.bs4.fp16/network_binary.nb       (for batched runs)
+#    The result is a pair of directories per batch size — int8 (preferred,
+#    quantised against a calibration fixture) and fp16 (lossless reference):
+#      models/kata1-b10c128.a733.bs4.unshared.onnx
+#      models/kata1-b10c128.a733.bs4.int8/network_binary.nb     ← used at runtime
+#      models/kata1-b10c128.a733.bs4.fp16/network_binary.nb     ← reference / fallback
+#      (and bs=1 variants, if you also need single-state latency)
 
 # 2. Build with the VIP9000 backend (auto-detected on the Cubie A7A).
 cmake -B build -DMINIGO_BACKEND=vip9000
 make -C build -j
 
-# 3. Live play — the backend picks the bs=1 NBG when --max-batch 1.
-./build/play       --model models/kata1-b10c128.a733.bs1.unshared.onnx \
-                   --max-batch 1 --sims 800 --komi 7.0
+# 3. Live play.  --max-batch 4 selects the bs=4 NBG (and the int8 sibling
+#    if both .int8/ and .fp16/ exist); --search-threads 16 keeps each
+#    bs=4 batch full so the NPU isn't padding 3 of 4 slots with zeros.
+./build/play       --model models/kata1-b10c128.a733.bs4.unshared.onnx \
+                   --max-batch 4 --search-threads 16 \
+                   --sims 800 --komi 7.0
 
-# 4. Benchmark (sections 1, 2, 4 work; section 3's batch sweep includes 8/32/...
-#    which exceed the compiled bs=4 — use vip9000_smoke for batch validation).
-./build/benchmark  --model models/kata1-b10c128.a733.bs1.unshared.onnx \
-                   --max-batch 1 --nn-iters 100 --sims 256 --komi 7.0
+# 4. Benchmark (sections 1, 2, 4 work; section 3's batch sweep includes
+#    8/32/... which exceed the compiled bs=4 — use vip9000_smoke for that).
+./build/benchmark  --model models/kata1-b10c128.a733.bs4.unshared.onnx \
+                   --max-batch 4 --search-threads 16 \
+                   --nn-iters 100 --sims 256 --komi 7.0
 
 # 5. Match games (kata1 vs kata1, etc.).
-./build/evaluate   --model1 models/kata1-b10c128.a733.bs1.unshared.onnx \
-                   --model2 models/kata1-b10c128.a733.bs1.unshared.onnx \
-                   --games 50 --sims 200 --komi 7.0 --max-batch 1
+./build/evaluate   --model1 models/kata1-b10c128.a733.bs4.unshared.onnx \
+                   --model2 models/kata1-b10c128.a733.bs4.unshared.onnx \
+                   --games 50 --sims 200 --komi 7.0 \
+                   --max-batch 4 --search-threads 16
 ```
 
-**Standalone smoke test** (`build/vip9000_smoke`, built only with this
-backend) drives `predict_batch` directly, bypassing MCTS — the fastest
-way to validate a freshly-converted NBG without the benchmark's wider
-batch sweep:
+**Why `--search-threads 16` matters with bs=4**: the bs=4 NBG always
+processes 4 batch slots regardless of how many leaves MCTS has ready.
+With `--search-threads 1`, you'd burn ~3.4 ms/call for 1 useful state
+(≈290 effective inf/s) instead of ~1167 inf/s.  KataGo's recommendation
+of 8–32 search threads applies — 16 is a good default.
+
+**Bs=1 latency mode** (single-state, lower per-call latency, slightly
+weaker policy quality on the current bs=1 int8 calibration):
 
 ```bash
-./build/vip9000_smoke --model models/kata1-b10c128.a733.bs1.unshared.onnx \
-                      --batch 1 --iters 100 --threads 1
-./build/vip9000_smoke --model models/kata1-b10c128.a733.bs4.unshared.onnx \
-                      --batch 4 --iters 50  --threads 1
+./build/play --model models/kata1-b10c128.a733.bs1.unshared.onnx \
+             --max-batch 1 --search-threads 1 \
+             --sims 800 --komi 7.0
 ```
 
-The smoke tool prints `policy[0..2]`, `value`, `score`, `score_sd`,
-`ownership[0..1]` from the first call so you can eyeball numerical sanity,
-then times `iters` calls back-to-back.
+**Standalone tools** (built only with this backend):
+
+```bash
+# Time a fresh NBG end-to-end, bypassing MCTS / NNEvaluator
+./build/vip9000_smoke    --model models/kata1-b10c128.a733.bs4.unshared.onnx \
+                         --batch 4 --iters 500 --threads 1
+
+# Compare int8 vs fp16 outputs on N random positions (top-1/3/5 +
+# value/score/ownership MAE).  Use after each new int8 calibration.
+./build/vip9000_accuracy --model models/kata1-b10c128.a733.bs4.unshared.onnx \
+                         --batch 4 --positions 200 --seed 42
+```
+
+`vip9000_smoke` prints `policy[0..2]`, `value`, `score`, `score_sd`,
+`ownership[0..1]` from the first call so you can eyeball sanity, then
+times `iters` calls back-to-back.  `vip9000_accuracy` runs the same model
+under both precisions in one process and reports policy top-K agreement
+plus per-head MAE (treating fp16 as ground truth).
 
 **A733-specific tuning** (single-core VIP9000 NanoDI+):
-- Use `--nn-server-threads 1` (extra threads serialize on the driver and
-  add latency without throughput).
-- `--max-batch 1` is the better default — bs=4 codegen on the current
-  Acuity toolchain doesn't amortize on 9×9 kata1 (per-state throughput is
-  the same, per-call latency is 4× higher).
-- Memory pool: kata1-b10c128 fp16 weighs ~6 MB; the prepare-time
-  workspace is allocated by the driver from kernel-managed CMA — no
-  user tuning needed.
+- **bs=4 int8 is the production default** — top-1 79 % / top-5 100 %
+  vs fp16 on the revised-calibration NBG, ~1167 states/s with
+  `--search-threads 16`.  See the perf and quality tables in the
+  "VIP9000 NPU Backend" architecture section for the full numbers.
+- **`--nn-server-threads 1`** for play (one MCTS in flight feeds the
+  queue at search-thread rate — a second server thread doesn't help).
+  For self-play with multiple parallel games, `--nn-server-threads 2
+  --nn-device-ids 0,0` gives ~10 % more aggregate throughput on int8.
+- **bs=1 is for latency-sensitive single-state callers only** — the
+  current bs=1 int8 NBG has top-1 = 7.5 % vs fp16, so MCTS-driven
+  workloads (play/evaluate) would lose strength.  Use bs=4 unless
+  you really need 0.82 ms/call.
+- **Memory**: each bs=4 int8 NBG is ~6.6 MB on disk and ~10–15 MB
+  resident after `vip_prepare_network`.  No user tuning needed.
 
 ## Architecture
 
@@ -1396,14 +1427,17 @@ truth, same as RKNN).  It then derives the NBG path:
 
 | ONNX path                                      | Resolved NBG (with `--max-batch K`)                           |
 |------------------------------------------------|---------------------------------------------------------------|
-| `models/foo.onnx`                              | `models/foo.a733.bs<K>.fp16/network_binary.nb`                |
-| `models/foo.unshared.onnx`                     | `models/foo.a733.bs<K>.fp16/network_binary.nb`                |
-| `models/foo.a733.bs1.unshared.onnx`            | `models/foo.a733.bs<K>.fp16/network_binary.nb` (re-stripped)  |
-| `models/foo.a733.bs1.fp16/network_binary.nb`   | itself (explicit override)                                    |
-| `models/foo.a733.bs1.fp16/`                    | `<dir>/network_binary.nb`                                     |
+| `models/foo.onnx`                              | `models/foo.a733.bs<K>.{int8,fp16}/network_binary.nb`         |
+| `models/foo.unshared.onnx`                     | `models/foo.a733.bs<K>.{int8,fp16}/network_binary.nb`         |
+| `models/foo.a733.bs1.unshared.onnx`            | `models/foo.a733.bs<K>.{int8,fp16}/network_binary.nb`         |
+| `models/foo.a733.bs1.int8.unshared.onnx`       | `models/foo.a733.bs<K>.{int8,fp16}/network_binary.nb`         |
+| `models/foo.a733.bs1.int8/network_binary.nb`   | itself (explicit override)                                    |
+| `models/foo.a733.bs1.int8/`                    | `<dir>/network_binary.nb`                                     |
 
 `K` is picked from `--max-batch`: 1 if `max-batch ≤ 1`, else 4.  Larger
-batches throw at create time — re-convert with the desired bs.
+batches throw at create time — re-convert with the desired bs.  Within
+a `K`, the resolver tries `.int8/` first and falls back to `.fp16/`;
+override with `VIP9000_FORCE_PRECISION=fp16` (or `int8`) to pin one.
 
 **NBG header pre-flight**
 
