@@ -30,20 +30,35 @@
 | Toolkit | **Allwinner's `ubuntu-npu:v2.0.10.1` Docker image** (2.9 GB). NOT pip `acuitylite==6.51.0` — its bundled chip table is missing A733's PID. |
 | Host requirement | **Real x86_64 Linux** with Docker. A nested container (Docker-in-Docker without `--privileged`) can compile `gen_nbg` but its VIP9000 simulator `vsi_nn_CreateGraph()` fails silently — see §6.3. |
 | `VSIMULATOR_CONFIG` | `VIP9000NANODI_PID0X1000003B` (NOT `_PLUS_` — Allwinner's `pegasus_setup.sh v3` says `_PLUS_` but the actual `.config` file shipped in the image has the no-`_PLUS_` name). |
-| Output check | `xxd network_binary.nb \| head -1` → bytes 0..3 must be `VPMN`, bytes 8..11 must be `3b 00 00 10` (target `0x1000003B`). Bytes 4..7 are the NBG format version: `00 00 02 00` (`0x20000` = NBG v2.0.0) is what v6.30.22 emits. |
+| fp16 path | `bash tools/onnx_to_a733_docker.sh <BS>` → `models/kata1-b10c128.a733.bs<BS>.fp16/network_binary.nb`. Lossless vs ORT but only 2 NN-core ops at bs=1 (zero at bs=4) → ~80 ms / call on board. Use only as a sanity baseline. |
+| int8 path (production) | `bash tools/a733_gen_calib.py … && bash tools/onnx_to_a733_quantize_docker.sh <BS>` → `models/kata1-b10c128.a733.bs<BS>.int8/network_binary.nb`. 46–144 NN-core ops, **~110× faster than fp16** on board. **bs=4 is the production default** (top-1 79% / top-5 100% vs ORT). See §3.5 for the calibration recipe and the inputmeta trap that takes top-1 from 87% → 3% if you miss it. |
+| Output check | `xxd network_binary.nb \| head -1` → bytes 0..3 must be `VPMN`, bytes 8..11 must be `3b 00 00 10` (target `0x1000003B`). Bytes 4..7 are the NBG format version (`0x20000` = NBG v2.0.0) — what v6.30.22 emits. |
 | On-board check | `vpm_run -s sample.txt -l 5 -b 1` should print `create network 0: NNN us` and `vpm run ret=0`, NOT `[…]nbglk_valid_nbg_check[920], binary target=…` (see §7). |
 
 **Bottom line for someone re-doing this on a real Linux host:**
 
 ```bash
-# On the real Linux host — Docker assumed already installed
-bash tools/onnx_to_a733_docker.sh   # produces models/kata1-b10c128.a733.bs1.fp16/network_binary.nb
+# fp16 NBGs (cheap reference, slow on board)
+bash tools/onnx_to_a733_docker.sh 1
+bash tools/onnx_to_a733_docker.sh 4
+
+# int8 NBGs (production, ~110× faster on board)
+.venv/bin/python tools/a733_gen_calib.py \
+    --output-dir build/a733_calib --num-games 80 \
+    --onnx-model models/kata1-b10c128.a733.bs1.unshared.onnx \
+    --strong-frac 0.7 --random-game-frac 0.2 --seed 1234
+bash tools/onnx_to_a733_quantize_docker.sh 1
+bash tools/onnx_to_a733_quantize_docker.sh 4
+
 xxd models/kata1-b10c128.a733.bs1.fp16/network_binary.nb | head -1
-# Expect: 5650 4d4e 0000 0200 3b00 0010 ...   (VPMN, ver 0x20000, target 0x1000003B)
+xxd models/kata1-b10c128.a733.bs1.int8/network_binary.nb | head -1
+# Both expect: 5650 4d4e 0000 0200 3b00 0010 ...   (VPMN, ver 0x20000, target 0x1000003B)
 ```
 
-If those bytes match, ship the `.nb` to the Cubie A7A and run the §7
-verification. If not, something regressed — read §6 to diagnose.
+If those bytes match, ship the `.nb` to the Cubie A7A. The runtime
+resolver in `src/vip9000_compute.cpp` picks `.int8/` first and falls
+back to `.fp16/`; set `VIP9000_FORCE_PRECISION=fp16` to pin the
+slower path for an A/B comparison. Run §7 to verify on-board.
 
 ---
 
@@ -52,11 +67,19 @@ verification. If not, something regressed — read §6 to diagnose.
 | In scope | Out of scope |
 |---|---|
 | Converting kata1 ONNX → `.nb` on an x86_64 Linux host with Docker | The `awnn` / VIPLite runtime on the Cubie A7A board (covered by README.md "VIP9000 NPU Backend" section) |
-| Producing an NBG that the on-board viplite v2.0.3.2-AW-2024-08-30 accepts at `vip_create_network` | The C++ `Vip9000ComputeHandle` backend in `src/vip9000_compute.cpp` (already merged on `multi-gpu`; works once the NBG header validates) |
-| Why pip `acuitylite==6.51.0` cannot do this | Quantisation paths (int8 / int16 / hybrid) — kata1 is fp16 only on this NPU and that's correct for it, see §2 |
+| Producing an NBG that the on-board viplite v2.0.3.2-AW-2024-08-30 accepts at `vip_create_network` | The C++ `Vip9000ComputeHandle` backend in `src/vip9000_compute.cpp` (works once the NBG header validates and the `.quantize` table is correct) |
+| Both the **fp16** path (sanity baseline) and the **int8 hybrid** path (production — ~110× faster) | Int16 / w8a16 / pcq variants — int8 hybrid is the right point on this NPU's accuracy/speed curve |
+| Why pip `acuitylite==6.51.0` cannot do either path | The `build/vip9000_accuracy` harness and `VIP9000_FORCE_PRECISION` env var — those live on the board side |
 
-The only artifact this doc is responsible for producing is
-`network_binary.nb` (plus the `nbg_meta.json` companion).
+The artifacts this doc is responsible for producing:
+
+```
+models/kata1-b10c128.a733.bs<N>.fp16/network_binary.nb        (slow but lossless)
+models/kata1-b10c128.a733.bs<N>.fp16/nbg_meta.json
+models/kata1-b10c128.a733.bs<N>.int8/network_binary.nb        (production)
+models/kata1-b10c128.a733.bs<N>.int8/nbg_meta.json
+models/kata1-b10c128.a733.bs<N>.int8/<base>_int8.quantize     (calibration table)
+```
 
 ---
 
@@ -89,11 +112,18 @@ VIP9000NANODI_PID0X1000003B` returns a match (it's in both the
 image's `Vivante_IDE/.../vsimulator/lib/libEmulator.so` and the
 acuitylib wheel's `vsi_sdk/prebuilt-sdk/x86_64_linux/lib/libEmulator.so`).
 
-VIP9000's MAC array runs **fp16 natively** at the same rate as int8.
-There's no throughput incentive to quantise kata1 — fp16 is
-essentially lossless on the network and runs at peak. Contrast with
-the RK3576/3588 path documented in `RKNN_CONVERSION.md` §11.2 where
-int16 runs at ⅓ rate and w8a16 has codegen bugs.
+VIP9000's spec sheet says fp16 runs at the same rate as int8 — but on
+this particular A733 silicon and toolkit pairing, kata1's fp16 NBG
+schedules ~93% of its ops onto the slow shader/PPU path (89 SP + 71
+SH + 29 NN_LUT vs only 2 NN-core ops at bs=1; bs=4 fp16 puts **zero**
+ops on the NN cores). The int8 NBG produced by the §3.5 quantize
+path schedules 46–144 ops onto the NN cores (per `nbinfo -o`), and
+on-board it runs **~110× faster than fp16** (see README §VIP9000
+backend: 0.72 ms vs 80.8 ms per bs=1 call). The README has the
+detailed perf table; this doc is the converter-side recipe.
+
+Contrast with the RK3576/3588 path documented in `RKNN_CONVERSION.md`
+§11.2 where int16 runs at ⅓ rate and w8a16 has codegen bugs.
 
 ---
 
@@ -394,9 +424,125 @@ and Allwinner's own ai-sdk ships v3 sample NBGs in both formats
 `examples/yolact/model/v3/yolact.nb` is `0x20000`). Both load fine on
 viplite v2.0.3+.
 
----
+### 3.5 Quantise to int8 hybrid (the production path)
 
-## 4. The turnkey script — `tools/onnx_to_a733_docker.sh`
+The fp16 NBGs from §3.3 are bit-exact vs ORT but ~93% of their ops
+land on the slow shader/PPU path because the VIP9000 NN cores want
+int8 dataflow. Quantising the trunk convs to int8 keeps the heads
+near-fp16 quality and lights up the NN cores — empirically ~110×
+faster on board (README §VIP9000 backend) with top-1 87% / top-5
+100% on a 100-position held-out eval at bs=1; bs=4 closes the gap
+further.
+
+**Step 3.5.1 — generate calibration data** with `tools/a733_gen_calib.py`.
+Plays 9×9 self-play games using kata1's own ONNX policy at
+`temperature=1.0` (so the resulting positions are *in-distribution*
+for kata1's activations), with 20% of whole games dropped to a
+pure-random eye-aware policy for tactical-position diversity.
+Snapshots are taken at moves 2/5/8/12/16/21/28/36/45/55/65/75 to
+cover opening, midgame, and endgame evenly. Encoder is a faithful
+port of `src/katago_inputs.cpp` (planes 14-17 / 20-21 zeroed,
+matching the C++ version).
+
+```bash
+.venv/bin/python tools/a733_gen_calib.py \
+    --output-dir   build/a733_calib \
+    --num-games    80 \
+    --onnx-model   models/kata1-b10c128.a733.bs1.unshared.onnx \
+    --strong-frac  0.7 \
+    --random-game-frac 0.2 \
+    --temperature  1.0 \
+    --seed         1234
+# → 960 samples (≈ 320 opening / 400 midgame / 240 endgame), each as
+#   build/a733_calib/state_spatial/NNNN.tensor   (np.savetxt-readable
+#   ASCII fp32, 1782 floats for [22,9,9])
+#   build/a733_calib/state_global/NNNN.tensor    (19 floats for [19])
+# plus dataset0_spatial.txt / dataset1_global.txt index files.
+```
+
+**Step 3.5.2 — run quantize + export** with
+`tools/onnx_to_a733_quantize_docker.sh`. The wrapper handles three
+non-obvious traps inside the container — see §6.6 for the full
+post-mortem; the script gets each one right:
+
+* It overwrites Acuity's auto-generated `<name>_inputmeta.yml` with a
+  hand-written one that sets `category: undefined` and
+  `reverse_channel: false`. The default `category: image` reorders
+  the 22 spatial planes like an RGB→BGR swap, calibrating against
+  scrambled input and producing a `.quantize` whose scales don't
+  match anything the runtime feeds (the on-board doesn't apply
+  inputmeta preprocessing). This single bit takes top-1 from
+  87% → 3%.
+* It seeds an empty `{"version":1,"tensors":[]}` `.quantize` file
+  before calling `pegasus.py quantize --rebuild-all`. Without this,
+  pegasus errors out at *"quantize file '...' does not exist"* before
+  any rebuild logic runs.
+* Calibration files use TEXT mode + `np.savetxt`-style ASCII
+  (`np.loadtxt` is what Acuity's TextDataset loader calls under the
+  hood). `type: NPY` mode silently fails with *"Cannot load file
+  containing pickled data when allow_pickle=False"* even on plain
+  float arrays.
+
+```bash
+# bs=4 is the production default (top-1 79% / top-5 100% on board)
+QUANTIZER=perchannel_symmetric_affine ALGO=kl_divergence ITER=400 \
+  bash tools/onnx_to_a733_quantize_docker.sh 4
+
+# bs=1 — keep around for the latency-sensitive path
+QUANTIZER=perchannel_symmetric_affine ALGO=kl_divergence ITER=400 \
+  bash tools/onnx_to_a733_quantize_docker.sh 1
+```
+
+`--quantizer perchannel_symmetric_affine` gives each conv weight a
+per-output-channel scale (per-tensor `asymmetric_affine` on weights
+loses ~1% top-1 because the single scale must cover all 128 output
+channels of every conv). Activations stay per-tensor int8 asymmetric
+either way — that's correct for activations.
+
+After both batch-size runs you'll have:
+
+```
+models/kata1-b10c128.a733.bs1.int8/network_binary.nb     ~2.5 MB (vs 6.3 MB fp16)
+models/kata1-b10c128.a733.bs1.int8/nbg_meta.json
+models/kata1-b10c128.a733.bs1.int8/<base>_int8.quantize  the calibration table
+models/kata1-b10c128.a733.bs4.int8/network_binary.nb     ~6.6 MB (vs 6.9 MB fp16)
+models/kata1-b10c128.a733.bs4.int8/nbg_meta.json
+models/kata1-b10c128.a733.bs4.int8/<base>_int8.quantize
+```
+
+The `.quantize` companion file is the per-tensor scale/zp table that
+the on-board input-quantize / output-dequantize code in
+`src/vip9000_compute.cpp` consumes (input encode = `q = round(x/scale) + zp`,
+output decode = `x = (q - zp) * scale`). Always ship it alongside the
+`.nb`.
+
+The script's final stage runs `nbinfo -o` on the produced NBG and
+prints the op-engine breakdown. A correctly quantised int8 NBG shows
+**46–48 NN ops at bs=1, 140-148 at bs=4**, vs **0–2** for the fp16
+path. If the breakdown still looks fp16-shaped, the calibration
+silently failed — check the `.quantize` file size (should be ~230 KB
+for kata1-b10c128, not the 30-byte stub).
+
+### 3.6 Validate accuracy host-side before shipping
+
+`pegasus.py inference --dtype quantized` runs the network through the
+same VIP9000 simulator the on-board NBG executes on. Generate a
+held-out eval set with a *different* `--seed` than the calibration:
+
+```bash
+.venv/bin/python tools/a733_gen_calib.py \
+    --output-dir build/a733_eval --num-games 30 \
+    --onnx-model models/kata1-b10c128.a733.bs1.unshared.onnx \
+    --strong-frac 0.7 --random-game-frac 0.2 --seed 99999
+```
+
+…then drive `pegasus.py inference` with the eval set and compare its
+outputs to `onnxruntime` on the same inputs (top-1/3/5 policy
+agreement, value/score MAEs). The exact recipe lives in commit
+history under `/tmp/eval_quant.sh` from the calibration debug
+session; folding it into a checked-in tool is on the TODO list. A
+healthy bs=1 int8 should hit ≥85% top-1 / ≥99% top-3 on this eval
+set, with score_mean MAE under 1.5 pts.
 
 Wraps §3.3 plus a guard for the image-load step. Default behaviour:
 finds `models/kata1-b10c128.a733.bs${BS}.unshared.onnx` (where
@@ -600,6 +746,71 @@ If you're starting from scratch and don't have the C++ runtime
 constraints, TIM-VX is a viable alternative. We documented this for
 completeness, not because we recommend it for this project.
 
+### 6.6 The inputmeta `category: image` trap (took int8 top-1 from 87% → 3%)
+
+The first int8 NBG we shipped to the board got **3% top-1, 0.73 value
+MAE, 27 pt score MAE** on `build/vip9000_accuracy` — essentially
+chance-level outputs (commit `093a1ff`). On-board input-quantize was
+correct (verified end-to-end with the fp16 NBG running on the same
+data path); the on-board NBG header was correct. The bug was on the
+host, in calibration:
+
+```yaml
+# Auto-generated by `pegasus.py generate inputmeta` for kata1:
+ports:
+- lid: state_spatial_146
+  category: image          # ← BAD: the auto-default for any input
+  layout: nchw
+  shape: [1, 22, 9, 9]
+  preprocess:
+    reverse_channel: true  # ← BAD: the auto-default with category=image
+    preproc_node_params:
+      add_preproc_node: false
+      preproc_type: TENSOR
+```
+
+`add_preproc_node: false` means *"don't fuse a preprocessing op into
+the graph,"* so we expected `reverse_channel: true` to be a no-op
+during export. **But it isn't a no-op during quantize.** Acuity's
+quantize pass applies the inputmeta preprocessing to every
+calibration sample before observing activations, then writes the
+observed scales/zps to the `.quantize` file. With
+`reverse_channel: true`, all 22 spatial planes were reordered (think
+RGB→BGR but on a 22-channel tensor): plane 0 (on-board mask, all-1)
+became plane 21 (encore, all-0), every stone color got mirrored,
+liberty planes ended up where ladder planes should be, etc. The
+network still ran — it just saw an entirely different input
+distribution than it ever saw at training time, so the activation
+ranges the calibrator measured were nonsense.
+
+On the runtime side, `src/vip9000_compute.cpp` does NOT apply
+inputmeta preprocessing — it feeds the user's fp32 directly into the
+NBG, then quantizes per the `.quantize` table. So the calibration
+distribution and the inference distribution disagreed on every
+plane. fp16 was unaffected (no `.quantize` file → no host-side scale
+applied to a model trained without one).
+
+The fp16 NBG passed `vpm_run` and produced sensible outputs because
+*its export path* honoured `add_preproc_node: false` and didn't bake
+the channel-reverse into the network. Only the `.quantize` table on
+the int8 path carried the corrupted ranges.
+
+**Fix**: write the inputmeta from scratch with `category: undefined`
+and `reverse_channel: false`, which is what
+`tools/onnx_to_a733_quantize_docker.sh` now does. Held-out eval went
+from 3.0% → 87.0% top-1 on bs=1 int8 (with the same calibration
+data; it was the inputmeta alone). bs=4 went 22.5% → 85% on the
+same calibration, then 79% → 99% top-5 once we also broadened the
+calibration to use kata1-policy-driven self-play instead of pure
+random play.
+
+This trap doesn't show up anywhere in Allwinner's ai-sdk samples
+because every one of them is an actual image network (lenet,
+resnet50, yolov5, yolact, MobileNetV2, ShuffleNetV2). For tensor
+inputs, the auto-generated inputmeta is wrong by default and every
+example you can crib from gets it "right" only because they're
+3-channel networks where reverse_channel:true is just RGB↔BGR.
+
 ---
 
 ## 7. On-board verification
@@ -709,6 +920,10 @@ later.
 | `pegasus export ovxlib --pack-nbg-unify` dies with `Fatal model generation error: 32512` (or `127 << 8`) | gen_nbg can't find shared libs | `ldconfig` with `vsimulator/lib` AND `common/lib` paths added |
 | `pegasus export ovxlib --pack-nbg-unify` dies with `Fatal model generation error: 65280` | gen_nbg ran but `vsi_nn_CreateGraph()` returned NULL | Real Linux host with `/proc` accessible; nested-container chroots don't work (§6.3) |
 | `pegasus export ovxlib` finishes with `Error(0),Warning(0)` but the script reports "ERROR: NBG not produced" | Acuity v6.30.22 with `--pack-nbg-unify` writes the `.nb` to `wksp_nbg_unify/` (sibling), not under `--output-path`'s directory | Search both `wksp/` AND `wksp_nbg_unify/`; the current `tools/onnx_to_a733_docker.sh` does this |
+| `pegasus.py quantize` errors out at *"quantize file '...' does not exist"* before doing anything | `--rebuild` / `--rebuild-all` both expect a pre-existing `.quantize` file | Seed an empty `{"version":1,"tensors":[]}` JSON before invoking; `tools/onnx_to_a733_quantize_docker.sh` does this |
+| Quantize step finishes "successfully" but the resulting NBG has the same op breakdown as fp16 | The `.quantize` file is the empty 30-byte stub — quantize silently failed during calibration loading | Check `stat -c %s <name>_int8.quantize`; healthy is ~230 KB. Most common cause: `type: NPY` in inputmeta (use `type: TEXT` + `np.savetxt`-format ASCII files), or calibration paths not visible inside the container |
+| Calibration runs but every per-channel logit / score / value max is way smaller than ORT's actual max | Acuity's auto-generated inputmeta has `category: image` + `reverse_channel: true`, which scrambles the 22 spatial planes during quantize even though `add_preproc_node: false` — see §6.6 | Replace the auto-generated yaml with `category: undefined` + `reverse_channel: false`; `tools/onnx_to_a733_quantize_docker.sh` writes a clean inputmeta from scratch |
+| On-board int8 NBG returns near-chance top-1 (~3%), score MAE >20 pts, but fp16 NBG works fine | Almost always the `category: image` trap above | Re-quantize after fixing the inputmeta; expect ≥85% top-1 / ≤1.5 pt score MAE on a held-out eval set |
 | `vpm_run` on the board prints `nbglk_valid_nbg_check[920], binary target=...` | NBG header chip ID doesn't match the actual NPU | Re-check §3.4 host-side header bytes; if those are right then the NBG was built against a different chip target — verify `--optimize` and `VSIMULATOR_CONFIG` both say `VIP9000NANODI_PID0X1000003B` |
 
 ---
@@ -719,29 +934,37 @@ later.
 |---|---|---|
 | `tools/kata_export_for_rknn.py` | KataGo `.txt.gz` → ONNX (4D-gpool, opset 13). Shared with the RKNN target. | ✅ |
 | `tools/onnx_rknn_mitigations.py` | `--unshare-initializers` (math-equivalent BN initializer split). Same script as the RKNN bs=1 fp16 fix. | ✅ |
-| `tools/onnx_to_a733_docker.sh` | **The actual entry point.** Wraps the §3.3 pipeline. Run on a real Linux host with Docker + `ubuntu-npu:v2.0.10.1` loaded. | ✅ |
+| `tools/onnx_to_a733_docker.sh` | fp16 path entry point. Wraps the §3.3 pipeline. Run on a real Linux host with Docker + `ubuntu-npu:v2.0.10.1` loaded. | ✅ (sanity baseline) |
+| `tools/a733_gen_calib.py` | Self-play calibration-data generator for the int8 path. Drives 70% of moves with kata1's own ONNX policy via `onnxruntime`, 30% random eye-aware (with 20% of whole games dropped to pure-random for tactical diversity). Snapshots cover opening / midgame / endgame evenly. Encodes via Python port of `src/katago_inputs.cpp`. | ✅ (production) |
+| `tools/onnx_to_a733_quantize_docker.sh` | int8 path entry point. Generates a clean inputmeta (workaround for the §6.6 trap), seeds the `.quantize` file (workaround for the `--rebuild-all` requires-file trap), runs `pegasus.py quantize` then `export ovxlib --dtype quantized --pack-nbg-unify`, and reports the op-engine breakdown. Defaults to `perchannel_symmetric_affine` int8 weights + per-tensor int8 activations, `kl_divergence` algorithm, 400 iterations. | ✅ (production) |
 | `tools/onnx_to_a733.py` | Pip-`acuitylite` path. Produces NBGs with `target=0x15` that the on-board runtime rejects. | ❌ DO NOT USE |
 | `tools/a733_verify.py` | Host-side ORT vs Acuity simulator parity. Worked for the old pip path (just for fp16 noise floor); doesn't run inside the Docker conversion flow. | ⚠️ optional, host-only |
 | `models/<base>.a733.bs<N>.unshared.onnx` | Source ONNX (canonical reference for downstream parity). | — |
-| `models/<base>.a733.bs<N>.fp16/network_binary.nb` | Deployable NBG. Header bytes 8..11 must be `3b 00 00 10`. | — |
-| `models/<base>.a733.bs<N>.fp16/nbg_meta.json` | Per-NBG input/output names, shapes, dtypes. The on-board awnn loader can match its buffers by these names. | — |
-| README.md "VIP9000 NPU Backend" section | On-board runtime notes (the C++ backend side). Read in tandem with this doc. | — |
+| `models/<base>.a733.bs<N>.fp16/network_binary.nb` | fp16 NBG (slow on board — ~93% of ops fall through to PPU). Header bytes 8..11 must be `3b 00 00 10`. | — |
+| `models/<base>.a733.bs<N>.int8/network_binary.nb` | int8 NBG (production — ~110× faster). Same header check. | — |
+| `models/<base>.a733.bs<N>.int8/<base>_int8.quantize` | Per-tensor scale/zp table the on-board input/output quant code consumes. Always ship alongside the `.nb`. | — |
+| `models/<base>.a733.bs<N>.{fp16,int8}/nbg_meta.json` | Per-NBG input/output names, shapes, dtypes. | — |
+| README.md "VIP9000 NPU Backend" section | On-board runtime notes (the C++ backend side, including `VIP9000_FORCE_PRECISION` env var, perf table, and the `build/vip9000_accuracy` harness). Read in tandem with this doc. | — |
 
 ---
 
 ## 10. What's deliberately not here
 
-* **Performance numbers on the actual hardware.** Add when the
-  benchmark in §7.2 has been run. (TODO once the regen lands.)
-* **Multi-thread scaling.** The C++ backend supports `vip_dup_network`;
-  expected to scale roughly linearly with thread count until DRAM
-  bandwidth saturates. Same TODO.
-* **Quantized paths.** Skipped because fp16 is essentially lossless on
-  kata1 and runs at peak rate on this NPU. The plumbing in
-  `tools/rknn_calibration.py` is portable if someone needs int8
-  later, but the conversion would be:
-  `pegasus.py quantize --quantizer asymmetric_affine --qtype uint8`
-  (followed by `--model-quantize <NAME>_uint8.quantize` on export).
+* **Performance numbers on the actual hardware.** Live in README.md's
+  VIP9000 backend section — fp16 vs int8 timing table, multi-thread
+  scaling, batch-size sweep.
+* **A checked-in `pegasus.py inference` accuracy harness.** The
+  calibration debug session in 2026-04-30 used a one-off
+  `/tmp/eval_quant.sh` + Python comparator to drive `pegasus.py
+  inference --dtype quantized` against ORT and report top-K /
+  per-head MAE. The on-board equivalent is `build/vip9000_accuracy`
+  (commit `093a1ff`); a host-side checked-in version is on the TODO
+  list.
+* **Int16 / w8a16 / per-channel-float8 paths.** Briefly explored:
+  int16 with `--quantizer dynamic_fixed_point` works (5 MB NBG, 42
+  NN ops at bs=1) but doesn't materially beat int8-hybrid on
+  accuracy and runs slower because the NN cores prefer int8
+  dataflow. Skipped as a production option.
 * **Deeper debugging of why nested containers can't run gen_nbg.**
   Documented as a wall in §6.3; not worth chasing further when a real
   host exists.
