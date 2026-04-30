@@ -1312,16 +1312,16 @@ The A733 NPU has one VIP9000 NanoDI+ core.  The VIPLite kernel driver
 serializes hardware command submission internally, so multiple server
 threads don't run in parallel — they queue on the same core, each
 paying full inference latency.  Measured on a Cubie A7A with kata1-b10c128
-at 9×9 (via `build/vip9000_smoke`), fp16 vs int8:
+at 9×9 (via `build/vip9000_smoke`), fp16 vs int8 (revised calibration):
 
 | precision | NBG  | batch | server threads | ms/call          | states/s         | notes                                |
 |-----------|------|------:|---------------:|-----------------:|-----------------:|--------------------------------------|
 | fp16      | bs=1 |     1 |              1 |  80.78           | 12               | single stream, fp16-native           |
 | fp16      | bs=4 |     4 |              1 | 338.68           | 11               | bs=4 doesn't amortize on fp16 path   |
 | fp16      | bs=1 |     1 |              2 | 159.97 (each)    | 11 (aggregate)   | 2 threads — no aggregate gain        |
-| **int8**  | bs=1 |     1 |              1 |   **0.72**       | **1382**         | 491 µs hardware + ~230 µs host       |
-| **int8**  | bs=4 |     4 |              1 |   **3.10**       | **1288**         | bs=4 amortizes cleanly on int8 path  |
-| **int8**  | bs=1 |     1 |              2 |   **1.18**       | **1610** (agg)   | int8 is fast enough that 2t helps    |
+| **int8**  | bs=1 |     1 |              1 |   **0.82**       | **1213**         | 491 µs hardware + ~330 µs host       |
+| **int8**  | bs=4 |     4 |              1 |   **3.43**       | **1167**         | bs=4 amortizes cleanly on int8 path  |
+| **int8**  | bs=1 |     1 |              2 |   **1.49**       | **1284** (agg)   | int8 is fast enough that 2t helps    |
 
 INT8 is **~110× faster** than fp16 on this hardware/model. This is much
 larger than the typical ~3× int8/fp16 ratio because kata1-b10c128's
@@ -1345,30 +1345,31 @@ Practical implications on the A733:
   batch dimension.  On fp16 it doesn't, so bs=1 was better there.
 
 **Numerical quality of the int8 NBGs** (200 random mid-game 9×9 positions,
-fp16 NBG treated as ground truth — `build/vip9000_accuracy --positions 200`):
+fp16 NBG treated as ground truth — `build/vip9000_accuracy --positions 200`,
+revised-calibration NBGs from `kata1-b10c128.a733.int8.revised.zip`):
 
-| precision | top-1 | top-3 | top-5 | value MAE | score MAE | score_sd MAE | own MAE |
-|-----------|------:|------:|------:|----------:|----------:|-------------:|--------:|
-| **int8 bs=1** | **3.0 %** | 7.5 % | 9.0 % | 0.7289 | **26.86 pts** | 21.62 | 0.2165 |
-| **int8 bs=4** | **22.5 %** | 58.5 % | 93.0 % | 0.0697 | 4.50 pts | 0.80 | 0.0223 |
+| precision | top-1 | top-3 | top-5 | value MAE | score MAE | score_sd MAE | policy logits MAE | own MAE |
+|-----------|------:|------:|------:|----------:|----------:|-------------:|------------------:|--------:|
+| **int8 bs=1** |  7.5 % | 28.0 % | 34.0 % | 0.0337 | 1.03 pts | 0.80 | 4.17  | 0.0148 |
+| **int8 bs=4** | **79.0 %** | **91.5 %** | **100.0 %** | 0.0412 | 1.00 pts | 0.78 | 0.38  | 0.0163 |
 
-* **bs=1 int8 is broken** — top-1 of 3 % is barely above chance for
-  ~70-legal-move positions, value MAE 0.73 (range is [−1, 1]), and
-  score MAE 27 points means the score head is essentially noise.  The
-  calibration set used during conversion was likely too small or
-  unrepresentative.  Do not use for play / self-play / training until
-  re-calibrated.
-* **bs=4 int8 is degraded but usable** — top-5 inclusion of 93 %
-  means MCTS will explore the right moves; value MAE 0.07 and score
-  MAE 4.5 points are noticeable strength regressions but not
-  game-breaking.  Best treated as a draft until a fuller calibration
-  pass lands.
-* **Why the big gap** — both NBGs were quantised with
-  `Quantization(...).quantize('uint8', ...)` against the same source
-  ONNX, but the calibration-fixture batch fed at conversion time
-  determines the per-tensor min/max range.  The bs=1 calibration
-  apparently saw a much narrower activation distribution than bs=4.
-  See A733_CONVERSION.md §4 for the calibration plumbing.
+* **bs=4 int8 is production-quality** — top-1 79 % with 100 % top-5
+  means MCTS visits the same candidate set as fp16 every time; value
+  MAE 0.04 (range [−1, 1]) and score MAE 1.0 point are negligible
+  strength regressions.  Safe for play / self-play / gating
+  evaluations.
+* **bs=1 int8 has a strong scalar-head, weak policy** — value /
+  score / ownership are all close to fp16 (score MAE 1.0 pt, value
+  MAE 0.03), but policy top-1 is only 7.5 %; policy logits MAE 4.17
+  is much higher than bs=4's 0.38.  MCTS strength would suffer because
+  the policy prior is the worst quantised head here.  Acceptable for
+  pure value-driven workloads; not recommended for play.
+* **Quality history** — the original (pre-revision) int8 NBGs had
+  bs=1 top-1 = 3 % / score MAE 27 pts and bs=4 top-1 = 22.5 % / score
+  MAE 4.5 pts.  The revision narrowed the per-tensor calibration ranges
+  via more representative fixtures; bs=4 jumped from "MCTS-only safe"
+  to "drop-in for fp16."  See A733_CONVERSION.md §4 for the
+  calibration data flow.
 
 **Precision and quantisation**
 
