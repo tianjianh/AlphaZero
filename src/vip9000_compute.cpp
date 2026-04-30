@@ -110,33 +110,36 @@ static std::string resolve_nbg_path(const std::string& model_path, int chosen_bs
     if (ends_with(base, ".unshared"))
         base = base.substr(0, base.size() - 9);
 
-    // Strip ".a733.bsN.fp16" / ".a733.bsN" if present so re-runs with a
-    // different max_batch_size pick the right NBG without re-typing the path.
+    // Strip ".a733.bsN.{fp16,int8}" / ".a733.bsN" if present so re-runs
+    // with a different max_batch_size pick the right NBG without re-typing.
     auto strip_suffix_tag = [&]() {
-        // Find ".a733.bs" position
         size_t pos = base.rfind(".a733.bs");
         if (pos == std::string::npos) return;
-        // After ".a733.bs" expect digits then maybe ".fp16"
         size_t i = pos + 8;
         while (i < base.size() && std::isdigit((unsigned char)base[i])) ++i;
         if (i == pos + 8) return;  // no digits — leave alone
-        // Optional ".fp16"
+        // Optional ".fp16" / ".int8" precision tag.
         if (i + 5 <= base.size() && base.compare(i, 5, ".fp16") == 0) i += 5;
-        // Only strip if we consumed everything to end-of-string.
+        else if (i + 5 <= base.size() && base.compare(i, 5, ".int8") == 0) i += 5;
         if (i == base.size()) base = base.substr(0, pos);
     };
     strip_suffix_tag();
 
-    std::string nbg = base + ".a733.bs" + std::to_string(chosen_bs)
-                    + ".fp16/network_binary.nb";
-    if (file_exists(nbg)) return nbg;
+    // Try INT8 first (faster on the VIP9000 fp pipeline when available),
+    // fall back to FP16.  This matches the convention from the converter:
+    // models/<base>.a733.bs<K>.{int8,fp16}/network_binary.nb.
+    const char* candidates[] = { ".int8/network_binary.nb",
+                                 ".fp16/network_binary.nb" };
+    for (const char* suffix : candidates) {
+        std::string p = base + ".a733.bs" + std::to_string(chosen_bs) + suffix;
+        if (file_exists(p)) return p;
+    }
 
     std::ostringstream os;
-    os << "VIP9000: pre-converted NBG not found at " << nbg
-       << ".  Convert the ONNX with `tools/onnx_to_a733.py "
-       << "--onnx " << model_path << " --output-dir "
-       << base << ".a733.bs" << chosen_bs << ".fp16 --mode fp16` "
-       << "(see A733_CONVERSION.md).";
+    os << "VIP9000: pre-converted NBG not found at "
+       << base << ".a733.bs" << chosen_bs << ".{int8,fp16}/network_binary.nb."
+       << "  Convert the ONNX with `bash tools/onnx_to_a733_docker.sh "
+       << chosen_bs << "` (see A733_CONVERSION.md).";
     throw std::runtime_error(os.str());
 }
 
@@ -865,11 +868,62 @@ VIP9000ComputeHandle::predict_batch(
             if (N < K)
                 std::memset(dst + (size_t)N * per_sample, 0,
                             (size_t)(K - N) * per_sample * sizeof(float));
+        } else if (tm.data_format == VIP_BUFFER_FORMAT_INT8 ||
+                   tm.data_format == VIP_BUFFER_FORMAT_UINT8) {
+            // INT8/UINT8 with TF asymmetric_affine: q = round(x/scale)+zp,
+            // clamped to the dtype range.  Pad slots [N..K) with the
+            // quantised zero (encodes fp32 0 → -zp/scale rounded; for the
+            // typical pad region the encoder already wrote 0.0f, but the
+            // input side of kata1 has zp ≠ 0 for state_global so we have
+            // to encode 0.0 explicitly rather than memset-zero the bytes).
+            const float scale = tm.tf_scale > 0 ? tm.tf_scale : 1.0f;
+            const int   zp    = tm.tf_zero_point;
+            const bool  is_signed = (tm.data_format == VIP_BUFFER_FORMAT_INT8);
+            const int   q_lo = is_signed ?  -128 : 0;
+            const int   q_hi = is_signed ?   127 : 255;
+            const size_t total_b = (size_t)K * per_sample;
+            if (buf_bytes < total_b) {
+                vip_unmap_buffer(buf);
+                throw std::runtime_error("VIP9000: input int8 buffer smaller than expected");
+            }
+            auto quantize = [&](float x) -> int {
+                int q = (int)std::lrintf(x / scale) + zp;
+                if (q < q_lo) q = q_lo;
+                if (q > q_hi) q = q_hi;
+                return q;
+            };
+            const int q_zero = quantize(0.0f);
+            uint8_t* dst = static_cast<uint8_t*>(mapped);
+            for (int n = 0; n < N; ++n) {
+                if (states[n].size() != per_state_floats) {
+                    vip_unmap_buffer(buf);
+                    std::ostringstream os;
+                    os << "VIP9000: state size mismatch — got " << states[n].size()
+                       << " expected " << per_state_floats;
+                    throw std::runtime_error(os.str());
+                }
+                const float* src = states[n].data() + (is_spatial ? 0 : spatial_per_sample);
+                uint8_t*    d   = dst + (size_t)n * per_sample;
+                if (is_signed) {
+                    int8_t* ds = reinterpret_cast<int8_t*>(d);
+                    for (size_t k = 0; k < per_sample; ++k) ds[k] = (int8_t)quantize(src[k]);
+                } else {
+                    for (size_t k = 0; k < per_sample; ++k) d[k] = (uint8_t)quantize(src[k]);
+                }
+            }
+            if (N < K) {
+                if (is_signed)
+                    std::memset(dst + (size_t)N * per_sample, (int8_t)q_zero,
+                                (size_t)(K - N) * per_sample);
+                else
+                    std::memset(dst + (size_t)N * per_sample, (uint8_t)q_zero,
+                                (size_t)(K - N) * per_sample);
+            }
         } else {
             vip_unmap_buffer(buf);
             std::ostringstream os;
             os << "VIP9000: unsupported input data_format " << (int)tm.data_format
-               << " (" << fmt_name(tm.data_format) << ") — only fp16/fp32 supported";
+               << " (" << fmt_name(tm.data_format) << ") — only fp16/fp32/int8/uint8 supported";
             throw std::runtime_error(os.str());
         }
         vip_flush_buffer(buf, VIP_BUFFER_OPER_TYPE_FLUSH);
@@ -912,11 +966,27 @@ VIP9000ComputeHandle::predict_batch(
             const float* src = static_cast<const float*>(mapped)
                              + (size_t)slot * per_sample;
             std::memcpy(dst, src, want * sizeof(float));
+        } else if (tm.data_format == VIP_BUFFER_FORMAT_INT8 ||
+                   tm.data_format == VIP_BUFFER_FORMAT_UINT8) {
+            // Dequantize: x = (q - zero_point) * scale
+            const float scale = tm.tf_scale;   // exact value as quantised
+            const int   zp    = tm.tf_zero_point;
+            if (tm.data_format == VIP_BUFFER_FORMAT_INT8) {
+                const int8_t* src = static_cast<const int8_t*>(mapped)
+                                  + (size_t)slot * per_sample;
+                for (size_t k = 0; k < want; ++k)
+                    dst[k] = (float)(src[k] - zp) * scale;
+            } else {
+                const uint8_t* src = static_cast<const uint8_t*>(mapped)
+                                   + (size_t)slot * per_sample;
+                for (size_t k = 0; k < want; ++k)
+                    dst[k] = (float)((int)src[k] - zp) * scale;
+            }
         } else {
             vip_unmap_buffer(buf);
             std::ostringstream os;
             os << "VIP9000: unsupported output data_format " << (int)tm.data_format
-               << " (" << fmt_name(tm.data_format) << ") — only fp16/fp32 supported";
+               << " (" << fmt_name(tm.data_format) << ") — only fp16/fp32/int8/uint8 supported";
             throw std::runtime_error(os.str());
         }
         // Zero anything we didn't fill (count > per_sample).

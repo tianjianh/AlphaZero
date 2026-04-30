@@ -1312,29 +1312,44 @@ The A733 NPU has one VIP9000 NanoDI+ core.  The VIPLite kernel driver
 serializes hardware command submission internally, so multiple server
 threads don't run in parallel — they queue on the same core, each
 paying full inference latency.  Measured on a Cubie A7A with kata1-b10c128
-fp16 at 9×9 (via `build/vip9000_smoke`):
+at 9×9 (via `build/vip9000_smoke`), fp16 vs int8:
 
-| NBG  | batch | server threads | ms/call          | states/s         | notes                         |
-|------|------:|---------------:|-----------------:|-----------------:|-------------------------------|
-| bs=1 |     1 |              1 |  80.78           | 12               | single stream                 |
-| bs=4 |     4 |              1 | 338.68           | 11               | full bs=4, no amortization    |
-| bs=1 |     1 |              2 | 159.97 (each)    | 11 (aggregate)   | 2 threads on one NPU core     |
+| precision | NBG  | batch | server threads | ms/call          | states/s         | notes                                |
+|-----------|------|------:|---------------:|-----------------:|-----------------:|--------------------------------------|
+| fp16      | bs=1 |     1 |              1 |  80.78           | 12               | single stream, fp16-native           |
+| fp16      | bs=4 |     4 |              1 | 338.68           | 11               | bs=4 doesn't amortize on fp16 path   |
+| fp16      | bs=1 |     1 |              2 | 159.97 (each)    | 11 (aggregate)   | 2 threads — no aggregate gain        |
+| **int8**  | bs=1 |     1 |              1 |   **0.72**       | **1382**         | 491 µs hardware + ~230 µs host       |
+| **int8**  | bs=4 |     4 |              1 |   **3.10**       | **1288**         | bs=4 amortizes cleanly on int8 path  |
+| **int8**  | bs=1 |     1 |              2 |   **1.18**       | **1610** (agg)   | int8 is fast enough that 2t helps    |
 
-So **`--nn-server-threads 1` is correct on the A733**.  `--nn-server-threads 2
---nn-device-ids 0,0` is supported and works (each thread gets its own
-network handle), but the only thing it buys is more latency.  This will
-change on multi-core VIP9000 variants if/when they show up.
+INT8 is **~110× faster** than fp16 on this hardware/model. This is much
+larger than the typical ~3× int8/fp16 ratio because kata1-b10c128's
+small spatials (9×9) and skinny channels (128) badly under-utilise
+VIP9000's fp16 tiler (it's optimised for ≥56×56 inputs); the int8 path
+hits a much better-tuned tile config on the MAC array.  For calibration:
+ResNet-50 INT8 on this NPU clocks ~8 ms/call (~1 TOPS achieved) — at
+similar absolute compute the same hardware delivers very different
+numbers depending on how well the workload maps to the tiler.
 
-For calibration: ResNet-50 INT8 on the same NPU clocks ~8 ms/call
-(~1 TOPS achieved); kata1-b10c128 fp16 at 9×9 lands at ~80 ms/call
-because the small spatials and skinny channels (128) under-utilise
-the MAC array — VeriSilicon's tiler is happiest with ≥56×56 inputs.
-INT8-quantising kata1 (`Quantization(model).quantize('uint8',...)` at
-conversion time, with calibration data) would land roughly **~3× faster**
-based on the int8/fp16 ratio observed in vendor benchmarks; not currently
-used because fp16 is essentially lossless on this network and 12 inf/s ×
-64 parallel games × 1 thread/game ≈ 700 sims/s aggregate is workable for
-a small network on a $50 SBC.
+Practical implications on the A733:
+
+* **Use INT8** — `tools/onnx_to_a733_docker.sh int8 1` /
+  `... int8 4`.  Backend auto-prefers `models/<base>.a733.bs<K>.int8/`
+  over `.fp16/` when both are present.
+* **`--nn-server-threads` ≤ 2** — on the int8 path 2 threads gives a
+  ~17 % aggregate gain (1610 vs 1382 states/s); 3+ threads hits driver
+  serialisation and doesn't help.  On the fp16 path, stay at 1.
+* **bs=4 int8 amortises** — per-state throughput holds (1288 vs 1382
+  states/s) while per-call latency is 4× higher, exactly matching the
+  batch dimension.  On fp16 it doesn't, so bs=1 was better there.
+
+> ⚠️ The current bs=1 int8 NBG produces visibly off-calibration outputs
+> on an empty board (e.g. `score=-23.7` where fp16 reports `score=0.38`),
+> while the bs=4 int8 NBG calibrates closer to fp16 (`score=1.41`).
+> Likely a calibration-set mismatch on the converter side; numerical
+> parity isn't validated end-to-end yet.  See A733_CONVERSION.md for the
+> calibration data flow.
 
 **Precision and quantisation**
 
