@@ -27,3 +27,4 @@ third_party/*
 calib/
 *.zip
 *.7z
+build_eigen/

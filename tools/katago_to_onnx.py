@@ -97,6 +97,11 @@ def main():
     out_path = args.output
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     print(f"Exporting ONNX to {out_path} ...")
+    # Use the legacy TorchScript exporter (`dynamo=False`). The new torch.export
+    # exporter aggressively folds BatchNorm into the preceding Conv and reuses
+    # the original conv-weight initializer name for the folded weight, which
+    # collides with the embedded state_dict step below: the C++ Eigen backend
+    # would end up reading folded weights and then double-applying mid_bn.
     torch.onnx.export(
         net,
         (sp, gl),
@@ -115,6 +120,7 @@ def main():
         },
         opset_version=args.opset,
         do_constant_folding=True,
+        dynamo=False,
     )
 
     # PyTorch's exporter writes weights to an external `.onnx.data`
@@ -123,6 +129,7 @@ def main():
     # one file is simpler to distribute and cache).
     try:
         import onnx
+        from onnx import numpy_helper
         from onnx.external_data_helper import load_external_data_for_model
         out_dir = os.path.dirname(out_path) or "."
         sidecar = out_path + ".data"
@@ -135,6 +142,25 @@ def main():
             onnx.save(mdl, out_path, save_as_external_data=False)
             os.remove(sidecar)
             print(f"  inlined external weights ({os.path.getsize(out_path):,} bytes)")
+
+        # Embed full state_dict so the C++ Eigen backend can read weights
+        # by their PyTorch names. ONNX export folds BatchNorm into Conv
+        # and may insert Identity passthroughs that collide with the
+        # state_dict names, so prefix every embedded tensor with `_sd_`
+        # to keep the optimized graph (TensorRT path) untouched. The C++
+        # Eigen loader expects the same prefix.
+        mdl = onnx.load(out_path)
+        added = 0
+        for name, tensor in net.state_dict().items():
+            arr = tensor.detach().cpu().numpy()
+            embedded_name = "_sd_" + name
+            mdl.graph.initializer.append(
+                numpy_helper.from_array(arr, name=embedded_name))
+            added += 1
+        onnx.save(mdl, out_path)
+        print(f"  embedded {added} state_dict tensors for Eigen "
+              f"(_sd_ prefix; {os.path.getsize(out_path):,} bytes total)")
+
         # Validate
         onnx_model = onnx.load(out_path)
         onnx.checker.check_model(onnx_model)

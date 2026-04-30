@@ -52,24 +52,18 @@ class _InferenceWrapper(nn.Module):
 def _embed_state_dict(onnx_path, model):
     """Embed the full PyTorch state_dict as ONNX initializer tensors.
 
-    ONNX export may fold BatchNorm into Conv, losing separate BN params.
-    We add all state_dict tensors as extra initializers with their original
-    PyTorch names. The Eigen backend reads these; the ONNX Runtime backend
-    ignores them (it uses the graph ops which have BN folded).
+    ONNX export may fold BatchNorm into Conv, losing separate BN params,
+    and can also reuse the original PyTorch names for the folded results.
+    Prefix every embedded tensor with `_sd_` so the Eigen backend reads
+    the un-folded weights regardless of what the optimizer did to the
+    graph initializers. ONNX Runtime / TensorRT ignore these (they use
+    the optimized graph).
     """
     onnx_model = onnx.load(onnx_path)
-    sd = model.state_dict()
-
-    existing_names = {init.name for init in onnx_model.graph.initializer}
-    for node in onnx_model.graph.node:
-        existing_names.update(node.output)
-
-    for name, tensor in sd.items():
-        if name not in existing_names:
-            np_data = tensor.detach().cpu().numpy()
-            onnx_tensor = numpy_helper.from_array(np_data, name=name)
-            onnx_model.graph.initializer.append(onnx_tensor)
-
+    for name, tensor in model.state_dict().items():
+        np_data = tensor.detach().cpu().numpy()
+        onnx_tensor = numpy_helper.from_array(np_data, name="_sd_" + name)
+        onnx_model.graph.initializer.append(onnx_tensor)
     onnx.save(onnx_model, onnx_path)
 
 

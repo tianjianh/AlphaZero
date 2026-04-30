@@ -300,6 +300,11 @@ elseif(MINIGO_BACKEND STREQUAL "vip9000")
 
 elseif(MINIGO_BACKEND STREQUAL "eigen")
   set(HAS_EIGEN TRUE)
+  # OpenMP unlocks Eigen's multi-threaded GEMM. Without it the trunk
+  # GEMMs run single-threaded regardless of batch size — the Eigen
+  # backend's batched forward pass (one [c_out, B*HW] GEMM per layer)
+  # only scales when this is on.
+  find_package(OpenMP)
 
 else()
   message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, eigen")
@@ -356,6 +361,12 @@ endif()
 
 if(HAS_EIGEN)
   target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_EIGEN=1)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(minigo_core PUBLIC OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP:     enabled (Eigen GEMM will multi-thread)")
+  else()
+    message(STATUS "OpenMP:     NOT FOUND — Eigen GEMM will be single-threaded")
+  endif()
 endif()
 
 if(HAS_OPENCL)

@@ -12,11 +12,20 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     std::unordered_map<std::string, OnnxTensor*> tm;
     for (auto& t : tensors) tm[t.name] = &t;
 
+    // Look up an initializer by name. Embedded-state_dict tensors are
+    // prefixed with `_sd_` (see scripts/export_onnx.py and
+    // tools/katago_to_onnx.py) so the optimized graph names don't
+    // collide with the un-folded weights the Eigen backend reads. Try
+    // both forms here so format detection works against either layout.
     auto get = [&](const std::string& name) -> OnnxTensor& {
-        auto it = tm.find(name);
+        auto it = tm.find("_sd_" + name);
+        if (it == tm.end()) it = tm.find(name);
         if (it == tm.end())
             throw std::runtime_error("Missing tensor: " + name);
         return *it->second;
+    };
+    auto has = [&](const std::string& name) -> bool {
+        return tm.count("_sd_" + name) > 0 || tm.count(name) > 0;
     };
 
     auto model = std::make_shared<LoadedModel>();
@@ -65,7 +74,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
     }
 
     // ── Detect model type and infer architecture ─────────────────
-    bool is_vit = tm.count("token_proj.weight") > 0;
+    bool is_vit = has("token_proj.weight");
 
     if (is_vit) {
         // ViT model — infer from token_proj weights
@@ -76,7 +85,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         model->num_res_blocks = 0;
 
         // board_size from orbit_ids buffer: length = board_size^2
-        if (tm.count("orbit_ids")) {
+        if (has("orbit_ids")) {
             auto& oi = get("orbit_ids");
             int hw = 1;
             for (auto d : oi.dims) hw *= (int)d;
@@ -87,7 +96,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
 
         // Infer depth: count blocks.N.attn.q_proj.weight
         model->vit_depth = 0;
-        while (tm.count("blocks." + std::to_string(model->vit_depth) + ".attn.q_proj.weight"))
+        while (has("blocks." + std::to_string(model->vit_depth) + ".attn.q_proj.weight"))
             model->vit_depth++;
 
         // Infer heads from q_proj: shape [num_heads*head_dim, d_model]
@@ -112,8 +121,8 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         // GPool blocks + global-pool heads) is supported.  The legacy
         // AlphaZero layout (`res_blocks.*` plain blocks + flat FC heads)
         // has been replaced wholesale; old .onnx files must be retrained.
-        bool is_new_resnet = tm.count("trunk.0.conv2.weight") > 0;
-        bool is_legacy_resnet = tm.count("res_blocks.0.conv1.weight") > 0;
+        bool is_new_resnet = has("trunk.0.conv2.weight");
+        bool is_legacy_resnet = has("res_blocks.0.conv1.weight");
         if (!is_new_resnet) {
             if (is_legacy_resnet) {
                 throw std::runtime_error(
@@ -134,7 +143,7 @@ std::shared_ptr<LoadedModel> LoadedModel::load(const std::string& model_path) {
         model->num_filters    = (int)iw.dims[0];
 
         model->num_res_blocks = 0;
-        while (tm.count("trunk." + std::to_string(model->num_res_blocks) + ".conv2.weight"))
+        while (has("trunk." + std::to_string(model->num_res_blocks) + ".conv2.weight"))
             model->num_res_blocks++;
 
         auto& pfw = get("policy_fc.weight");
