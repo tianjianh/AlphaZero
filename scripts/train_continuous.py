@@ -19,6 +19,7 @@ See cont_train.todo for the complete design rationale.
 
 import argparse
 import glob
+import io
 import json
 import signal
 import os
@@ -73,6 +74,71 @@ def _decompress_bytes(filepath):
             return gzip.decompress(f.read())
     with open(filepath, "rb") as f:
         return f.read()
+
+
+def _decompress_blob(blob, kind):
+    """Decompress an in-memory file blob.  `kind` is 'zst', 'gz', or '' (raw).
+
+    Used by WindowRingBuffer to lazily decompress game bytes at sample
+    time — the same stream-reader logic as _decompress_bytes, but
+    operating on bytes already loaded into RAM rather than hitting disk.
+    """
+    if kind == "zst":
+        dctx = zstd.ZstdDecompressor()
+        with dctx.stream_reader(io.BytesIO(blob)) as reader:
+            return reader.read()
+    if kind == "gz":
+        import gzip
+        return gzip.decompress(blob)
+    return blob
+
+
+def _read_blob_with_count(filepath):
+    """Read a g_*.bin.zst file as raw compressed bytes and peek the V2
+    row count from the decompressed header.
+
+    Returns (blob, kind, n_rows) on success, or (None, '', 0) on any error
+    or non-V2 content.  The blob is the on-disk bytes verbatim — keep it
+    compressed in memory, decompress lazily later.
+
+    Path A storage path: caller stores `blob` in the ring slot; sampler
+    decompresses via _decompress_blob(blob, kind) only when rows from
+    that slot are needed by a batch.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            blob = f.read()
+    except OSError:
+        return None, "", 0
+
+    if filepath.endswith(".zst"):
+        kind = "zst"
+        try:
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(io.BytesIO(blob)) as reader:
+                hdr = reader.read(12)
+        except zstd.ZstdError:
+            return None, "", 0
+    elif filepath.endswith(".gz"):
+        kind = "gz"
+        try:
+            import gzip
+            hdr = gzip.decompress(blob)[:12]
+        except OSError:
+            return None, "", 0
+    else:
+        kind = ""
+        hdr = blob[:12]
+
+    if len(hdr) < 12:
+        return None, "", 0
+    try:
+        magic, _, count = struct.unpack_from("<HHi", hdr, 0)
+    except struct.error:
+        return None, "", 0
+    if magic != _V2_MAGIC:
+        return None, "", 0
+    return blob, kind, int(count)
 
 
 def _peek_row_count(filepath):
@@ -351,55 +417,107 @@ class WindowScanner(threading.Thread):
 # ═══════════════════════════════════════════════════════════
 
 class WindowRingBuffer:
-    """Per-rank in-RAM row ring with a background ingest thread.
+    """Per-rank in-RAM ring of compressed game blobs.
 
-    Circular buffer at row granularity.  A `_head` pointer tracks the
-    next write position; appending n_new rows does at most two
-    contiguous slice copies (one when the write wraps).  Eviction is
-    implicit — writes into slots that used to hold old rows overwrite
-    them in place.  Appending is O(n_new), not O(ring_rows) — critical
-    at 1.6M rows / 10 GB per rank, where a full-ring shift would make
-    ingest a memory-bandwidth bottleneck.
+    PATH A (compressed-in-memory) design: each ring slot holds the raw
+    ``g_*.bin.zst`` bytes of one selfplay game (~25 KB) plus its row count.
+    Decompression+parse happens lazily per batch, only for the games a
+    sample touches.  Trades ~50 ms of CPU per batch for a ~20× reduction
+    in host RAM vs. storing decompressed numpy rows — the decisive win
+    because it lets the trainer's effective sampling window approach
+    KataGo-scale on commodity hosts.
 
-    Sampling is still uniform over [0, _size) — when the ring is full,
-    _size == N and every index is live regardless of where _head sits.
-    The ordering of rows inside the ring doesn't match their arrival
-    order any more, but batches are sampled randomly anyway so that
-    doesn't matter.
+    Sampling pattern (important)
+    ----------------------------
+    We do **game-granular sampling**: pick ``K = batch_size //
+    samples_per_game`` games uniformly with replacement, then sample
+    ``samples_per_game`` rows from within each chosen game.  This is
+    the same trick KataGo's npz shuffler uses to keep per-batch CPU
+    work bounded.  Strict row-uniform sampling over a large compressed
+    ring is intractable: a 256-row batch from a 2000-game ring would
+    hit ~240 distinct games per batch (coupon-collector), forcing 240
+    decompressions per step — ~1.2 s on a single thread.  Game-granular
+    sampling at ``samples_per_game=8`` instead hits ~32 games per batch,
+    parallelizes 4× across a small thread pool, lands in <100 ms.
+
+    Trade-off: rows from the same game in one batch share value,
+    score, and outcome targets.  At ``samples_per_game=8``, that's ~3%
+    of the batch correlated with each game.  Across batches every
+    sample is independent.  KataGo accepts the same correlation;
+    raising K (lowering samples_per_game) reduces it at the cost of
+    more decompressions per batch.
+
+    Sizing
+    ------
+    The constructor takes ``ring_rows`` (= ring_games × ~moves × n_aug)
+    for API compatibility with the legacy row-ring caller.  Internally
+    we convert this to a slot count (one slot per game) by dividing by
+    a per-game row estimate.  ``ring_rows_current()`` returns the
+    *actual* row total summed across filled slots, so the cold-start
+    gate continues to work.
+
+    Thread safety
+    -------------
+    All reads/writes of slot bytes, row counts, head, and filled-count
+    happen under self._lock.  Decompression and tensor packing happen
+    OUTSIDE the lock — Python refcounts the snapshotted bytes objects,
+    so a concurrent ingest overwriting a slot can't invalidate an
+    in-flight sample.
     """
 
     INGEST_POLL_MIN_S = 0.5
     INGEST_POLL_MAX_S = 3.0
     MAX_QUEUED_IDS = 256
 
+    # 9x9 games average ~80–120 moves × 8 augmentations ≈ ~800 rows.  Used
+    # only to translate the row-budget API into a slot count.
+    _APPROX_ROWS_PER_GAME = 800
+
     def __init__(self, pool_dir, ring_rows, board_size, rng_seed,
-                 initial_watermark=0):
+                 initial_watermark=0, samples_per_game=8,
+                 decompress_workers=4):
         self.pool_dir = pool_dir
         self.ring_rows = int(ring_rows)
         self.board_size = board_size
         self._rng = np.random.default_rng(rng_seed)
+        self.samples_per_game = max(1, int(samples_per_game))
 
-        # Shared state (lock-protected; numpy ops run while holding)
+        # Number of game slots in the ring.  At least 1.
+        self._n_slots = max(1, self.ring_rows // self._APPROX_ROWS_PER_GAME)
+
+        # Shared state (lock-protected)
         self._lock = threading.Lock()
-        self._states = None      # [N, C, H, W]
-        self._policies = None    # [N, P]
-        self._values = None      # [N]
-        self._scores = None      # [N]
-        self._owns = None        # [N, hw]
-        self._opps = None        # [N]
-        self._head = 0           # next write slot (mod N)
-        self._size = 0           # number of valid rows (<= N)
+        # Each slot holds raw compressed bytes (or None if unused) plus
+        # the format kind ("zst" / "gz" / "") needed to decompress later.
+        self._game_bytes = [None] * self._n_slots
+        self._game_kind = [""] * self._n_slots
+        self._game_n_rows = np.zeros(self._n_slots, dtype=np.int32)
+        self._head_slot = 0       # next slot to overwrite
+        self._n_filled = 0        # number of slots holding valid bytes (<= n_slots)
 
         self._watermark = int(initial_watermark)
         self._stop = threading.Event()
         self._ingest_thread = None
         self._ingest_poll = self.INGEST_POLL_MIN_S
 
+        # Persistent thread pool for parallel zstd decompression.  zstd's
+        # C library releases the GIL during decompress; numpy parse holds
+        # it.  Empirically ~2× speedup at 4 workers, diminishing returns
+        # past 8.  Start small and let the user tune via the
+        # decompress_workers ctor arg.
+        from concurrent.futures import ThreadPoolExecutor
+        self._decompress_workers = max(1, int(decompress_workers))
+        self._pool = ThreadPoolExecutor(
+            max_workers=self._decompress_workers, thread_name_prefix="ring-dec")
+
     # ---- public API ------------------------------------------------
 
     def ring_rows_current(self):
+        """Total rows currently stored across all filled slots."""
         with self._lock:
-            return self._size
+            if self._n_filled == 0:
+                return 0
+            return int(self._game_n_rows[:self._n_filled].sum())
 
     def start_ingest(self):
         if self._ingest_thread is not None:
@@ -412,29 +530,116 @@ class WindowRingBuffer:
         self._stop.set()
 
     def sample_batch(self, batch_size, device, timeout_s=30.0):
-        """Block until enough rows, then sample batch_size rows uniformly.
-        Raises TimeoutError if the ring stays below batch_size for too long."""
+        """Block until ring has ≥ batch_size rows; sample game-granularly.
+
+        Pick ``K = ceil(batch_size / samples_per_game)`` games uniformly
+        with replacement, decompress them in parallel, take
+        ``samples_per_game`` rows from each (random within-game).
+        Concatenate, truncate to exactly ``batch_size``.
+
+        Phase 1 (under lock): snapshot bytes refs for the chosen games.
+        Phase 2 (lock released): parallel decompress + parse + gather.
+        """
         deadline = time.time() + timeout_s
         poll = 0.5
+        spg = self.samples_per_game
+        K = max(1, (batch_size + spg - 1) // spg)
+
         while True:
             with self._lock:
-                if self._size >= batch_size:
-                    idx = self._rng.integers(0, self._size, size=batch_size)
-                    # Copy slices (not views) — circular writes after we
-                    # release the lock would otherwise mutate the tensors
-                    # under us.
-                    states = np.ascontiguousarray(self._states[idx])
-                    policies = np.ascontiguousarray(self._policies[idx])
-                    values = np.ascontiguousarray(self._values[idx])
-                    scores = np.ascontiguousarray(self._scores[idx])
-                    owns = np.ascontiguousarray(self._owns[idx])
-                    opps = np.ascontiguousarray(self._opps[idx])
+                n = self._n_filled
+                if n > 0:
+                    total_rows = int(self._game_n_rows[:n].sum())
+                else:
+                    total_rows = 0
+
+                if total_rows >= batch_size and n > 0:
+                    # Pick K random slots (with replacement).  No
+                    # row-weighted sampling: 9x9 games are uniform
+                    # enough in row count (~640–960) that uniform-over-
+                    # slots is a close approximation to uniform-over-
+                    # rows for our purposes.
+                    chosen = self._rng.integers(0, n, size=K)
+                    # Snapshot unique slots (pinning bytes refs)
+                    unique = np.unique(chosen)
+                    snapshot = {}
+                    for s in unique.tolist():
+                        snapshot[s] = (
+                            self._game_bytes[s],
+                            self._game_kind[s],
+                            int(self._game_n_rows[s]),
+                        )
                     break
+
             if time.time() > deadline:
                 raise TimeoutError(
                     f"sample_batch timed out waiting for ring "
-                    f"(size={self._size}, need={batch_size})")
+                    f"(rows={total_rows}, slots_filled={n}, need={batch_size})")
             time.sleep(poll)
+
+        # Phase 2: parallel decompress + parse for unique slots.
+        def _work(item):
+            slot, blob, kind = item
+            if blob is None:
+                return slot, None
+            try:
+                raw = _decompress_blob(blob, kind)
+                parsed = _parse_records(raw, self.board_size)
+                return slot, parsed
+            except (ValueError, zstd.ZstdError):
+                return slot, None
+
+        items = [(s, b, k) for s, (b, k, _nr) in snapshot.items()]
+        slot_parsed = {}
+        for slot, parsed in self._pool.map(_work, items):
+            slot_parsed[int(slot)] = parsed
+
+        # Gather samples_per_game rows per chosen slot.
+        states_b, policies_b, values_b, scores_b, owns_b, opps_b = \
+            [], [], [], [], [], []
+        rng = self._rng  # serialized through self._lock when sampling indices
+        for slot in chosen.tolist():
+            parsed = slot_parsed.get(int(slot))
+            if parsed is None:
+                # Find any working parse in this batch as a fallback so
+                # we always return batch_size rows even if a couple of
+                # blobs were corrupted.
+                for cand in slot_parsed.values():
+                    if cand is not None:
+                        parsed = cand
+                        break
+                if parsed is None:
+                    raise RuntimeError(
+                        "sample_batch: every blob in this batch failed "
+                        "to decompress; ring is corrupt")
+            s_arr, p_arr, v_arr, sc_arr, o_arr, op_arr = parsed
+            n_rows = s_arr.shape[0]
+            if n_rows == 0:
+                continue
+            # Sample spg rows from within this game.  With-replacement
+            # is fine: in 9x9 most games have hundreds of rows.
+            idx = rng.integers(0, n_rows, size=spg)
+            states_b.append(s_arr[idx])
+            policies_b.append(p_arr[idx])
+            values_b.append(v_arr[idx])
+            scores_b.append(sc_arr[idx])
+            owns_b.append(o_arr[idx])
+            opps_b.append(op_arr[idx])
+
+        # Concatenate and trim to exactly batch_size.
+        states = np.concatenate(states_b)[:batch_size]
+        policies = np.concatenate(policies_b)[:batch_size]
+        values = np.concatenate(values_b)[:batch_size]
+        scores = np.concatenate(scores_b)[:batch_size]
+        owns = np.concatenate(owns_b)[:batch_size]
+        opps = np.concatenate(opps_b)[:batch_size]
+
+        states = np.ascontiguousarray(states)
+        policies = np.ascontiguousarray(policies)
+        values = np.ascontiguousarray(values)
+        scores = np.ascontiguousarray(scores)
+        owns = np.ascontiguousarray(owns)
+        opps = np.ascontiguousarray(opps)
 
         return (torch.from_numpy(states).to(device, non_blocking=True),
                 torch.from_numpy(policies).to(device, non_blocking=True),
@@ -449,74 +654,18 @@ class WindowRingBuffer:
 
     # ---- internals -------------------------------------------------
 
-    def _ensure_arrays(self, sample_states):
-        """Lazy-allocate ring arrays sized from the first real batch."""
-        if self._states is not None:
+    def _append_blob(self, blob, kind, n_rows):
+        """Circular append at game granularity (O(1))."""
+        if blob is None or n_rows <= 0:
             return
-        N = self.ring_rows
-        C, H, W = sample_states[0].shape
-        self._states = np.zeros((N, C, H, W), dtype=np.float32)
-        self._policies = np.zeros((N, H * W + 1), dtype=np.float32)
-        self._values = np.zeros((N,), dtype=np.float32)
-        self._scores = np.zeros((N,), dtype=np.float32)
-        self._owns = np.zeros((N, H * W), dtype=np.float32)
-        self._opps = np.zeros((N,), dtype=np.int64)
-
-    def _append(self, parsed):
-        """Circular append.  Writes into [head:head+n_new) mod N; two
-        contiguous slice copies at most.  O(n_new)."""
-        states, policies, values, scores, owns, opps = parsed
         with self._lock:
-            self._ensure_arrays(states)
-            n_new = states.shape[0]
-            N = self.ring_rows
-
-            if n_new >= N:
-                # Pathological: one file larger than ring — keep last N rows.
-                states = states[-N:]
-                policies = policies[-N:]
-                values = values[-N:]
-                scores = scores[-N:]
-                owns = owns[-N:]
-                opps = opps[-N:]
-                self._states[:] = states
-                self._policies[:] = policies
-                self._values[:] = values
-                self._scores[:] = scores
-                self._owns[:] = owns
-                self._opps[:] = opps
-                self._head = 0
-                self._size = N
-                return
-
-            head = self._head
-            end = head + n_new
-            if end <= N:
-                # Single contiguous write.
-                self._states[head:end] = states
-                self._policies[head:end] = policies
-                self._values[head:end] = values
-                self._scores[head:end] = scores
-                self._owns[head:end] = owns
-                self._opps[head:end] = opps
-            else:
-                # Wrap: write [head:N) then [0:end-N).
-                k = N - head
-                self._states[head:] = states[:k]
-                self._states[:n_new - k] = states[k:]
-                self._policies[head:] = policies[:k]
-                self._policies[:n_new - k] = policies[k:]
-                self._values[head:] = values[:k]
-                self._values[:n_new - k] = values[k:]
-                self._scores[head:] = scores[:k]
-                self._scores[:n_new - k] = scores[k:]
-                self._owns[head:] = owns[:k]
-                self._owns[:n_new - k] = owns[k:]
-                self._opps[head:] = opps[:k]
-                self._opps[:n_new - k] = opps[k:]
-
-            self._head = end % N
-            self._size = min(self._size + n_new, N)
+            slot = self._head_slot
+            self._game_bytes[slot] = blob
+            self._game_kind[slot] = kind
+            self._game_n_rows[slot] = int(n_rows)
+            self._head_slot = (slot + 1) % self._n_slots
+            if self._n_filled < self._n_slots:
+                self._n_filled += 1
 
     def _ingest_loop(self):
         while not self._stop.is_set():
@@ -542,10 +691,9 @@ class WindowRingBuffer:
                     if self._stop.is_set():
                         break
                     try:
-                        data = _decompress_bytes(p)
-                        parsed = _parse_records(data, self.board_size)
-                        if parsed is not None:
-                            self._append(parsed)
+                        blob, kind, n_rows = _read_blob_with_count(p)
+                        if blob is not None and n_rows > 0:
+                            self._append_blob(blob, kind, n_rows)
                         self._watermark = gid
                     except (OSError, ValueError, zstd.ZstdError) as e:
                         # File may have been pruned mid-read — skip it and
@@ -765,6 +913,17 @@ def main():
     ap.add_argument("--n-augmentations", type=int, default=8)
     ap.add_argument("--ring-games", type=int, default=2000,
                     help="Games in per-rank ring; rows = ring_games * ~800")
+    ap.add_argument("--samples-per-game", type=int, default=8,
+                    help="Rows per game pulled into each batch (game-"
+                         "granular sampling).  K = batch_size / "
+                         "samples_per_game decompressions per batch.  "
+                         "Higher = fewer decompressions, more within-"
+                         "batch correlation; lower = more decompressions, "
+                         "more diverse batch.")
+    ap.add_argument("--ring-decompress-workers", type=int, default=4,
+                    help="Thread pool size for parallel zstd decompress "
+                         "during sample_batch.  zstd C lib releases the "
+                         "GIL during decode; ~2× speedup at 4 workers.")
     ap.add_argument("--bucket-cap-mult", type=int, default=64)
     ap.add_argument("--min-window-games", type=int, default=2000,
                     help="Cold-start gate: min files on disk before training")
@@ -993,6 +1152,8 @@ def main():
         board_size=args.board,
         rng_seed=args.base_seed + rank + step,  # different per-rank, per-resume
         initial_watermark=ring_warmup_id,
+        samples_per_game=args.samples_per_game,
+        decompress_workers=args.ring_decompress_workers,
     )
     window.start_ingest()
 

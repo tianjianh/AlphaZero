@@ -266,6 +266,8 @@ def train_cmd(args, log_dir):
            "--replay-target", str(args.replay_target),
            "--n-augmentations", str(args.n_augmentations),
            "--ring-games", str(args.ring_games),
+           "--samples-per-game", str(args.samples_per_game),
+           "--ring-decompress-workers", str(args.ring_decompress_workers),
            "--bucket-cap-mult", str(args.bucket_cap_mult),
            "--min-window-games", str(args.min_window_games),
            "--min-ring-rows", str(args.min_ring_rows),
@@ -723,11 +725,13 @@ def add_run_args(p):
                    help="NN server threads for rate; defaults to "
                         "len(--rate-nn-device-ids) if unset")
 
-    # Model
+    # Model — defaults match the KataGo b10c128 warm-start that init
+    # produces.  Run 1 (filters=64, blocks=5) capped out at +250 Elo of
+    # usable separation on 9x9 — too small.  See training_strategy.md.
     p.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
     p.add_argument("--board", type=int, default=9)
-    p.add_argument("--filters", type=int, default=64)
-    p.add_argument("--blocks", type=int, default=5)
+    p.add_argument("--filters", type=int, default=128)
+    p.add_argument("--blocks", type=int, default=10)
     p.add_argument("--d-model", type=int, default=192)
     p.add_argument("--depth", type=int, default=8)
     p.add_argument("--heads", type=int, default=6)
@@ -735,16 +739,33 @@ def add_run_args(p):
     p.add_argument("--mlp-ratio", type=int, default=4)
     p.add_argument("--fp8", action="store_true")
 
-    # Training
-    p.add_argument("--batch-size", type=int, default=1024)
+    # Training — per-DDP-rank batch.  Default 256 → global=1024 with 4
+    # ranks (matches KataGo's small-machine BATCHSIZE=128 scaled to our
+    # rank count).  Override to 384 or 512 for 2-GPU runs.
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--base-lr", type=float, default=3e-4)
     p.add_argument("--warmup-steps", type=int, default=2000)
     p.add_argument("--lr-milestones", default="100000,400000,1500000")
     p.add_argument("--lr-gamma", type=float, default=0.5)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    # replay_target=4 matches KataGo's production async setting
+    # (-max-train-bucket-per-new-data).  Their synchronous_loop.sh uses 8
+    # but that's small-machine experimentation, not their main runs.
     p.add_argument("--replay-target", type=float, default=4.0)
     p.add_argument("--n-augmentations", type=int, default=8)
+    # ring_games is host-RAM-bound: each rank holds ring_games × ~800 rows
+    # × ~6 KB ≈ ~10 GB at 2000 games.  4-rank box with ~64 GB host RAM
+    # caps at ~2000 per rank.  Raise to 4000+ if host has ≥128 GB.
+    # Tighter than KataGo's hour-scale shuffle buffer; see
+    # training_strategy.md "Ring buffer staleness".
     p.add_argument("--ring-games", type=int, default=2000)
+    # Game-granular sampling controls.  K = batch_size / samples_per_game
+    # games decompressed per batch (each contributes samples_per_game
+    # rows).  Default 8 → ~32 unique games per batch at batch_size=256,
+    # which is the throughput sweet spot.  See WindowRingBuffer
+    # docstring in train_continuous.py for the trade-off.
+    p.add_argument("--samples-per-game", type=int, default=8)
+    p.add_argument("--ring-decompress-workers", type=int, default=4)
     p.add_argument("--bucket-cap-mult", type=int, default=64)
     p.add_argument("--min-window-games", type=int, default=2000)
     p.add_argument("--min-ring-rows", type=int, default=10240)
@@ -754,11 +775,15 @@ def add_run_args(p):
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--value-ramp-steps", type=int, default=30000)
     p.add_argument("--score-ramp-steps", type=int, default=50000)
-    # Head-weight endpoints (the ramps interpolate from *_start to *_end).
+    # Head-weight endpoints.  score_mean_weight_end lowered 0.010 → 0.008
+    # to mitigate the score-head feedback loop observed in run 2:
+    # loss_score_mean climbed 9 → 19 across the run while policy/value
+    # continued to descend, dragging loss_total to a fake plateau.  See
+    # training_strategy.md "Score-head feedback loop".
     p.add_argument("--value-weight-start", type=float, default=1.0)
     p.add_argument("--value-weight-end", type=float, default=2.0)
     p.add_argument("--score-mean-weight-start", type=float, default=0.004)
-    p.add_argument("--score-mean-weight-end", type=float, default=0.010)
+    p.add_argument("--score-mean-weight-end", type=float, default=0.008)
     # Fixed head weights (no ramp, but overridable per-run via CLI).
     p.add_argument("--policy-weight", type=float, default=1.0)
     p.add_argument("--score-stdev-weight", type=float, default=0.006)
@@ -766,13 +791,18 @@ def add_run_args(p):
     p.add_argument("--ownership-weight", type=float, default=0.85)
     p.add_argument("--opp-policy-weight", type=float, default=0.1)
 
-    # Selfplay
+    # Selfplay — sims raised 500 → 600 because the policy targets at 500
+    # were too noisy for late-stage training.  KataGo's b10c128 async
+    # configs typically use 600–1500.  Cost: ~20% slower selfplay.
     p.add_argument("--selfplay-batch-games", type=int, default=300)
-    p.add_argument("--selfplay-sims", type=int, default=500)
-    p.add_argument("--window-games", type=int, default=80000)
-    p.add_argument("--score-weight-max", type=float, default=0.06,
+    p.add_argument("--selfplay-sims", type=int, default=600)
+    p.add_argument("--window-games", type=int, default=100000)
+    p.add_argument("--score-weight-max", type=float, default=0.04,
                    help="MCTS score weight at full ramp (selfplay reads "
-                        "score_ramp from status.json and multiplies)")
+                        "score_ramp from status.json and multiplies). "
+                        "Lowered 0.06 → 0.04 to reduce the score head's "
+                        "feedback into MCTS Q-values; see "
+                        "training_strategy.md.")
     p.add_argument("--selfplay-threads", type=int, default=0,
                    help="Parallel game workers (0 = os.cpu_count())")
     p.add_argument("--selfplay-search-threads", type=int, default=16,
@@ -827,10 +857,14 @@ def main():
 
     p_init = sub.add_parser("init",
                             help="Archive prior run and bootstrap seed model")
+    # Defaults match `add_run_args` so init-then-run with no arch flags
+    # produces a consistent arch.  Mismatch would silently train a default-
+    # sized net while selfplay used the bootstrap of a different size — see
+    # training_strategy.md "Issues overlooked: init/run arch divergence".
     p_init.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
     p_init.add_argument("--board", type=int, default=9)
-    p_init.add_argument("--filters", type=int, default=64)
-    p_init.add_argument("--blocks", type=int, default=5)
+    p_init.add_argument("--filters", type=int, default=128)
+    p_init.add_argument("--blocks", type=int, default=10)
     p_init.add_argument("--d-model", type=int, default=192)
     p_init.add_argument("--depth", type=int, default=8)
     p_init.add_argument("--heads", type=int, default=6)
