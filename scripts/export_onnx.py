@@ -23,12 +23,11 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 import onnx
 from onnx import numpy_helper
 
 sys.path.insert(0, os.path.dirname(__file__))
-from model import AlphaZeroNet, GoViT, create_model
+from model import create_model
 
 
 class _InferenceWrapper(nn.Module):
@@ -67,8 +66,12 @@ def _embed_state_dict(onnx_path, model):
     onnx.save(onnx_model, onnx_path)
 
 
-def export_to_onnx(model, output_path, board_size=9, input_channels=17, arch="resnet"):
+def export_to_onnx(model, output_path, board_size=9, input_channels=17):
     """Export a PyTorch model to ONNX format with dynamic batch axis.
+
+    Arch-agnostic: the model object carries its own architecture (both
+    AlphaZeroNet and GoViT implement forward_inference with identical
+    output shapes), so no arch flag is needed here.
 
     The ONNX file contains:
     1. The optimized graph (BN folded into Conv) for ONNX Runtime / TensorRT
@@ -173,7 +176,7 @@ def main():
         else:
             print(f"No checkpoint at {args.checkpoint}, exporting random weights")
 
-    export_to_onnx(model, args.output, board_size=args.board, arch=args.arch)
+    export_to_onnx(model, args.output, board_size=args.board)
 
 
 if __name__ == "__main__":

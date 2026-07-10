@@ -14,7 +14,7 @@ Architecture:
   - Every step is a collective decision: rank 0 computes go/no-go on the
     bucket + cold-start gate, broadcasts the bool, all ranks act together.
 
-See cont_train.todo for the complete design rationale.
+See CONTINUOUS_TRAINING.md for the complete design rationale.
 """
 
 import argparse
@@ -23,19 +23,16 @@ import io
 import json
 import signal
 import os
-import random
 import re
 import struct
 import sys
 import tempfile
 import threading
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.distributed as dist
@@ -47,7 +44,7 @@ from model import create_model
 
 
 # ═══════════════════════════════════════════════════════════
-#  V2 binary format (matches train.py / main_selfplay.cpp)
+#  V2 binary format (matches main_selfplay.cpp)
 # ═══════════════════════════════════════════════════════════
 
 _V2_MAGIC = 0x4D47  # 'MG'
@@ -892,15 +889,15 @@ def main():
                     help="Directory for train.log and train_metrics.csv")
     ap.add_argument("--board", type=int, default=9)
     ap.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
-    ap.add_argument("--filters", type=int, default=64)
-    ap.add_argument("--blocks", type=int, default=5)
+    ap.add_argument("--filters", type=int, default=128)
+    ap.add_argument("--blocks", type=int, default=10)
     ap.add_argument("--d-model", type=int, default=192)
     ap.add_argument("--depth", type=int, default=8)
     ap.add_argument("--heads", type=int, default=6)
     ap.add_argument("--kv-groups", type=int, default=2)
     ap.add_argument("--mlp-ratio", type=int, default=4)
     # Training
-    ap.add_argument("--batch-size", type=int, default=1024,
+    ap.add_argument("--batch-size", type=int, default=256,
                     help="Per-rank batch size")
     ap.add_argument("--base-lr", type=float, default=3e-4)
     ap.add_argument("--warmup-steps", type=int, default=2000)
@@ -924,7 +921,16 @@ def main():
                     help="Thread pool size for parallel zstd decompress "
                          "during sample_batch.  zstd C lib releases the "
                          "GIL during decode; ~2× speedup at 4 workers.")
-    ap.add_argument("--bucket-cap-mult", type=int, default=64)
+    # Bucket cap = bucket_cap_mult × global_batch samples.  Must be LARGE
+    # relative to one selfplay publish chunk (~300 games ≈ 120k samples of
+    # credit at replay_target=4 / n_aug=8), or credit is silently clipped
+    # at the cap on every publish and the effective replay ratio drops
+    # below replay_target.  KataGo's default is an UNBOUNDED bucket
+    # (python/train.py: max_train_bucket_size None → 1e30); 512 ×
+    # global_batch ≈ 4-5 publish chunks is a bounded approximation.
+    # The selfplay driver reads bucket_fill from status.json and pauses
+    # when it saturates, so a big cap doesn't cause unbounded data lead.
+    ap.add_argument("--bucket-cap-mult", type=int, default=512)
     ap.add_argument("--min-window-games", type=int, default=2000,
                     help="Cold-start gate: min files on disk before training")
     ap.add_argument("--min-ring-rows", type=int, default=10240,
@@ -942,7 +948,7 @@ def main():
     ap.add_argument("--value-weight-start", type=float, default=1.0)
     ap.add_argument("--value-weight-end", type=float, default=2.0)
     ap.add_argument("--score-mean-weight-start", type=float, default=0.004)
-    ap.add_argument("--score-mean-weight-end", type=float, default=0.010)
+    ap.add_argument("--score-mean-weight-end", type=float, default=0.008)
     ap.add_argument("--score-stdev-weight", type=float, default=0.006)
     ap.add_argument("--score-belief-weight", type=float, default=0.035)
     ap.add_argument("--ownership-weight", type=float, default=0.85)
@@ -972,7 +978,7 @@ def main():
     # the process between exports and drop up to (export_every - 1)
     # steps of optimizer + bucket + watermark state.
     shutdown_event = threading.Event()
-    def _handle_shutdown(sig, _frame):
+    def _handle_shutdown(_sig, _frame):
         shutdown_event.set()
     signal.signal(signal.SIGTERM, _handle_shutdown)
     try:
@@ -1011,7 +1017,7 @@ def main():
         events = EventLogger(os.path.join(args.log_dir, "train.log"))
         metrics = CsvLogger(os.path.join(args.log_dir, "train_metrics.csv"), [
             "step", "wall_time", "samples_seen", "lr", "value_weight",
-            "score_weight_mcts", "score_mean_weight",
+            "score_ramp", "score_mean_weight",
             "loss_total", "loss_policy", "loss_value", "loss_score_mean",
             "loss_score_stdev", "loss_ownership", "loss_score_belief",
             "loss_opp_policy",
@@ -1221,11 +1227,45 @@ def main():
             dist.broadcast(sd_t, src=0)
         return bool(sd_t.item())
 
+    def publish_status(state, score_ramp_val, value_w_val, score_mean_w_val,
+                       lr_val):
+        """Write status.json (rank 0).  This is the trainer↔selfplay
+        contract: selfplay reads score_ramp (MCTS score-weight ramp) and
+        bucket_fill (backpressure — it pauses when the bucket saturates,
+        see selfplay_driver.py THROTTLE).  wall_time doubles as the
+        liveness signal, so this is also called from the wait states,
+        not just the step loop."""
+        _atomic_write_json(args.status_file, {
+            "state": state,               # "training" | "cold_start" | "budget_sleep"
+            "step": step,
+            "samples_seen": step * global_batch,
+            "global_batch": global_batch,
+            "score_ramp": score_ramp_val,
+            "value_weight": value_w_val,
+            "score_mean_weight": score_mean_w_val,
+            "lr": lr_val,
+            "bucket_level": bucket.available() if bucket else 0,
+            "bucket_cap": bucket.max if bucket else 0,
+            "bucket_fill": bucket.fill_ratio() if bucket else 0.0,
+            "window_games": scanner.window_games() if scanner else 0,
+            "wall_time": time.time(),
+        })
+
     shutdown_reason = None
     while True:
         if shutdown_requested():
             shutdown_reason = "signal"
             break
+
+        # ── LR + ramps (computed up front so the wait states can
+        #    publish current values in status.json too) ────
+        lr = lr_sched.lr(step)
+        value_w = linear_ramp(step, args.value_ramp_steps,
+                              start=args.value_weight_start,
+                              end=args.value_weight_end)
+        score_ramp = linear_ramp(step, args.score_ramp_steps, 0.0, 1.0)
+        score_mean_w = (args.score_mean_weight_start
+                        + (args.score_mean_weight_end - args.score_mean_weight_start) * score_ramp)
 
         # ── Cold-start gate (both conditions must hold) ───
         if is_main:
@@ -1251,6 +1291,8 @@ def main():
                            ring_rows_rank0=local_rows,
                            min_window=args.min_window_games,
                            min_ring=args.min_ring_rows)
+                publish_status("cold_start", score_ramp, value_w,
+                               score_mean_w, lr)
                 last_cold_log_t = now
             # Wait on the event so the signal interrupts the sleep.
             shutdown_event.wait(5.0)
@@ -1269,19 +1311,13 @@ def main():
             if is_main and (now - last_budget_log_t) >= WAIT_LOG_INTERVAL_S:
                 events.log("BUDGET_SLEEP", bucket=bucket.available(),
                            cap=bucket.max)
+                publish_status("budget_sleep", score_ramp, value_w,
+                               score_mean_w, lr)
                 last_budget_log_t = now
             shutdown_event.wait(5.0)
             continue
 
-        # ── LR + ramps ────────────────────────────────────
-        lr = lr_sched.lr(step)
         set_lr(lr)
-        value_w = linear_ramp(step, args.value_ramp_steps,
-                              start=args.value_weight_start,
-                              end=args.value_weight_end)
-        score_ramp = linear_ramp(step, args.score_ramp_steps, 0.0, 1.0)
-        score_mean_w = (args.score_mean_weight_start
-                        + (args.score_mean_weight_end - args.score_mean_weight_start) * score_ramp)
 
         weights = {
             "policy": args.policy_weight,
@@ -1330,18 +1366,12 @@ def main():
                         if loss_ema is not None else total.item())
 
         # ── Status publish ───────────────────────────────
+        # NOTE: the MCTS score weight itself is NOT published — its
+        # maximum (--score-weight-max) is a selfplay-driver setting the
+        # trainer doesn't know.  Selfplay computes score_weight_max ×
+        # score_ramp from the ramp published here.
         if is_main and step % args.status_publish_every == 0:
-            _atomic_write_json(args.status_file, {
-                "step": step,
-                "score_ramp": score_ramp,
-                "value_ramp": (value_w - args.value_weight_start)
-                              / max(1e-9, args.value_weight_end - args.value_weight_start),
-                "value_weight": value_w,
-                "score_mean_weight": score_mean_w,
-                "mcts_score_weight": 0.06 * score_ramp,
-                "lr": lr,
-                "wall_time": time.time(),
-            })
+            publish_status("training", score_ramp, value_w, score_mean_w, lr)
 
         # ── Metric rows ──────────────────────────────────
         if is_main and step % args.log_every == 0:
@@ -1357,7 +1387,7 @@ def main():
                 "step": step, "wall_time": f"{now:.3f}",
                 "samples_seen": step * global_batch,
                 "lr": lr, "value_weight": value_w,
-                "score_weight_mcts": 0.06 * score_ramp,
+                "score_ramp": score_ramp,
                 "score_mean_weight": score_mean_w,
                 "loss_total": avg["total"], "loss_policy": avg["policy"],
                 "loss_value": avg["value"], "loss_score_mean": avg["score_mean"],
@@ -1398,8 +1428,7 @@ def main():
                 )
                 cpu_model.load_state_dict(base_model.state_dict(), strict=False)
                 cpu_model.eval()
-                export_to_onnx(cpu_model, tmp_path,
-                               board_size=args.board, arch=args.arch)
+                export_to_onnx(cpu_model, tmp_path, board_size=args.board)
                 os.replace(tmp_path, out_path)
 
                 # Atomic (bucket_level, watermark_id) snapshot — see

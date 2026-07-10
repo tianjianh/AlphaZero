@@ -17,8 +17,8 @@ Subcommands
 import argparse
 import datetime
 import glob
+import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -35,6 +35,19 @@ MODELS_DIR = PROJECT_ROOT / "models"
 RATINGS_DIR = PROJECT_ROOT / "ratings"
 LOGS_ROOT = PROJECT_ROOT / "logs"
 ARCHIVE_ROOT = PROJECT_ROOT / "archive"
+
+# Written by `init`, loaded by `run`.  The single source of truth for
+# every parameter that MUST agree between the seed model, the trainer's
+# model construction, and the game rules used by selfplay/gate — so
+# nothing architecture-defining ever needs to be re-specified (or can
+# silently diverge) on `run`.
+RUN_CONFIG_PATH = TRAINING_DIR / "run_config.json"
+
+# Keys persisted at init time.  board/arch/filters/... define the
+# network; komi defines the game the network is trained for.
+RUN_CONFIG_KEYS = ["arch", "board", "filters", "blocks",
+                   "d_model", "depth", "heads", "kv_groups", "mlp_ratio",
+                   "komi"]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -78,6 +91,63 @@ def build_if_needed():
                    cwd=str(BUILD_DIR), check=True)
     subprocess.run(["make", f"-j{os.cpu_count() or 4}"],
                    cwd=str(BUILD_DIR), check=True)
+
+
+def save_run_config(args):
+    """Persist the architecture-defining parameters chosen at init."""
+    TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {k: getattr(args, k) for k in RUN_CONFIG_KEYS}
+    tmp = RUN_CONFIG_PATH.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, RUN_CONFIG_PATH)
+    print(f"[init] wrote {RUN_CONFIG_PATH.relative_to(PROJECT_ROOT)}: {cfg}")
+
+
+def load_run_config(args, argv):
+    """Apply training/run_config.json onto `args` for the `run` command.
+
+    - Missing file: hard error (init must run first — it also seeds the
+      model, so running without it can't work anyway).
+    - For each config key: if the user did NOT pass the flag on the
+      command line, the persisted value wins (no re-specifying).
+    - If the user DID pass it and it contradicts the config, abort with
+      a clear message: a run whose trainer builds a different net than
+      the accepted/ seed silently trains garbage.  Changing architecture
+      requires a fresh `init`.
+    """
+    if not RUN_CONFIG_PATH.is_file():
+        raise SystemExit(
+            f"ERROR: {RUN_CONFIG_PATH} not found.  Run "
+            f"'python scripts/run_continuous.py init' first — it seeds the "
+            f"model AND records the architecture for `run`.")
+    with open(RUN_CONFIG_PATH) as f:
+        cfg = json.load(f)
+
+    passed = set()
+    for tok in argv:
+        if tok.startswith("--"):
+            passed.add(tok.split("=", 1)[0].lstrip("-").replace("-", "_"))
+
+    conflicts = []
+    for k in RUN_CONFIG_KEYS:
+        if k not in cfg:
+            continue  # older config file — key falls back to CLI default
+        if k in passed:
+            if getattr(args, k) != cfg[k]:
+                conflicts.append(
+                    f"  --{k.replace('_', '-')} {getattr(args, k)} "
+                    f"(run_config.json has {cfg[k]})")
+        else:
+            setattr(args, k, cfg[k])
+    if conflicts:
+        raise SystemExit(
+            "ERROR: command-line flags contradict training/run_config.json "
+            "(the architecture this run was initialized with):\n"
+            + "\n".join(conflicts) +
+            "\nChanging the architecture requires a fresh `init` "
+            "(which archives the old run).")
+    return cfg
 
 
 def bootstrap_model(args):
@@ -146,6 +216,7 @@ class Worker:
         self.start_times = []
         self.backoff = 1.0
         self.disabled = False
+        self.restart_at = None   # monotonic deadline for a pending respawn
 
     def spawn(self):
         env = os.environ.copy()
@@ -212,8 +283,12 @@ class Worker:
         return len(self.start_times) >= self.MAX_RESTARTS_IN_WINDOW
 
     def handle_exit(self, rc, sup_log):
+        """Schedule a respawn after backoff.  Does NOT sleep — a blocking
+        sleep here would stall the whole supervise loop (heartbeats and
+        other workers' crash handling) for up to MAX_BACKOFF_S."""
         sup_log("CRASH", proc=self.name, rc=rc)
         self.close_log()
+        self.proc = None
         if self.should_disable():
             self.disabled = True
             sup_log("DISABLED", proc=self.name,
@@ -221,9 +296,17 @@ class Worker:
             return
         backoff = min(self.backoff, self.MAX_BACKOFF_S)
         self.backoff = min(self.backoff * 2.0, self.MAX_BACKOFF_S)
-        sup_log("RESTART", proc=self.name, after_s=f"{backoff:.1f}")
-        time.sleep(backoff)
-        self.spawn()
+        self.restart_at = time.monotonic() + backoff
+        sup_log("RESTART_SCHEDULED", proc=self.name, after_s=f"{backoff:.1f}")
+
+    def maybe_respawn(self, sup_log):
+        """Called from the supervise loop; spawns when the backoff expires."""
+        if self.disabled or self.proc is not None or self.restart_at is None:
+            return
+        if time.monotonic() >= self.restart_at:
+            self.restart_at = None
+            self.spawn()
+            sup_log("RESTART", proc=self.name, pid=self.proc.pid)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -332,6 +415,8 @@ def selfplay_cmd(args, log_dir):
             "--komi", str(args.komi),
             "--score-scale", str(args.score_scale),
             "--score-weight-max", str(args.score_weight_max),
+            "--throttle-high", str(args.throttle_high),
+            "--throttle-low", str(args.throttle_low),
             ]
 
 
@@ -419,19 +504,21 @@ def _heartbeat_snapshot():
     if latest_link.is_symlink():
         latest = os.readlink(str(latest_link))
 
-    step = lr = score_ramp = "-"
+    step = lr = score_ramp = bucket_fill = train_state = "-"
     status_path = TRAINING_DIR / "status.json"
     if status_path.is_file():
         try:
-            import json as _json
             with open(status_path) as f:
-                s = _json.load(f)
+                s = json.load(f)
             step = s.get("step", "-")
             lr = s.get("lr", "-")
             if isinstance(lr, float):
                 lr = f"{lr:.2e}"
             sr = s.get("score_ramp", "-")
             score_ramp = f"{sr:.2f}" if isinstance(sr, (int, float)) else sr
+            bf = s.get("bucket_fill", "-")
+            bucket_fill = f"{bf:.2f}" if isinstance(bf, (int, float)) else bf
+            train_state = s.get("state", "-")
         except (OSError, ValueError):
             pass
 
@@ -439,6 +526,8 @@ def _heartbeat_snapshot():
         "step": step,
         "lr": lr,
         "score_ramp": score_ramp,
+        "bucket_fill": bucket_fill,
+        "train_state": train_state,
         "pool": pool,
         "candidates": candidates,
         "accepted": accepted,
@@ -561,6 +650,12 @@ def cmd_run(args):
             for w in workers:
                 if w.disabled:
                     continue
+                w.maybe_respawn(sup_log)
+                if w.proc is None:
+                    # Respawn still pending (backoff) — worker counts as
+                    # alive so the loop keeps supervising it.
+                    any_alive = True
+                    continue
                 rc = w.poll()
                 if rc is None:
                     any_alive = True
@@ -579,6 +674,8 @@ def cmd_run(args):
                 snap = _heartbeat_snapshot()
                 sup_log("HEARTBEAT",
                         step=snap["step"], lr=snap["lr"],
+                        state=snap["train_state"],
+                        bucket=snap["bucket_fill"],
                         score_ramp=snap["score_ramp"],
                         pool=snap["pool"],
                         cand=snap["candidates"],
@@ -652,11 +749,13 @@ def cmd_init(args):
 
     build_if_needed()
     bootstrap_model(args)
+    save_run_config(args)
     print(f"[init] done.  Start training with:  "
-          f"python {Path(__file__).relative_to(PROJECT_ROOT)} run ...")
+          f"python {Path(__file__).relative_to(PROJECT_ROOT)} run "
+          f"(architecture is remembered — no need to repeat --filters etc.)")
 
 
-def cmd_status(args):
+def cmd_status(_args):
     accepted = sorted(glob.glob(str(MODELS_DIR / "accepted" / "v*.onnx")))
     candidates = sorted(glob.glob(str(MODELS_DIR / "candidates" / "v*.onnx")))
     rejected = sorted(glob.glob(str(MODELS_DIR / "rejected" / "v*.onnx")))
@@ -677,13 +776,18 @@ def cmd_status(args):
     status_path = TRAINING_DIR / "status.json"
     if status_path.is_file():
         try:
-            import json
             with open(status_path) as f:
                 s = json.load(f)
-            print(f"Status:       step={s.get('step')} "
-                  f"lr={s.get('lr')} score_ramp={s.get('score_ramp'):.3f} "
-                  f"value_weight={s.get('value_weight')}")
-        except (OSError, ValueError):
+            sr = s.get("score_ramp")
+            bf = s.get("bucket_fill")
+            sr_str = f"{sr:.3f}" if isinstance(sr, (int, float)) else "-"
+            print(f"Status:       state={s.get('state', '-')} "
+                  f"step={s.get('step')} lr={s.get('lr')} "
+                  f"score_ramp={sr_str}")
+            if isinstance(bf, (int, float)):
+                print(f"Bucket:       {bf:.2f} full "
+                      f"({s.get('bucket_level')}/{s.get('bucket_cap')} samples)")
+        except (OSError, ValueError, TypeError):
             pass
 
     logs_current = LOGS_ROOT / "current"
@@ -725,9 +829,10 @@ def add_run_args(p):
                    help="NN server threads for rate; defaults to "
                         "len(--rate-nn-device-ids) if unset")
 
-    # Model — defaults match the KataGo b10c128 warm-start that init
-    # produces.  Run 1 (filters=64, blocks=5) capped out at +250 Elo of
-    # usable separation on 9x9 — too small.  See training_strategy.md.
+    # Model — the EFFECTIVE values come from training/run_config.json
+    # (written by `init`); these CLI defaults only matter for conflict
+    # detection.  Passing a value that contradicts run_config.json is a
+    # hard error — change architecture via a fresh `init`, never here.
     p.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
     p.add_argument("--board", type=int, default=9)
     p.add_argument("--filters", type=int, default=128)
@@ -766,7 +871,7 @@ def add_run_args(p):
     # docstring in train_continuous.py for the trade-off.
     p.add_argument("--samples-per-game", type=int, default=8)
     p.add_argument("--ring-decompress-workers", type=int, default=4)
-    p.add_argument("--bucket-cap-mult", type=int, default=64)
+    p.add_argument("--bucket-cap-mult", type=int, default=512)
     p.add_argument("--min-window-games", type=int, default=2000)
     p.add_argument("--min-ring-rows", type=int, default=10240)
     p.add_argument("--sample-batch-timeout-s", type=float, default=30.0)
@@ -807,6 +912,15 @@ def add_run_args(p):
                    help="Parallel game workers (0 = os.cpu_count())")
     p.add_argument("--selfplay-search-threads", type=int, default=16,
                    help="MCTS search threads per move")
+    # Rollout↔train backpressure (see selfplay_driver.py THROTTLE):
+    # selfplay pauses when the trainer's replay bucket saturates, so GPU
+    # time isn't spent generating games whose training budget would be
+    # discarded at the bucket cap.
+    p.add_argument("--throttle-high", type=float, default=0.9,
+                   help="Pause selfplay when trainer bucket_fill >= this "
+                        "(0 disables)")
+    p.add_argument("--throttle-low", type=float, default=0.5,
+                   help="Resume selfplay when bucket_fill < this")
 
     # Gatekeeper
     p.add_argument("--gate-games", type=int, default=200)
@@ -870,6 +984,9 @@ def main():
     p_init.add_argument("--heads", type=int, default=6)
     p_init.add_argument("--kv-groups", type=int, default=2)
     p_init.add_argument("--mlp-ratio", type=int, default=4)
+    p_init.add_argument("--komi", type=float, default=7.5,
+                        help="Komi the run trains for (recorded in "
+                             "run_config.json; selfplay/gate/rate use it)")
     p_init.add_argument("-y", "--yes", action="store_true",
                         help="Skip confirmation prompt")
 
@@ -883,6 +1000,9 @@ def main():
     if args.command == "init":
         cmd_init(args)
     elif args.command == "run":
+        # Architecture + komi come from training/run_config.json (written
+        # by init); contradicting CLI flags are a hard error.
+        load_run_config(args, sys.argv[1:])
         cmd_run(args)
     elif args.command == "status":
         cmd_status(args)

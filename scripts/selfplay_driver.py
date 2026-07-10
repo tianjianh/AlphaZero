@@ -211,9 +211,10 @@ def main():
     ap.add_argument("--log-dir", default="logs/current")
     ap.add_argument("--build-dir", default="build")
     ap.add_argument("--games-per-batch", type=int, default=300)
-    ap.add_argument("--window-games", type=int, default=80000)
-    # Selfplay binary knobs (mirror run_loop.py defaults where sensible)
-    ap.add_argument("--sims", type=int, default=500)
+    ap.add_argument("--window-games", type=int, default=100000)
+    # Selfplay binary knobs (defaults match run_continuous.py's, so a
+    # standalone launch behaves the same as a supervised one)
+    ap.add_argument("--sims", type=int, default=600)
     ap.add_argument("--threads", type=int, default=0,
                     help="CPU worker threads; 0 = os.cpu_count()")
     ap.add_argument("--search-threads", type=int, default=16)
@@ -227,13 +228,35 @@ def main():
     ap.add_argument("--temp-threshold", type=int, default=12)
     ap.add_argument("--komi", type=float, default=7.5)
     ap.add_argument("--win-loss-weight", type=float, default=1.0)
-    ap.add_argument("--score-weight-max", type=float, default=0.06,
+    ap.add_argument("--score-weight-max", type=float, default=0.04,
                     help="Full value of MCTS score weight at end of ramp")
     ap.add_argument("--score-scale", type=float, default=18.0)
     # Misc
     ap.add_argument("--model-poll-interval", type=float, default=5.0,
                     help="Seconds to wait when no accepted model exists yet")
     ap.add_argument("--zstd-level", type=int, default=3)
+    # ── Rollout↔train backpressure ──────────────────────────
+    # The trainer paces itself against data with a KataGo-style train
+    # bucket (train_continuous.py): credit = replay_target × new rows,
+    # drained by training steps.  When SELFPLAY outpaces TRAINING the
+    # bucket pins at its cap and every further game's credit is
+    # discarded — GPU time spent generating positions the trainer will
+    # never be allowed to consume at the target replay ratio.  The
+    # driver therefore reads bucket_fill from status.json and pauses
+    # between batches while the bucket is saturated (hysteresis so it
+    # doesn't flap).  This closes the loop KataGo leaves open (their
+    # async setup assumes distributed selfplay that a single trainer
+    # never outpaces; on one host the valve is needed in both
+    # directions).  No throttle during cold start: before the trainer's
+    # first step (step=0 / no status.json) selfplay free-runs to fill
+    # the window.
+    ap.add_argument("--throttle-high", type=float, default=0.9,
+                    help="Pause selfplay when trainer bucket_fill rises "
+                         "to this (0 disables throttling)")
+    ap.add_argument("--throttle-low", type=float, default=0.5,
+                    help="Resume selfplay when bucket_fill falls below this")
+    ap.add_argument("--throttle-poll", type=float, default=15.0,
+                    help="Seconds between bucket_fill re-checks while paused")
     args = ap.parse_args()
 
     os.makedirs(args.pool_dir, exist_ok=True)
@@ -251,7 +274,7 @@ def main():
     batches_csv = CsvLogger(os.path.join(args.log_dir, "selfplay_batches.csv"), [
         "batch_id", "wall_time_start", "wall_time_end", "model_in_use",
         "games_played", "positions_written", "duration_s", "selfplay_duration_s",
-        "score_weight", "pool_size", "publish_failures",
+        "score_weight", "pool_size", "publish_failures", "throttle_wait_s",
     ])
 
     cleanup_orphans(args.pool_dir, log)
@@ -290,6 +313,43 @@ def main():
 
     last_model = None
     batch_id = 0
+    throttled = False
+
+    def throttle_wait():
+        """Block while the trainer's bucket is saturated.  Returns the
+        seconds spent waiting.  Engages at --throttle-high, releases at
+        --throttle-low (hysteresis).  Inactive until the trainer has
+        taken its first step, so the cold-start window fills freely.
+        A dead trainer (stale status with a full bucket) keeps selfplay
+        paused — generating data nobody will train on is the exact
+        waste this valve exists to stop; the supervisor's restart of
+        the trainer releases it."""
+        nonlocal throttled
+        if args.throttle_high <= 0:
+            return 0.0
+        waited = 0.0
+        while not stop["flag"]:
+            st = read_status(args.status_file)
+            fill = st.get("bucket_fill")
+            step = st.get("step", 0)
+            if not isinstance(fill, (int, float)) or step == 0:
+                break  # trainer not started yet — no backpressure
+            if throttled:
+                if fill < args.throttle_low:
+                    throttled = False
+                    log("THROTTLE_RESUME", bucket_fill=f"{fill:.3f}",
+                        waited_s=f"{waited:.0f}")
+                    break
+            else:
+                if fill < args.throttle_high:
+                    break
+                throttled = True
+                log("THROTTLE_PAUSE", bucket_fill=f"{fill:.3f}",
+                    high=args.throttle_high, low=args.throttle_low,
+                    note="trainer bucket saturated; pausing selfplay")
+            stop_event.wait(args.throttle_poll)
+            waited += args.throttle_poll
+        return waited
 
     while not stop["flag"]:
         model_path = resolve_accepted_latest(args.accepted_dir)
@@ -300,6 +360,11 @@ def main():
         if model_path != last_model:
             log("MODEL_SWAP", old=last_model or "-", new=model_path)
             last_model = model_path
+
+        # Backpressure: don't start a batch the trainer has no budget for.
+        throttle_waited = throttle_wait()
+        if stop["flag"]:
+            break
 
         status = read_status(args.status_file)
         score_ramp = float(status.get("score_ramp", 0.0))
@@ -439,6 +504,7 @@ def main():
             "score_weight": f"{score_w:.6f}",
             "pool_size": pool_size,
             "publish_failures": publish_failures,
+            "throttle_wait_s": f"{throttle_waited:.1f}",
         })
 
     log("SHUTDOWN", batches=batch_id)

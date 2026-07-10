@@ -15,10 +15,8 @@ Usage:
 import argparse
 import curses
 import glob
-import locale
 import os
 import struct
-import sys
 
 
 # ═══════════════════════════════════════════════════════════

@@ -18,7 +18,6 @@ Seven-headed architecture (KataGo-style):
     7. Opponent Policy — opponent's next move [B, action_size]
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -387,8 +386,6 @@ class GoViT(nn.Module):
                  mlp_ratio=4, head_dim=32, use_fp8=False):
         super().__init__()
         self.board_size = board_size
-        hw = board_size * board_size
-        action_size = hw + 1
 
         # Token embedding: per-intersection linear projection
         self.token_proj = _linear(input_channels, d_model, use_fp8=use_fp8)
@@ -442,7 +439,6 @@ class GoViT(nn.Module):
         self.opp_pass_logit = nn.Parameter(torch.zeros(1))
 
     def _trunk(self, x):
-        B = x.size(0)
         x = x.flatten(2).transpose(1, 2)                           # [B, hw, C_in]
         x = self.token_proj(x)                                      # [B, hw, d_model]
         x = x + self.row_embed(self.row_ids) + self.col_embed(self.col_ids)

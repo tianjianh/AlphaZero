@@ -5,8 +5,11 @@ build-*/
 models/
 training/
 trt_cache/
-training_plan
-pipeline_config
+logs/
+ratings/
+archive/
+eval_games/
+.claude/
 
 # Data files
 *.bin
