@@ -2,12 +2,13 @@
 
 KataGo-style continuous pipeline. Four independent workers — **selfplay**,
 **train**, **gatekeeper**, and optionally **rate** — run concurrently and
-coordinate only through the filesystem. Replaces the old phased
-iterate/train/eval loop (preserved as `run_loop_phased.py`).
+coordinate only through the filesystem. This is the ONLY training
+pipeline in the repo (the old phased iterate/train/eval loop has been
+removed).
 
-Design rationale and trade-offs are tracked in `cont_train.todo`. This
-document is the **operator's reference**: how to run it, what each knob
-does, where logs land, and how to diagnose common problems.
+This document is both the design rationale and the **operator's
+reference**: how to run it, what each knob does, where logs land, and
+how to diagnose common problems.
 
 ---
 
@@ -72,7 +73,7 @@ python scripts/run_continuous.py run \
   --max-batch 256 \
   \
   `# Training-side DDP batch (per rank; global batch = batch-size × world_size)` \
-  --batch-size 1024 \
+  --batch-size 512 \
   \
   --rating
 ```
@@ -123,11 +124,13 @@ All four workers run in parallel. GPU assignment per-process via
 - **selfplay** (`scripts/selfplay_driver.py`) — Python supervisor around
   the existing `build/selfplay` binary. Each iteration:
   1. Resolves `models/accepted/latest` → concrete version path.
-  2. Reads `training/status.json` → current `score_ramp`.
-  3. Spawns `build/selfplay` into a fresh staging dir (N games).
-  4. Compresses `game_*.bin` → `g_<id>.bin.zst` with monotonic IDs,
+  2. Checks `training/status.json` `bucket_fill` → pauses while the
+     trainer's bucket is saturated (THROTTLE, hysteresis 0.9/0.5).
+  3. Reads `training/status.json` → current `score_ramp`.
+  4. Spawns `build/selfplay` into a fresh staging dir (N games).
+  5. Compresses `game_*.bin` → `g_<id>.bin.zst` with monotonic IDs,
      atomic rename.
-  5. Prunes the pool to `window_games` files (oldest first).
+  6. Prunes the pool to `window_games` files (oldest first).
 
   Sole writer of `training/selfplay/`. Crash-safe: `next_id =
   max(existing IDs on disk) + 1`, recomputed per batch. Orphan `.tmp`
@@ -164,7 +167,13 @@ All four workers run in parallel. GPU assignment per-process via
   (monotonic IDs).
 - Train → gatekeeper: ONNX dumps in `models/candidates/v*.onnx`.
 - Gatekeeper → selfplay: `models/accepted/latest` symlink swap.
-- Train → selfplay: `training/status.json` (ramp state).
+- Train → selfplay: `training/status.json` — carries BOTH the ramp
+  state (`score_ramp`, read every batch to scale the MCTS score
+  weight) and the backpressure signal (`bucket_fill`, read to decide
+  whether to pause selfplay — see "Selfplay throttle" below).
+- Init → run: `training/run_config.json` — architecture + komi chosen
+  at `init`; `run` loads it so nothing architecture-defining is ever
+  re-specified, and contradicting CLI flags are a hard error.
 
 All writes are atomic (`*.tmp` → `os.rename`).
 
@@ -179,7 +188,7 @@ fast as selfplay produces them. KataGo-style credit:
 
 ```
 bucket          = current credit in samples (rows)
-max_samples     = bucket_cap_mult * batch_size * world_size   (default 64 * 1024 * W)
+max_samples     = bucket_cap_mult * batch_size * world_size   (default 512 * global_batch)
 watermark_id    = max filename ID already credited
 
 Scanner (rank 0, every ~5s):
@@ -188,44 +197,85 @@ Scanner (rank 0, every ~5s):
   watermark_id = max id seen this pass
 
 Trainer:
-  if bucket < batch_size * world_size: sleep; continue
+  if bucket < batch_size * world_size: sleep (BUDGET_SLEEP); continue
   train_step(...)
   bucket -= batch_size * world_size
 ```
 
 `replay_target = 4` means each unique position is visited ~4 times
-across augmented views (KataGo's semantics). The `//N_AUGMENTATIONS`
-divisor accounts for the C++ writer emitting all 8 dihedral
-augmentations per position.
+across augmented views (KataGo's semantics — their
+`-max-train-bucket-per-new-data`). The `//N_AUGMENTATIONS` divisor
+accounts for the C++ writer emitting all 8 dihedral augmentations per
+position.
+
+**Cap sizing**: one selfplay publish (~300 games ≈ 240k rows) credits
+~120k samples in one scanner tick.  The cap must dwarf that chunk or
+credit silently clips on every publish, driving the effective replay
+ratio below `replay_target`.  KataGo's default is an unbounded bucket
+(`python/train.py`: `max_train_bucket_size = None → 1e30`);
+`bucket_cap_mult = 512` (≈ 4-5 publish chunks at global batch 1024)
+is the bounded approximation.  Runaway data lead is prevented by the
+selfplay throttle, not by the cap.
+
+### Selfplay throttle (rollout↔train backpressure)
+
+The bucket paces the TRAINER against data.  The reverse — selfplay
+outpacing training — needs its own valve on a single host (KataGo's
+async setup never needed one: their trainer can't be outpaced by
+distributed contributors it doesn't control, and their single-host
+recipe `synchronous_loop.sh` strictly alternates instead).
+
+The trainer publishes `bucket_fill` (level / cap) in `status.json`,
+including during its wait states.  The selfplay driver checks it
+between batches:
+
+```
+fill >= throttle_high (0.9)  → THROTTLE_PAUSE: stop launching batches
+fill <  throttle_low  (0.5)  → THROTTLE_RESUME: continue
+step == 0 or no status.json  → no throttle (cold-start fills freely)
+```
+
+Hysteresis prevents flapping; the pause means selfplay GPU time is
+never spent generating positions whose training credit would be
+discarded at the bucket cap.  A dead trainer (stale status, full
+bucket) keeps selfplay paused — that is the correct behavior, since
+data generated while nothing trains is pure waste; the supervisor's
+restart of the trainer releases the valve.  Disable with
+`--throttle-high 0`.
 
 **Why filename-ID-based, not file-index-based**: selfplay prunes old
 files once the pool exceeds `window_games`. An index into
 `sorted(pool)` shifts when files are pruned; a monotonic filename ID
 survives any pruning pattern.
 
-### Per-rank ring buffer
+### Per-rank ring buffer (compressed-in-memory, game-granular)
 
 `window_games` governs **disk retention** (enforced by selfplay's
 pruner). The trainer's **effective sampling window** is a smaller
-in-RAM ring buffer — default `ring_games = 2000` games × ~800 aug_rows
-= ~1.6M rows × ~6 KB ≈ **10 GB per rank**.
+in-RAM ring — default `ring_games = 2000` game slots per rank.
 
-Circular at row granularity: a `_head` pointer tracks the next write
-slot, new rows overwrite old ones in place, and sampling still draws
-uniformly from `[0, _size)` since every slot holds valid data once
-full. Appending is O(n_new), not O(ring_rows) — a shift-and-append
-design would memmove the entire ~10 GB ring on every ingested game
-and turn ingest into a bandwidth bottleneck.
+Each slot holds one game's raw **compressed** `g_*.bin.zst` bytes
+(~25 KB) plus its row count; the whole ring is a few hundred MB
+instead of the ~10 GB a decompressed row-ring would need.
+Decompression + parse happens lazily per batch, only for the games a
+batch touches.
+
+Sampling is **game-granular** (the same trick as KataGo's npz
+shuffler): pick `K = batch_size / samples_per_game` games uniformly
+with replacement, decompress them in parallel (small thread pool;
+zstd releases the GIL), take `samples_per_game` rows from each.
+Strict row-uniform sampling over a compressed ring would touch ~240
+distinct games per 256-row batch (coupon collector) and decompress
+for ~1.2 s per step; game-granular at `samples_per_game = 8` touches
+~32 and lands under 100 ms.  Trade-off: rows sharing a game share
+value/score targets (~3% of the batch per game) — KataGo accepts the
+same correlation.
 
 Each rank ingests independently. On resume, the ring's ingest starts
 from roughly the newest `1.5 × ring_games` files (not id=0), so it
 rehydrates with the freshest window instead of replaying the oldest
 retained pool — which would briefly have the trainer learning from
 hours-stale data before the cold-start gate notices.
-
-Freshness: at 1.5 games/s sustained, a row's ring lifetime is ~1.6M /
-1200 rows/s ≈ 22 min. Tighter than KataGo's hour-scale shuffle buffer,
-but adequate — model strength changes slowly in continuous training.
 
 ### Cold-start gate
 
@@ -268,23 +318,27 @@ Fresh-start safety. Both are **step-driven**, not signal-driven.
   0 would make value loss dwarf policy loss and waste early capacity
   on a noise signal.
 
-- **Score ramp** drives two weights from 0 → 1 over
-  `score_ramp_steps` (default 50k):
-  - `mcts_score_weight(step) = 0.00 + 0.06 * ramp`   (0 → 0.06)
-  - `head_score_mean_weight(step) = 0.004 + 0.006 * ramp`  (0.004 → 0.010)
+- **Score ramp** is a single 0 → 1 factor over `score_ramp_steps`
+  (default 50k) that drives two weights, each owned by the component
+  that uses it:
+  - trainer: `head_score_mean_weight(step)` ramps
+    `--score-mean-weight-start 0.004` → `--score-mean-weight-end 0.008`
+  - selfplay driver: `mcts score_weight = --score-weight-max (0.04) ×
+    score_ramp` — computed BY THE DRIVER from the published ramp;
+    the trainer does not know (or publish) the selfplay maximum.
 
   The score head is untrustworthy on a random-init network; its
   predictions actively distort MCTS search by biasing Q values toward
-  meaningless scores. Only `mcts_score_weight` and
-  `head_score_mean_weight` ramp — `head_score_stdev_weight` (0.006),
-  `head_score_belief_weight` (0.035), and `head_ownership_weight`
-  (0.85) stay fixed from step 0 (matching phased precedent).
+  meaningless scores. Only these two ramp —
+  `head_score_stdev_weight` (0.006), `head_score_belief_weight`
+  (0.035), and `head_ownership_weight` (0.85) stay fixed from step 0.
 
-Rank 0 publishes both factors to `training/status.json` every
-`status_publish_every` steps (default 100). Selfplay re-reads this
-file at the start of each batch and passes `--score-weight 0.06 *
-score_ramp` to `build/selfplay`. This gives selfplay a smooth ramp
-signal (minutes-scale updates) rather than multi-hour jumps tied to
+Rank 0 publishes `score_ramp` to `training/status.json` every
+`status_publish_every` steps (default 100), and at least every ~30 s
+during cold-start / budget-sleep waits (which doubles as the
+liveness signal for the throttle). Selfplay re-reads the file at the
+start of each batch. This gives selfplay a smooth ramp signal
+(minutes-scale updates) rather than multi-hour jumps tied to
 candidate exports.
 
 ### LR schedule
@@ -364,27 +418,31 @@ supervisor forwards a single shared value.
 ### `scripts/run_continuous.py init`
 
 One-time bootstrap. Archives any existing `training/`, `models/`,
-`ratings/`, `logs/` into `*.archive-<ts>/` siblings (no deletion),
-builds the C++ binaries if needed, and seeds
-`models/accepted/v000000000.onnx` with a random-init ONNX.
+`ratings/`, `logs/` into `archive/<ts>/` (no deletion), builds the
+C++ binaries if needed, seeds `models/accepted/v000000000.onnx` with
+a random-init ONNX, and writes **`training/run_config.json`** — the
+single source of truth for architecture + komi that `run` reads back.
 
 ```
 --arch {resnet,vit}      # default: resnet
 --board N                # default: 9
---filters N              # ResNet filters (default: 64)
---blocks N               # ResNet blocks (default: 5)
+--filters N              # ResNet filters (default: 128)
+--blocks N               # ResNet blocks (default: 10)
 --d-model N              # ViT (default: 192)
 --depth N                # ViT (default: 8)
 --heads N                # ViT (default: 6)
 --kv-groups N            # ViT GQA (default: 2)
 --mlp-ratio N            # ViT (default: 4)
+--komi F                 # default: 7.5 (recorded for selfplay/gate/rate)
 -y, --yes                # skip confirmation
 ```
 
 ### `scripts/run_continuous.py run`
 
 Launches all workers. All CLI flags have sensible defaults; override
-only what you need.
+only what you need.  **Architecture + komi come from
+`training/run_config.json`** — passing a flag that contradicts it is a
+hard error (change architecture only via a fresh `init`).
 
 **Per-worker GPU + NN assignment** (naming convention: every flag
 tied to one worker is prefixed with that worker's name, so `--help
@@ -425,7 +483,7 @@ tied to one worker is prefixed with that worker's name, so `--help
 
 **Training:**
 ```
---batch-size 1024          # per DDP rank
+--batch-size 256           # per DDP rank (global = 256 × world_size)
 --base-lr 3e-4
 --warmup-steps 2000
 --lr-milestones 100000,400000,1500000
@@ -461,9 +519,9 @@ the workload-shape knobs.)
 **Selfplay workload:**
 ```
 --selfplay-batch-games 300    # games per build/selfplay invocation
---selfplay-sims 500           # MCTS simulations per move
---window-games 80000          # disk retention cap
---score-weight-max 0.06       # MCTS score weight at full ramp
+--selfplay-sims 600           # MCTS simulations per move
+--window-games 100000         # disk retention cap
+--score-weight-max 0.04       # MCTS score weight at full ramp
 ```
 
 **Gatekeeper workload:**
@@ -546,8 +604,17 @@ training/
 ├── checkpoints/
 │   └── training.pt                   # weights + optimizer + step +
 │                                     #   bucket_level + watermark_id
-└── status.json                       # rank 0 publishes ramp state here
-                                      #   every STATUS_PUBLISH_EVERY steps
+├── run_config.json                   # arch + komi (written by init,
+│                                     #   loaded + enforced by run)
+└── status.json                       # rank 0 publishes here every
+                                      #   STATUS_PUBLISH_EVERY steps and
+                                      #   during wait states:
+                                      #   {state, step, samples_seen,
+                                      #    global_batch, score_ramp,
+                                      #    value_weight, score_mean_weight,
+                                      #    lr, bucket_level, bucket_cap,
+                                      #    bucket_fill, window_games,
+                                      #    wall_time}
 
 models/
 ├── candidates/                       # trainer writes here
@@ -581,7 +648,7 @@ logs/
 │   └── supervisor.log                # SPAWN / CRASH / RESTART events
 └── current -> <ts>                   # always points at the live run
 
-*.archive-<ts>/                       # previous run artifacts after init
+archive/<ts>/                         # previous run artifacts after init
 ```
 
 ---
@@ -592,7 +659,7 @@ logs/
 
 **`train_metrics.csv`** (aggregated per 100 steps by default):
 ```
-step, wall_time, samples_seen, lr, value_weight, score_weight_mcts,
+step, wall_time, samples_seen, lr, value_weight, score_ramp,
 score_mean_weight, loss_total, loss_policy, loss_value, loss_score_mean,
 loss_score_stdev, loss_ownership, loss_score_belief, loss_opp_policy,
 window_games, window_rows, bucket_samples, bucket_fill_ratio, ring_rows,
@@ -603,7 +670,7 @@ steps_per_sec, gpu_mem_mb
 ```
 batch_id, wall_time_start, wall_time_end, model_in_use, games_played,
 positions_written, duration_s, selfplay_duration_s, score_weight,
-pool_size, publish_failures
+pool_size, publish_failures, throttle_wait_s
 ```
 
 The `publish_failures` column counts games in a batch whose zstd
@@ -635,8 +702,13 @@ GATE_STALE_DROP  cand=...
 LR_DROP          step=100000 new_lr=1.5e-4 milestones_hit=1
 BUDGET_SLEEP     bucket=0 cap=131072
 COLD_START_WAIT  window_games=412 ring_rows_rank0=6000
+THROTTLE_PAUSE   bucket_fill=0.917 high=0.9 low=0.5   (selfplay.log)
+THROTTLE_RESUME  bucket_fill=0.492 waited_s=45        (selfplay.log)
+HEARTBEAT        step=... state=... bucket=... pool=...  (supervisor.log)
 SPAWN            proc=train pid=12345 gpus=0,1
-CRASH            proc=... rc=... — followed by RESTART or DISABLED
+CRASH            proc=... rc=... — followed by RESTART_SCHEDULED,
+                 RESTART or DISABLED (backoff no longer blocks the
+                 supervise loop)
 ```
 
 ### Diagnostic playbook
@@ -644,7 +716,7 @@ CRASH            proc=... rc=... — followed by RESTART or DISABLED
 | Symptom                               | Where to look                                      | Likely knob                               |
 | ------------------------------------- | -------------------------------------------------- | ----------------------------------------- |
 | Trainer sleeping often                | `train.log` BUDGET_SLEEP frequency                 | `replay_target` too low / selfplay slow   |
-| Trainer bucket saturated              | `train_metrics.csv` `bucket_fill_ratio` near 1     | `bucket_cap_mult` too high; trainer slow  |
+| Trainer bucket saturated              | selfplay.log THROTTLE_PAUSE (expected behavior)    | training is the bottleneck: more train GPU, or accept the pacing |
 | Gatekeeper queue growing              | `gate_decisions.csv` arrival vs verdict rate       | `export_every` too low / `gate_games` high|
 | Many GATE_STALE_DROP                  | `gatekeeper.log`                                   | `export_every` too low vs gate rate       |
 | All candidates ACCEPT                 | `gate_decisions.csv` verdict column                | `gate_threshold` too loose                |
@@ -722,7 +794,7 @@ Most-likely tuning targets based on real run behavior:
 | `gate_threshold`      | 0.5     | Many accepts with no Elo gain → bump to 0.52-0.55.                             |
 | `value_ramp_steps`    | 30000   | Value loss plateaus before ramp finishes → shorten. Still noisy at 30k → 50k+. |
 | `score_ramp_steps`    | 50000   | Flat Elo stretch right around step 50k → shorten. Score head still wrong past 50k → lengthen. |
-| `bucket_cap_mult`     | 64      | Don't raise to hide TRT rebuild stalls — fix the cache first.                  |
+| `bucket_cap_mult`     | 512     | Cap = mult × global batch. Must dwarf one publish chunk (~120k samples) or credit clips; runaway lead is prevented by the selfplay throttle, not the cap. |
 | `window_games`        | 80000   | Shorter (30k) for fresher data / less disk. Governs retention, not sampling.   |
 | `ring_games`          | 2000    | Raise (4-5k → 20-25 GB/rank) for more diversity if RAM allows. Don't go below 1000 (intra-batch correlation). |
 | `lr_milestones[0]`    | 100000  | Throughput much lower than conservative and first drop never fires → lower to 80k, or lower `base_lr` (cleaner). |
@@ -914,32 +986,12 @@ without writing outputs.
   `b6c64` is on the [extra_networks](https://katagotraining.org/extra_networks/)
   page (note: b6c64 only matches MiniGo's `small` preset, not `large`).
 
-### Standalone usage (without run_continuous)
-
-The same script works with `run_loop.sh` (single-process phased
-pipeline). It uses different output paths — `models/v0000.onnx` for
-the initial versioned model and `models/best.onnx` as the
-selfplay-target copy:
-
-```bash
-./run_loop.sh init large
-python tools/warm_init_from_katago.py \
-  --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
-  --filters 128 --blocks 10 \
-  --onnx       models/v0000.onnx \
-  --checkpoint training/checkpoints/training.pt
-cp models/v0000.onnx models/best.onnx
-./run_loop.sh train
-```
-
 ---
 
 ## See also
 
-- `cont_train.todo` — full design rationale and trade-offs.
 - `COMPARISON_WITH_KATAGO.md` — how this pipeline mirrors (and
   deviates from) KataGo's training code.
-- `README.md` — project overview.
-- `DEVELOPMENT.md` — build, test, repo layout.
-- `run_loop_phased.py` — the previous phased pipeline, preserved for
-  reference.
+- `README.md` — project overview, build, architecture.
+- `training_strategy.md` — postmortems and tuning rationale from
+  earlier runs.

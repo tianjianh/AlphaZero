@@ -4,8 +4,8 @@ This document captures what we learned from the first two continuous-training
 runs (Apr 24 → May 4, 2026) so the next run avoids repeating the same
 mistakes. It is *not* a tuning guide; it is a postmortem and a watchlist.
 
-For canonical knob descriptions see `CONTINUOUS_TRAINING.md`. For design
-rationale see `cont_train.todo`. For the upstream reference see
+For canonical knob descriptions and design rationale see `CONTINUOUS_TRAINING.md`. For
+the upstream reference see
 [KataGo `SelfplayTraining.md`](https://github.com/lightvector/KataGo/blob/master/SelfplayTraining.md).
 
 ---

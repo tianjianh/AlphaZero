@@ -59,52 +59,38 @@ training-only auxiliaries that shape the trunk's internal representations.
 
 **Loss weights and target contributions**
 
-Weights are calibrated to match KataGo's proportions: policy dominant
-(~55%), value strong secondary (~18%), ownership moderate (~10%),
-score total ~5%, opponent ~9%.  `value_weight` ramps across plan stages
-(1.5 → 5.0) because raw value CE drops from ~0.8 (init) to ~0.08
-(converged) — a fixed weight would make value either dominant at init
-or negligible once converged.  Table shows late-stage (Overnight extend):
+Weights are calibrated toward KataGo's proportions: policy dominant,
+value strong secondary, ownership moderate, score small.  In the
+continuous pipeline two weights ramp **by training step** (not by
+phase): `value_weight` ramps `1.0 → 2.0` over `--value-ramp-steps`
+(default 30k) because raw value CE shrinks as the model converges, and
+`score_mean_weight` ramps `0.004 → 0.008` over `--score-ramp-steps`
+(default 50k) so the noisy early score signal doesn't distort the trunk.
 
-| Head | Late weight | Loss function | Raw loss | Weighted | % |
-|------|------------:|---------------|----------|---------:|---:|
-| Policy | 1.0 | soft CE | ~1.3 | **1.27** | 55% |
-| Value | 5.0 (ramped 1.5→5.0) | CE (W/L/D) | ~0.08 | **0.40** | 17% |
-| Ownership | 0.85 | BCE mean | ~0.27 | **0.23** | 10% |
-| Opponent Policy | 0.1 | CE | ~2.0 | **0.20** | 9% |
-| Score Belief | 0.035 | soft CE (163 bins) | ~2.8 | **0.10** | 4% |
-| ScoreMean | 0.015 (ramped 0.004→0.015) | **Huber(δ=12)** | ~5.7 | **0.09** | 4% |
-| ScoreStdev | 0.006 | **Huber(δ=10)** | ~2.6 | **0.02** | 1% |
-| **Total** | | | | **2.30** | |
+| Head | Weight (continuous defaults) | Loss function |
+|------|------------------------------|---------------|
+| Policy | 1.0 | soft CE |
+| Value | 1.0 → 2.0 (step ramp) | CE (W/L/D) |
+| Ownership | 0.85 | BCE mean |
+| Opponent Policy | 0.1 | CE |
+| Score Belief | 0.035 | soft CE (163 bins) |
+| ScoreMean | 0.004 → 0.008 (step ramp) | **Huber(δ=12)** |
+| ScoreStdev | 0.006 | **Huber(δ=10)** |
 
-`value_weight` ramp: 1.5 (bootstrap) → 1.5 → 2.0 → 3.0 → 4.0 → 5.0.
-This keeps value at ~15-21% of total loss across all training stages,
-matching KataGo's value proportion despite our raw value loss being
-much smaller (0.08 vs KataGo's typical ~0.5 with larger models).
-
-**KataGo comparison (loss functions).**  Score losses now use the same
-Huber formulation as KataGo.  Weights are higher than KataGo's because
-we lack their additional score-related heads (TD score ×3, lead,
-scoring — ~5 extra heads that contribute score gradient through the
-shared trunk):
+**KataGo comparison (loss functions).**  Score losses use the same
+Huber formulation as KataGo.  Weights differ because we lack their
+additional score-related heads (TD score ×3, lead, scoring — ~5 extra
+heads that contribute score gradient through the shared trunk):
 
 | | KataGo | MiniGo |
 |---|---|---|
 | Score mean | Huber(δ=12) | **Huber(δ=12)** (same) |
 | Score stdev | Huber(δ=10) | **Huber(δ=10)** (same) |
 | Score belief | CDF MSE + PDF CE, weight 0.04 total | soft CE, weight **0.035** |
-| scoreMean weight | `0.0015` | `0.004 → 0.015` (higher to compensate for lacking TD/lead) |
+| scoreMean weight | `0.0015` | `0.004 → 0.008` (higher to compensate for lacking TD/lead) |
 | scoreStdev weight | `0.001` | `0.006` |
-| Value weight | `1.20` | `1.5 → 5.0` (ramped; higher because our val_raw is 10× smaller) |
-| Ownership weight | `1.5` | `0.85` (lower to give room for value ramp) |
-
-**Why ownership weight is 0.85 (not KataGo's 1.5):**
-`F.binary_cross_entropy_with_logits` averages BCE over all 81
-intersections, returning ~0.27 mid-training.  KataGo uses weight 1.5
-but their value proportion is naturally ~20% from a higher raw value
-loss.  Our raw value loss is tiny (0.08), so we need weight 5.0 on
-value — giving ownership a lower weight (0.85 × 0.27 = 0.23, ~10%)
-keeps the total budget balanced.
+| Value weight | `1.20` | `1.0 → 2.0` (step-ramped) |
+| Ownership weight | `1.5` | `0.85` (BCE averaged over 81 points is already dense signal) |
 
 **MCTS utility formula:**
 ```
@@ -115,35 +101,27 @@ utility = win_loss_weight × (P(win) - P(loss))
 | Param | Default | KataGo | Meaning |
 |-------|---------|--------|---------|
 | `win_loss_weight` | 1.0 | 1.0 | multiplier on P(win)-P(loss) term |
-| `score_weight` | 0.0 → 0.30 (ramped) | 0.30 (fixed) | how much MCTS values score predictions |
+| `score_weight` | 0 → `--score-weight-max` (0.04), ramped by trainer's `score_ramp` | 0.30 (fixed) | how much MCTS values score predictions |
 | `score_scale` | 18.0 | `2×√boardArea` = 18 for 9×9 | atan compression: 10pt lead → `atan(10/18)/(π/2) ≈ 0.32` |
 
-KataGo additionally integrates score utility over the score distribution
+The selfplay driver reads `score_ramp` from `training/status.json` each
+batch and passes `score_weight = score_weight_max × score_ramp` to the
+C++ engine, so search only starts caring about score once the score head
+has had gradient steps to become meaningful.  KataGo additionally
+integrates score utility over the score distribution
 `(scoreMean, scoreStdev)` so uncertain scores are dampened.  We use a
 point estimate on `scoreMean` — a reasonable approximation once the model
 is trained and stdev is small.  Stdev integration is a future improvement.
 
 **Configurability**
 
-All 7 loss weights and 3 MCTS weights are individually configurable
-three ways, with this precedence (high → low):
-
-1. **Per-stage override** in `plan.json` stages[]:
-   ```json
-   { "name": "Steady improve", ...,
-     "score_weight": 0.05, "ownership_weight": 2.0,
-     "score_mean_weight": 0.008, "win_loss_weight": 1.2 }
-   ```
-2. **CLI flag** to `run_loop.py train` (overrides plan default but not stage override):
-   ```bash
-   python run_loop.py train --policy-weight 2.0 --ownership-weight 3.0 \
-                            --score-scale 15.0
-   ```
-   Available flags: `--policy-weight`, `--value-weight`,
-   `--score-mean-weight`, `--score-stdev-weight`, `--ownership-weight`,
-   `--score-belief-weight`, `--opp-policy-weight`, `--win-loss-weight`,
-   `--score-weight`, `--score-scale`.
-3. **Plan defaults** in `plan.json` `training` / `mcts` sections.
+All 7 loss weights and the MCTS weights are flags on
+`run_continuous.py run` (forwarded to the trainer / selfplay driver):
+`--policy-weight`, `--value-weight-start/-end`,
+`--score-mean-weight-start/-end`, `--score-stdev-weight`,
+`--ownership-weight`, `--score-belief-weight`, `--opp-policy-weight`,
+`--score-weight-max`, `--score-scale`, plus `--value-ramp-steps` /
+`--score-ramp-steps` for the ramp lengths.
 
 ### Selfplay data format
 
@@ -373,200 +351,107 @@ All binaries automatically use whichever backend was compiled.
 
 ## Quick Start
 
-### Train (automated pipeline)
+### Train (continuous pipeline)
 
-The training pipeline uses two commands: `init` (choose network, generate
-training plan) and `train` (run or resume training).
+Training is **continuous, KataGo-style**: selfplay, training, gatekeeping,
+and (optionally) rating run as concurrent processes coordinating through
+the filesystem — no phased iterations.  Two commands:
 
 ```bash
-# 1. Initialize — pick a preset or custom architecture.  Training plan and
-# default model size are both set by the preset, but you can override either
-# with --filters/--blocks (or --d-model/--depth) to decouple them.
-python run_loop.py init small                # 9x9 ResNet 64f/5b,   48 iters (~24M  sim-games)
-python run_loop.py init small --arch vit     # 9x9 ViT  d192/8L,    48 iters
-python run_loop.py init large                # 9x9 ResNet 128f/10b, 72 iters (~47M  sim-games, 2x small)
-python run_loop.py init xlarge               # 9x9 ResNet 128f/10b, 200 iters (~670M sim-games, deep run)
-python run_loop.py init quick                # 5x5 ResNet 32f/3b,   5 iters (test)
-python run_loop.py init quick --arch vit     # 5x5 ViT (test)
+# 1. Initialize — choose the architecture ONCE.  It is recorded in
+#    training/run_config.json; `run` reads it back, so you never
+#    re-specify --filters/--blocks (contradicting flags are an error).
+python scripts/run_continuous.py init                        # 9x9 ResNet 128f/10b, komi 7.5
+python scripts/run_continuous.py init --filters 64 --blocks 5
+python scripts/run_continuous.py init --arch vit --d-model 192 --depth 8
 
-# 2. Train — GPUs are auto-detected, just run:
-python run_loop.py train
+# 2. Run — launches all workers under one supervisor:
+python scripts/run_continuous.py run \
+    --train-gpus 0 --selfplay-gpus 1 --gate-gpus 1 \
+    --selfplay-nn-device-ids 0,0 --gate-nn-device-ids 0
 
-# Or with explicit hardware settings:
-python run_loop.py train --threads 64 --nn-device-ids 0,0,1,1 --max-batch 512
-
-# Run a limited number of iterations then pause:
-python run_loop.py train --iterations 20
-
-# 3. Check progress:
-python run_loop.py status
+# 3. Check progress any time:
+python scripts/run_continuous.py status
+tail -f logs/current/supervisor.log      # HEARTBEAT lines roll up all workers
 ```
 
-**Resumable** — stop at any time (Ctrl+C) and re-run `python run_loop.py train`
-to continue from where it left off.  Pipeline state, selfplay data,
-checkpoints, and training logs are all preserved.
+Stop with Ctrl-C (workers finish their current batch/match, trainer
+checkpoints, everything resumes on the next `run`).  A second Ctrl-C
+force-kills.
 
-#### Training pipeline
+See **[CONTINUOUS_TRAINING.md](CONTINUOUS_TRAINING.md)** for the full
+design.  The essentials:
 
-Each iteration runs three phases:
+#### The four workers
 
-1. **Self-play**: generate games with the current best model (C++, multi-GPU)
-2. **Train**: train on a sliding window of recent data (Python/PyTorch, multi-GPU DDP)
-3. **Evaluate & gate**: play games between candidate and best model; promote
-   if candidate wins ≥ 55% (configurable)
-
-The pipeline is controlled by a **training plan** (`training/plan.json` file)
-generated during `init`.  The plan defines staged training with escalating
-parameters.  Example (ResNet, `large` preset — 72 iters, ~47M sim-games):
-
-```
-  Stage               Iters    Games  Sims  Epoch      LR   Gate
-  ──────────────────────────────────────────────────────────────
-  Bootstrap           1-4       400   200     3    1.2e-3   off
-  Warm up             5-8       600   300     3      9e-4   off
-  Early gated         9-14      900   400     3      6e-4   100g
-  Consolidate        15-24     1100   450     4    4.5e-4   200g
-  Steady improve     25-40     1300   550     5      3e-4   200g
-  Overnight extend   41-72     1400   600     5      2e-4   200g
-```
-
-Each stage defines: selfplay games per iteration, MCTS simulations per move,
-training epochs, learning rate, and evaluation games for gating.  Early stages
-use fewer sims and no gating for fast exploration; later stages increase data
-quality and enable gating to ensure only stronger models are promoted.
-
-Per-stage overrides also control all **loss weights** (7 training head
-weights) and **MCTS utility weights** (`win_loss_weight`, `score_weight`,
-`score_scale`).  These escalate across stages — e.g. `score_weight` starts
-at 0 (ignore score during bootstrap) and increases to 0.1+ in late stages
-once the score head is reliable.
-
-The three main presets are different training schedules — all three work
-with any model size (override with `--filters`/`--blocks`):
-
-| Plan     | Iters | Sim-games | vs small | Default model |
-|----------|------:|----------:|---------:|---------------|
-| `small`  |    48 |    ~24M   |     1.0× | 64f/5b        |
-| `large`  |    72 |    ~47M   |     2.0× | 128f/10b      |
-| `xlarge` |   200 |   ~670M   |    28.4× | 128f/10b      |
-
-The plan is a JSON file — edit it to customize the schedule.
-
-#### Model version management
-
-All models live in `models/` with a simple versioning scheme:
-- `models/v0000.onnx` — initial random model (created by `init`)
-- `models/v0001.onnx` ... `models/v0060.onnx` — candidates from each iteration
-- `models/best.onnx` — copy of the current best (used for self-play)
-- `training/checkpoints/v0001.pt` ... — training checkpoints with optimizer state
-
-Only models that pass evaluation gating are promoted to `best.onnx`.
-The `training/state` file tracks progress for resume.
-
-#### Logging
-
-All training metrics are written to `training/logs/train.log` in real-time:
-per-iteration parameters, per-epoch losses, selfplay timing, evaluation
-win rates, and promotion decisions.  This single file captures the full
-training history for debugging and tuning.
-
-#### Value-head diagnostics (per epoch)
-
-Raw `val` loss alone hides three very different failure modes for the
-value head (W/L/D classifier): genuine good fit, easy-position-dominated
-average (most 9×9 samples are decided endgame positions where any model
-gets CE≈0.02), and overconfident collapse where predicted probabilities
-no longer track empirical accuracy.  Each epoch therefore emits an
-extra `val-diag` line to stdout AND `train.log`:
-
-```
-Epoch 1/3  loss=2.2274  pol=1.2676  val=0.0787  smn=10.8004 ...
-    val-diag  phase CE: early=0.412(16%) mid=0.134(24%) late=0.018(60%)
-              ECE=0.037  calib[0.33-0.50:conf=0.421/acc=0.398@5% ...]
-```
-
-The diagnostic is **value-head-only** — policy, score, and ownership
-heads aren't classifiers with "confidence", so their loss numbers are
-already informative.  Two metrics:
-
-**Phase CE** — value cross-entropy bucketed by game phase, where phase
-is estimated from stone count on the board (channel 0 + channel 8 of
-the encoded state = current-snapshot stones for both colors):
-
-| Bin | Stones | Corresponds to | Healthy CE |
-|---|---|---|---|
-| `early` | 0–15 | Opening; position fluid | 0.3–0.6 |
-| `mid` | 16–40 | Middle game; decisive fights | 0.1–0.3 |
-| `late` | 41+ | Endgame; usually decided | 0.01–0.05 |
-
-The `(XX%)` annotation is the fraction of samples in that bin.  For
-typical 9×9 training (80–130 move games), expect roughly **15/25/60**.
-`late%` near 0 signals games too short to reach endgame (rare after
-iter ~4).
-
-**ECE (Expected Calibration Error)** — measures whether predicted
-confidence tracks empirical accuracy.  Formally: Σ (|B|/N) · |acc−conf|
-across 4 confidence buckets `[0.33,0.5)`, `[0.5,0.7)`, `[0.7,0.9)`,
-`[0.9,1.0]`.  The `calib[...]` field shows per-bucket `conf/acc/@%`
-so you can see *where* miscalibration lives.
-
-#### How to read the diagnostic
-
-**Healthy output — do nothing:**
-```
-val-diag  phase CE: early=0.42(15%) mid=0.15(25%) late=0.02(60%)
-          ECE=0.03  calib[... conf≈acc in every bucket ...]
-```
-- Monotone drop early → late: position info is being used.
-- ECE < 0.05: predictions are calibrated.
-- `conf ≈ acc` in every bucket with ≥10% samples.
-
-**Red-flag patterns and what to do:**
-
-| Pattern | Likely cause | Action |
+| Worker | GPU use | What it does |
 |---|---|---|
-| `early ≈ mid ≈ late` (flat) | Model ignores position features; trunk underfit or value head bottlenecked | Increase `value_weight`, check trunk capacity, verify training data isn't corrupted |
-| `early > 1.0` (very high) | Value head not learning opening at all | Raise `value_weight`; check that `value_target` derivation is correct |
-| `early < 0.1` but `ECE` large | Overconfident on opening positions (dangerous — MCTS will over-commit at root) | Lower `value_weight`, add label smoothing, or regularize |
-| `late% > 80%` | Games very long / opening samples scarce | Usually fine — selfplay just produces long games; consider data augmentation if opening play is weak |
-| `late% ≈ 0%` | Games too short to reach endgame | Usually only iter 1–3; self-heals as model improves |
-| `ECE > 0.10` | Confidence doesn't match accuracy | Value head is miscalibrated; MCTS will make bad decisions.  Lower `value_weight` or add KL-to-uniform regularization |
-| `[0.9–1.0]` bucket: `conf=0.95, acc=0.70` | Overconfident on "easy" positions | Dangerous; model is assigning near-certainty to positions that aren't.  Check for value-head collapse or insufficient data variety |
-| `[0.7–0.9]` bucket: `conf=0.80, acc=0.50` | Overconfident on hard middle-game positions | Most actionable — these are the positions MCTS actually searches.  Increase diversity in selfplay, lower temperature threshold, or bump `value_weight` |
+| `selfplay_driver.py` | selfplay GPUs | Loops `build/selfplay` batches with `models/accepted/latest`; compresses games to `training/selfplay/g_<id>.bin.zst`; prunes the pool to `--window-games` |
+| `train_continuous.py` | train GPUs (DDP via torchrun) | One continuous step loop over a sliding window; exports a candidate ONNX every `--export-every` steps |
+| `gatekeeper.py` | gate GPUs | Evaluates the newest candidate vs `accepted/latest` with `build/evaluate`; promotes on `score > threshold` (default 0.5); stale-drops older candidates |
+| `rate.py` (opt-in `--rating`) | rate GPUs | Periodic round-robin Elo over recent accepted models (monitoring only) |
 
-**When to bump `value_weight`:** if `early CE > 0.5` for 3+ iterations
-in a row while policy loss keeps dropping — value is lagging behind
-policy.  Default `1.5` may be too low for small models; try `2.5–3.0`.
+#### Rollout ↔ training synchronization (two-sided valve)
 
-**When to lower `value_weight`:** if `ECE > 0.10` or overconfidence in
-the `[0.9-1.0]` bucket persists — too much gradient on value is
-collapsing the head.  Try `1.0` and add score-head supervision via a
-higher `score_mean_weight`.
+The trainer paces itself with a KataGo-style **replay bucket**
+(`python/train.py` `max_train_bucket_per_new_data` in upstream): every new
+selfplay row credits `replay_target / n_augmentations` samples of budget;
+each step drains `global_batch`.  Empty bucket → trainer sleeps
+(`BUDGET_SLEEP`) instead of over-replaying stale data.
 
-Diagnostic cost: one softmax + one cross-entropy with `reduction='none'`
-per batch under `torch.no_grad()` — well under 1% of step time.
+The reverse direction — **selfplay outpacing training** — is handled by
+backpressure that KataGo's distributed setup doesn't need but a single
+host does: the trainer publishes `bucket_fill` in `training/status.json`,
+and the selfplay driver **pauses between batches** when the bucket
+saturates (`THROTTLE_PAUSE` at ≥ 0.9 fill) and resumes once training
+drains it (< 0.5).  Without this, games beyond the bucket cap would burn
+selfplay GPU time on credit that gets discarded.  Tune with
+`--throttle-high/--throttle-low` (0 disables).
 
-DDP note: each rank computes on its own data shard; rank-0 prints.
-For 2-GPU configs this is close to global; for 4+ GPU configs the
-per-bucket counts may be noisier.
+#### Model lifecycle
 
-#### GPU auto-detection
+```
+models/
+├── accepted/            # promoted models; latest -> v<step>.onnx symlink
+│   ├── v000000000.onnx  # seed from init (random or warm-init)
+│   └── latest           # what selfplay plays with (atomic symlink swap)
+├── candidates/          # trainer exports, awaiting gate
+└── rejected/            # failed gate or stale-dropped
+training/
+├── run_config.json      # architecture + komi, written by init
+├── checkpoints/training.pt   # weights + optimizer + bucket/watermark state
+├── selfplay/g_*.bin.zst      # game pool (sliding window)
+└── status.json          # trainer → selfplay/supervisor contract
+```
 
-The `train` command auto-detects NVIDIA GPUs and configures:
-- **C++ selfplay/evaluate**: 2 NN server threads per GPU with pipelining
-  - 1 GPU → `--nn-server-threads 2 --nn-device-ids 0,0`
-  - 2 GPUs → `--nn-server-threads 4 --nn-device-ids 0,0,1,1`
-- **Python training**: auto-launches via `torchrun` with DDP (DistributedDataParallel)
-  when multiple GPUs are detected.  Each GPU runs its own process with NCCL
-  gradient synchronization.  Data is split across GPUs; effective batch size
-  scales with GPU count.
+**Resumable** — the trainer checkpoints weights, optimizer, step, bucket
+level, and scanner watermark on every export and on shutdown; selfplay IDs
+are recovered from directory state.  Re-running `run` continues everywhere
+it left off.
 
-Override with explicit flags if needed.
+#### Warm-starting from KataGo weights
+
+`tools/warm_init_from_katago.py` can seed the run with kata1 b10c128 trunk
+weights instead of random init — see the tool's docstring for the exact
+workflow (replace `accepted/v000000000.onnx` and optionally
+`training/checkpoints/training.pt` between `init` and `run`).
+
+#### Monitoring
+
+- `logs/current/supervisor.log` — one `HEARTBEAT` line per interval:
+  trainer step/state, bucket fill, pool size, candidates/accepted counts.
+- `logs/current/train.log` + `train_metrics.csv` — per-step losses, LR,
+  ramps, bucket, ring occupancy.
+- `logs/current/selfplay.log` + `selfplay_batches.csv` — per-batch games,
+  positions, throttle waits.
+- `logs/current/gatekeeper.log` + `gate_decisions.csv` — match results.
+- `training/status.json` — live trainer state (`state`, `step`,
+  `bucket_fill`, `score_ramp`, ...).
 
 #### Evaluation binary
 
-The `evaluate` binary plays match games between two models to determine
-which is stronger.  Games are saved as SGF files for review:
+The `evaluate` binary plays match games between two models (used by the
+gatekeeper, and directly for ad-hoc matches).  Games can be saved as SGF:
 
 ```bash
 ./build/evaluate --model1 candidate.onnx --model2 baseline.onnx \
@@ -578,8 +463,7 @@ which is stronger.  Games are saved as SGF files for review:
 
 Each model gets its own NNEvaluator with separate compute contexts.
 Games alternate which model plays Black.  Temperature is 0 (deterministic)
-with no Dirichlet noise for clean evaluation.  During training, evaluation
-games are saved to `training/eval/iter_NNNN/`.
+with no Dirichlet noise for clean evaluation.
 
 #### Visualizing games
 
@@ -587,13 +471,13 @@ Review selfplay or evaluation games with the visualizer:
 
 ```bash
 # Selfplay game (binary format, supports .bin / .bin.zst / .bin.gz)
-python scripts/visualize.py training/selfplay/iter_0001/game_0.bin.zst
+python scripts/visualize.py training/selfplay/g_00000000000000001.bin.zst
 
 # Evaluation game (SGF format)
-python scripts/visualize.py training/eval/iter_0006/game_0.sgf
+python scripts/visualize.py eval_games/game_0.sgf
 
 # All games in a directory
-python scripts/visualize.py training/eval/iter_0006/
+python scripts/visualize.py eval_games/
 ```
 
 The visualizer uses ncurses with the same board style as the play UI.
@@ -603,11 +487,11 @@ For `.bin` files: shows value (V) and score (S) per move from training data.
 ### Play
 
 ```bash
-# Against trained model (backend selected at compile time)
-./build/play --model models/best.onnx --sims 800
+# Against your trained model (backend selected at compile time)
+./build/play --model models/accepted/latest --sims 800
 
 # Human vs Human (with optional analysis)
-./build/play --model models/best.onnx  # choose H at mode prompt
+./build/play --model models/accepted/latest  # choose H at mode prompt
 
 # Against random bot (no model needed)
 ./build/play --random --board 9
@@ -737,7 +621,7 @@ would have run after the stop was raised.
 
 ```bash
 # Benchmark the current best model
-./build/benchmark --model models/best.onnx \
+./build/benchmark --model models/accepted/latest \
     --games 10 --threads 10 --search-threads 16 --max-batch 512
 
 # Generate a standalone model for benchmarking
@@ -754,7 +638,8 @@ You can run a stock **KataGo** network (`kata1` and similar) inside this engine'
 MCTS, for human play, benchmark, and match games. KataGo weights are
 **inference-only** in this build — they cannot be used to generate selfplay
 training records or fine-tuned. See `KATAGO_INFERENCE.md` for full details and
-known limitations (ladder features and a few encore-only signals are zeroed).
+known limitations (ladder features and a few encore-only signals are zeroed),
+and **`FORMATS.md`** for the complete model/data format-support matrix.
 
 #### What accepts KataGo weights
 
@@ -965,12 +850,17 @@ reused for all evaluations during that thread's lifetime — matching KataGo's
    the pre-allocated `NNResultBuf` to the server queue and **blocks** on
    its condvar until the server processes the batch containing this leaf.
 
-3. **Expand**: CAS `UNEVALUATED → EXPANDING → EXPANDED`.  Only one thread
-   expands each node; others that collide revert their virtual losses,
-   `yield()`, and retry from the root.
+3. **Expand**: claim `UNEVALUATED → EXPANDING` with a single `fetch_or`
+   (states encoded so the claimed bit is idempotent on `EXPANDED`), publish
+   with a release store.  Only one thread expands each node; others that
+   collide revert their virtual losses, `yield()`, and retry from the root.
+   No `compare_exchange` anywhere on the search path — everything lowers to
+   single AMOs, so it stays cheap on Zaamo-only RISC-V, x86, and ARM alike.
 
 4. **Backprop**: undo virtual loss, increment visit count, update value
-   (all via atomics — `std::atomic<int>` for counts, CAS loop for float value).
+   (all via atomics — `std::atomic<int>` `fetch_add` for counts, fixed-point
+   `std::atomic<int64_t>` `fetch_add` for the value sum — exact and
+   interleaving-independent, unlike float accumulation).
 
 **Batch size adapts naturally**: while the GPU processes batch N, search
 threads descend and submit leaves for batch N+1.  Steady-state batch size
@@ -1565,33 +1455,39 @@ completely isolated.  No shared mutable state during inference.
 
 #### Per-engine lock for context lifecycle (TensorRT)
 
-Per-thread streams make **inference** lock-free, but they do NOT make
-`IExecutionContext` **lifecycle** operations thread-safe.  Per NVIDIA
-TRT 10 docs, `ICudaEngine::createExecutionContext()` and
-`~IExecutionContext` are not thread-safe with respect to other context
-creation/destruction on the same engine — the engine keeps an internal
-list of live contexts that both operations mutate.
+Per-thread streams make **inference** lock-free, but `IExecutionContext`
+**lifecycle** operations on a shared engine still need serialization.
+The TRT headers and guide give **no thread-safety guarantee** for
+`ICudaEngine::createExecutionContext()` / `~IExecutionContext`
+(`NvInferRuntime.h` documents thread-safety requirements only for the
+logger/allocator callbacks), and the engine tracks its live contexts
+internally.
 
-With `--nn-device-ids 0,0,1,1`, two server threads share one engine per
-GPU.  At process exit, `~NNEvaluator` calls `notify_all()` and all four
-threads tear down their handles in parallel → each calls `delete
-exec_ctx` on contexts that point into the same engine → concurrent
-mutation of the internal list corrupts it → the damage only surfaces
-when `~ICudaEngine` walks the list at teardown, manifesting as
-`double free or corruption (out)` after `Done! N games`.
+Empirically: with `--nn-device-ids 0,0,1,1`, two server threads share
+one engine per GPU.  At process exit, `~NNEvaluator` wakes all server
+threads at once; each called `delete exec_ctx` on contexts belonging to
+the same engine concurrently, and the corruption surfaced later when
+`~ICudaEngine` ran — `double free or corruption (out)` after
+`Done! N games`.  Serializing the lifecycle fixed it.
 
 Fix: one `engine_mutex` per `TRTDeviceState` held around (a) engine
 build, (b) `createExecutionContext()`, and (c) `delete exec_ctx`.
 Inference (`enqueueV3`, `setTensorAddress`, `setInputShape`) stays
 unlocked — each thread still owns its own `exec_ctx` and stream, so
-the GPU scheduler interleaves kernels across threads as before.  This
-matches KataGo's `trtbackend.cpp`: one per-engine lock for lifecycle,
-zero locks for inference.
+the GPU scheduler interleaves kernels across threads as before.
 
-The **OpenCL** backend has a shared `cl_command_queue` per device but is
-currently disabled (the KataGo-style ResNet requires SE/GPool kernels not
-yet implemented in OpenCL).  When re-enabled, it should follow the same
-pattern: one queue per handle, not per device.
+Note: upstream **KataGo does not need this lock** — its `trtbackend.cpp`
+builds a **separate engine per server thread** (weights duplicated on
+GPU per thread), so no `ICudaEngine` is ever shared; its only trtbackend
+mutex is inside `TRTErrorRecorder`, which the TRT API requires to be
+thread-safe.  MiniGo instead shares one engine per device (one weight
+copy, per-thread exec contexts — a pattern TRT explicitly supports for
+inference) and pays one mutex on the rare lifecycle path for it.
+
+The **OpenCL** backend follows the analogous rule: the
+`cl_command_queue` (the OpenCL analogue of a CUDA stream) is created
+**per handle**, not per device — only the immutable `cl_context` +
+compiled `cl_program` live in shared device state.
 
 The **Metal** backend shares one `MTLCommandQueue` per device.  Apple
 explicitly guarantees thread safety for Metal command queue submission,
@@ -1887,27 +1783,33 @@ threads: `total = min(games, threads) × search_threads`.
 
 ## Resumable Training
 
-The pipeline is fully resumable at every phase boundary.  Run
-`python run_loop.py train` after any interruption to continue:
+The continuous pipeline resumes cleanly after any interruption — just
+re-run `python scripts/run_continuous.py run`:
 
-- **Pipeline state** (`training/state`): tracks current iteration, best model
-  version, total games played, and promotion count
-- **Selfplay resume**: skips iterations that already have enough game files
-- **Training resume**: skips iterations whose versioned ONNX + checkpoint exist
-- **Checkpoints** (`training/checkpoints/training.pt`): model weights + optimizer (Adam for ResNet, AdamW for ViT)
-  state (momentum buffers) for smooth continuation.  Mixed precision
-  auto-detected (FP8/BF16/FP16, see Precision table above)
-- **Selfplay data**: accumulates in per-iteration directories
-  (`training/selfplay/iter_0001/`, etc.) and is never deleted
+- **Trainer checkpoint** (`training/checkpoints/training.pt`): model
+  weights + optimizer state (Adam for ResNet, AdamW for ViT) + step +
+  replay-bucket level + scanner watermark, saved atomically on every
+  export AND on graceful shutdown (SIGTERM/Ctrl-C).  Mixed precision is
+  auto-detected (FP8/BF16/FP16, see Precision table above).
+- **Selfplay IDs**: monotonic `g_<id>.bin.zst` IDs are recovered from
+  directory state (`max(existing) + 1`) — no counter file to corrupt.
+  Orphaned `.tmp` files and staging dirs are cleaned at startup.
+- **Ring warm-up**: on resume, each rank's in-RAM ring rehydrates from
+  the NEWEST ~`--ring-games` pool files (not the oldest), so training
+  restarts on fresh data.
+- **Gatekeeper / models**: promotion state is the filesystem itself
+  (`accepted/`, `candidates/`, `rejected/`, `latest` symlink) — nothing
+  else to restore.
 
-Training uses a **sliding window** — only data from the last N iterations
-is loaded (configurable via `PLAN_WINDOW_SIZE` in the training plan),
-keeping training focused on recent, stronger games.  This is the standard
-approach used by AlphaGo Zero and KataGo.
+Training samples from a **sliding window**: the pool keeps the newest
+`--window-games` games on disk; each rank's ring holds the newest
+`--ring-games` in RAM (compressed; decompressed lazily per batch).
+This is the standard recent-window approach used by AlphaGo Zero and
+KataGo, bounded by host RAM instead of a shuffle-daemon.
 
-Selfplay data is compressed with **zstd** after generation (~10x smaller on
-disk).  The training DataLoader streams and decompresses one file at a time
-with 8 prefetch workers, keeping GPU utilization high with minimal memory.
+Selfplay data is compressed with **zstd** at publish time (~10× smaller
+on disk); the ring stores the compressed bytes and pays ~tens of ms of
+decompression per batch instead of ~20× the host RAM.
 
 ## Neural Network
 
@@ -2061,78 +1963,81 @@ python3 export_onnx.py --init --board 9 --filters 256 --blocks 20 --output ../mo
 
 ```
 minigo-cpp/
-├── CMakeLists.txt              # Build (Eigen required, OpenCL/Metal optional)
-├── run_loop.py                 # Training pipeline (init/train/status)
-│   ├── plan.json               #   Generated training schedule (editable)
-├── models/                     # ONNX model files
-│   ├── best.onnx               #   Current best (used for selfplay)
-│   └── v0001.onnx ...          #   Version snapshots
-├── trt_cache/                  # TensorRT compiled engine cache
-├── training/                   # All training artifacts
-│   ├── selfplay/               #   Game data (iter_0001/, iter_0002/, ...)
-│   ├── eval/                   #   Evaluation match SGFs (iter_0006/, iter_0007/, ...)
-│   ├── checkpoints/            #   PyTorch checkpoints (training.pt, v0001.pt, ...)
-│   ├── logs/                   #   train.log (structured), pipeline.log
-│   └── state                   #   Pipeline resume state
-├── test_multi_gpu.sh           # Multi-GPU test suite
+├── CMakeLists.txt              # Build (backend auto-detect: tensorrt/cuda/metal/…)
+├── models/                     # Model lifecycle (created by run_continuous init)
+│   ├── accepted/               #   Promoted models + `latest` symlink (selfplay reads)
+│   ├── candidates/             #   Trainer exports awaiting the gatekeeper
+│   ├── rejected/               #   Failed gate / stale-dropped
+│   └── trt_cache/              #   Shared TensorRT engine cache (MINIGO_TRT_CACHE)
+├── training/
+│   ├── run_config.json         #   Architecture + komi (written by init, read by run)
+│   ├── selfplay/               #   Game pool: g_<id>.bin.zst (sliding window)
+│   ├── checkpoints/training.pt #   Trainer checkpoint (weights+optimizer+bucket)
+│   └── status.json             #   Trainer → selfplay/supervisor live state
+├── logs/<timestamp>/           # Per-run logs; logs/current symlink
 ├── include/
 │   ├── config.h                # Hyperparameters
 │   ├── game.h                  # Go engine (ring buffer history, fast is_legal)
 │   ├── loaded_model.h          # Shared CPU weights (ONNX parsed once)
 │   ├── compute_context.h       # ComputeContext + ComputeHandle base classes
 │   ├── batch_evaluator.h       # BatchEvaluator interface + NNResultBuf
+│   ├── nn_request_queue.h      # Ring-buffer request queue (KataGo semantics)
 │   ├── nn_evaluator.h          # KataGo-style batching server (N server threads)
 │   ├── async_bot.h             # Persistent worker wrapper (ponder + analyze)
+│   ├── katago_inputs.h         # KataGo V7 input encoder (22 spatial + 19 global)
 │   ├── eigen_compute.h         # Eigen CPU backend (context + handle)
 │   ├── opencl_compute.h        # OpenCL GPU backend (context + handle)
 │   ├── cuda_compute.h          # CUDA GPU backend (context + handle)
 │   ├── tensorrt_compute.h      # TensorRT GPU backend (context + handle)
 │   ├── metal_compute.h         # Metal/MPSGraph GPU backend (macOS)
+│   ├── rknn_compute.h          # Rockchip NPU backend (aarch64)
+│   ├── vip9000_compute.h       # VeriSilicon NPU backend (aarch64)
 │   ├── onnx_loader.h           # Built-in minimal ONNX protobuf parser
 │   └── mcts.h                  # Multi-threaded MCTS (atomic MCTSNode)
-├── src/
-│   ├── game.cpp                # Full Go rules (captures, ko, scoring)
-│   ├── onnx_loader.cpp         # ONNX weight parser (no external dependency)
-│   ├── loaded_model.cpp        # ONNX parsing + BN pre-fusion
-│   ├── compute_context.cpp     # Backend factory
-│   ├── eigen_compute.cpp       # Eigen context + handle
-│   ├── opencl_compute.cpp      # OpenCL context + handle + embedded kernels
-│   ├── cuda_compute.cu         # CUDA context + handle + FP16 WMMA kernels
-│   ├── tensorrt_compute.cpp    # TensorRT context + handle (ONNX→engine)
-│   ├── metal_compute.mm        # Metal/MPSGraph context + handle (Obj-C++)
-│   ├── nn_evaluator.cpp        # NNEvaluator N server threads (KataGo pattern)
-│   ├── mcts.cpp                # Multi-threaded MCTS + tree reuse (make_move)
-│   ├── async_bot.cpp           # Persistent worker thread + callback reporting
+├── src/                        # Implementations of the above + 4 binaries:
 │   ├── main_play.cpp           # Human vs AI (uses AsyncBot for ponder/analyze)
-│   ├── main_selfplay.cpp       # Multi-threaded data generation
-│   ├── main_evaluate.cpp       # Model vs model evaluation matches
+│   ├── main_selfplay.cpp       # Multi-threaded data generation (V2 .bin)
+│   ├── main_evaluate.cpp       # Model vs model evaluation matches (+SGF)
 │   └── main_benchmark.cpp      # Performance tests
-└── scripts/
-    ├── model.py                # PyTorch model definition
-    ├── export_onnx.py          # PyTorch → ONNX export
-    ├── train.py                # Train on self-play data (DDP, streaming)
-    └── visualize.py            # Selfplay/eval game viewer (.bin/.zst/.sgf)
+├── scripts/                    # The continuous pipeline + tooling
+│   ├── run_continuous.py       # Supervisor: init / run / status
+│   ├── train_continuous.py     # Continuous trainer (DDP, bucket, ring)
+│   ├── selfplay_driver.py      # Selfplay loop + publish + throttle
+│   ├── gatekeeper.py           # Candidate gating vs accepted/latest
+│   ├── rate.py                 # Optional Elo rating loop
+│   ├── model.py                # PyTorch model definition
+│   ├── export_onnx.py          # PyTorch → ONNX export
+│   └── visualize.py            # Selfplay/eval game viewer (.bin/.zst/.sgf)
+└── tools/                      # KataGo conversion + NPU toolchain scripts
 ```
 
 ## CLI Reference
 
-### run_loop.py
+### run_continuous.py
 
 ```
-python run_loop.py init <preset>      Initialize training (clears previous state)
-  Presets: quick, small, large
-  Custom:  init --board 9 --filters 96 --blocks 8
+python scripts/run_continuous.py init [options]
+  --arch {resnet,vit}     Architecture (default: resnet)
+  --board N               Board size (default: 9)
+  --filters N --blocks N  ResNet size (default: 128/10)
+  --d-model/--depth/--heads/--kv-groups/--mlp-ratio   ViT size
+  --komi F                Komi for the whole run (default: 7.5)
+  -y                      Skip confirmation (archives any previous run)
+  → writes training/run_config.json + seeds models/accepted/v000000000.onnx
 
-python run_loop.py train [options]    Start or resume training
-  --threads N             Worker threads (default: all cores)
-  --search-threads N      MCTS search threads per move (default: 16)
-  --selfplay-instances N  Parallel selfplay processes (default: 1)
-  --nn-server-threads N   NN server threads (default: auto-detect)
-  --nn-device-ids IDS     GPU indices, comma-sep (default: auto-detect)
-  --max-batch N           Max GPU batch size for NN server (default: 256)
-  --iterations N          Max iterations this session (default: all)
+python scripts/run_continuous.py run [options]
+  Architecture + komi come from run_config.json — do NOT re-specify.
+  Per-worker GPUs:   --train-gpus/--selfplay-gpus/--gate-gpus/--rate-gpus
+  Per-worker NN:     --<proc>-nn-device-ids (+ optional --<proc>-nn-server-threads)
+  Selfplay:          --selfplay-batch-games --selfplay-sims --window-games
+                     --score-weight-max --throttle-high --throttle-low
+  Training:          --batch-size --base-lr --replay-target --ring-games
+                     --export-every --value-ramp-steps --score-ramp-steps ...
+  Gating:            --gate-games --gate-sims --gate-threshold
+  Rating (opt-in):   --rating --rating-games --rating-interval ...
+  Shutdown:          --graceful-timeout (Ctrl-C = graceful, 2nd = kill)
 
-python run_loop.py status             Show training progress
+python scripts/run_continuous.py status    Show pool/models/step summary
 ```
 
 ### selfplay
@@ -2150,7 +2055,7 @@ python run_loop.py status             Show training progress
   --dirichlet-alpha F    Root noise concentration (default: 0.15)
   --dirichlet-epsilon F  Root noise weight (default: 0.25)
   --temp-threshold N     Moves of stochastic play (default: 15)
-  --score-scale F        Score atan compression scale (default: 10.0)
+  --score-scale F        Score atan compression scale (default: 18.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
@@ -2164,9 +2069,9 @@ python run_loop.py status             Show training progress
   --search-threads N     MCTS search threads (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
   --c-puct F             UCB exploration constant (default: 1.5)
-  --komi F               Komi value (default: 6.5)
+  --komi F               Komi value (default: 7.5)
   --score-weight F       Score utility weight (default: 0.0)
-  --score-scale F        Score atan compression scale (default: 10.0)
+  --score-scale F        Score atan compression scale (default: 18.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
   --pvs K                Top K moves shown in analysis HUD (default: 5)
@@ -2191,7 +2096,7 @@ the full state machine.
   --max-batch N          Max GPU batch size (default: 256)
   --threshold FLOAT      Win rate to pass (default: 0.55)
   --c-puct F             UCB exploration constant (default: 1.5)
-  --score-scale F        Score atan compression scale (default: 10.0)
+  --score-scale F        Score atan compression scale (default: 18.0)
   --output DIR           Save game records as SGF files
   --nn-server-threads N  NN server threads per model (default: 1)
   --nn-device-ids IDS    GPU indices (default: "0")
@@ -2211,7 +2116,7 @@ SGF files can be reviewed with `python scripts/visualize.py`.
   --threads N            Self-play worker threads (default: 1)
   --search-threads N     MCTS search threads per move (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
-  --score-scale F        Score atan compression scale (default: 10.0)
+  --score-scale F        Score atan compression scale (default: 18.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
@@ -2271,8 +2176,20 @@ Delete the `trt_cache/` directory to force a rebuild after upgrading TensorRT or
 **OpenCL kernel compile error**: shown in the exception message; usually means
 the GPU doesn't support the feature used.  File a bug with the error text.
 
-**Training interrupted**: Just re-run `python run_loop.py train` — it resumes automatically
-from the last completed iteration.  Check `python run_loop.py status` to see progress.
+**Training interrupted**: Just re-run `python scripts/run_continuous.py run ...` —
+the trainer resumes from its checkpoint (step, optimizer, replay bucket) and the
+other workers pick up from the filesystem.  Check
+`python scripts/run_continuous.py status` or `logs/current/supervisor.log`.
+
+**Selfplay logs THROTTLE_PAUSE and idles**: working as intended — the trainer's
+replay bucket is full (training is the bottleneck).  It resumes automatically
+when the trainer drains the bucket below `--throttle-low`.  If the trainer is
+DEAD (check `logs/current/train.stdio.log`), fix that instead; pausing selfplay
+while nothing trains is exactly what stops GPU waste.
+
+**Trainer logs BUDGET_SLEEP**: the inverse — selfplay is the bottleneck and the
+trainer has exhausted its replay budget (`--replay-target` × new rows).  Give
+selfplay more GPU, more `--selfplay-threads`, or accept the pacing.
 
 **Slow on macOS with OpenCL**: Rebuild with Metal backend:
 `cmake .. -DMINIGO_BACKEND=metal && make -j$(sysctl -n hw.ncpu)`.

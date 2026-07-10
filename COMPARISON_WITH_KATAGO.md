@@ -7,11 +7,11 @@ Side-by-side comparison of implementation details across all major subsystems.
 | Aspect | KataGo | MiniGo C++ |
 |---|---|---|
 | **Server loop function** | `NNEvaluator::serve()` | `NNEvaluator::server_loop()` |
-| **Queue type** | `ThreadSafeQueue<NNResultBuf*>` (custom, dual-vector swap) | `NNRequestQueue` class wrapping `std::deque<NNResultBuf*>` + mutex + cv |
-| **Queue drain** | `waitPopUpToN(buf, N)` — atomic multi-pop under one lock | `NNRequestQueue::wait_drain_up_to(out, N)` — loop of `pop_front` under one lock (O(1) per element) |
+| **Queue type** | `ThreadSafeQueue<NNResultBuf*>` (custom, dual-vector swap) | `NNRequestQueue`: fixed power-of-two ring of `NNResultBuf*` (bitwise-AND wrap, no reallocation) |
+| **Queue drain** | `waitPopUpToN(buf, N)` — atomic multi-pop under one lock | `NNRequestQueue::wait_drain_up_to(out, N)` — multi-pop from the ring under one lock |
 | **Queue capacity** | Pre-allocated `maxBatchSize * 4 * numGPUs` | Lazy chunked allocation via `std::deque` (each chunk holds ≈ 64 pointers, allocated on demand) |
-| **Queue bounded?** | Yes — `notFullCondVar` blocks pushers when full | No — `NNRequestQueue::push` never blocks (matches KataGo's `forcePush`) |
-| **Queue notify rule** | `notify_all` only on empty→1 transition (`if sizeUnsynchronized()==1`) | Same: `cv_.notify_all()` inside `NNRequestQueue` only on empty→non-empty edge |
+| **Queue bounded?** | Effectively unbounded in nneval (`forcePush` can exceed maxSize) | Yes — fixed ring sized to the declared client-thread count (each search thread has ≤1 request in flight); a full ring blocks the pusher (KataGo `waitPush` semantics), which never happens in normal operation |
+| **Queue notify rule** | `notify_all` only on empty→1 transition (`if sizeUnsynchronized()==1`) | Same on `not_empty_`; `not_full_` notified only on the full→not-full edge (zero notifies in normal operation) |
 | **Batch sizing** | Dynamic — `setCurrentBatchSize()` adjustable at runtime | Static — `min(queue.size(), max_batch_size)` |
 | **Batch timeout** | None (blocks indefinitely) | None (blocks indefinitely) |
 | **GPU call** | `NeuralNet::getOutput()` — synchronous, blocks | `handle->predict_batch()` — synchronous, blocks |
@@ -39,11 +39,11 @@ Side-by-side comparison of implementation details across all major subsystems.
 |---|---|---|
 | **Visit count** | `std::atomic<int64_t>` | `std::atomic<int>` |
 | **Virtual losses** | `std::atomic<int32_t>` | `std::atomic<int>` |
-| **Value accumulator** | `std::atomic<double>` (multiple: winloss, score, lead, utility) | `std::atomic<int32_t>` bit-pattern CAS on float |
+| **Value accumulator** | `std::atomic<double>` (multiple: winloss, score, lead, utility) | fixed-point `std::atomic<int64_t>` `fetch_add` (exact, single AMO) |
 | **Node states** | 7 states: UNEVALUATED → EVALUATING → EXPANDED0 → GROWING1 → EXPANDED1 → GROWING2 → EXPANDED2 | 3 states: UNEVALUATED → EXPANDING → EXPANDED |
 | **Children storage** | Progressive arrays: 8 → 64 → MAX_POLICY_SIZE (no reallocation) | `std::vector<std::unique_ptr<MCTSNode>>` |
 | **Transposition table** | Yes — `SearchNodeTable` with hash lookup | No — pure tree (no sharing) |
-| **Memory order** | `acquire`/`release` for state; mixed for stats | `relaxed` for everything except state CAS |
+| **Memory order** | `acquire`/`release` for state; mixed for stats | `relaxed` for everything except state claim/publish (`acq_rel`/`release`) |
 | **Prior** | Stored in edge (`SearchChildPointer`) | Stored in node (`float prior`) |
 
 ## 4. Virtual Loss and Search
@@ -114,10 +114,10 @@ Side-by-side comparison of implementation details across all major subsystems.
 | Aspect | KataGo | MiniGo C++ |
 |---|---|---|
 | **Queue lock** | `std::mutex` inside `ThreadSafeQueue` | `std::mutex` inside `NNRequestQueue::mu_` (encapsulated; `NNEvaluator` does not touch it directly) |
-| **Queue signal** | `notEmptyCondVar` + `notFullCondVar` | Single `NNRequestQueue::cv_` (no `notFull` — the queue is unbounded, matching KataGo's `forcePush` semantics) |
+| **Queue signal** | `notEmptyCondVar` + `notFullCondVar` | Same pair: `not_empty_` (consumers) + `not_full_` (producers, backstop only) |
 | **Shutdown** | `isKilled` flag + queue `close()`/`setReadOnly()` (which internally `notify_all`s) | `NNRequestQueue::close()` sets `closed_` and `notify_all`s; `wait_drain_up_to` returns false on closed+empty so servers exit |
-| **Atomic float** | `std::atomic<double>` (platform support) | CAS loop on `std::atomic<int32_t>` bit pattern |
-| **Per-node lock** | `MutexPool` indexed by hash (for expansion) | Lock-free CAS on state enum |
+| **Atomic float** | `std::atomic<double>` (platform support) | fixed-point `std::atomic<int64_t>` + `fetch_add` (no CAS) |
+| **Per-node lock** | `MutexPool` indexed by hash (for expansion) | Lock-free `fetch_or` claim on state enum (AMO-only) |
 | **Stats lock** | `statsLock` mutex for virtual loss writes | Lock-free `fetch_add`/`fetch_sub` |
 | **TRT engine lifecycle lock** | Per-engine mutex around build + ctx create/delete | `TRTDeviceState::engine_mutex` (same scope) |
 | **TRT inference lock** | None — per-thread CUDA stream | None — `cudaStreamPerThread` |
@@ -139,7 +139,7 @@ Side-by-side comparison of implementation details across all major subsystems.
 - **ONNX model format** — industry standard, no custom converter needed (KataGo uses custom binary)
 - **Implicit GEMM kernel** — fused im2col computed on-the-fly in register-blocked SGEMM
 - **CUDA WMMA kernels** — hand-written FP16 Tensor Core implicit GEMM (no cuDNN dependency)
-- **CAS float accumulation** — portable C++17, no `std::atomic<double>` dependency
+- **Fixed-point value accumulation** — `int64 fetch_add`: portable, exact, and free of compare_exchange (works on Zaamo-only RISC-V where CAS would fall back to libatomic)
 - **Ring buffer history** — O(1) update vs vector operations
 - **Simpler node states** — 3 states vs 7 (no progressive resizing)
 - **`notify_one` delivery** — avoids thundering herd on result notification
@@ -150,7 +150,7 @@ Side-by-side comparison of implementation details across all major subsystems.
 
 | Aspect | KataGo | MiniGo C++ |
 |---|---|---|
-| **Pipeline orchestration** | Custom C++ `SelfplayManager` + Python training | Bash `run_loop.sh` (init/train/status) + Python training |
+| **Pipeline orchestration** | Custom C++ `SelfplayManager` + Python training | Python `run_continuous.py` supervisor: concurrent selfplay/train/gate/rate workers |
 | **Selfplay data format** | Custom binary (gzipped) | Binary `.bin` compressed with zstd |
 | **Training framework** | Custom C++ training loop (TF or PyTorch) | PyTorch with DDP via `torchrun` |
 | **Multi-GPU training** | Custom data-parallel or single GPU | PyTorch DistributedDataParallel (NCCL) |
@@ -160,7 +160,7 @@ Side-by-side comparison of implementation details across all major subsystems.
 | **Evaluation games** | Ongoing Elo estimation from selfplay results | Dedicated `evaluate` binary, games saved as SGF |
 | **Model versioning** | Sequential network files, best tracked separately | `models/v0000.onnx` ... `v0100.onnx` + `best.onnx` |
 | **LR schedule** | Configured externally, manual changes | Staged plan: per-stage LR defined in `training_plan` |
-| **Resume** | Checkpoint-based, manual restart | Automatic: `run_loop.sh train` detects state and continues |
+| **Resume** | Checkpoint-based, manual restart | Automatic: re-run `run_continuous.py run` — checkpoint restores step/optimizer/bucket/watermark |
 | **Training plan** | Manual configuration files | Generated by `init`, editable text file with stage definitions |
 | **GPU auto-detection** | Manual `--config` | Auto: detects GPU count, sets NN servers + DDP processes |
 | **Selfplay compression** | gzip | zstd (faster decompress, similar ratio) |
@@ -245,12 +245,13 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
         // ── Step 1: Block until queue has items ──
         // batch.clear();
         // if (!queue_.wait_drain_up_to(batch, max_batch_size_)) break;
-        //   — blocks inside NNRequestQueue on cv_ until !items_.empty() || closed_
+        //   — blocks inside NNRequestQueue on not_empty_ until size!=0 || closed
         //   — returns false when queue is closed AND empty → thread exits
 
         // ── Step 2: Drain up to max_batch_size items ──
-        // Handled inside wait_drain_up_to: std::deque::pop_front × n
-        // (O(1) per element, no shift); lock released on return.
+        // Handled inside wait_drain_up_to: n reads off the ring
+        // (bitwise-AND wrap, O(1) per element); notifies not_full_
+        // only if the ring was full; lock released on return.
 
         // ── Step 3: Flatten states (CPU work) ──
         // For each NNResultBuf* in batch:
@@ -442,35 +443,36 @@ NNEvaluator destructor:
        - clReleaseProgram, clReleaseCommandQueue, clReleaseContext per GPU
 ```
 
-#### TensorRT lifecycle: per-engine lock (matches KataGo)
+#### TensorRT lifecycle: per-engine lock (a deviation KataGo doesn't need)
 
-TensorRT differs from OpenCL here.  Per NVIDIA TRT 10 docs,
-`ICudaEngine::createExecutionContext()` and `~IExecutionContext` are
-**not thread-safe** with respect to other context creation/destruction
-on the same engine — the engine maintains an internal list of live
-contexts that both operations mutate.  Per-thread CUDA streams make
-**inference** (`enqueueV3`) safe but do NOT cover lifecycle.
+The TRT headers/guide give **no thread-safety guarantee** for
+`ICudaEngine::createExecutionContext()` / `~IExecutionContext`
+(`NvInferRuntime.h` documents thread-safety only for logger/allocator
+callbacks).  Per-thread CUDA streams make **inference** (`enqueueV3`)
+safe across contexts but say nothing about lifecycle.
 
-With `--nn-device-ids 0,0,1,1` (two server threads per GPU), step 2
-above (`notify_all`) wakes all four threads simultaneously.  Each then
-runs step 4 in parallel — calling `delete exec_ctx` on contexts that
-share an engine.  Concurrent list mutation corrupts engine internals;
-the damage only surfaces when `~ICudaEngine` walks the list at step 6,
-manifesting as `double free or corruption (out)` after `Done! N games`.
+Empirically, with `--nn-device-ids 0,0,1,1` (two server threads per
+GPU), step 2 above (`notify_all`) wakes all threads simultaneously;
+each ran `delete exec_ctx` on contexts sharing one engine in parallel,
+and the corruption surfaced at step 6 as `double free or corruption
+(out)` after `Done! N games`.  Serializing lifecycle ops fixed it.
 
-**KataGo's `trtbackend.cpp`** uses a single per-engine mutex around
-(a) engine build, (b) `createExecutionContext()`, and (c)
-`delete exec_ctx`, leaving inference lock-free.  **MiniGo matches this
-exactly**: one `engine_mutex` per `TRTDeviceState` covers the same
-three points.  Inference keeps using `cudaStreamPerThread` with no
-mutex so the GPU scheduler can still interleave kernels from different
-threads on the same GPU.
+**KataGo sidesteps the whole question**: its `trtbackend.cpp` builds a
+**separate engine per server thread** (deserialized per thread; weights
+duplicated on GPU), so no `ICudaEngine` is ever shared and no lifecycle
+lock exists upstream — the only trtbackend mutex is inside
+`TRTErrorRecorder`, which the TRT API requires to be thread-safe.
+**MiniGo shares one engine per device** (single weight copy, per-thread
+exec contexts) and therefore adds `TRTDeviceState::engine_mutex` around
+(a) engine build, (b) `createExecutionContext()`, (c) `delete exec_ctx`.
+Inference keeps `cudaStreamPerThread` with no mutex.
 
 | Lock | KataGo | MiniGo |
 |------|--------|--------|
-| Per-engine lifecycle mutex | `TRTModel::mutex` (held during build, ctx create, ctx delete) | `TRTDeviceState::engine_mutex` (same three points) |
+| Engine sharing | None — one engine per server thread (per-thread weight copies) | One engine per device, shared by that device's server threads |
+| Lifecycle serialization | Not needed (nothing shared) | `TRTDeviceState::engine_mutex` (build, ctx create, ctx delete) |
 | Inference | Lock-free, per-thread stream | Lock-free, `cudaStreamPerThread` |
-| Disk cache serialization | Per-cache-path mutex in engine cache | `build_mutexes[cache_path]` static map |
+| Disk cache serialization | Timing-cache lock via filesystem | `build_mutexes[cache_path]` static map (also covers two identical GPUs sharing one cache file) |
 
 Sources:
 - [KataGo nneval.cpp](https://github.com/lightvector/KataGo/blob/master/cpp/neuralnet/nneval.cpp)

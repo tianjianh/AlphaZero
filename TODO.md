@@ -59,7 +59,7 @@ Implementation (was in commit bca5e9e, reverted in cb24be1):
 
 The padding was implemented and tested locally but still crashed on the remote
 Blackwell machine. Most likely cause: `model.py` wasn't deployed (the error's
-`train.py` line numbers shifted correctly from the autocast changes, but model.py
+`train_continuous.py` line numbers shifted correctly from the autocast changes, but model.py
 padding changes may not have been pulled).
 
 ### Verification steps
@@ -70,7 +70,7 @@ padding changes may not have been pulled).
        print(f"GoViT: FP8 sequence padding {hw} → {hw + self.seq_pad}")
    ```
 
-2. Deploy BOTH `scripts/model.py` and `scripts/train.py` to the Blackwell machine.
+2. Deploy BOTH `scripts/model.py` and `scripts/train_continuous.py` to the Blackwell machine.
 
 3. Delete old TensorRT engine cache on the Blackwell machine:
    ```bash
@@ -142,3 +142,40 @@ See the stubs in:
 - `src/cuda_compute.cu` (`CUDAComputeHandle` constructor)
 - `src/opencl_compute.cpp` (`OpenCLComputeHandle` constructor)
 - `src/metal_compute.mm` (`MetalComputeHandle` constructor)
+
+## Deferred items from the 2026-07 codebase audit
+
+Verified against upstream KataGo source but deliberately NOT changed in
+the audit pass (each is a behavior change or larger refactor):
+
+1. **Positional superko**: the ko rule is simple ko (one-position
+   memory via `prev_board`); Tromp-Taylor mandates positional superko.
+   Long cycles (triple ko, sending-two-returning-one) are bounded only
+   by `max_moves_per_game`.  Adding PSK needs a position-hash set
+   maintained in `GoGame::play()`.  Documented in `game.cpp
+   score_game()` and `COMPARISON_WITH_KATAGO.md`.
+2. **`score_scale` not board-adaptive**: `config.h` hard-codes 18.0
+   (KataGo's `2*sqrt(area)` evaluated for 9x9).  A 19x19 run should
+   derive ~38 from the model's board size at load time.
+3. **Eigen backend re-parses the ONNX per handle**: with N server
+   threads that is N× parse cost and N× weight RAM.  Immutable weights
+   belong in `EigenComputeContext`, shared across handles.  Harmless
+   at N=1 (the common Eigen case).
+4. **TensorRT >= 11 runs FP32/TF32 only**: TRT 11 removed weakly-typed
+   precision flags; reduced precision now requires exporting FP16/BF16
+   ONNX graphs.  The build supports TRT 11 (guarded), but for FP16/BF16
+   engines install TRT 10.x until the exporters emit half-precision
+   graphs.
+5. **KataGo-model banner prints `filters=0 blocks=0`**: LoadedModel
+   doesn't populate trunk metadata for KataGo-format ONNX.  Cosmetic.
+6. **Per-eval blocking handoff still uses mutex+condvar** (the only
+   sync heavier than a single AMO left on the search path): each NN
+   evaluation does one queue push (mutex) and one wait on the buf's
+   mutex+condvar; the server takes the buf mutex once to deliver.
+   This is KataGo's own design and is amortized against ~0.4-3 ms of
+   GPU inference per batch, so it is NOT worth churn today.  If
+   mutex cost ever matters more (e.g. Zaamo-only RISC-V with slow
+   futex paths), the C++20 upgrade path is `std::atomic<int>::wait/
+   notify_one` on `NNResultBuf::done` — removes the per-buf mutex and
+   condvar entirely (plain load + futex, no LR/SC needed).  Requires
+   bumping the project to -std=c++20.
