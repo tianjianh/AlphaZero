@@ -82,6 +82,7 @@ GoGame GoGame::copy() const {
     g.consecutive_passes = consecutive_passes;
     g.game_over       = game_over;
     g.winner          = winner;
+    g.final_black_score = final_black_score;
     // Ring buffer copy: all inline storage — no heap allocation
     g.ring_buf_  = ring_buf_;
     g.ring_head_ = ring_head_;
@@ -448,13 +449,19 @@ void GoGame::get_ownership(Stone player, std::vector<float>& out) const {
 }
 
 void GoGame::score_game() {
-    // Tromp-Taylor scoring: score the final position as-is after two
+    // Tromp-Taylor AREA SCORING of the final position as-is after two
     // passes.  No heuristic dead-stone removal — under Chinese rules the
     // game is played to completion, so any stones still on the board are
     // alive.  For training this provides the correct signal: the network
     // learns to capture dead stones before passing rather than relying on
     // a post-game cleanup (which was also order-dependent and broke semeai
     // / seki positions).
+    //
+    // NOTE: the KO RULE is simple ko (one-position memory via prev_board),
+    // not Tromp-Taylor's positional superko — long cycles (triple ko etc.)
+    // are bounded only by max_moves_per_game.  KataGo defaults to
+    // positional superko; adding it here would need a position-hash set
+    // in play().  See COMPARISON_WITH_KATAGO.md.
     auto [b, w] = score();
     final_black_score = b - w;
     if (b > w) winner = BLACK;
@@ -468,48 +475,6 @@ std::string GoGame::action_to_str(int action) const {
     int r = action / n, c = action % n;
     const char* cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
     return std::string(1, cols[c]) + std::to_string(n - r);
-}
-
-int GoGame::str_to_action(const std::string& s) const {
-    if (s == "PASS" || s == "pass") return board_size * board_size;
-    const char* cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
-    char col_char = std::toupper(s[0]);
-    int c = 0;
-    while (cols[c] && cols[c] != col_char) c++;
-    int row_num = std::stoi(s.substr(1));
-    int r = board_size - row_num;
-    return r * board_size + c;
-}
-
-std::string GoGame::display() const {
-    const char* cols = "ABCDEFGHJKLMNOPQRSTUVWXYZ";
-    const char symbols[] = {'.', 'X', 'O'};
-    std::ostringstream ss;
-
-    ss << "   ";
-    for (int c = 0; c < board_size; c++) ss << cols[c] << ' ';
-    ss << '\n';
-
-    for (int r = 0; r < board_size; r++) {
-        int row_num = board_size - r;
-        if (row_num < 10) ss << ' ';
-        ss << row_num << ' ';
-        for (int c = 0; c < board_size; c++) {
-            ss << symbols[board[r][c]];
-            if (c < board_size - 1) ss << ' ';
-        }
-        ss << ' ';
-        if (row_num < 10) ss << ' ';
-        ss << row_num << '\n';
-    }
-
-    ss << "   ";
-    for (int c = 0; c < board_size; c++) ss << cols[c] << ' ';
-    ss << '\n';
-
-    ss << "Move " << move_count << " | Turn: "
-       << (current_player == BLACK ? "Black(X)" : "White(O)");
-    return ss.str();
 }
 
 }  // namespace minigo

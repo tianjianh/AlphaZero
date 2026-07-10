@@ -14,7 +14,6 @@
 #include <cstring>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <algorithm>
@@ -1051,11 +1050,11 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
 
     // Upload input (not part of graph — source address changes)
     CUDA_CHECK(cudaMemcpyAsync(I.buf_flat_in, I.host_input.data(),
-        input_floats * sizeof(float), cudaMemcpyHostToDevice, I.cudaStreamPerThread));
+        input_floats * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
 
     // Execute compute pipeline via CUDA graph (or capture on first call / batch change)
     I.ensure_graph(N);
-    CUDA_CHECK(cudaGraphLaunch(I.graph_exec, I.cudaStreamPerThread));
+    CUDA_CHECK(cudaGraphLaunch(I.graph_exec, cudaStreamPerThread));
 
     // Read back results into pre-allocated host buffers
     I.host_pol.resize((size_t)action_size * N);
@@ -1063,13 +1062,13 @@ CUDAComputeHandle::predict_batch(const std::vector<std::vector<float>>& states) 
     I.host_scr.resize(N);
 
     CUDA_CHECK(cudaMemcpyAsync(I.host_pol.data(), I.buf_pol_feat,
-        I.host_pol.size() * sizeof(float), cudaMemcpyDeviceToHost, I.cudaStreamPerThread));
+        I.host_pol.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaMemcpyAsync(I.host_val.data(), I.buf_val_out,
-        N * sizeof(float), cudaMemcpyDeviceToHost, I.cudaStreamPerThread));
+        N * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaMemcpyAsync(I.host_scr.data(), I.buf_scr_out,
-        N * sizeof(float), cudaMemcpyDeviceToHost, I.cudaStreamPerThread));
+        N * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
-    CUDA_CHECK(cudaStreamSynchronize(I.cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     // Pack results
     std::vector<CUDAComputeHandle::Result> results(N);

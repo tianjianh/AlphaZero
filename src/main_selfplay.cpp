@@ -6,6 +6,7 @@
 #include "nn_evaluator.h"
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -101,10 +102,10 @@ int main(int argc, char* argv[]) {
                 << "  --dirichlet-alpha F     Root noise concentration (default: 0.15 for 9x9)\n"
                 << "  --dirichlet-epsilon F   Root noise weight (default: 0.25)\n"
                 << "  --temp-threshold N      Moves of stochastic play (default: 15)\n"
-                << "  --komi F                Komi value (default: 6.5)\n"
+                << "  --komi F                Komi value (default: 7.5)\n"
                 << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
-                << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
+                << "  --score-scale F         Score atan compression scale (default: 18.0)\n"
                 << "  --nn-server-threads N   NN server threads (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -116,7 +117,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    system(("mkdir -p " + output_dir).c_str());
+    std::filesystem::create_directories(output_dir);
 
     // Parse device IDs
     std::vector<int> device_ids = parse_device_ids(nn_device_ids_str);
@@ -152,8 +153,13 @@ int main(int argc, char* argv[]) {
     auto context = std::shared_ptr<ComputeContext>(create_compute_context(device_ids));
 
     // Create NNEvaluator with N server threads
+    // Client-thread bound: each of the num_threads game workers runs
+    // search_threads MCTS threads, each with at most one request in
+    // flight — sizes the evaluator's fixed request ring exactly.
     auto nn_evaluator = std::make_shared<NNEvaluator>(
-        model, context, device_ids, config.max_batch_size);
+        model, context, device_ids, config.max_batch_size,
+        num_threads * std::max(1, search_threads));
+    nn_evaluator->wait_ready();   // throws if no server thread came up
 
     std::cout << "MiniGo C++ Self-Play\n"
               << "  Board:            " << config.board_size << "x" << config.board_size << "\n"

@@ -16,18 +16,9 @@ optionally also seeds training.pt so the train worker resumes warm):
         --arch resnet --filters 128 --blocks 10 \
         --onnx       models/accepted/v000000000.onnx \
         --checkpoint training/checkpoints/training.pt
-    python scripts/run_continuous.py run --filters 128 --blocks 10 [...]
+    python scripts/run_continuous.py run [...]
 
-Workflow with run_loop.py (single-process, simpler):
-
-    python run_loop.py init large
-    python tools/warm_init_from_katago.py \
-        --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
-        --arch resnet --filters 128 --blocks 10 \
-        --checkpoint training/checkpoints/training.pt
-    python run_loop.py train
-
-What gets transferred (with `large` preset, 128f/10b):
+What gets transferred (128f/10b):
     - MiniGo's 5 SE residual blocks (positions 0,2,4,6,8) get their
       conv1+conv2 weights from KataGo's regular (non-gpool) blocks,
       paired closest-depth-first.
@@ -890,7 +881,7 @@ def warm_init(sd: dict, kg: KataGoModel, verbose: bool = True) -> dict:
 
 
 def _save_checkpoint(model, path: str) -> None:
-    """Write a checkpoint compatible with both train.py and train_continuous.py."""
+    """Write a checkpoint compatible with train_continuous.py."""
     obj = {
         "model_state_dict": model.state_dict(),
         # Bare-minimum keys the resume paths look for. Defaults to 0

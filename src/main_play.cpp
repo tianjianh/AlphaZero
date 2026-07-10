@@ -55,20 +55,20 @@ static void init_colors() {
 // Star points for standard board sizes
 // ================================================================
 static bool is_star_point(int r, int c, int n) {
-    if (n == 9)  return (r==2||r==6)&&(c==2||c==6) || (r==4&&c==4);  // 4 corners + tengen
-    if (n == 13) return (r==3||r==9)&&(c==3||c==9) || (r==6&&c==6);
-    if (n == 19) return (r==3||r==15)&&(c==3||c==15) || (r==9&&c==9)
-                     || (r==3||r==15)&&c==9 || r==9&&(c==3||c==15);  // 9 points but keep standard
+    if (n == 9)  return ((r==2||r==6) && (c==2||c==6)) || (r==4 && c==4);  // 4 corners + tengen
+    if (n == 13) return ((r==3||r==9) && (c==3||c==9)) || (r==6 && c==6);
+    if (n == 19) return ((r==3||r==15) && (c==3||c==15)) || (r==9 && c==9)
+                     || ((r==3||r==15) && c==9) || (r==9 && (c==3||c==15));  // 9 star points
     return false;
 }
 
 // ================================================================
 // Board drawing (ncurses)
 // ================================================================
-static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
+static void draw_board(WINDOW* win, const GoGame& game,
                         int cursor_r, int cursor_c, bool cursor_active,
                         int last_r, int last_c,
-                        Stone human_color, bool use_random,
+                        Stone human_color,
                         const std::string& status_msg,
                         const std::string& ai_info,
                         const std::string& input_buf) {
@@ -112,7 +112,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
         int y = oy + r;
 
         // Row label
-        char rl[4];
+        char rl[8];
         snprintf(rl, sizeof(rl), "%2d", n - r);
         wattron(win, COLOR_PAIR(CP_LABEL));
         mvwaddstr(win, y, ox - 3, rl);
@@ -141,14 +141,15 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
             bool is_last   = (r == last_r && c == last_c);
             int cell = game.board[r][c];
 
-            if (cell == BLACK) {
-                wattron(win, COLOR_PAIR(CP_BLACK_STONE) | A_BOLD);
-                mvwaddch(win, y, x, 'X');
-                wattroff(win, COLOR_PAIR(CP_BLACK_STONE) | A_BOLD);
-            } else if (cell == WHITE) {
-                wattron(win, COLOR_PAIR(CP_WHITE_STONE) | A_BOLD);
-                mvwaddch(win, y, x, 'O');
-                wattroff(win, COLOR_PAIR(CP_WHITE_STONE) | A_BOLD);
+            if (cell == BLACK || cell == WHITE) {
+                // Last-played stone renders in CP_RED (that color pair's
+                // declared purpose) so the opponent's reply is findable
+                // at a glance.
+                int cp = is_last ? CP_RED
+                       : (cell == BLACK ? CP_BLACK_STONE : CP_WHITE_STONE);
+                wattron(win, COLOR_PAIR(cp) | A_BOLD);
+                mvwaddch(win, y, x, cell == BLACK ? 'X' : 'O');
+                wattroff(win, COLOR_PAIR(cp) | A_BOLD);
             } else if (is_cursor && !game.game_over) {
                 char ghost = (game.current_player == BLACK) ? 'X' : 'O';
                 wattron(win, A_BOLD);
@@ -174,7 +175,7 @@ static void draw_board(WINDOW* win, const GoGame& game, const Config& config,
 
         // Row label right
         wattron(win, COLOR_PAIR(CP_LABEL));
-        char rr[4];
+        char rr[8];
         snprintf(rr, sizeof(rr), "%d", n - r);
         mvwaddstr(win, y, ox + (n - 1) * cell_w + 2, rr);
         wattroff(win, COLOR_PAIR(CP_LABEL));
@@ -320,10 +321,10 @@ int main(int argc, char* argv[]) {
                    "  --sims N               MCTS simulations (default: 800)\n"
                    "  --search-threads N     MCTS search threads (default: 16)\n"
                    "  --max-batch N          Max GPU batch size (default: 256)\n"
-                   "  --komi F               Komi value (default: 6.5)\n"
+                   "  --komi F               Komi value (default: 7.5)\n"
                    "  --win-loss-weight F    Win/loss utility weight (default: 1.0)\n"
                    "  --score-weight F       Score utility weight (default: 0.0)\n"
-                   "  --score-scale F        Score atan compression scale (default: 10.0)\n"
+                   "  --score-scale F        Score atan compression scale (default: 18.0)\n"
                    "  --c-puct F             UCB exploration constant (default: 1.5)\n"
                    "  --nn-server-threads N  NN server threads (default: 1)\n"
                    "  --nn-device-ids IDS    Comma-separated GPU indices (default: \"0\")\n"
@@ -341,6 +342,12 @@ int main(int argc, char* argv[]) {
 
     // Load model (before ncurses init so errors print normally)
     std::vector<int> device_ids = parse_device_ids(nn_device_ids_str);
+    if ((int)device_ids.size() != nn_server_threads) {
+        fprintf(stderr, "Error: --nn-device-ids has %zu entries but "
+                        "--nn-server-threads is %d (must match)\n",
+                device_ids.size(), nn_server_threads);
+        return 1;
+    }
     std::shared_ptr<LoadedModel> model;
     std::shared_ptr<ComputeContext> context;
     std::shared_ptr<NNEvaluator> evaluator;
@@ -361,7 +368,8 @@ int main(int argc, char* argv[]) {
             config.max_moves_per_game = config.board_size * config.board_size * 2;
             config.num_search_threads = search_threads;
             evaluator = std::make_shared<NNEvaluator>(
-                model, context, device_ids, config.max_batch_size);
+                model, context, device_ids, config.max_batch_size,
+                std::max(1, search_threads));  // one bot's search threads
             printf("Waiting for GPU engines ...\n");
             fflush(stdout);
             evaluator->wait_ready();
@@ -566,8 +574,8 @@ int main(int argc, char* argv[]) {
 
             refresh_ai_info();
 
-            draw_board(stdscr, game, config, cursor_r, cursor_c, cursor_active,
-                       last_r, last_c, human_color, use_random,
+            draw_board(stdscr, game, cursor_r, cursor_c, cursor_active,
+                       last_r, last_c, human_color,
                        status_msg, ai_info, input_buf);
 
             // Ownership overlay: draw +/- at empty intersections
@@ -605,8 +613,8 @@ int main(int argc, char* argv[]) {
                 char buf[128];
                 snprintf(buf, sizeof(buf), "Game over  B:%.1f  W:%.1f  [r]restart [q]quit", bs, ws);
                 status_msg = buf;
-                draw_board(stdscr, game, config, -1, -1, false,
-                           last_r, last_c, human_color, use_random,
+                draw_board(stdscr, game, -1, -1, false,
+                           last_r, last_c, human_color,
                            status_msg, ai_info, "");
                 timeout(-1);
                 int key = getch();
@@ -621,8 +629,8 @@ int main(int argc, char* argv[]) {
 
                 int action;
                 if (use_random) {
-                    draw_board(stdscr, game, config, -1, -1, false,
-                               last_r, last_c, human_color, use_random,
+                    draw_board(stdscr, game, -1, -1, false,
+                               last_r, last_c, human_color,
                                status_msg, ai_info, "");
                     action = random_legal_move(game);
                     if (action == config.action_size() - 1)
@@ -638,8 +646,8 @@ int main(int argc, char* argv[]) {
                     while (future.wait_for(std::chrono::milliseconds(100))
                            != std::future_status::ready) {
                         refresh_ai_info();
-                        draw_board(stdscr, game, config, -1, -1, false,
-                                   last_r, last_c, human_color, use_random,
+                        draw_board(stdscr, game, -1, -1, false,
+                                   last_r, last_c, human_color,
                                    status_msg, ai_info, "");
                     }
                     action = future.get();
@@ -750,8 +758,8 @@ int main(int argc, char* argv[]) {
                     int action = r * n + c;
                     if (game.is_legal(action)) {
                         cursor_r = r; cursor_c = c; cursor_active = true;
-                        draw_board(stdscr, game, config, cursor_r, cursor_c, true,
-                                   last_r, last_c, human_color, use_random,
+                        draw_board(stdscr, game, cursor_r, cursor_c, true,
+                                   last_r, last_c, human_color,
                                    status_msg, ai_info, input_buf);
                         napms(120);
                         play_human_move(action);

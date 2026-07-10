@@ -369,14 +369,7 @@ static void init_device(OpenCLDeviceState& ds, int device_id) {
     cl_int err;
     ds.context = clCreateContext(nullptr, 1, &ds.device, nullptr, nullptr, &err);
     CL_CHECK(err);
-
-#ifdef CL_VERSION_2_0
-    cl_queue_properties props[] = { 0 };
-    ds.queue = clCreateCommandQueueWithProperties(ds.context, ds.device, props, &err);
-#else
-    ds.queue = clCreateCommandQueue(ds.context, ds.device, 0, &err);
-#endif
-    CL_CHECK(err);
+    // No command queue here — queues are per-handle (per server thread).
 }
 
 static void compile_kernels(OpenCLDeviceState& ds) {
@@ -409,7 +402,6 @@ OpenCLComputeContext::OpenCLComputeContext(const std::vector<int>& device_ids) {
 OpenCLComputeContext::~OpenCLComputeContext() {
     for (auto& [id, ds] : devices_) {
         if (ds.program) clReleaseProgram(ds.program);
-        if (ds.queue)   clReleaseCommandQueue(ds.queue);
         if (ds.context) clReleaseContext(ds.context);
     }
 }
@@ -462,8 +454,18 @@ OpenCLComputeHandle::OpenCLComputeHandle(OpenCLDeviceState& dev,
     num_filters    = model->num_filters;
     num_res_blocks = model->num_res_blocks;
 
-    // Create kernel handles from the shared compiled program
+    // Per-handle command queue on this server thread (per-thread
+    // execution state — see OpenCLDeviceState comment in the header).
     cl_int err;
+#ifdef CL_VERSION_2_0
+    cl_queue_properties props[] = { 0 };
+    queue_ = clCreateCommandQueueWithProperties(dev_.context, dev_.device, props, &err);
+#else
+    queue_ = clCreateCommandQueue(dev_.context, dev_.device, 0, &err);
+#endif
+    CL_CHECK(err);
+
+    // Create kernel handles from the shared compiled program
     auto mk = [&](const char* name) -> cl_kernel {
         cl_kernel k = clCreateKernel(dev_.program, name, &err);
         CL_CHECK(err);
@@ -521,6 +523,9 @@ OpenCLComputeHandle::OpenCLComputeHandle(OpenCLDeviceState& dev,
 }
 
 OpenCLComputeHandle::~OpenCLComputeHandle() {
+    // Drain this handle's own queue before freeing buffers it may
+    // still reference.
+    if (queue_) clFinish(queue_);
     free_workspace();
     free_weights();
     if (k_transpose_nchw_)          clReleaseKernel(k_transpose_nchw_);
@@ -529,6 +534,7 @@ OpenCLComputeHandle::~OpenCLComputeHandle() {
     if (k_fc_bias_relu_)            clReleaseKernel(k_fc_bias_relu_);
     if (k_fc_bias_softmax_)         clReleaseKernel(k_fc_bias_softmax_);
     if (k_fc_bias_tanh_)            clReleaseKernel(k_fc_bias_tanh_);
+    if (queue_)                     clReleaseCommandQueue(queue_);
 }
 
 // ================================================================
@@ -663,7 +669,7 @@ void OpenCLComputeHandle::run_conv3x3(cl_mem input_buf, cl_mem output_buf,
     CL_CHECK(clSetKernelArg(k_conv3x3_sgemm_bn_, 10, sizeof(int),    &W));
     CL_CHECK(clSetKernelArg(k_conv3x3_sgemm_bn_, 11, sizeof(int),    &mode));
     CL_CHECK(clSetKernelArg(k_conv3x3_sgemm_bn_, 12, sizeof(int),    &do_relu_i));
-    CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_conv3x3_sgemm_bn_, 2,
+    CL_CHECK(clEnqueueNDRangeKernel(queue_, k_conv3x3_sgemm_bn_, 2,
                                     nullptr, gs2, ls2, 0, nullptr, nullptr));
 }
 
@@ -685,7 +691,7 @@ void OpenCLComputeHandle::run_conv1x1_bn_relu_reshape(cl_mem input_buf, cl_mem o
 
     size_t gs[2] = { round_up((size_t)N,  16),
                      round_up((size_t)HW, 16) };
-    CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_conv1x1_bn_relu_reshape_, 2,
+    CL_CHECK(clEnqueueNDRangeKernel(queue_, k_conv1x1_bn_relu_reshape_, 2,
                                     nullptr, gs, nullptr, 0, nullptr, nullptr));
 }
 
@@ -706,7 +712,7 @@ void OpenCLComputeHandle::run_fc_bias_relu(cl_mem input_buf, cl_mem output_buf,
 
     size_t gs[2] = { round_up((size_t)M, 16),
                      round_up((size_t)N, 16) };
-    CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_relu_, 2,
+    CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_relu_, 2,
                                     nullptr, gs, nullptr, 0, nullptr, nullptr));
 }
 
@@ -733,7 +739,7 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
     for (auto& s : states)
         flat_input.insert(flat_input.end(), s.begin(), s.end());
 
-    CL_CHECK(clEnqueueWriteBuffer(dev_.queue, buf_flat_in_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueWriteBuffer(queue_, buf_flat_in_, CL_FALSE, 0,
         input_floats * sizeof(float), flat_input.data(),
         0, nullptr, nullptr));
 
@@ -747,7 +753,7 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
         CL_CHECK(clSetKernelArg(k_transpose_nchw_, 2, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_transpose_nchw_, 3, sizeof(int), &C));
         CL_CHECK(clSetKernelArg(k_transpose_nchw_, 4, sizeof(int), &HW));
-        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_transpose_nchw_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_transpose_nchw_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
@@ -784,7 +790,7 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 4, sizeof(int), &M));
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 5, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_fc_bias_softmax_, 6, sizeof(int), &K));
-        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_softmax_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_softmax_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
@@ -804,7 +810,7 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 3, sizeof(cl_mem), &value_fc2_gpu_.bias));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 4, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 5, sizeof(int), &K));
-        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_tanh_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_tanh_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
@@ -822,24 +828,24 @@ OpenCLComputeHandle::predict_batch(const std::vector<std::vector<float>>& states
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 3, sizeof(cl_mem), &score_fc2_gpu_.bias));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 4, sizeof(int), &N));
         CL_CHECK(clSetKernelArg(k_fc_bias_tanh_, 5, sizeof(int), &K));
-        CL_CHECK(clEnqueueNDRangeKernel(dev_.queue, k_fc_bias_tanh_, 1,
+        CL_CHECK(clEnqueueNDRangeKernel(queue_, k_fc_bias_tanh_, 1,
                                         nullptr, &gs, nullptr, 0, nullptr, nullptr));
     }
 
     // ── Read back results ────────────────────────────────────────
     std::vector<float> pol_flat((size_t)action_size * N);
-    CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_pol_feat_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueReadBuffer(queue_, buf_pol_feat_, CL_FALSE, 0,
         pol_flat.size() * sizeof(float), pol_flat.data(), 0, nullptr, nullptr));
 
     std::vector<float> val_flat((size_t)N);
-    CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_val_out_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueReadBuffer(queue_, buf_val_out_, CL_FALSE, 0,
         val_flat.size() * sizeof(float), val_flat.data(), 0, nullptr, nullptr));
 
     std::vector<float> scr_flat((size_t)N);
-    CL_CHECK(clEnqueueReadBuffer(dev_.queue, buf_scr_out_, CL_FALSE, 0,
+    CL_CHECK(clEnqueueReadBuffer(queue_, buf_scr_out_, CL_FALSE, 0,
         scr_flat.size() * sizeof(float), scr_flat.data(), 0, nullptr, nullptr));
 
-    CL_CHECK(clFinish(dev_.queue));
+    CL_CHECK(clFinish(queue_));
 
     // ── Pack results ─────────────────────────────────────────────
     std::vector<OpenCLComputeHandle::Result> results(N);

@@ -61,10 +61,10 @@ int main(int argc, char* argv[]) {
                       << "  --threads N             Self-play worker threads (default: 1)\n"
                       << "  --search-threads N      MCTS search threads per move (default: 16)\n"
                       << "  --max-batch N           Max GPU batch size (default: 256)\n"
-                      << "  --komi F                Komi value (default: 6.5)\n"
+                      << "  --komi F                Komi value (default: 7.5)\n"
                       << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                       << "  --score-weight F        Score utility weight (default: 0.0)\n"
-                      << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
+                      << "  --score-scale F         Score atan compression scale (default: 18.0)\n"
                       << "  --nn-server-threads N   NN server threads (default: 1)\n"
                       << "  --nn-device-ids IDS     Comma-separated device indices (default: \"0\")\n";
             return 0;
@@ -105,7 +105,18 @@ int main(int argc, char* argv[]) {
         std::cout << "No model loaded — NN/MCTS benchmarks will be skipped.\n";
     }
 
-    if (board_override > 0) config.board_size = board_override;
+    // --board only applies when no model is loaded (game-engine bench).
+    // A loaded model fixes the board size; overriding it would feed
+    // wrong-sized planes to the network (same rule as main_play).
+    if (board_override > 0) {
+        if (has_model && board_override != config.board_size) {
+            std::cerr << "WARNING: --board " << board_override
+                      << " ignored — model is " << config.board_size
+                      << "x" << config.board_size << "\n";
+        } else if (!has_model) {
+            config.board_size = board_override;
+        }
+    }
     config.max_moves_per_game = config.board_size * config.board_size * 2;
 
     std::cout << "MiniGo C++ Benchmark\n"
@@ -154,7 +165,9 @@ int main(int argc, char* argv[]) {
 
     // Create a single-server evaluator for tests 2-4 (direct inference)
     auto eval_single = std::make_shared<NNEvaluator>(
-        model, context, std::vector<int>{device_ids[0]}, config.max_batch_size);
+        model, context, std::vector<int>{device_ids[0]}, config.max_batch_size,
+        128);  // section 3 pushes direct evaluate() batches up to 128
+    eval_single->wait_ready();   // throws if the server thread failed
 
     // ── 2. Single-thread NN inference ────────────────────────────
     {
@@ -244,7 +257,9 @@ int main(int argc, char* argv[]) {
         config.num_search_threads = search_threads;
 
         auto nn_evaluator = std::make_shared<NNEvaluator>(
-            model, context, device_ids, config.max_batch_size);
+            model, context, device_ids, config.max_batch_size,
+            num_threads * std::max(1, search_threads));
+        nn_evaluator->wait_ready();
 
         std::atomic<int> games_done{0};
         std::atomic<int> total_records{0};

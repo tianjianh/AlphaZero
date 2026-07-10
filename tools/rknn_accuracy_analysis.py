@@ -36,7 +36,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 
 def _find_analysis_table(output_dir: str) -> Optional[Path]:

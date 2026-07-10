@@ -31,10 +31,17 @@ public:
     // context: shared device contexts (created once on main thread)
     // gpu_ids: one GPU index per server thread (length = number of server threads)
     // max_batch_size: cap on batch size per predict_batch call
+    // max_client_threads: upper bound on threads that submit requests
+    //     concurrently (each search thread has at most ONE request in
+    //     flight — it pushes, then blocks on its NNResultBuf).  Sizes
+    //     the fixed request ring so pushes never block in normal
+    //     operation.  0 = fall back to the max_batch × 4 × servers
+    //     heuristic only (fine for small callers).
     NNEvaluator(std::shared_ptr<LoadedModel> model,
                 std::shared_ptr<ComputeContext> context,
                 const std::vector<int>& gpu_ids,
-                int max_batch_size);
+                int max_batch_size,
+                int max_client_threads = 0);
     ~NNEvaluator() override;
 
     // Batch interface
@@ -53,6 +60,9 @@ public:
     // Block until all server threads have created their ComputeHandles.
     // Call this after construction to ensure GPU resources are fully
     // initialized before starting another NNEvaluator on the same GPUs.
+    // Throws if EVERY server thread failed handle creation — without
+    // this, all subsequent evaluate calls would block forever on a
+    // queue no server drains.
     void wait_ready();
 
 private:
@@ -72,8 +82,9 @@ private:
     // Ready synchronization — server threads signal when handle is created
     std::mutex                    ready_mutex_;
     std::condition_variable       ready_cv_;
-    int                           handles_ready_ = 0;
-    int                           num_threads_   = 0;
+    int                           handles_ready_  = 0;
+    int                           handles_failed_ = 0;
+    int                           num_threads_    = 0;
 };
 
 }  // namespace minigo

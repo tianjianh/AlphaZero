@@ -4,7 +4,8 @@
 #include "game.h"
 #include "batch_evaluator.h"
 #include <atomic>
-#include <cstring>
+#include <cmath>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -15,13 +16,31 @@ namespace minigo {
 // ================================================================
 // MCTSNode — thread-safe for multi-threaded search
 //
-// visit_count, virtual_loss_count: std::atomic<int>
-// total_value: atomic float via int32_t CAS (portable C++17)
-// is_expanded: three-state (UNEVALUATED → EXPANDING → EXPANDED)
-//   ensures only one thread calls expand(), others backprop and retry.
+// Concurrency primitives are deliberately restricted to single-AMO
+// atomics (fetch_add / fetch_or) and plain load/store — NO
+// compare_exchange anywhere on the search path.  Rationale: CAS
+// requires LR/SC (Zalrsc) or AMOCAS (Zacas); on RISC-V profiles that
+// ship only Zaamo, every compare_exchange lowers to a libatomic
+// call (a hidden shared lock) — ruinous once per node per playout.
+// fetch_add / fetch_or map to amoadd / amoor on Zaamo, LOCK XADD /
+// LOCK OR on x86, and ldadd / ldset on ARMv8.1 — cheap everywhere.
+//
+// visit_count, virtual_loss_count: atomic<int>, fetch_add/sub only
+// total_value: fixed-point atomic<int64_t>, fetch_add only
+// state: three-state lifecycle, claimed via fetch_or (see NodeState)
 // ================================================================
 
-enum NodeState : int { NODE_UNEVALUATED = 0, NODE_EXPANDING = 1, NODE_EXPANDED = 2 };
+// Node lifecycle encoding.  Bit 0 is the "claimed" bit, set in BOTH
+// EXPANDING and EXPANDED.  This lets the one-time UNEVALUATED →
+// EXPANDING claim be a single fetch_or(NODE_EXPANDING) instead of a
+// compare_exchange: the returned previous value distinguishes all
+// three cases, and OR-ing bit 0 into an already-EXPANDED node (3|1=3)
+// changes nothing, so a lost race does no damage.
+enum NodeState : int {
+    NODE_UNEVALUATED = 0,
+    NODE_EXPANDING   = 1,   // claimed bit
+    NODE_EXPANDED    = 3,   // claimed bit | published bit
+};
 
 struct MCTSNode {
     MCTSNode* parent = nullptr;
@@ -40,55 +59,38 @@ struct MCTSNode {
     // Flat vector indexed by action (set during expand)
     std::vector<std::unique_ptr<MCTSNode>> children;
 
-    // ── Atomic float total_value via int32 CAS ───────────────────
-    std::atomic<int32_t> value_bits_{0};
+    // ── Atomic value accumulator: fixed-point int64, fetch_add ──
+    // Replaces the old float-bits compare_exchange_weak retry loop.
+    // Single amoadd.d per backprop step, and integer addition is
+    // associative, so the accumulated total is exact and identical
+    // regardless of thread interleaving (the float CAS-add was
+    // run-order-dependent).
+    //
+    // Scale 2^20: quantization 1e-6 per sample, far below NN noise.
+    // Headroom: |utility| ≤ ~4 in practice (win/loss ± weight plus
+    // compressed score term); even at |v| = 64 a node absorbs 2^37
+    // visits before int64 overflow — beyond any conceivable search.
+    static constexpr float VALUE_FP_SCALE = 1048576.0f;   // 2^20
+    std::atomic<int64_t> value_fp_{0};
+    static_assert(std::atomic<int64_t>::is_always_lock_free,
+                  "64-bit AMO required (RV64 amoadd.d / x86-64 LOCK XADD); "
+                  "a mutex-backed fallback would poison the search hot path");
 
     void add_value(float v) {
-        int32_t old_bits = value_bits_.load(std::memory_order_relaxed);
-        int32_t new_bits;
-        float old_f, new_f;
-        do {
-            std::memcpy(&old_f, &old_bits, sizeof(float));
-            new_f = old_f + v;
-            std::memcpy(&new_bits, &new_f, sizeof(float));
-        } while (!value_bits_.compare_exchange_weak(old_bits, new_bits,
-                 std::memory_order_relaxed));
+        value_fp_.fetch_add((int64_t)llroundf(v * VALUE_FP_SCALE),
+                            std::memory_order_relaxed);
     }
 
     float total_value() const {
-        int32_t bits = value_bits_.load(std::memory_order_relaxed);
-        float f;
-        std::memcpy(&f, &bits, sizeof(float));
-        return f;
+        return (float)value_fp_.load(std::memory_order_relaxed)
+               * (1.0f / VALUE_FP_SCALE);
     }
 
-    // ── Derived values ───────────────────────────────────────────
-    // Q from PARENT's perspective (for UCB selection).
-    // Backprop stores total_value from this node's (child's) perspective,
-    // so we negate.  Virtual loss: each pending thread counts as a loss
-    // for the parent (−1), i.e. +1 from child's perspective, hence +vlc.
-    float q_value() const {
-        int vc  = visit_count.load(std::memory_order_relaxed);
-        int vlc = virtual_loss_count.load(std::memory_order_relaxed);
-        int total = vc + vlc;
-        if (total == 0) return 0.0f;
-        return -(total_value() + (float)vlc) / (float)total;
-    }
-
-    float ucb_score(float c_puct) const {
-        int parent_total = parent->visit_count.load(std::memory_order_relaxed)
-                         + parent->virtual_loss_count.load(std::memory_order_relaxed);
-        int self_total   = visit_count.load(std::memory_order_relaxed)
-                         + virtual_loss_count.load(std::memory_order_relaxed);
-        float u = c_puct * prior * std::sqrt((float)parent_total)
-                  / (1.0f + self_total);
-        return q_value() + u;
-    }
-
-    bool is_leaf() const {
-        return state.load(std::memory_order_acquire) != NODE_EXPANDED;
-    }
-
+    // UCB selection lives in select_child() (mcts.cpp), which computes
+    // Q from the PARENT's perspective: backprop stores total_value from
+    // this node's (child's) perspective, so it negates.  Virtual loss:
+    // each pending thread counts as a loss for the parent (−1), i.e.
+    // +1 from the child's perspective, hence the +vlc term there.
     MCTSNode* select_child(float c_puct);
 };
 
@@ -162,7 +164,6 @@ private:
     // search() is rebuilding the root at the start of a new search.
     mutable std::mutex        tree_mutex_;
     std::unique_ptr<MCTSNode> root_;
-    int   action_size_      = 0;
     bool  root_noise_added_ = false;  // set by search() when Dirichlet noise
                                       // is injected; reset by make_move() and
                                       // when a fresh root is built
@@ -193,10 +194,6 @@ private:
 
     // Revert vloss ONLY (for abandoned/collision playouts — KataGo pattern)
     void revert_virtual_losses(const std::vector<MCTSNode*>& path);
-
-    // ── Single-threaded search (fallback for DirectEvaluator) ────
-    void search_single_threaded(MCTSNode* root, const GoGame& game,
-                                int action_size, int num_simulations);
 };
 
 // ================================================================

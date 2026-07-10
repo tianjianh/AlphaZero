@@ -47,8 +47,6 @@ The output directory contains one .npy per sample for each input tensor and a
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple

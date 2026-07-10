@@ -11,11 +11,10 @@
 namespace minigo {
 
 MCTSNode* MCTSNode::select_child(float c_puct) {
-    // Hoist the parent terms (visit_count + virtual_loss + sqrt) out of
-    // the per-child loop — they don't change while we iterate, and
-    // ucb_score() was re-reading them per child via 2 atomic loads + a
-    // sqrt.  For a 82-child root that's 164 atomic ops + 82 sqrts saved
-    // per descent step.  The math here mirrors ucb_score() exactly.
+    // PUCT selection.  Parent terms (visit_count + virtual_loss + sqrt)
+    // are hoisted out of the per-child loop — they don't change while we
+    // iterate; per-child that saves 2 atomic loads + a sqrt (×82 children
+    // at a 9x9 root, per descent step).
     int parent_total =
         visit_count.load(std::memory_order_relaxed) +
         virtual_loss_count.load(std::memory_order_relaxed);
@@ -215,8 +214,9 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
         // ── Expanded node with no selectable child ───────────────
         // select_child returned nullptr on an expanded node (all children
         // have NaN UCB scores).  Without this guard the thread retries
-        // forever: CAS fails (node is EXPANDED, not UNEVALUATED),
-        // sims_done never increments → livelock, 3000% CPU, 0% GPU.
+        // forever: the expansion claim always loses (node is EXPANDED,
+        // not UNEVALUATED), sims_done never increments → livelock,
+        // 3000% CPU, 0% GPU.
         if (node->state.load(std::memory_order_acquire) == NODE_EXPANDED) {
             backprop(path, 0.0f);
             sims_done.fetch_add(1, std::memory_order_relaxed);
@@ -234,10 +234,20 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
             continue;
         }
 
-        // ── CAS to claim expansion ──────────────────────────────
-        int expected = NODE_UNEVALUATED;
-        if (!node->state.compare_exchange_strong(expected, NODE_EXPANDING,
-                std::memory_order_acq_rel)) {
+        // ── Claim expansion (single AMO — see NodeState encoding) ──
+        // fetch_or of the claimed bit replaces the old
+        // compare_exchange_strong(UNEVALUATED → EXPANDING):
+        //   prev == UNEVALUATED  → we won; proceed to evaluate+expand.
+        //   prev == EXPANDING    → another thread is expanding: same
+        //                          collision path as before.
+        //   prev == EXPANDED     → raced past a completed expansion
+        //                          (3|1 == 3, so the OR left it
+        //                          untouched): also retry from root.
+        // (Bit-test form: lets x86 compile the returned-value fetch_or
+        // as LOCK BTS; RISC-V amoor returns the old word natively.)
+        int prev = node->state.fetch_or(NODE_EXPANDING,
+                                        std::memory_order_acq_rel);
+        if (prev & NODE_EXPANDING) {
             revert_virtual_losses(path);
             std::this_thread::yield();
             continue;
@@ -271,110 +281,6 @@ void MCTS::search_thread_loop(MCTSNode* root, const GoGame& game,
 }
 
 // ================================================================
-// Single-threaded VLP search (for DirectEvaluator / Eigen)
-//
-// Uses VLP batching: collect vloss_parallel leaves, batch evaluate,
-// expand, backprop.  Kept for the Eigen backend where there's no
-// server thread and batch submission is direct.
-// ================================================================
-
-void MCTS::search_single_threaded(MCTSNode* root, const GoGame& game,
-                                   int action_size, int num_simulations) {
-    int sims_done      = 0;
-    int vloss_parallel = config_.virtual_loss_parallel;
-
-    while (sims_done < num_simulations) {
-        int batch_count = std::min(vloss_parallel, num_simulations - sims_done);
-
-        struct PendingLeaf {
-            std::vector<MCTSNode*> path;
-            MCTSNode*              leaf;
-            std::vector<float>     state;
-            std::vector<float>     legal;
-        };
-
-        std::vector<PendingLeaf> pending;
-        pending.reserve(batch_count);
-
-        // Pre-allocate GoGame on heap — reused across batch
-        auto game_copy_ptr = std::make_unique<GoGame>(game.copy());
-
-        for (int i = 0; i < batch_count; i++) {
-            PendingLeaf leaf;
-
-            MCTSNode* node = root;
-            *game_copy_ptr = game.copy();
-            leaf.path.push_back(node);
-            node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
-
-            while (!node->children.empty()) {
-                node = node->select_child(config_.c_puct);
-                if (!node) break;
-                node->virtual_loss_count.fetch_add(1, std::memory_order_relaxed);
-                leaf.path.push_back(node);
-                int action = node->action;
-                if (action == action_size - 1)
-                    game_copy_ptr->play(PASS_MOVE);
-                else
-                    game_copy_ptr->play(action);
-            }
-
-            if (!node) {
-                for (auto* n : leaf.path)
-                    n->virtual_loss_count.fetch_sub(1, std::memory_order_relaxed);
-                continue;
-            }
-
-            leaf.leaf = node;
-
-            if (game_copy_ptr->game_over) {
-                float v;
-                if      (game_copy_ptr->winner == EMPTY)                            v =  0.0f;
-                else if (game_copy_ptr->winner == game_copy_ptr->current_player)    v =  1.0f;
-                else                                                                 v = -1.0f;
-                backprop(leaf.path, v);
-                sims_done++;
-                continue;
-            }
-
-            evaluator_->encode_state(*game_copy_ptr, leaf.state);
-            game_copy_ptr->get_legal_moves(leaf.legal);
-            pending.push_back(std::move(leaf));
-        }
-
-        if (pending.empty()) continue;
-
-        std::vector<std::vector<float>> states;
-        states.reserve(pending.size());
-        for (auto& p : pending)
-            states.push_back(std::move(p.state));
-
-        auto results = evaluator_->evaluate(states);
-
-        for (size_t i = 0; i < pending.size(); i++) {
-            auto& res = results[i];
-            auto& leaf = pending[i];
-
-            mask_policy(res.policy, leaf.legal, action_size);
-            if (leaf.leaf->children.empty())
-                expand(leaf.leaf, res.policy, leaf.legal);
-            leaf.leaf->nn_score    = res.score;
-            leaf.leaf->nn_score_sd = res.score_sd;
-            leaf.leaf->state.store(NODE_EXPANDED, std::memory_order_release);
-
-            float utility = config_.win_loss_weight * res.value;
-            if (config_.score_weight != 0.0f) {
-                float score_utility = atanf(res.score / config_.score_scale) / (float)(M_PI / 2.0);
-                utility += config_.score_weight * score_utility;
-            }
-            if (!std::isfinite(utility)) utility = 0.0f;
-            backprop(leaf.path, utility);
-            sims_done++;
-        }
-    }
-}
-
-// ================================================================
 // search() — dispatch
 // ================================================================
 
@@ -390,8 +296,7 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
     // (selfplay, eval, benchmark) never call request_stop, so the
     // flag is default-false and stays false for them.
 
-    action_size_ = config_.action_size();
-    int action_size = action_size_;
+    int action_size = config_.action_size();
 
     // ── Decide whether to reuse the existing root ───────────────
     bool can_reuse = false;
@@ -411,8 +316,11 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
 
         std::vector<float> state_enc;
         evaluator_->encode_state(game, state_enc);
-        auto root_results = evaluator_->evaluate({ state_enc });
-        root_nn_output = std::move(root_results[0]);
+        // Single-state path (stack NNResultBuf, one queue push) — the
+        // batch evaluate() wrapper here was a leftover of the deleted
+        // VLP per-leaf search: it heap-allocated a buf and went through
+        // push_batch for one state.
+        root_nn_output = evaluator_->evaluate_single(state_enc);
 
         std::vector<float> legal;
         game.get_legal_moves(legal);
@@ -420,10 +328,6 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
         expand(new_root.get(), root_nn_output.policy, legal);
         new_root->nn_score    = root_nn_output.score;
         new_root->nn_score_sd = root_nn_output.score_sd;
-        // Snapshot ownership at the root so AnalysisInfo can show it.
-        // (MCTSNode itself doesn't carry ownership — only the root needs
-        // it for the analysis HUD.)
-        root_nn_ownership_    = root_nn_output.ownership;
         new_root->state.store(NODE_EXPANDED, std::memory_order_release);
         new_root->visit_count.store(1, std::memory_order_relaxed);
         float root_utility = config_.win_loss_weight * root_nn_output.value;
@@ -443,6 +347,12 @@ void MCTS::search(GoGame& game, std::vector<float>& visits,
             old_root = std::move(root_);
             root_ = std::move(new_root);
             root_noise_added_ = false;
+            // Snapshot ownership for AnalysisInfo INSIDE the lock:
+            // get_analysis() copies this vector under tree_mutex_ from
+            // the AsyncBot callback thread (live-analysis HUD), which
+            // can fire concurrently with this root rebuild.  Assigning
+            // it outside the lock was a data race on the vector.
+            root_nn_ownership_ = std::move(root_nn_output.ownership);
         }
         // Add Dirichlet noise at the root once per position.  After
         // make_move() the flag is cleared, so the next search that

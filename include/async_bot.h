@@ -5,7 +5,6 @@
 #include "mcts.h"
 #include "batch_evaluator.h"
 
-#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -122,16 +121,12 @@ public:
     MCTS::AnalysisInfo get_analysis(int max_moves = 5) const;
     bool is_searching() const;
 
-    // Direct access to the underlying MCTS (niche use).
-    MCTS* mcts() { return mcts_.get(); }
-
 private:
     enum class Mode { IDLE, GENMOVE, PONDER, SHUTDOWN };
 
     void worker_loop();
     void stop_locked(std::unique_lock<std::mutex>& lock);  // control_mutex_ must be held
 
-    BatchEvaluator* evaluator_;
     Config          config_;
 
     mutable std::mutex       game_mutex_;  // protects game_

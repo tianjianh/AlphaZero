@@ -6,6 +6,7 @@
 #include "nn_evaluator.h"
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -178,10 +179,10 @@ int main(int argc, char* argv[]) {
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
                 << "  --threshold FLOAT       Win rate to pass (default: 0.55)\n"
                 << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
-                << "  --komi F                Komi value (default: 6.5)\n"
+                << "  --komi F                Komi value (default: 7.5)\n"
                 << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"
-                << "  --score-scale F         Score atan compression scale (default: 10.0)\n"
+                << "  --score-scale F         Score atan compression scale (default: 18.0)\n"
                 << "  --output DIR            Save game records as SGF files\n"
                 << "  --nn-server-threads N   NN server threads per model (default: 1)\n"
                 << "  --nn-device-ids IDS     Comma-separated GPU indices (default: \"0\")\n";
@@ -247,11 +248,14 @@ int main(int argc, char* argv[]) {
     // same GPU from two different runtimes can race at the CUDA driver
     // level.  Wait for eval1's server threads to finish creating their
     // handles (engine loaded, buffers allocated) before starting eval2.
+    // Client-thread bound per evaluator: every game worker's search
+    // threads may hit the same model's evaluator simultaneously.
+    int max_clients = num_threads * std::max(1, search_threads);
     auto eval1 = std::make_shared<NNEvaluator>(
-        model1, ctx1, device_ids, max_batch_size);
+        model1, ctx1, device_ids, max_batch_size, max_clients);
     eval1->wait_ready();
     auto eval2 = std::make_shared<NNEvaluator>(
-        model2, ctx2, device_ids, max_batch_size);
+        model2, ctx2, device_ids, max_batch_size, max_clients);
     eval2->wait_ready();
 
     auto model_desc = [](const LoadedModel* m) -> std::string {
@@ -283,7 +287,7 @@ int main(int argc, char* argv[]) {
 
     // Create output dir for SGF if requested
     if (!output_dir.empty())
-        system(("mkdir -p " + output_dir).c_str());
+        std::filesystem::create_directories(output_dir);
 
     std::mutex print_mutex;
     std::atomic<int> games_done{0};

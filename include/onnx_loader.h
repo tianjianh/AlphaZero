@@ -5,7 +5,8 @@
 #include <cstdint>
 
 // Shared minimal ONNX protobuf parser (no external dependency).
-// Used by both EigenEngine and OpenCLEngine to load weights.
+// Used by loaded_model.cpp (model metadata + weights) and the Eigen
+// backend (direct weight access).
 
 namespace minigo {
 namespace onnx_parser {

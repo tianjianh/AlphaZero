@@ -276,25 +276,38 @@ void encode_for_katago(const GoGame& game,
     // ends the game when the previous move was also a pass.
     if (game.consecutive_passes >= 1) gl[14] = 1.0f;
 
-    // gl[15]: komi parity wave — triangular wave with period 2 in
-    // selfKomi units, peaking at 0.5 / -0.5 (draw-enabling komi).
+    // gl[15,16]: playoutDoublingAdvantage (unused → 0,0).
+    // gl[17]:    button rule (unused → 0).
+
+    // gl[18]: komi parity wave — triangular wave with period 2 in
+    // selfKomi units.  Port of upstream fillRowV7 (nninputs.cpp:2681-
+    // 2713): the komi floor is anchored on the parity of komi values
+    // that can produce draws, which is the parity of the BOARD AREA
+    // (drawableKomisAreEven = (xSize*ySize) % 2 == 0) — NOT the parity
+    // of floor(selfKomi).  On 9x9 (area 81, odd) with komi 6.5 the
+    // correct wave is +0.5 for black / -0.5 for white; anchoring on
+    // floor(selfKomi) parity produced the sign-flipped values.
     {
         float self_komi = (pla == WHITE) ? game.komi : -game.komi;
-        // Implement upstream's piecewise wave.
-        float floor_k = std::floor(self_komi);
-        float delta = self_komi - floor_k;     // in [0, 1)
-        // Upstream defines delta in [0, 2). Adjust by parity: if floor
-        // is odd, shift by 1.
-        if (((int)floor_k & 1) != 0) delta += 1.0f;
-        // delta now in [0, 2)
+        bool board_area_is_even = (HW % 2) == 0;
+        bool drawable_komis_are_even = board_area_is_even;
+
+        float komi_floor;
+        if (drawable_komis_are_even)
+            komi_floor = std::floor(self_komi / 2.0f) * 2.0f;
+        else
+            komi_floor = std::floor((self_komi - 1.0f) / 2.0f) * 2.0f + 1.0f;
+
+        float delta = self_komi - komi_floor;   // in [0, 2)
+        if (delta < 0.0f) delta = 0.0f;
+        if (delta > 2.0f) delta = 2.0f;
+
         float wave;
         if      (delta < 0.5f) wave = delta;
         else if (delta < 1.5f) wave = 1.0f - delta;
         else                   wave = delta - 2.0f;
-        gl[15] = wave;
+        gl[18] = wave;
     }
-
-    // gl[16,17,18]: unused in V7.
 }
 
 }  // namespace minigo

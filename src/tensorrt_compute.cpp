@@ -9,6 +9,8 @@
 
 #include <sys/stat.h>
 
+#include <filesystem>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -63,19 +65,26 @@ struct TRTDeviceState {
 
     // Serializes ALL engine-level host-side operations on the same
     // ICudaEngine: (1) lazy engine build on first create_handle(),
-    // (2) createExecutionContext(), (3) delete exec_ctx.  Per NVIDIA
-    // TRT 10 docs, ICudaEngine lifecycle + context creation/destruction
-    // are NOT thread-safe with respect to one another — even when each
-    // exec_ctx runs on its own per-thread CUDA stream.  The engine
-    // holds an internal list of live execution contexts; concurrent
-    // ~IExecutionContext corrupts that list and the damage only
-    // surfaces when ~ICudaEngine walks the list at process teardown,
-    // manifesting as "double free or corruption (out)" after
-    // "Done! N games".  Only observed with --nn-device-ids 0,0 or
-    // 0,0,1,1 (two+ server threads per GPU).  Matches KataGo's
-    // trtbackend.cpp pattern: one per-engine mutex for lifecycle,
-    // no mutex for inference (enqueueV3, setTensorAddress,
-    // setInputShape — each thread has its own exec_ctx and stream).
+    // (2) createExecutionContext(), (3) delete exec_ctx.
+    //
+    // Why: the TRT headers/guide give NO thread-safety guarantee for
+    // engine lifecycle operations (NvInferRuntime.h documents thread-
+    // safety requirements only for logger/allocator callbacks), and we
+    // empirically hit "double free or corruption (out)" at process
+    // teardown when ~NNEvaluator woke two same-GPU server threads that
+    // then destroyed their exec_ctxs concurrently (the engine tracks
+    // its live contexts internally; --nn-device-ids 0,0 / 0,0,1,1).
+    // Serializing lifecycle ops fixed it (commit 8465041) and costs
+    // nothing off the startup/shutdown path.
+    //
+    // Note upstream KataGo does NOT need this lock — its trtbackend
+    // builds a SEPARATE engine per server thread (weights duplicated
+    // per thread on GPU), so no ICudaEngine is ever shared.  We share
+    // one engine per device (one weight copy, per-thread exec contexts,
+    // which TRT explicitly supports for inference) and therefore pay
+    // one mutex on the rare lifecycle path instead.  Inference
+    // (enqueueV3, setTensorAddress, setInputShape) stays lock-free —
+    // each thread owns its exec_ctx and cudaStreamPerThread.
     std::mutex                              engine_mutex;
     nvinfer1::ICudaEngine*                  engine  = nullptr;
     nvinfer1::IRuntime*                     runtime = nullptr;
@@ -129,8 +138,8 @@ static std::string make_cache_path(const std::string& model_path,
 
     const char* env_cache = std::getenv("MINIGO_TRT_CACHE");
     std::string cache_dir = (env_cache && env_cache[0]) ? env_cache : "trt_cache";
-    // Quote to tolerate spaces; -p creates intermediate directories.
-    system(("mkdir -p '" + cache_dir + "'").c_str());
+    std::error_code ec;
+    std::filesystem::create_directories(cache_dir, ec);  // best-effort; load/store below reports real failures
 
     // Include precision so FP16/BF16/FP8 engines don't collide
     std::string prec_tag;
@@ -256,12 +265,25 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
     // Workspace for tactic selection and runtime scratch memory.
     // Freed after build; generous allocation lets TRT pick faster tactics.
     size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
+    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, free_mem / 2);
 
-    // Enable best available precision: FP8 > FP16 > FP32
+    // Enable best available precision: FP8 > BF16 > FP16 > FP32.
     // Detect from SM version (set in init_device) and TRT capability.
+    //
+    // TRT >= 11 removed weakly-typed networks: BuilderFlag::kFP16/kBF16/
+    // kFP8 and platformHasFastFp16() no longer exist, and precision is
+    // dictated by the tensor dtypes in the ONNX itself.  Our exporters
+    // emit FP32 graphs, so on TRT 11 the engine builds FP32 (TF32 for
+    // matmul/conv via the default kTF32 flag).  Reduced-precision on
+    // TRT 11 requires exporting FP16/BF16 ONNX — until then, prefer a
+    // TRT 10.x install (see README) for FP16/BF16 engines.
     std::string build_prec = "FP32";
+#if NV_TENSORRT_MAJOR >= 11
+    std::cout << "TensorRT " << NV_TENSORRT_MAJOR
+              << ": strongly-typed build — engine precision follows the "
+                 "ONNX dtypes (FP32 graph -> FP32/TF32 engine)\n";
+#else
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     if (dev.precision == "FP8") {
@@ -276,6 +298,7 @@ static nvinfer1::ICudaEngine* build_or_load_engine(
         build_prec = "FP16";
     }
 #pragma GCC diagnostic pop
+#endif
     std::cout << "TensorRT: building with " << build_prec << " precision\n";
 
     // Optimization profile for dynamic batch size [1, max_batch_size].
@@ -449,6 +472,19 @@ struct TensorRTComputeHandle::Impl {
     std::string score_sd_name;
     std::string ownership_name;
 
+    // Persistent host staging buffers, sized once for max_batch_size
+    // (KataGo pattern: NNServerBuf/InputBuffers allocated per server
+    // thread, reused for every batch — trtbackend.cpp InputBuffers).
+    // Without these, every predict_batch call heap-allocates ~3 MB of
+    // std::vectors on the hot path.
+    std::vector<float> h_input;          // MiniGo flat input / KataGo spatial
+    std::vector<float> h_input_global;   // KataGo global
+    std::vector<float> h_policy;
+    std::vector<float> h_value;
+    std::vector<float> h_score;
+    std::vector<float> h_score_sd;
+    std::vector<float> h_ownership;
+
     Impl(TRTDeviceState& d) : dev(d) {}
 
     ~Impl() {
@@ -581,6 +617,10 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     }
 
     impl_ = new Impl(dev);
+    // From here on, any throw must release Impl ourselves: the object
+    // isn't constructed yet, so ~TensorRTComputeHandle won't run.
+    // ~Impl frees whatever was allocated before the failure.
+    try {
     auto& I = *impl_;
 
     I.format                = model->format;
@@ -628,6 +668,19 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
     CUDA_CHECK(cudaMalloc(&I.d_score_sd,  (size_t)max_batch_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&I.d_ownership, (size_t)max_batch_size * HW * sizeof(float)));
 
+    // Host staging buffers — allocated once, reused every predict_batch.
+    if (I.format == ModelFormat::KataGo) {
+        I.h_input.resize((size_t)max_batch_size * I.input_channels * HW);
+        I.h_input_global.resize((size_t)max_batch_size * I.input_global_channels);
+    } else {
+        I.h_input.resize((size_t)max_batch_size * I.input_channels * HW);
+    }
+    I.h_policy.resize((size_t)max_batch_size * action_size);
+    I.h_value.resize((size_t)max_batch_size);
+    I.h_score.resize((size_t)max_batch_size);
+    I.h_score_sd.resize((size_t)max_batch_size);
+    I.h_ownership.resize((size_t)max_batch_size * HW);
+
     std::cout << "TensorRT handle ready (" << I.dev.precision << "): board=" << I.board_size;
     if (model->model_type == "vit")
         std::cout << " d_model=" << model->num_filters
@@ -638,6 +691,11 @@ TensorRTComputeHandle::TensorRTComputeHandle(TRTDeviceState& dev,
         std::cout << " filters=" << model->num_filters
                   << " blocks=" << model->num_res_blocks;
     std::cout << "\n";
+    } catch (...) {
+        delete impl_;
+        impl_ = nullptr;
+        throw;
+    }
 }
 
 TensorRTComputeHandle::~TensorRTComputeHandle() {
@@ -668,12 +726,15 @@ TensorRTComputeHandle::predict_batch(
     int HW = H * W;
     int action_size = HW + 1;
 
+    if (N > I.max_batch_size)
+        throw std::runtime_error(
+            "TensorRT: batch " + std::to_string(N) + " exceeds max_batch_size "
+            + std::to_string(I.max_batch_size));
+
     if (I.format == ModelFormat::KataGo) {
         // Encoder packs each state as: [22*H*W spatial floats][19 global floats].
         const int sp_per = I.input_channels * HW;
         const int gl_per = I.input_global_channels;
-        std::vector<float> flat_spatial((size_t)N * sp_per, 0.0f);
-        std::vector<float> flat_global ((size_t)N * gl_per, 0.0f);
         for (int n = 0; n < N; ++n) {
             const auto& s = states[n];
             if ((int)s.size() != sp_per + gl_per)
@@ -681,15 +742,15 @@ TensorRTComputeHandle::predict_batch(
                     "TensorRT KataGo: state size mismatch (" +
                     std::to_string(s.size()) + " vs expected " +
                     std::to_string(sp_per + gl_per) + ")");
-            std::memcpy(flat_spatial.data() + (size_t)n * sp_per,
+            std::memcpy(I.h_input.data() + (size_t)n * sp_per,
                         s.data(), sp_per * sizeof(float));
-            std::memcpy(flat_global.data() + (size_t)n * gl_per,
+            std::memcpy(I.h_input_global.data() + (size_t)n * gl_per,
                         s.data() + sp_per, gl_per * sizeof(float));
         }
-        CUDA_CHECK(cudaMemcpyAsync(I.d_input_spatial, flat_spatial.data(),
+        CUDA_CHECK(cudaMemcpyAsync(I.d_input_spatial, I.h_input.data(),
             (size_t)N * sp_per * sizeof(float),
             cudaMemcpyHostToDevice, cudaStreamPerThread));
-        CUDA_CHECK(cudaMemcpyAsync(I.d_input_global, flat_global.data(),
+        CUDA_CHECK(cudaMemcpyAsync(I.d_input_global, I.h_input_global.data(),
             (size_t)N * gl_per * sizeof(float),
             cudaMemcpyHostToDevice, cudaStreamPerThread));
 
@@ -705,14 +766,20 @@ TensorRTComputeHandle::predict_batch(
             throw std::runtime_error("TensorRT: setTensorAddress(state_global) failed");
     } else {
         // Flatten input states and upload (MiniGo single input)
-        size_t input_floats = (size_t)N * I.input_channels * HW;
-        std::vector<float> flat_input;
-        flat_input.reserve(input_floats);
-        for (auto& s : states)
-            flat_input.insert(flat_input.end(), s.begin(), s.end());
-
-        CUDA_CHECK(cudaMemcpyAsync(I.d_input, flat_input.data(),
-            input_floats * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        const int in_per = I.input_channels * HW;
+        for (int n = 0; n < N; ++n) {
+            const auto& s = states[n];
+            if ((int)s.size() != in_per)
+                throw std::runtime_error(
+                    "TensorRT: state size mismatch (" +
+                    std::to_string(s.size()) + " vs expected " +
+                    std::to_string(in_per) + ")");
+            std::memcpy(I.h_input.data() + (size_t)n * in_per,
+                        s.data(), in_per * sizeof(float));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(I.d_input, I.h_input.data(),
+            (size_t)N * in_per * sizeof(float),
+            cudaMemcpyHostToDevice, cudaStreamPerThread));
 
         nvinfer1::Dims4 input_dims(N, I.input_channels, H, W);
         if (!I.exec_ctx->setInputShape(I.input_name.c_str(), input_dims))
@@ -742,40 +809,36 @@ TensorRTComputeHandle::predict_batch(
     if (!I.exec_ctx->enqueueV3(cudaStreamPerThread))
         throw std::runtime_error("TensorRT: enqueueV3 failed");
 
-    // Read back results
-    std::vector<float> pol_flat((size_t)N * action_size);
-    std::vector<float> val_flat((size_t)N);
-    std::vector<float> scr_flat((size_t)N);
-    std::vector<float> scr_sd_flat((size_t)N);
-    std::vector<float> own_flat((size_t)N * HW);
-
-    CUDA_CHECK(cudaMemcpyAsync(pol_flat.data(), I.d_policy,
-        pol_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaMemcpyAsync(val_flat.data(), I.d_value,
-        val_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    // Read back results into the persistent staging buffers
+    CUDA_CHECK(cudaMemcpyAsync(I.h_policy.data(), I.d_policy,
+        (size_t)N * action_size * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaMemcpyAsync(I.h_value.data(), I.d_value,
+        (size_t)N * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
     if (!I.score_name.empty())
-        CUDA_CHECK(cudaMemcpyAsync(scr_flat.data(), I.d_score,
-            scr_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(I.h_score.data(), I.d_score,
+            (size_t)N * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     if (!I.score_sd_name.empty())
-        CUDA_CHECK(cudaMemcpyAsync(scr_sd_flat.data(), I.d_score_sd,
-            scr_sd_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(I.h_score_sd.data(), I.d_score_sd,
+            (size_t)N * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     if (!I.ownership_name.empty())
-        CUDA_CHECK(cudaMemcpyAsync(own_flat.data(), I.d_ownership,
-            own_flat.size() * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaMemcpyAsync(I.h_ownership.data(), I.d_ownership,
+            (size_t)N * HW * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread));
 
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
-    // Pack results — TRT outputs are row-major [N, action_size] and [N, 1]
+    // Pack results — TRT outputs are row-major [N, action_size] and [N, 1].
+    // Missing optional heads read zeros: the staging buffers are
+    // zero-initialised at allocation and never written for absent heads.
     std::vector<TensorRTComputeHandle::Result> results(N);
     for (int n = 0; n < N; n++) {
-        results[n].policy.assign(pol_flat.begin() + n * action_size,
-                                 pol_flat.begin() + (n + 1) * action_size);
-        results[n].value    = val_flat[n];
-        results[n].score    = scr_flat[n];
-        results[n].score_sd = scr_sd_flat[n];
-        results[n].ownership.assign(own_flat.begin() + n * HW,
-                                    own_flat.begin() + (n + 1) * HW);
+        results[n].policy.assign(I.h_policy.begin() + (size_t)n * action_size,
+                                 I.h_policy.begin() + (size_t)(n + 1) * action_size);
+        results[n].value    = I.h_value[n];
+        results[n].score    = I.h_score[n];
+        results[n].score_sd = I.h_score_sd[n];
+        results[n].ownership.assign(I.h_ownership.begin() + (size_t)n * HW,
+                                    I.h_ownership.begin() + (size_t)(n + 1) * HW);
     }
     return results;
 }

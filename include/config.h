@@ -7,7 +7,8 @@ namespace minigo {
 struct Config {
     // Board
     int board_size = 9;
-    float komi = 6.5f;
+    float komi = 7.5f;   // 9x9 area-scoring komi; matches GoGame's default
+                         // and the continuous pipeline's --komi 7.5
 
     // Neural network
     std::string model_type = "resnet";  // "resnet" or "vit"
@@ -44,7 +45,6 @@ struct Config {
     // Tuning: increase num_search_threads until GPU utilization plateaus.
     // KataGo recommends 8-32 per position for strong GPUs.
     int num_search_threads = 1;     // search threads per MCTS::search() call
-    int virtual_loss_parallel = 32; // VLP for single-threaded Eigen fallback
 
     // NN server batch inference (independent of search thread count)
     // Server takes min(queue_size, max_batch_size) — just a cap.

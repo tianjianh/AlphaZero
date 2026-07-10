@@ -51,9 +51,7 @@ public:
     bool is_ko_ban(int action) const;
 
     // Display
-    std::string display() const;
     std::string action_to_str(int action) const;
-    int str_to_action(const std::string& s) const;
 
     // State
     int board_size;

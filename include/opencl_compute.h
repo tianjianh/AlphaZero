@@ -16,18 +16,23 @@
 
 namespace minigo {
 
-// Per-unique-GPU device state (shared by all threads on that GPU)
+// Per-unique-GPU device state (shared by all threads on that GPU).
+// Deliberately holds NO cl_command_queue: an in-order command queue is
+// per-thread execution state (the OpenCL analogue of a CUDA stream), so
+// each ComputeHandle creates its own.  Sharing one queue across two
+// server threads on the same GPU would serialize their pipelines and
+// entangle their clFinish() completion (KataGo likewise gives every
+// ComputeHandle its own queue — cpp/neuralnet/openclbackend.cpp).
 struct OpenCLDeviceState {
     cl_platform_id  platform = nullptr;
     cl_device_id    device   = nullptr;
     cl_context      context  = nullptr;
-    cl_command_queue queue    = nullptr;
     cl_program      program  = nullptr;
 };
 
 class OpenCLComputeContext : public ComputeContext {
 public:
-    // Initialize one cl_context + cl_queue + compiled cl_program per unique GPU
+    // Initialize one cl_context + compiled cl_program per unique GPU
     explicit OpenCLComputeContext(const std::vector<int>& device_ids);
     ~OpenCLComputeContext();
 
@@ -53,6 +58,11 @@ public:
 
 private:
     OpenCLDeviceState& dev_;
+
+    // Per-handle command queue (per-thread execution state — see
+    // OpenCLDeviceState comment).  Created in the ctor on the owning
+    // server thread, released in the dtor.
+    cl_command_queue queue_ = nullptr;
 
     // ── Kernel handles ─────────────────────────────────────────
     cl_kernel k_transpose_nchw_          = nullptr;

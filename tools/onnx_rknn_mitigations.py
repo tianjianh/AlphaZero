@@ -50,11 +50,11 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import onnx
-from onnx import TensorProto, helper, numpy_helper
+from onnx import helper, numpy_helper
 
 
 # ────────────────────────────────────────────────────────────────────────

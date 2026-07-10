@@ -44,8 +44,7 @@ static int pick_action(const std::vector<float>& visits, float temperature) {
 // ================================================================
 
 AsyncBot::AsyncBot(BatchEvaluator* evaluator, const Config& config)
-    : evaluator_(evaluator),
-      config_(config),
+    : config_(config),
       game_(config.board_size, config.komi),
       mcts_(std::make_unique<MCTS>(evaluator, config)) {
     worker_thread_ = std::thread(&AsyncBot::worker_loop, this);
@@ -196,12 +195,12 @@ void AsyncBot::stop_locked(std::unique_lock<std::mutex>& lock) {
         pending_mode_ = Mode::IDLE;
     }
 
-    // Signal any running search to exit.  request_stop is safe to call
-    // even if no search is running (it just sets an atomic flag that
-    // the next search() will reset).
-    lock.unlock();
+    // Signal any running search to exit.  request_stop is a single
+    // relaxed atomic store — it takes no locks and cannot block, so
+    // there is no reason to drop control_mutex_ around it (an earlier
+    // revision unlocked/relocked here; that was leftover caution, and
+    // the gap it opened served no purpose).
     mcts_->request_stop();
-    lock.lock();
 
     // Wait for the worker's current iteration to finish and set IDLE.
     done_cv_.wait(lock, [this] {

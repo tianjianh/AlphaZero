@@ -731,6 +731,14 @@ VIP9000ComputeHandle::VIP9000ComputeHandle(VIP9000DeviceState& dev,
     // Skipping the optimisation: with N=1 or 2 server threads the
     // duplicate weight RAM is negligible vs. activation memory the
     // driver allocates on prepare anyway.
+    //
+    // The ENTIRE allocate/prepare/set sequence runs under lifecycle_mu:
+    // the VIPLite driver is not documented as thread-safe for context
+    // lifecycle operations, and two handles constructing concurrently
+    // (NNEvaluator spawns all server threads at once) would otherwise
+    // race create_buffer/prepare_network in the driver.  The destructor
+    // already serializes the mirror ops (destroy_buffer/destroy_network)
+    // under the same mutex.  Inference (vip_run_network) stays unlocked.
     {
         std::lock_guard<std::mutex> lk(dev.lifecycle_mu);
         VIP_CHECK(vip_create_network(dev.nbg_bytes.data(),
@@ -739,36 +747,35 @@ VIP9000ComputeHandle::VIP9000ComputeHandle(VIP9000DeviceState& dev,
                                      &I.net),
                   "vip_create_network(handle)");
         I.net_owned = true;
-    }
 
-    // Allocate input/output buffers using cached metadata.  These don't
-    // depend on prepare and can be created up-front.
-    I.input_buffers.assign(dev.n_inputs, nullptr);
-    for (uint32_t i = 0; i < dev.n_inputs; ++i) {
-        auto p = make_create_params(dev.in_meta[i]);
-        VIP_CHECK(vip_create_buffer(&p, sizeof(p), &I.input_buffers[i]),
-                  "vip_create_buffer(input)");
-    }
-    I.output_buffers.assign(dev.n_outputs, nullptr);
-    for (uint32_t i = 0; i < dev.n_outputs; ++i) {
-        auto p = make_create_params(dev.out_meta[i]);
-        VIP_CHECK(vip_create_buffer(&p, sizeof(p), &I.output_buffers[i]),
-                  "vip_create_buffer(output)");
-    }
+        // Allocate input/output buffers using cached metadata.
+        I.input_buffers.assign(dev.n_inputs, nullptr);
+        for (uint32_t i = 0; i < dev.n_inputs; ++i) {
+            auto p = make_create_params(dev.in_meta[i]);
+            VIP_CHECK(vip_create_buffer(&p, sizeof(p), &I.input_buffers[i]),
+                      "vip_create_buffer(input)");
+        }
+        I.output_buffers.assign(dev.n_outputs, nullptr);
+        for (uint32_t i = 0; i < dev.n_outputs; ++i) {
+            auto p = make_create_params(dev.out_meta[i]);
+            VIP_CHECK(vip_create_buffer(&p, sizeof(p), &I.output_buffers[i]),
+                      "vip_create_buffer(output)");
+        }
 
-    // VIPLite contract (matches vpm_run.c): vip_prepare_network must be
-    // called BEFORE vip_set_input / vip_set_output — prepare allocates
-    // the command buffer and internal memory pool that set_input then
-    // patches with buffer addresses.  Calling them in the wrong order
-    // returns nbglk_set_input "pls prepare network firstly" / status=-9.
-    VIP_CHECK(vip_prepare_network(I.net), "vip_prepare_network");
+        // VIPLite contract (matches vpm_run.c): vip_prepare_network must be
+        // called BEFORE vip_set_input / vip_set_output — prepare allocates
+        // the command buffer and internal memory pool that set_input then
+        // patches with buffer addresses.  Calling them in the wrong order
+        // returns nbglk_set_input "pls prepare network firstly" / status=-9.
+        VIP_CHECK(vip_prepare_network(I.net), "vip_prepare_network");
 
-    for (uint32_t i = 0; i < dev.n_inputs; ++i)
-        VIP_CHECK(vip_set_input(I.net, i, I.input_buffers[i]),
-                  "vip_set_input");
-    for (uint32_t i = 0; i < dev.n_outputs; ++i)
-        VIP_CHECK(vip_set_output(I.net, i, I.output_buffers[i]),
-                  "vip_set_output");
+        for (uint32_t i = 0; i < dev.n_inputs; ++i)
+            VIP_CHECK(vip_set_input(I.net, i, I.input_buffers[i]),
+                      "vip_set_input");
+        for (uint32_t i = 0; i < dev.n_outputs; ++i)
+            VIP_CHECK(vip_set_output(I.net, i, I.output_buffers[i]),
+                      "vip_set_output");
+    }
 
     std::cout << "VIP9000 handle ready: thread=" << thread_index
               << " model_bs=" << dev.model_batch << "\n";

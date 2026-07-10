@@ -16,9 +16,10 @@ namespace minigo {
 // requests.
 //
 // Role mirrors KataGo's ThreadSafeQueue<NNResultBuf*> inside its
-// NNEvaluator: encapsulate the mutex, condition variable, notification
-// rules, and shutdown semantics so NNEvaluator does not manipulate
-// those primitives directly.
+// NNEvaluator: encapsulate the mutex, the two condition variables
+// (not_empty_ for consumers, not_full_ for the rare blocked producer),
+// the notification rules, and shutdown semantics so NNEvaluator does
+// not manipulate those primitives directly.
 //
 // Layout:
 //   buf_: std::vector<NNResultBuf*> of power-of-two capacity
@@ -30,17 +31,27 @@ namespace minigo {
 // Drain is O(n) — n slot reads + index increment.  No memmove ever.
 //
 // Notification rule (KataGo pattern, see cpp/core/threadsafequeue.h):
-//   cv_.notify_all() only on the empty → non-empty transition.
+//   not_empty_.notify_all() only on the empty → non-empty transition;
+//   not_full_.notify_all() only when a drain frees space on a full ring.
 //
-// Capacity:
+// Capacity (FIXED — the ring never reallocates):
 //   - Construction takes any positive desired_capacity and rounds it
 //     up to the next power of two internally (so the bitwise-AND
-//     modulo is always valid).  Callers do not need to think about
-//     power-of-two sizing.
-//   - The ring is bounded.  Push throws std::runtime_error on full —
-//     with KataGo's max_batch × 4 × num_server_threads heuristic that
-//     should never happen in normal operation; hitting it means the
-//     assumed producer upper bound was wrong.
+//     modulo is always valid).
+//   - The occupancy bound is structural: every search thread owns ONE
+//     NNResultBuf, pushes it, and BLOCKS on its condvar until the
+//     server delivers the result — so a client thread never has a
+//     second request in flight.  NNEvaluator therefore sizes the ring
+//     to cover the declared client-thread count, and in normal
+//     operation a push always finds a free slot.
+//   - If a caller nevertheless exceeds capacity (e.g. a direct
+//     evaluate() with a batch larger than the ring), push BLOCKS until
+//     the servers drain space — the semantics of KataGo's bounded
+//     ThreadSafeQueue::waitPush (cpp/core/threadsafequeue.h).  This is
+//     pure backpressure: a full ring means the GPU is already
+//     saturated, and it can never deadlock while at least one server
+//     thread is draining (servers never wait on producers).  Close()
+//     also wakes blocked pushers so shutdown is never stuck.
 // ----------------------------------------------------------------
 class NNRequestQueue {
 public:
@@ -56,42 +67,56 @@ public:
     // Final capacity (rounded up to the next power of two at construction).
     size_t capacity() const { return buf_.size(); }
 
-    // Non-blocking push of a single item.  Notify_all on the empty→1
-    // transition only.  Throws on capacity overflow.
+    // Push a single item.  Non-blocking in normal operation (the ring
+    // is sized for the client-thread count); blocks on a full ring
+    // until a server drains space.  Notify_all on the empty→1 edge.
+    //
+    // Post-close: inserts if there is space (a server that hasn't yet
+    // observed closed && empty will still drain and deliver it), but
+    // NEVER inserts into a closed full ring — nothing is guaranteed to
+    // drain it, and writing anyway would overwrite an undelivered
+    // entry.  Either way the documented contract stands: stop
+    // submitting before close(), or results may never arrive.
     void push(NNResultBuf* buf) {
         bool was_empty;
         {
-            std::lock_guard<std::mutex> lock(mu_);
-            if (size_ == buf_.size())
-                throw std::runtime_error(
-                    "NNRequestQueue: capacity exceeded — raise "
-                    "max_batch_size * 4 * num_server_threads");
+            std::unique_lock<std::mutex> lock(mu_);
+            not_full_.wait(lock, [this] {
+                return size_ < buf_.size() || closed_;
+            });
+            if (size_ == buf_.size()) return;   // closed && full: drop
             was_empty = (size_ == 0);
             buf_[tail_] = buf;
             tail_ = (tail_ + 1) & mask_;
             ++size_;
         }
-        if (was_empty) cv_.notify_all();
+        if (was_empty) not_empty_.notify_all();
     }
 
-    // Non-blocking push of N items under a single lock acquisition.
-    // Notify_all on the empty → (≥1) edge only.  Throws on overflow.
+    // Push N items.  Inserts as much as fits under one lock
+    // acquisition, blocking for space as needed (so a batch larger
+    // than the whole ring still goes through in chunks while servers
+    // drain the earlier entries).  Notify_all on each empty→(≥1) edge.
+    // Post-close semantics per chunk are identical to push().
     void push_batch(const std::vector<NNResultBuf*>& bufs) {
-        if (bufs.empty()) return;
-        bool was_empty;
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            if (size_ + bufs.size() > buf_.size())
-                throw std::runtime_error(
-                    "NNRequestQueue: capacity exceeded on batch push");
-            was_empty = (size_ == 0);
-            for (NNResultBuf* b : bufs) {
-                buf_[tail_] = b;
-                tail_ = (tail_ + 1) & mask_;
+        size_t i = 0;
+        while (i < bufs.size()) {
+            bool was_empty;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                not_full_.wait(lock, [this] {
+                    return size_ < buf_.size() || closed_;
+                });
+                if (size_ == buf_.size()) return;   // closed && full: drop rest
+                was_empty = (size_ == 0);
+                while (i < bufs.size() && size_ < buf_.size()) {
+                    buf_[tail_] = bufs[i++];
+                    tail_ = (tail_ + 1) & mask_;
+                    ++size_;
+                }
             }
-            size_ += bufs.size();
+            if (was_empty) not_empty_.notify_all();
         }
-        if (was_empty) cv_.notify_all();
     }
 
     // Block until the queue is non-empty or is closed.  Drain up to
@@ -101,16 +126,22 @@ public:
     //   returns false — the queue is closed AND empty; the consumer
     //                   should exit its loop
     bool wait_drain_up_to(std::vector<NNResultBuf*>& out, size_t max_n) {
-        std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait(lock, [this] { return size_ != 0 || closed_; });
-        if (size_ == 0) return false;   // closed && empty
-        size_t n = std::min(max_n, size_);
-        out.reserve(out.size() + n);
-        for (size_t i = 0; i < n; ++i) {
-            out.push_back(buf_[head_]);
-            head_ = (head_ + 1) & mask_;
+        bool freed_space;
+        {
+            std::unique_lock<std::mutex> lock(mu_);
+            not_empty_.wait(lock, [this] { return size_ != 0 || closed_; });
+            if (size_ == 0) return false;   // closed && empty
+            bool was_full = (size_ == buf_.size());
+            size_t n = std::min(max_n, size_);
+            out.reserve(out.size() + n);
+            for (size_t i = 0; i < n; ++i) {
+                out.push_back(buf_[head_]);
+                head_ = (head_ + 1) & mask_;
+            }
+            size_ -= n;
+            freed_space = was_full;   // full → not-full edge only
         }
-        size_ -= n;
+        if (freed_space) not_full_.notify_all();
         return true;
     }
 
@@ -118,16 +149,19 @@ public:
     // closed state: consumers still drain any remaining items, then
     // see size_ == 0 && closed_ on the next wait and exit.
     //
-    // Post-close pushes still succeed if there is capacity, matching
-    // the old NNEvaluator behaviour of letting in-flight submissions
-    // finish.  Items pushed after every consumer has exited will never
-    // be drained — caller must stop submitting before close().
+    // A push racing with close() may still be served — servers exit
+    // only once the queue is closed AND empty — which is why push()
+    // still inserts post-close when there is space.  But an item
+    // pushed after every consumer has exited is never drained, so the
+    // contract remains: stop submitting before close().  (All binaries
+    // join their search threads before destroying the NNEvaluator.)
     void close() {
         {
             std::lock_guard<std::mutex> lock(mu_);
             closed_ = true;
         }
-        cv_.notify_all();
+        not_empty_.notify_all();
+        not_full_.notify_all();   // wake any pusher blocked on a full ring
     }
 
 private:
@@ -139,7 +173,8 @@ private:
     }
 
     std::mutex                   mu_;
-    std::condition_variable      cv_;
+    std::condition_variable      not_empty_;  // consumers wait here
+    std::condition_variable      not_full_;   // producers wait here (rare)
     std::vector<NNResultBuf*>    buf_;
     size_t                       mask_;      // capacity - 1
     size_t                       head_ = 0;

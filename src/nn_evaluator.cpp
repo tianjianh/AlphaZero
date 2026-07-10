@@ -17,15 +17,21 @@ void NNEvaluator::encode_state(const GoGame& game, std::vector<float>& out) cons
 NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
                          std::shared_ptr<ComputeContext> context,
                          const std::vector<int>& gpu_ids,
-                         int max_batch_size)
+                         int max_batch_size,
+                         int max_client_threads)
     : model_(std::move(model)),
       context_(std::move(context)),
       max_batch_size_(max_batch_size),
-      // Ring-buffer capacity is KataGo's max_batch × 4 × num_server_threads
-      // heuristic (nneval.cpp:156).  The queue rounds up to the next power
-      // of two internally so the ring can use bitwise-AND modulo.
-      queue_((size_t)std::max(1, max_batch_size) * 4 *
-             std::max<size_t>(1, gpu_ids.size())) {
+      // Fixed ring capacity.  The structural occupancy bound is the
+      // client-thread count (each search thread pushes ONE buf and
+      // blocks until it's served), so cover that when the caller
+      // declares it; KataGo's max_batch × 4 × num_server_threads
+      // heuristic (nneval.cpp:156) is kept as the floor.  The queue
+      // rounds up to a power of two internally, and pushes beyond
+      // capacity block (backpressure) instead of failing.
+      queue_(std::max((size_t)std::max(0, max_client_threads),
+                      (size_t)std::max(1, max_batch_size) * 4 *
+                      std::max<size_t>(1, gpu_ids.size()))) {
     int num_threads = (int)gpu_ids.size();
 
     std::cout << "NNEvaluator: " << num_threads << " server thread(s), devices=[";
@@ -45,6 +51,10 @@ NNEvaluator::NNEvaluator(std::shared_ptr<LoadedModel> model,
 void NNEvaluator::wait_ready() {
     std::unique_lock<std::mutex> lock(ready_mutex_);
     ready_cv_.wait(lock, [this] { return handles_ready_ >= num_threads_; });
+    if (handles_failed_ >= num_threads_)
+        throw std::runtime_error(
+            "NNEvaluator: every server thread failed to create its "
+            "ComputeHandle — no thread is draining the request queue");
 }
 
 NNEvaluator::~NNEvaluator() {
@@ -126,10 +136,12 @@ void NNEvaluator::server_loop(int thread_id, int gpu_id) {
     }
 
     // Signal that this thread's handle is ready (even on failure, so
-    // wait_ready() doesn't block forever).
+    // wait_ready() doesn't block forever — it throws instead when
+    // every thread failed).
     {
         std::lock_guard<std::mutex> lock(ready_mutex_);
         handles_ready_++;
+        if (!handle) handles_failed_++;
     }
     ready_cv_.notify_all();
 
