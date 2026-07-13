@@ -590,8 +590,9 @@ first-class citizen:
 - Stock kata1 *checkpoints* are not resumable by the trainer (their
   heads differ from our 7-head set); they run as-is or warm-init.
 
-See [docs/KATAGO_INFERENCE.md](docs/KATAGO_INFERENCE.md) for encoder fidelity notes (ladder planes
-and encore-only signals are zeroed) and [docs/FORMATS.md](docs/FORMATS.md) for the full
+See [docs/KATAGO_INFERENCE.md](docs/KATAGO_INFERENCE.md) for encoder fidelity notes (ladder
+planes are fully computed via a port of upstream's ladder search;
+encore-only signals are zeroed) and [docs/FORMATS.md](docs/FORMATS.md) for the full
 format-support matrix.
 
 | Tool | KataGo-format ONNX accepted? |
@@ -982,6 +983,16 @@ python scripts/make_test_vectors.py build/test_vectors
 
 Exit code 0 = within tolerance.  For the OpenCL backend, combine with
 `MINIGO_OPENCL_PRECISION=fp32|fp16|fp16-portable` to test each tier.
+
+Related: `tools/encoder_parity_test.py` proves the C++ and Python
+KataGo-V7 encoders (incl. the ladder solver) bit-identical — run it
+after touching `src/katago_inputs.cpp`, `src/game.cpp`, or
+`scripts/gamedata.py`:
+
+```bash
+make -C build encode_dump
+python3 tools/encoder_parity_test.py --records 'training/selfplay/g_*.bin.zst'
+```
 
 ## Troubleshooting
 

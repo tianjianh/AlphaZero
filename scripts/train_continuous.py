@@ -51,7 +51,7 @@ from model import create_model
 #  random dihedral transform happens per sample in sample_batch.
 # ═══════════════════════════════════════════════════════════
 
-from gamedata import parse_v3, peek_v3_moves, V3_HEADER_LEN, sample_positions
+from gamedata import parse_v3, peek_v3_moves, V3_HEADER_LEN, sample_positions, sample_job
 
 
 def _decompress_zst(blob):
@@ -384,15 +384,28 @@ class WindowRingBuffer:
         self._ingest_thread = None
         self._ingest_poll = self.INGEST_POLL_MIN_S
 
-        # Persistent thread pool for parallel zstd decompression.  zstd's
-        # C library releases the GIL during decompress; numpy parse holds
-        # it.  Empirically ~2× speedup at 4 workers, diminishing returns
-        # past 8.  Start small and let the user tune via the
-        # decompress_workers ctor arg.
-        from concurrent.futures import ThreadPoolExecutor
+        # Persistent worker pool for per-batch decompress+replay+encode.
+        #
+        #   minigo encoder: ThreadPoolExecutor — zstd's C decompressor
+        #   releases the GIL and the numpy encode is cheap (~45 µs/row).
+        #
+        #   katago encoder: ProcessPoolExecutor (spawn) — the V7 ladder
+        #   solver (gamedata planes 14-17) is pure Python (~3 ms per
+        #   position) and GIL-bound, so threads cannot parallelize it.
+        #   `spawn` keeps the workers CUDA-free (they import gamedata
+        #   only, never torch), avoiding forked-CUDA-context hazards.
         self._decompress_workers = max(1, int(decompress_workers))
-        self._pool = ThreadPoolExecutor(
-            max_workers=self._decompress_workers, thread_name_prefix="ring-dec")
+        if encoder == "katago":
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+            self._pool = ProcessPoolExecutor(
+                max_workers=self._decompress_workers,
+                mp_context=multiprocessing.get_context("spawn"))
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._decompress_workers,
+                thread_name_prefix="ring-dec")
 
     # ---- public API ------------------------------------------------
 
@@ -412,6 +425,10 @@ class WindowRingBuffer:
 
     def stop_ingest(self):
         self._stop.set()
+        # Shut the sampling pool down explicitly — ProcessPoolExecutor
+        # left to interpreter teardown prints a harmless-but-noisy
+        # weakref traceback on Python 3.12.
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def sample_batch(self, batch_size, device, timeout_s=30.0):
         """Block until ring has ≥ batch_size rows; sample game-granularly.
@@ -464,28 +481,21 @@ class WindowRingBuffer:
         # Phase 2: per unique game — decompress, parse, replay ONCE, and
         # encode cnt×spg sampled positions.  Seeds are drawn under the
         # ring RNG here (single-threaded) so workers don't share an RNG.
-        jobs = []
+        slots = []
+        blobs, wants, seeds = [], [], []
         for slot, (blob, cnt) in snapshot.items():
-            seed = int(self._rng.integers(0, 2**63 - 1))
-            jobs.append((slot, blob, cnt * spg, seed))
-
-        def _work(job):
-            slot, blob, want, seed = job
-            if blob is None:
-                return slot, None
-            try:
-                game = parse_v3(_decompress_zst(blob))
-                if game.n_moves == 0:
-                    return slot, None
-                rng = np.random.default_rng(seed)
-                idx = rng.integers(0, game.n_moves, size=want)
-                return slot, sample_positions(game, idx, self.encoder, rng)
-            except (ValueError, zstd.ZstdError):
-                return slot, None
+            slots.append(slot)
+            blobs.append(blob)
+            wants.append(cnt * spg)
+            seeds.append(int(self._rng.integers(0, 2**63 - 1)))
+        encoders = [self.encoder] * len(slots)
 
         parts = []
         failed_rows = 0
-        for slot, out in self._pool.map(_work, jobs):
+        # gamedata.sample_job is module-level so it pickles for the
+        # process pool (katago) and runs identically on the thread pool.
+        for slot, out in zip(slots, self._pool.map(sample_job, blobs, wants,
+                                                   seeds, encoders)):
             if out is None:
                 failed_rows += snapshot[slot][1] * spg
             else:

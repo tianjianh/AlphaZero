@@ -116,7 +116,8 @@ if(MINIGO_BACKEND STREQUAL "auto")
       set(MINIGO_BACKEND "eigen")
     endif()
   else()
-    # Linux: try TensorRT > CUDA > OpenCL
+    # Linux: try TensorRT > OpenCL > Eigen (CUDA backend is a
+    # stub for the current architectures — never auto-selected)
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
@@ -169,7 +170,7 @@ if(MINIGO_BACKEND STREQUAL "auto")
       endif()
       # No TensorRT (or SM too old): fall through to OpenCL.  The CUDA
       # backend's forward pass is still a stub that throws at handle
-      # creation (see TODO.md), so `auto` must NEVER select it — the
+      # creation (see docs/ROADMAP.md), so `auto` must NEVER select it — the
       # NVIDIA OpenCL ICD ships with the driver and the OpenCL backend
       # implements every model format.  Use -DMINIGO_BACKEND=cuda only
       # if you are developing that backend.
@@ -444,6 +445,8 @@ add_executable(benchmark src/main_benchmark.cpp)
 add_executable(evaluate  src/main_evaluate.cpp)
 add_executable(verify    src/main_verify.cpp)
 target_link_libraries(verify PRIVATE minigo_core)
+add_executable(encode_dump src/main_encode_dump.cpp)
+target_link_libraries(encode_dump PRIVATE minigo_core)
 if(HAS_VIP9000)
   add_executable(vip9000_smoke    src/main_vip9000_smoke.cpp)
   add_executable(vip9000_accuracy src/main_vip9000_accuracy.cpp)

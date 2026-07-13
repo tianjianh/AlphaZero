@@ -50,6 +50,21 @@ public:
     // Used by the KataGo V7 encoder for plane 6.
     bool is_ko_ban(int action) const;
 
+    // Board snapshot `steps_back` plies ago (0 = current), clamped to the
+    // oldest retained snapshot (like KataGo's getRecentBoard).  Returned
+    // pointer is into the history ring: tightly packed r*board_size + c.
+    // Used by the KataGo V7 encoder's ladder planes 15/16.
+    const int8_t* recent_board(int steps_back) const;
+
+    // Simple-ko point of the position `steps_back` plies ago (0 =
+    // current), as a flat board index, or -1 if none.  Clamped like
+    // recent_board.  Tracked with the single-capture rule (captured
+    // exactly one stone; capturing stone is a lone stone whose only
+    // liberty is the captured square) — equivalent to is_ko_ban's
+    // board-replay test for legal positions, and mirrored by
+    // scripts/gamedata.py's Replay.ko_point.
+    int recent_ko_point(int steps_back) const;
+
     // Display
     std::string action_to_str(int action) const;
 
@@ -86,6 +101,14 @@ private:
     static constexpr int RECENT_ACTIONS_CAP = 5;
     std::array<int, RECENT_ACTIONS_CAP> recent_actions_;
     int recent_actions_count_ = 0;
+
+    // Simple-ko points for the current and recent positions (newest at
+    // index 0, -1 = none).  Only the KataGo V7 ladder features read
+    // history entries; index 0 also matches is_ko_ban's unique flagged
+    // point.  Capacity 3 covers planes 15/16 (boards 1-2 plies back).
+    static constexpr int RECENT_KO_CAP = 3;
+    std::array<int, RECENT_KO_CAP> recent_ko_;
+    int recent_ko_count_ = 0;
 
     struct Pos { int r, c; };
     // Stack-based group helpers — out_group is a caller-supplied buffer

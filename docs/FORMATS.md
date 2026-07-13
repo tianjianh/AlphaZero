@@ -98,10 +98,14 @@ Both encodings exist twice, and the pairs must stay byte-identical:
 | MiniGo 17-plane (8×2 history + color) | `game.cpp encode()` | `gamedata.encode_minigo` |
 | KataGo V7 (22 spatial + 19 global) | `src/katago_inputs.cpp` | `gamedata.encode_katago` |
 
-Shared V7 fidelity caveats (both sides): ladder planes 14-17, encore/
-button/PDA features and non-default rules bits are zero; ko plane uses
-simple ko.  The komi parity wave sits at `gl[18]` with board-area
-parity anchoring (upstream `fillRowV7`).
+Shared V7 fidelity caveats (both sides): encore/button/PDA features
+and non-default rules bits are zero; ko plane uses simple ko.  Ladder
+planes 14-17 ARE computed — both sides carry a faithful port of
+upstream's bounded ladder search, proven bit-identical across C++ and
+Python by `tools/encoder_parity_test.py` (synthetic ladder scenarios +
+real selfplay records; run it after touching either encoder).  The
+komi parity wave sits at `gl[18]` with board-area parity anchoring
+(upstream `fillRowV7`).
 
 ## 5. Other formats
 

@@ -214,8 +214,9 @@ shapes for KataGo and MiniGo:
 | Ownership | `[N, 1, H, W]` raw → tanh in [-1, 1] | `[N, H*W]` = `(tanh(raw) + 1) / 2` in [0, 1] | `(tanh+1)/2` + flatten baked in |
 
 Drop / approximation in the encoder direction (input):
-- **Ladder features** (spatial planes 14-17): zeroed — our encoder
-  doesn't run a ladder simulator.
+- **Ladder features** (spatial planes 14-17): computed — faithful port
+  of upstream's bounded ladder search (both C++ and Python encoders;
+  bit-identical, see `tools/encoder_parity_test.py`).
 - **Encore-only planes** (7, 20-21): zeroed — encore is unsupported.
 - **Pass-would-end-phase** (global 14): approximated from
   `consecutive_passes >= 1`. Upstream's logic is more nuanced under
@@ -254,8 +255,10 @@ the rest are intentional simplifications.
 
 What this gap means in practice:
 - A 800-sim run of kata1 in this engine will play **slightly weaker**
-  than kata1 in upstream `katago` at 800 sims. Most of the gap is
-  ladder-feature absence + dynamic score utility being approximate.
+  than kata1 in upstream `katago` at 800 sims. With ladder features
+  now implemented, the remaining gap is the approximate dynamic score
+  utility (point estimate on scoreMean instead of integrating over the
+  score distribution).
 - The output of the network itself (policy, value, score) is
   numerically identical to upstream's at the same input encoding —
   parity test confirms `max_abs_diff ~3e-5` between PyTorch and
@@ -274,12 +277,13 @@ These are the deliberate simplifications relative to upstream KataGo's
 runtime. Each one is a known strength leak; document and live with it,
 or port the upstream piece if it bites.
 
-- **Ladder features (planes 14-17) are zeroed.** A faithful port
-  requires a recursive ladder simulator with depth limit. Skipping
-  this costs measurable strength on ladder-heavy positions but the
-  network still gets stones, liberties, history, area, and globals.
-  Plan: port `searchIsLadderCapturedAttackerFirst` from upstream
-  `cpp/board/boardLogic.cpp`.
+- ~~Ladder features (planes 14-17) are zeroed~~ **DONE**: both
+  encoders now run a faithful port of upstream's bounded ladder search
+  (`searchIsLadderCaptured` / `...AttackerFirst2Libs` + `iterLadders`,
+  25k-node budget, double-ko-death rule, prev-board features 15/16
+  with historical ko points).  C++ ≈ 50-215 µs/position; the pure-
+  Python mirror (~3 ms/position) is parallelized with a spawn-based
+  process pool in the trainer's ring for `--arch katago`.
 - **Encore-only spatial planes (7, 20-21) are zeroed.** Plane 7 is
   ko-recap-blocked (encore phase only); planes 20-21 are
   second-encore start-stone colors. No encore support means these

@@ -35,6 +35,15 @@ performance feature, not a correctness gap.
   softmax chain (~50% of ViT time); a warp-cooperative (i,j)-parallel
   scheme needs cross-lane reductions.
 
+## KataGo-arch trainer sampling prefetch
+
+`--arch katago` batch sampling costs ~230 ms/batch (V7 ladder planes in
+pure Python, already parallelized across a 4-worker spawn process
+pool; the minigo path is unaffected at ~80 ms).  The step loop samples
+synchronously, so a one-batch prefetch (sample batch N+1 while N
+trains) would hide the cost entirely.  Alternative: Cythonize
+`gamedata`'s ladder module.
+
 ## FP8 training on Blackwell (te.Linear wgrad alignment)
 
 **Status**: blocked — needs verification on a Blackwell machine.

@@ -27,6 +27,8 @@ void GoGame::reset() {
     ring_size_ = 0;
     recent_actions_.fill(-2);
     recent_actions_count_ = 0;
+    recent_ko_.fill(-1);
+    recent_ko_count_ = 1;   // initial position: no ko
     update_history();
 }
 
@@ -34,6 +36,20 @@ int GoGame::recent_action(int steps_back) const {
     if (steps_back < 0 || steps_back >= RECENT_ACTIONS_CAP) return -2;
     if (steps_back >= recent_actions_count_) return -2;
     return recent_actions_[steps_back];
+}
+
+const int8_t* GoGame::recent_board(int steps_back) const {
+    if (steps_back < 0) steps_back = 0;
+    if (steps_back > ring_size_ - 1) steps_back = ring_size_ - 1;  // clamp to oldest
+    int idx = (ring_head_ + ring_size_ - 1 - steps_back) % RING_CAP;
+    return ring_buf_[idx].data();
+}
+
+int GoGame::recent_ko_point(int steps_back) const {
+    if (steps_back < 0) steps_back = 0;
+    if (recent_ko_count_ <= 0) return -1;
+    if (steps_back > recent_ko_count_ - 1) steps_back = recent_ko_count_ - 1;
+    return recent_ko_[steps_back];
 }
 
 bool GoGame::is_ko_ban(int action) const {
@@ -89,6 +105,8 @@ GoGame GoGame::copy() const {
     g.ring_size_ = ring_size_;
     g.recent_actions_       = recent_actions_;
     g.recent_actions_count_ = recent_actions_count_;
+    g.recent_ko_            = recent_ko_;
+    g.recent_ko_count_      = recent_ko_count_;
     return g;
 }
 
@@ -285,6 +303,38 @@ void GoGame::play(int action) {
         if (c > 0)     try_capture(r, c - 1);
         if (c < n - 1) try_capture(r, c + 1);
     }
+
+    // Simple-ko point for the NEW position (single-capture rule; mirrors
+    // scripts/gamedata.py Replay.play).  Derived by diffing prev_board:
+    // captured cells were the mover's opponent and are now empty.
+    int ko_point = -1;
+    if (action != PASS_MOVE) {
+        Stone opp2 = opponent(current_player);  // still the mover's opponent
+        int captured = -1, captured_count = 0;
+        for (int rr = 0; rr < n && captured_count <= 1; rr++)
+            for (int cc = 0; cc < n; cc++)
+                if (prev_board[rr][cc] == opp2 && board[rr][cc] == EMPTY) {
+                    captured = rr * n + cc;
+                    if (++captured_count > 1) break;
+                }
+        if (captured_count == 1) {
+            Pos grp[MAX_BOARD * MAX_BOARD]; int libs;
+            int gsize = get_group(action / n, action % n, grp, libs);
+            if (gsize == 1 && libs == 1) {
+                int lr = captured / n, lc = captured % n;
+                bool lone_lib_is_captured =
+                    (std::abs(lr - action / n) + std::abs(lc - action % n) == 1) &&
+                    board[lr][lc] == EMPTY;
+                // gsize==1 && libs==1: the lone liberty is the unique empty
+                // neighbor; it equals the captured square iff adjacent+empty.
+                if (lone_lib_is_captured) ko_point = captured;
+            }
+        }
+    }
+    for (int i = RECENT_KO_CAP - 1; i > 0; --i)
+        recent_ko_[i] = recent_ko_[i - 1];
+    recent_ko_[0] = ko_point;
+    if (recent_ko_count_ < RECENT_KO_CAP) ++recent_ko_count_;
 
     last_move = action;
     move_count++;
