@@ -160,6 +160,8 @@ def bootstrap_model(args):
         d.mkdir(parents=True, exist_ok=True)
 
     seed_path = accepted / "v000000000.onnx"
+    # --filters/--blocks size the resnet AND the katago arch (channels /
+    # blocks); the vit branch adds its own dims below.
     cmd = [
         sys.executable, str(SCRIPTS_DIR / "export_onnx.py"),
         "--init", "--output", str(seed_path),
@@ -347,7 +349,6 @@ def train_cmd(args, log_dir):
            "--lr-gamma", str(args.lr_gamma),
            "--weight-decay", str(args.weight_decay),
            "--replay-target", str(args.replay_target),
-           "--n-augmentations", str(args.n_augmentations),
            "--ring-games", str(args.ring_games),
            "--samples-per-game", str(args.samples_per_game),
            "--ring-decompress-workers", str(args.ring_decompress_workers),
@@ -833,7 +834,8 @@ def add_run_args(p):
     # (written by `init`); these CLI defaults only matter for conflict
     # detection.  Passing a value that contradicts run_config.json is a
     # hard error — change architecture via a fresh `init`, never here.
-    p.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
+    p.add_argument("--arch", default="resnet",
+                   choices=["resnet", "vit", "katago"])
     p.add_argument("--board", type=int, default=9)
     p.add_argument("--filters", type=int, default=128)
     p.add_argument("--blocks", type=int, default=10)
@@ -857,7 +859,6 @@ def add_run_args(p):
     # (-max-train-bucket-per-new-data).  Their synchronous_loop.sh uses 8
     # but that's small-machine experimentation, not their main runs.
     p.add_argument("--replay-target", type=float, default=4.0)
-    p.add_argument("--n-augmentations", type=int, default=8)
     # ring_games is host-RAM-bound: each rank holds ring_games × ~800 rows
     # × ~6 KB ≈ ~10 GB at 2000 games.  4-rank box with ~64 GB host RAM
     # caps at ~2000 per rank.  Raise to 4000+ if host has ≥128 GB.
@@ -975,7 +976,8 @@ def main():
     # produces a consistent arch.  Mismatch would silently train a default-
     # sized net while selfplay used the bootstrap of a different size — see
     # training_strategy.md "Issues overlooked: init/run arch divergence".
-    p_init.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
+    p_init.add_argument("--arch", default="resnet",
+                        choices=["resnet", "vit", "katago"])
     p_init.add_argument("--board", type=int, default=9)
     p_init.add_argument("--filters", type=int, default=128)
     p_init.add_argument("--blocks", type=int, default=10)

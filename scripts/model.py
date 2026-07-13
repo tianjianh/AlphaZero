@@ -150,6 +150,7 @@ class GPoolHead(nn.Module):
 
 
 class AlphaZeroNet(nn.Module):
+    input_kind = "single"   # MiniGo 17-plane tensor
     """KataGo-style ResNet: alternating SE and GPool residual blocks.
 
     Block 0 is SE, block 1 is GPool, and so on — with N blocks, ceil(N/2)
@@ -495,6 +496,172 @@ class GoViT(nn.Module):
         return probs, value, score
 
 
+# ══════════════════════════════════════════════════════════
+#  KataGoNet — trainable KataGo-V7 architecture
+#
+#  KataGo-style trunk (pre-activation residual blocks with global-
+#  pooling bias injection, dual input: 22 spatial planes + 19 global
+#  features) attached to the SAME 7-head set as AlphaZeroNet/GoViT,
+#  so all three architectures train under one loss and export the
+#  same 5-output inference contract.  The ONNX it exports is a
+#  "KataGo V7 format" model exactly like a converted kata1 net
+#  (inputs state_spatial [B,22,H,W] + state_global [B,19]).
+#
+#  Trunk fidelity notes (vs upstream b-series / tools/katago_arch.py):
+#  - stem: conv3x3(spatial) + linear(global) broadcast-added.
+#  - blocks alternate ordinary / gpool, pre-activation
+#    (BN→ReLU→conv), matching upstream block structure.
+#  - gpool stats use KataGo's (mean, mean·(√HW−14)·0.1, max) triple.
+#  Heads are OURS (not kata1's): stock kata1 checkpoints therefore
+#  can't be resumed directly — convert them for inference with
+#  tools/katago_to_onnx.py, or warm-init a fresh KataGoNet trunk.
+# ══════════════════════════════════════════════════════════
+
+def _kata_gpool_stats(x):
+    """KataGo gpool triple: [mean, mean·(√HW−14)·0.1, max] → [B, 3C]."""
+    hw = x.size(2) * x.size(3)
+    scale = (float(hw) ** 0.5 - 14.0) * 0.1
+    mean = x.mean(dim=[2, 3])
+    return torch.cat([mean, mean * scale, x.amax(dim=[2, 3])], dim=1)
+
+
+class KataGoPreActBlock(nn.Module):
+    """Pre-activation ordinary residual block (BN→ReLU→3x3, twice)."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+
+    def forward(self, x):
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        return x + out
+
+
+class KataGoGPoolBlock(nn.Module):
+    """Pre-activation residual block with a global-pooling side branch.
+
+    The side branch is globally pooled with KataGo's stats triple and
+    projected to per-channel biases added into the regular branch
+    before the second conv (upstream GlobalPoolingResidualBlock).
+    """
+
+    def __init__(self, channels, pool_channels=None):
+        super().__init__()
+        if pool_channels is None:
+            pool_channels = max(16, channels // 4)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv_regular = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.conv_gpool = nn.Conv2d(channels, pool_channels, 3, padding=1, bias=False)
+        self.gpool_bn = nn.BatchNorm2d(pool_channels)
+        self.gpool_to_bias = nn.Linear(3 * pool_channels, channels)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        # Zero-init the injection so the block starts as a plain residual.
+        nn.init.zeros_(self.gpool_to_bias.weight)
+        nn.init.zeros_(self.gpool_to_bias.bias)
+
+    def forward(self, x):
+        pre = F.relu(self.bn1(x))
+        regular = self.conv_regular(pre)
+        gp = F.relu(self.gpool_bn(self.conv_gpool(pre)))
+        bias = self.gpool_to_bias(_kata_gpool_stats(gp))
+        out = regular + bias.unsqueeze(-1).unsqueeze(-1)
+        out = self.conv2(F.relu(self.bn2(out)))
+        return x + out
+
+
+class KataGoNet(nn.Module):
+    """Trainable KataGo-V7 architecture with MiniGo's 7-head set.
+
+    forward(spatial [B,22,H,W], global [B,19]) — same 7-tuple contract
+    as AlphaZeroNet/GoViT, so train_continuous is architecture-uniform.
+    """
+
+    # Input contract (matches src/katago_inputs.cpp / scripts/gamedata.py)
+    SPATIAL_CHANNELS = 22
+    GLOBAL_CHANNELS = 19
+    input_kind = "dual"   # export/training dispatch (others default "single")
+
+    def __init__(self, board_size=9, channels=128, num_blocks=10, use_fp8=False):
+        super().__init__()
+        self.board_size = board_size
+        action_size = board_size * board_size + 1
+        hw = board_size * board_size
+
+        # Stem: conv(spatial) + linear(global) broadcast-added (upstream stem)
+        self.stem_conv = nn.Conv2d(self.SPATIAL_CHANNELS, channels, 3,
+                                   padding=1, bias=False)
+        self.stem_global = nn.Linear(self.GLOBAL_CHANNELS, channels)
+
+        self.blocks = nn.ModuleList(
+            KataGoGPoolBlock(channels) if i % 2 == 1 else KataGoPreActBlock(channels)
+            for i in range(num_blocks))
+        self.tip_bn = nn.BatchNorm2d(channels)
+
+        # ── Heads: identical structure to AlphaZeroNet ──
+        self.policy_conv = nn.Conv2d(channels, 2, 1, bias=False)
+        self.policy_bn = nn.BatchNorm2d(2)
+        self.policy_fc = _linear(2 * hw, action_size, use_fp8=use_fp8)
+
+        head_ch = 32
+        mlp_hidden = max(64, channels)
+        self.value_head = GPoolHead(channels, head_ch, mlp_hidden,
+                                    out_features=3, use_fp8=use_fp8)
+        self.score_mean_head = GPoolHead(channels, head_ch, mlp_hidden,
+                                         out_features=1, use_fp8=use_fp8)
+        self.score_stdev_head = GPoolHead(channels, head_ch, mlp_hidden,
+                                          out_features=1, use_fp8=use_fp8)
+        self.ownership_conv = nn.Conv2d(channels, 1, 1)
+        num_bins = hw * 2 + 1
+        self.score_belief_head = GPoolHead(channels, head_ch, mlp_hidden,
+                                           out_features=num_bins, use_fp8=use_fp8)
+        self.opp_policy_conv = nn.Conv2d(channels, 2, 1, bias=False)
+        self.opp_policy_bn = nn.BatchNorm2d(2)
+        self.opp_policy_fc = _linear(2 * hw, action_size, use_fp8=use_fp8)
+
+    def _trunk(self, spatial, global_features):
+        out = self.stem_conv(spatial) \
+            + self.stem_global(global_features).unsqueeze(-1).unsqueeze(-1)
+        for block in self.blocks:
+            out = block(out)
+        return F.relu(self.tip_bn(out))
+
+    def _policy(self, trunk):
+        p = F.relu(self.policy_bn(self.policy_conv(trunk)))
+        return self.policy_fc(p.view(p.size(0), -1))
+
+    def forward(self, spatial, global_features):
+        trunk = self._trunk(spatial, global_features)
+
+        policy = self._policy(trunk)
+        value = self.value_head(trunk)                          # [B, 3] logits
+        score_mean = self.score_mean_head(trunk)                # [B, 1]
+        score_stdev = F.softplus(self.score_stdev_head(trunk))  # [B, 1]
+        ownership = self.ownership_conv(trunk).view(spatial.size(0), -1)
+        score_belief = self.score_belief_head(trunk)            # [B, num_bins]
+
+        opp = F.relu(self.opp_policy_bn(self.opp_policy_conv(trunk)))
+        opp_policy = self.opp_policy_fc(opp.view(opp.size(0), -1))
+
+        return policy, value, score_mean, score_stdev, ownership, score_belief, opp_policy
+
+    def forward_inference(self, spatial, global_features):
+        trunk = self._trunk(spatial, global_features)
+
+        policy = self._policy(trunk)
+        value = self.value_head(trunk)
+        score_mean = self.score_mean_head(trunk)
+        score_stdev = F.softplus(self.score_stdev_head(trunk))
+        ownership = torch.sigmoid(
+            self.ownership_conv(trunk).view(spatial.size(0), -1))
+
+        return policy, value, score_mean, score_stdev, ownership
+
+
 def convert_te_to_nn(model):
     """Replace te.Linear with nn.Linear for ONNX export compatibility."""
     if _te is None:
@@ -517,8 +684,17 @@ def convert_te_to_nn(model):
             setattr(parent, parts[-1], replacement)
 
 
+ARCHITECTURES = ("resnet", "vit", "katago")
+
+
 def create_model(arch="resnet", board_size=9, input_channels=17, **kwargs):
-    """Factory: create model by architecture name."""
+    """Factory: create model by architecture name.
+
+    resnet / vit take the MiniGo 17-plane input (single tensor);
+    katago takes the KataGo-V7 dual input (22 spatial + 19 global) and
+    ignores input_channels.  Check `model.input_kind` ("single"/"dual")
+    to dispatch encoding and forward-call shape.
+    """
     use_fp8 = kwargs.get("use_fp8", False)
     if arch == "resnet":
         return AlphaZeroNet(
@@ -538,5 +714,13 @@ def create_model(arch="resnet", board_size=9, input_channels=17, **kwargs):
             head_dim=kwargs.get("head_dim", 32),
             use_fp8=use_fp8,
         )
+    elif arch == "katago":
+        return KataGoNet(
+            board_size=board_size,
+            channels=kwargs.get("num_filters", 128),
+            num_blocks=kwargs.get("num_res_blocks", 10),
+            use_fp8=use_fp8,
+        )
     else:
-        raise ValueError(f"Unknown architecture: {arch}")
+        raise ValueError(f"Unknown architecture: {arch} "
+                         f"(supported: {ARCHITECTURES})")

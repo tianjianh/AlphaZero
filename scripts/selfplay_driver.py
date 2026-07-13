@@ -124,18 +124,15 @@ def _compress_and_publish(bin_path, final_path, zstd_level=_ZSTD_LEVEL):
 
 
 def _count_rows(zst_path):
-    """Peek into a .bin.zst file and read the V2 header row count."""
-    import struct
+    """Peek into a .bin.zst file and read the V3 move count (= training
+    positions; augmentation happens at load time, not on disk)."""
+    from gamedata import peek_v3_moves, V3_HEADER_LEN
     try:
         dctx = zstd.ZstdDecompressor()
         with open(zst_path, "rb") as f:
-            reader = dctx.stream_reader(f)
-            hdr = reader.read(12)
-        if len(hdr) < 12:
-            return 0
-        magic, _, count = struct.unpack_from("<HHi", hdr, 0)
-        return count if magic == 0x4D47 else 0
-    except (OSError, struct.error, zstd.ZstdError):
+            hdr = dctx.stream_reader(f).read(V3_HEADER_LEN)
+        return peek_v3_moves(hdr)
+    except (OSError, zstd.ZstdError):
         return 0
 
 

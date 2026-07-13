@@ -16,7 +16,7 @@ import argparse
 import curses
 import glob
 import os
-import struct
+import sys
 
 
 # ═══════════════════════════════════════════════════════════
@@ -87,125 +87,54 @@ def flood_group(board, size, r, c):
 
 
 # ═══════════════════════════════════════════════════════════
-# Binary selfplay data reader
+# V3 selfplay game reader (moves stored directly — no state-diff
+# reconstruction; see scripts/gamedata.py for the format)
 # ═══════════════════════════════════════════════════════════
 
-def decompress(filepath):
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gamedata import parse_v3  # noqa: E402
+
+
+def read_v3_game(filepath):
+    """Read a V3 game record (.bin or .bin.zst) → gamedata.GameV3."""
     if filepath.endswith(".zst"):
         import zstandard as zstd
         with open(filepath, "rb") as f:
-            return zstd.ZstdDecompressor().decompress(f.read())
-    elif filepath.endswith(".gz"):
-        import gzip
-        with gzip.open(filepath, "rb") as f:
-            return f.read()
+            with zstd.ZstdDecompressor().stream_reader(f) as reader:
+                data = reader.read()
     else:
         with open(filepath, "rb") as f:
-            return f.read()
+            data = f.read()
+    return parse_v3(data)
 
 
-def read_bin_file(filepath):
-    """Read selfplay .bin file (V2 with V1 fallback).
+def moves_from_v3(game):
+    """Convert a GameV3 into the viewer's move list:
+    (color, r_or_None, c_or_None, policy, value, score, ownership).
 
-    V2: [magic:u16=0x4D47][version:u16=2][count:i32][board_size:i32]
-        per record: ... + [ownership:f32×board²][opponent_action:i32]
-    V1: [count:i32]
-        per record: [state_size:i32][state][policy_size:i32][policy][value:f32][score:f32]
-
-    Returns list of (state, policy, value, score, ownership_or_None, opp_action_or_None).
+    value/score are the per-move training targets derived exactly the
+    way the trainer derives them (winner/black_score from the mover's
+    perspective); ownership is the final ternary map from the mover's
+    perspective (1.0 = mover owns).
     """
-    data = decompress(filepath)
-    pos = 0
-
-    # Detect V2 by magic header
-    is_v2 = False
-    board_sq = 0
-    if len(data) >= 4:
-        magic = struct.unpack_from("<H", data, 0)[0]
-        if magic == 0x4D47:
-            is_v2 = True
-            _magic, _version, n, board_size = struct.unpack_from("<HHii", data, 0)
-            board_sq = board_size * board_size
-            pos = 12
-        else:
-            n = struct.unpack_from("i", data, pos)[0]
-            pos += 4
-
-    records = []
-    for _ in range(n):
-        ss = struct.unpack_from("i", data, pos)[0]; pos += 4
-        state = struct.unpack_from(f"{ss}f", data, pos); pos += ss * 4
-        ps = struct.unpack_from("i", data, pos)[0]; pos += 4
-        policy = struct.unpack_from(f"{ps}f", data, pos); pos += ps * 4
-        value = struct.unpack_from("f", data, pos)[0]; pos += 4
-        score = struct.unpack_from("f", data, pos)[0]; pos += 4
-        if is_v2:
-            ownership = struct.unpack_from(f"{board_sq}f", data, pos); pos += board_sq * 4
-            opp_action = struct.unpack_from("i", data, pos)[0]; pos += 4
-        else:
-            ownership = None
-            opp_action = None
-        records.append((state, policy, value, score, ownership, opp_action))
-    return records
-
-
-def extract_games_from_bin(records, board_size):
-    """Group augmented records into games (8 augmentations per position).
-
-    Returns list of games. Each game is a list of
-    (board_state, policy, value, score, ownership, opp_action).
-    The first augmentation (identity) is used for display.
-    """
-    # Records come in groups of 8 (dihedral augmentation)
-    moves_per_game = len(records) // 8
-    if moves_per_game == 0:
-        return []
-
-    game = []
-    for i in range(0, len(records), 8):
-        game.append(records[i])  # identity augmentation (full tuple)
-
-    return [game]  # one game per .bin file
-
-
-def replay_game_from_bin(game, board_size):
-    """Recover moves from recorded board states (state-diff), not argmax(policy).
-
-    State plane layout (game.cpp:260-287, history_length=8):
-      ch 0..7   current player's stones, t-0 (now) .. t-7
-      ch 8..15  opponent's stones,       t-0 (now) .. t-7
-      ch 16     color plane (1.0 if BLACK to play)
-
-    Move at step i = the new stone in record[i+1]'s ch 8 vs record[i]'s ch 0
-    (captures don't change this — the moving side adds exactly one stone).
-    For the final step there is no record[i+1]; fall back to
-    record[i-1].opp_action, which equals trajectory[i].action by construction
-    (mcts.cpp:740-744).
-    """
-    hw = board_size * board_size
+    n = game.board_size
+    hw = n * n
     moves = []
-    n = len(game)
-
-    for i, rec in enumerate(game):
-        state, policy, value, score = rec[0], rec[1], rec[2], rec[3]
-        ownership = rec[4] if len(rec) > 4 else None
-        current = BLACK if state[16 * hw] > 0.5 else WHITE
-
-        if i + 1 < n:
-            next_state = game[i + 1][0]
-            cur_set = {p for p in range(hw) if state[p] > 0.5}
-            new_stones = [p for p in range(hw)
-                          if next_state[8 * hw + p] > 0.5 and p not in cur_set]
-            action = new_stones[0] if len(new_stones) == 1 else hw
+    for m in range(game.n_moves):
+        player = BLACK if (m % 2 == 0) else WHITE
+        if game.winner == 0:
+            value = 0.0
         else:
-            action = game[i - 1][5] if i >= 1 and len(game[i - 1]) > 5 else hw
-
-        if action == hw or action < 0:
-            moves.append((current, None, None, policy, value, score, ownership))
+            value = 1.0 if game.winner == player else -1.0
+        score = game.black_score if player == BLACK else -game.black_score
+        ownership = tuple(1.0 if o == player else 0.0 for o in game.owners)
+        a = int(game.actions[m])
+        if a < 0 or a >= hw:
+            moves.append((player, None, None, tuple(game.policies[m]),
+                          value, score, ownership))
         else:
-            r, c = action // board_size, action % board_size
-            moves.append((current, r, c, policy, value, score, ownership))
-
+            moves.append((player, a // n, a % n, tuple(game.policies[m]),
+                          value, score, ownership))
     return moves
 
 
@@ -523,22 +452,14 @@ def view_single_file(path, board_size, game_idx):
                  f"  Komi: {komi}  Result: {result}")
         view_game_curses(bs, moves, title=title, is_sgf=True)
     elif ".bin" in path:
-        records = read_bin_file(path)
-        print(f"  Loaded {len(records)} records ({len(records)//8} moves × 8 augmentations)")
-        game = extract_games_from_bin(records, board_size)
-        if not game:
-            print(f"No games in {path}")
-            return
-        g = game[0]
-        moves = replay_game_from_bin(g, board_size)
-        # Show outcome from first position's value and final score
-        first_val = g[0][2]
-        first_score = g[0][3]
-        outcome = "Black wins" if first_val > 0 else "White wins" if first_val < 0 else "Draw"
+        game = read_v3_game(path)
+        moves = moves_from_v3(game)
+        outcome = ("Black wins" if game.winner == 1 else
+                   "White wins" if game.winner == 2 else "Draw")
         title = (f"{os.path.basename(path)}\n"
-                 f"  {len(moves)} moves  {outcome}\n"
-                 f"  Value: {first_val:+.2f}  Score: {first_score:+.1f} pts")
-        view_game_curses(board_size, moves, title=title, is_sgf=False)
+                 f"  {len(moves)} moves  {outcome}  komi {game.komi:g}\n"
+                 f"  Score (black): {game.black_score:+.1f} pts")
+        view_game_curses(game.board_size, moves, title=title, is_sgf=False)
     else:
         print(f"Unknown file format: {path}")
 

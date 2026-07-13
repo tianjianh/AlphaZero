@@ -34,15 +34,18 @@ class _InferenceWrapper(nn.Module):
     """Wrapper that calls forward_inference() and post-processes value logits.
 
     Value: softmax([B, 3]) → P(win) - P(loss) → [B, 1]
-    All other outputs passed through unchanged.
+    All other outputs passed through unchanged.  Handles both input
+    kinds: single (MiniGo 17-plane x) and dual (KataGo V7 spatial +
+    global) — forward(*inputs) dispatches on arity.
     """
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
-    def forward(self, x):
-        policy, value_logits, score_mean, score_stdev, ownership = self.model.forward_inference(x)
+    def forward(self, *inputs):
+        policy, value_logits, score_mean, score_stdev, ownership = \
+            self.model.forward_inference(*inputs)
         value_probs = F.softmax(value_logits, dim=1)
         value = value_probs[:, 0:1] - value_probs[:, 1:2]  # P(win) - P(loss) → [B, 1]
         return policy, value, score_mean, score_stdev, ownership
@@ -69,9 +72,12 @@ def _embed_state_dict(onnx_path, model):
 def export_to_onnx(model, output_path, board_size=9, input_channels=17):
     """Export a PyTorch model to ONNX format with dynamic batch axis.
 
-    Arch-agnostic: the model object carries its own architecture (both
-    AlphaZeroNet and GoViT implement forward_inference with identical
-    output shapes), so no arch flag is needed here.
+    Arch-agnostic: the model object carries its own architecture and
+    input kind.  Single-input models (AlphaZeroNet, GoViT) export as
+    `state [B,17,H,W]`; dual-input models (KataGoNet) export as
+    `state_spatial [B,22,H,W]` + `state_global [B,19]` — the same
+    contract as a converted kata1 network, so the C++ loader treats
+    them identically (ModelFormat::KataGo).
 
     The ONNX file contains:
     1. The optimized graph (BN folded into Conv) for ONNX Runtime / TensorRT
@@ -85,11 +91,18 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17):
     wrapper = _InferenceWrapper(model)
     wrapper.eval()
 
-    dummy = torch.randn(1, input_channels, board_size, board_size)
+    dual = getattr(model, "input_kind", "single") == "dual"
+    if dual:
+        dummy = (torch.randn(1, model.SPATIAL_CHANNELS, board_size, board_size),
+                 torch.randn(1, model.GLOBAL_CHANNELS))
+        input_names = ["state_spatial", "state_global"]
+    else:
+        dummy = (torch.randn(1, input_channels, board_size, board_size),)
+        input_names = ["state"]
 
     # Run once to populate batch norm running stats
     with torch.no_grad():
-        wrapper(dummy)
+        wrapper(*dummy)
 
     board_area = board_size * board_size
     output_names = ["policy_logits", "value", "score_mean", "score_stdev", "ownership"]
@@ -98,16 +111,10 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17):
         wrapper,
         dummy,
         output_path,
-        input_names=["state"],
+        input_names=input_names,
         output_names=output_names,
-        dynamic_axes={
-            "state": {0: "batch"},
-            "policy_logits": {0: "batch"},
-            "value": {0: "batch"},
-            "score_mean": {0: "batch"},
-            "score_stdev": {0: "batch"},
-            "ownership": {0: "batch"},
-        },
+        dynamic_axes={**{name: {0: "batch"} for name in input_names},
+                      **{name: {0: "batch"} for name in output_names}},
         opset_version=18,
         do_constant_folding=True,
         external_data=False,
@@ -121,7 +128,11 @@ def export_to_onnx(model, output_path, board_size=9, input_channels=17):
     action_size = board_area + 1
     print(f"Exported ONNX model to {output_path}")
     print(f"  Size: {file_size / 1024:.1f} KB")
-    print(f"  Input: [batch, {input_channels}, {board_size}, {board_size}]")
+    if dual:
+        print(f"  Inputs: state_spatial [batch, {model.SPATIAL_CHANNELS}, "
+              f"{board_size}, {board_size}], state_global [batch, {model.GLOBAL_CHANNELS}]")
+    else:
+        print(f"  Input: [batch, {input_channels}, {board_size}, {board_size}]")
     print(f"  Outputs:")
     print(f"    policy_logits [batch, {action_size}]")
     print(f"    value [batch, 1]  (P(win) - P(loss))")
@@ -139,12 +150,17 @@ def main():
 
   # ViT
   python3 export_onnx.py --init --arch vit --output ../models/vit.onnx
+
+  # KataGo-V7 architecture (dual input, sized via --filters/--blocks)
+  python3 export_onnx.py --init --arch katago --filters 128 --blocks 10 \\
+      --output ../models/kata.onnx
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", default="../training/checkpoints/training.pt")
     parser.add_argument("--output", default="../models/model.onnx")
     parser.add_argument("--board", type=int, default=9)
-    parser.add_argument("--arch", default="resnet", choices=["resnet", "vit"])
+    parser.add_argument("--arch", default="resnet",
+                        choices=["resnet", "vit", "katago"])
     # ResNet params
     parser.add_argument("--filters", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=5)
