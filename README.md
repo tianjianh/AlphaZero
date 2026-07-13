@@ -31,8 +31,11 @@ Each search thread pre-allocates one `NNResultBuf` (mutex + condvar), matching K
 
 **Model format:** `.onnx` (universal — loaded by all backends via a built-in minimal protobuf parser, no external protobuf dependency).  The RKNN backend additionally consumes a pre-compiled `.rknn` file that sits next to the `.onnx` (e.g. `models/best.onnx` → `models/best.rknn`): the ONNX is still parsed for metadata (board size, channel count), while the weights come from the `.rknn`.  The VIP9000 backend consumes a pre-compiled `.nb` (Network Binary Graph) bundled in a sibling directory; the resolver picks `.a733.bs<K>.int8/network_binary.nb` first and falls back to `.fp16/` (where `K = 1` for `--max-batch 1`, `4` for `--max-batch ≤ 4`).  Set `VIP9000_FORCE_PRECISION=fp16` (or `int8`) to pin one or the other; otherwise int8 wins when both directories exist.
 
-This build can also load **KataGo** networks (`kata1` and similar) for inference.
-See [KataGo inference](#katago-inference-tensorrt-only) below for the conversion + run workflow.
+This build also supports the **KataGo V7 model format** end to end: converted
+`kata1` networks run in every binary (including selfplay — V3 game records are
+engine-neutral), and the katago architecture is trainable from scratch with
+`--arch katago`.  See [KataGo V7 models](#katago-v7-models--running-and-training)
+below and `FORMATS.md`.
 
 ### Neural network architecture
 
@@ -123,18 +126,27 @@ All 7 loss weights and the MCTS weights are flags on
 `--score-weight-max`, `--score-scale`, plus `--value-ramp-steps` /
 `--score-ramp-steps` for the ramp lengths.
 
-### Selfplay data format
+### Selfplay data format (V3 — engine-neutral game records)
 
-Binary V2 format with ownership and opponent action:
+One file per game.  Records store the GAME (moves + per-move MCTS
+policy + outcome + final ownership), **not encoded states and no
+pre-baked augmentation** — the trainer replays the moves and encodes
+positions on the fly for whichever architecture it trains (MiniGo
+17-plane or KataGo V7), applying a random dihedral transform per
+sample.  That makes one record pool serve all three architectures,
+lets ANY model format generate selfplay data (including converted
+kata1 nets), and shrinks records ~60×.
+
 ```
-Header: [magic: 0x4D47] [version: 2] [count: i32] [board_size: i32]
-Per record:
-  [state_size: i32] [state: f32×S]
-  [policy_size: i32] [policy: f32×P]
-  [value: f32] [score: f32]
-  [ownership: f32×board²]
-  [opponent_action: i32]
+Header: [magic:u16 'MG'] [version:u16 = 3] [board_size:i32] [komi:f32]
+        [n_moves:i32] [winner:i8 0/1/2] [black_score:f32]
+Per move: [action:i16  (hw = pass)] [policy: f32×(hw+1)]
+Footer:   [owner: i8×hw  (0 empty/dame, 1 black, 2 white)]
 ```
+
+Parser, replay engine, both encoders, and augmentation live in
+`scripts/gamedata.py`; per-position targets (value/score/ownership/
+opponent action) are derived at load time.  See `FORMATS.md`.
 
 ## Prerequisites
 
@@ -395,7 +407,7 @@ design.  The essentials:
 
 The trainer paces itself with a KataGo-style **replay bucket**
 (`python/train.py` `max_train_bucket_per_new_data` in upstream): every new
-selfplay row credits `replay_target / n_augmentations` samples of budget;
+selfplay row (one unique position in V3) credits `replay_target` samples of budget;
 each step drains `global_batch`.  Empty bucket → trainer sleeps
 (`BUDGET_SLEEP`) instead of over-replaying stale data.
 
@@ -632,39 +644,40 @@ cd ..
     --games 10 --threads 10 --search-threads 16
 ```
 
-### KataGo inference (TensorRT only)
+### KataGo V7 models — running AND training
 
-You can run a stock **KataGo** network (`kata1` and similar) inside this engine's
-MCTS, for human play, benchmark, and match games. KataGo weights are
-**inference-only** in this build — they cannot be used to generate selfplay
-training records or fine-tuned. See `KATAGO_INFERENCE.md` for full details and
-known limitations (ladder features and a few encore-only signals are zeroed),
-and **`FORMATS.md`** for the complete model/data format-support matrix.
+The KataGo V7 model format (dual input `state_spatial [B,22,H,W]` +
+`state_global [B,19]`, same 5 inference outputs as ours) is a
+first-class citizen:
 
-#### What accepts KataGo weights
+- **Run a stock kata1 network**: convert once with
+  `tools/katago_to_onnx.py`, then use it in `play`, `evaluate`,
+  `benchmark` — and `selfplay`: V3 game records are encoding-free, so
+  a kata1 net can generate training data for ANY architecture.
+- **Train the katago architecture from scratch**: `--arch katago`
+  everywhere (`run_continuous.py init --arch katago`,
+  `train_continuous.py`, `export_onnx.py`).  `KataGoNet`
+  (scripts/model.py) is a KataGo-style pre-activation trunk with
+  MiniGo's 7-head set, trained by the same loop as resnet/vit from the
+  same V3 record pool, exported to the same dual-input ONNX contract.
+- Stock kata1 *checkpoints* are not resumable by the trainer (their
+  heads differ from our 7-head set); they run as-is or warm-init.
 
-| Tool | Input format | Purpose | KataGo accepted? |
-|---|---|---|---|
-| `tools/katago_to_onnx.py` | `.txt.gz` / `.bin.gz` | one-shot conversion to ONNX | yes — required first step |
-| `tools/katago_parity_test.py` | `.txt.gz` + `.onnx` | validate the converted ONNX | yes |
-| `tools/warm_init_from_katago.py` | `.txt.gz` / `.bin.gz` | warm-init MiniGo's trunk (training prep) | yes (existing tool — unrelated to inference) |
-| `build/play` | `.onnx` (KataGo or MiniGo) | interactive play | yes |
-| `build/evaluate` | `.onnx` × 2 | match games (kata1 vs MiniGo, kata1 vs kata1, …) | yes |
-| `build/benchmark` | `.onnx` (KataGo or MiniGo) | NN/MCTS throughput | yes (sections 1–4; section 5 selfplay is auto-skipped) |
-| `build/selfplay` | `.onnx` | generate training records | **no — refuses KataGo with `return 2`** |
-| `scripts/train*.py`, `run_continuous.py` | `.pt` / `.onnx` | training pipeline | no — KataGo never enters training |
+See `KATAGO_INFERENCE.md` for encoder fidelity notes (ladder planes
+and encore-only signals are zeroed) and **`FORMATS.md`** for the full
+format-support matrix.
 
-Backend support: **TensorRT** (NVIDIA, x86_64), **RKNN** (Rockchip NPU,
-aarch64), **VIP9000** (VeriSilicon NPU on Allwinner A733, aarch64).
-Eigen / CUDA / OpenCL / Metal throw `"KataGo format requires the TensorRT
-backend"` at handle creation; the NPU backends consume their respective
-pre-compiled artifacts (`.rknn` / `.nb`) generated alongside the ONNX.
+| Tool | KataGo-format ONNX accepted? |
+|---|---|
+| `build/play` / `build/evaluate` / `build/benchmark` | yes (all sections) |
+| `build/selfplay` | **yes — V3 records are engine-neutral** |
+| `scripts/train_continuous.py` | yes via `--arch katago` (fresh or resumed `KataGoNet`) |
+| `tools/katago_to_onnx.py` / `katago_parity_test.py` / `warm_init_from_katago.py` | stock-weight conversion / validation / warm-init |
 
-> ⚠ I tested `selfplay` to **confirm the rejection guard fires**, not to use it.
-> Selfplay refuses KataGo models on purpose — the V2 record format and the
-> 8-fold augmentation are MiniGo-shaped, so feeding KataGo states through them
-> would produce corrupt training data. Use `play` / `evaluate` / `benchmark`
-> for KataGo runs.
+Backend support for the dual-input format: **TensorRT** (full),
+**Eigen** (CPU forward), **RKNN / VIP9000** (via their pre-compiled
+artifacts).  CUDA / OpenCL / Metal accept it at the interface but
+their kernels are TODO placeholders (as for the MiniGo formats).
 
 #### How to use it (5 steps)
 

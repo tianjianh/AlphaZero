@@ -1,9 +1,14 @@
 # KataGo Inference
 
-This build can run a KataGo network through MiniGo's MCTS / NNEvaluator
-runtime for **inference only** (play, benchmark, match games). KataGo
-weights never enter the training pipeline; selfplay binaries reject
-KataGo models with a clear error.
+This build runs KataGo networks through MiniGo's MCTS / NNEvaluator
+runtime — play, benchmark, match games, **and selfplay**: V3 game
+records are engine-neutral (moves + targets, no encoded states), so a
+converted kata1 net can generate training data for any architecture.
+The KataGo V7 *architecture* is also trainable from scratch via
+`--arch katago` (see FORMATS.md); stock kata1 *checkpoints* themselves
+are still not resumable by the trainer — their head set differs from
+MiniGo's 7-head training contract — so they run as-is or warm-init a
+fresh KataGoNet.
 
 ---
 
@@ -349,8 +354,8 @@ Anything outside that is approximated:
 
 ## Boundaries enforced
 
-The principle "KataGo weights are inference-only" is enforced at
-every entry point:
+Remaining boundary — stock kata1 checkpoints never enter the
+*optimizer* (conversion is one-way; training uses MiniGo's head set):
 
 | Entry point | KataGo handling |
 |---|---|

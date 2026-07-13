@@ -770,7 +770,9 @@ includes the model path, so KataGo and MiniGo engines never collide.
 
 ### What and why
 
-The principle "KataGo weights are inference-only, TensorRT-only" is
+(HISTORICAL — superseded by the V3 format cleanup: selfplay now accepts KataGo-format models because game records are engine-neutral, and the non-TRT backends accept the format at the interface with placeholder implementations.  Kept for archaeology.)
+
+The original principle "KataGo weights are inference-only, TensorRT-only" was
 enforced at every entry point that should reject a KataGo model.
 Each guard is the smallest possible diff (4-7 lines) and uses a
 clear error message.

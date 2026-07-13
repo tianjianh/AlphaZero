@@ -1,65 +1,100 @@
 # Format Support Matrix
 
-Inventory of every model / data / record format the repo touches, which
-component supports it, and to what degree.  Written as the ground truth
-for the planned format consolidation: today **inference (play /
-evaluate / benchmark) accepts both MiniGo and KataGo model formats, but
-training is MiniGo-only end-to-end** — KataGo weights can seed a run
-(warm-init) but KataGo-encoded data can never enter the training loop.
+Post-cleanup state: **three first-class model architectures, one
+engine-neutral game-record format, two board-state encodings.**  Every
+architecture supports both running (selfplay / play / evaluate /
+benchmark) and training; the record pool is shared by all of them.
+Legacy compatibility (V1/V2 records, `.bin.gz`, KataGo-inference-only
+restrictions) has been removed.
 
-## 1. Model formats
+## 1. Model architectures (all trainable, all runnable)
 
-| # | Format | Produced by | Consumed by | Degree |
-|---|--------|-------------|-------------|--------|
-| M1 | **MiniGo ONNX** — single input `state [B,17,H,W]`, outputs `policy_logits, value, score_mean, score_stdev, ownership` (post-processing baked in) | `scripts/export_onnx.py` (from random init or `.pt`) | every backend (TensorRT/CUDA*/Eigen/OpenCL*/Metal*/RKNN†/VIP9000†); all 4 binaries; whole training pipeline | **Native.** Full support everywhere. |
-| M2 | **KataGo-converted ONNX** — dual input `state_spatial [B,22,H,W]` + `state_global [B,19]`, same 5 outputs | `tools/katago_to_onnx.py` (from K1) | TensorRT backend (full); RKNN/VIP9000 via pre-compiled sibling artifacts (M5/M6); `play`/`evaluate`/`benchmark` | **Inference-only.** `selfplay` refuses (`return 2`); Eigen/CUDA/OpenCL/Metal throw at handle creation; never enters training. Ladder + encore-only input features are zeroed (see `KATAGO_INFERENCE.md`). |
-| K1 | **KataGo native weights** `.txt.gz` / `.bin.gz` | katagotraining.org | `tools/katago_to_onnx.py`, `tools/warm_init_from_katago.py`, `tools/katago_parity_test.py` — Python tools only | **Conversion source only.** The C++ engine never loads these directly (KataGo's own `desc.cpp` parser is ported inside the tools). |
-| M3 | **PyTorch checkpoint** `training.pt` — weights + optimizer + step + bucket + watermark + arch metadata | `train_continuous.py` (every export + shutdown); `warm_init_from_katago.py --checkpoint` | `train_continuous.py` (resume), `export_onnx.py --checkpoint` | **Native training state.** Not an inference format. |
-| M4 | **TensorRT engine cache** `.engine` under `MINIGO_TRT_CACHE` | TensorRT backend (lazy, per GPU × max-batch × precision × TRT version) | TensorRT backend | Derived artifact, auto-managed; safe to delete. |
-| M5 | **RKNN compiled model** `.rknn` (sits next to the `.onnx`) | `tools/onnx_to_rknn.py` on x86_64 (rknn-toolkit2) | RKNN backend (aarch64) — ONNX still parsed for metadata, weights come from `.rknn` | Offline-compiled sibling; works for M1 and M2 sources. |
-| M6 | **VIP9000 NBG** `network_binary.nb` in `.a733.bs<K>.{int8,fp16}/` sibling dirs | `tools/onnx_to_a733*.sh` (Acuity Docker, x86_64) | VIP9000 backend (aarch64) | Offline-compiled sibling; works for M1 and M2 sources. |
+| Arch | Input | PyTorch class | ONNX contract | Sized by |
+|------|-------|---------------|---------------|----------|
+| `resnet` | MiniGo 17-plane `state [B,17,H,W]` | `AlphaZeroNet` | single input, 5 outputs | `--filters/--blocks` |
+| `vit` | MiniGo 17-plane `state [B,17,H,W]` | `GoViT` | single input, 5 outputs | `--d-model/--depth/…` |
+| `katago` | KataGo V7 `state_spatial [B,22,H,W]` + `state_global [B,19]` | `KataGoNet` | dual input, 5 outputs | `--filters/--blocks` (= channels/blocks) |
 
-\* CUDA / OpenCL / Metal currently throw a placeholder at handle
-creation for the KataGo-style ResNet (SE + GPool blocks) — intentional
-TODO state; TensorRT is the production GPU backend.
-† Via M5/M6 sibling artifacts, not the ONNX weights themselves.
+- All three share the **same 7-head training contract**
+  (policy, value-WDL, scoreMean, scoreStdev, ownership + training-only
+  scoreBelief, oppPolicy) and the same 5-output inference ONNX
+  (`policy_logits, value, score_mean, score_stdev, ownership`).
+- `model.input_kind` (`"single"`/`"dual"`) is the dispatch point for
+  encoding and forward-call arity everywhere (trainer, exporter).
+- The C++ loader auto-detects the format from the ONNX input names
+  (`state_spatial` present → `ModelFormat::KataGo`); a **converted
+  stock kata1 network** (`tools/katago_to_onnx.py`) satisfies the same
+  dual-input contract and is a drop-in for every binary — including
+  selfplay, since V3 records are encoding-free.  Stock kata1
+  *checkpoints* are not resumable by the trainer (their heads differ);
+  they run as-is or warm-init a fresh `KataGoNet`.
 
-## 2. Training-data formats
+## 2. Model file formats
 
-| # | Format | Produced by | Consumed by | Degree |
-|---|--------|-------------|-------------|--------|
-| D1 | **V2 selfplay records** `.bin` — header `[magic 0x4D47][version 2][count][board]`, per-record `[state 17ch][policy][value][score][ownership][opponent_action]`, 8-fold dihedral pre-augmented | `build/selfplay` (MiniGo models ONLY) | `selfplay_driver.py` (compresses), `train_continuous.py` (`_parse_records`), `scripts/visualize.py` | **The only training format.** States are MiniGo 17-plane; a KataGo-encoded state cannot be represented. |
-| D2 | **Compressed pool files** `g_<id>.bin.zst` (zstd, content-size in frame header) | `selfplay_driver.py` publish step | trainer scanner + ring (streaming reader), `visualize.py` | Native pool format; IDs are the coordination watermark. |
-| D3 | `.bin.gz` (gzip V2) | nothing anymore | readers keep a gzip fallback (`train_continuous._decompress_*`, `visualize.py`) | **Legacy read-only.** Candidate for removal in the format cleanup. |
-| D4 | **KataGo training rows** (`.npz` shuffle output) | — | — | **Not supported anywhere.** KataGo's trainer format; would only matter if we ever trained on KataGo selfplay data. |
+| # | Format | Produced by | Consumed by |
+|---|--------|-------------|-------------|
+| M1 | ONNX, single-input (resnet/vit) | `scripts/export_onnx.py` | all backends*, all binaries, whole pipeline |
+| M2 | ONNX, dual-input (katago arch or converted kata1) | `export_onnx.py --arch katago` / `tools/katago_to_onnx.py` | same as M1 — no binary treats it specially anymore |
+| M3 | PyTorch checkpoint `training.pt` (weights+optimizer+step+bucket+watermark+arch) | trainer | trainer resume, `export_onnx.py --checkpoint` |
+| K1 | KataGo native weights `.txt.gz`/`.bin.gz` | katagotraining.org | conversion/warm-init tools only (never loaded by C++) |
+| M4 | TRT `.engine` cache | TRT backend (auto) | TRT backend (safe to delete) |
+| M5/M6 | `.rknn` / VIP9000 `.nb` | offline converters | NPU backends (compiled siblings of M1/M2) |
 
-## 3. Game-record / misc formats
+\* Backend support level: **TensorRT implements both input kinds
+fully.  Eigen implements resnet + katago on CPU (ViT is a TODO
+placeholder).  CUDA / OpenCL / Metal accept every format at the
+interface but their kernels are TODO placeholders** — `create_handle`
+succeeds structurally and the handle constructor throws a uniform
+"placeholder (TODO)" error.  RKNN/VIP9000 run whatever was compiled
+into their artifacts.
 
-| # | Format | Produced by | Consumed by | Degree |
-|---|--------|-------------|-------------|--------|
-| G1 | **SGF** | `build/evaluate --output` | `scripts/visualize.py` | Review-only; not parsed back into training. |
-| S1 | **`training/status.json`** | trainer rank 0 | selfplay driver (score ramp + throttle), supervisor heartbeat, `status` command | Pipeline contract (schema documented in `CONTINUOUS_TRAINING.md`). |
-| S2 | **`training/run_config.json`** | `run_continuous.py init` | `run_continuous.py run` (defaults + conflict detection) | Architecture/komi single source of truth. |
+## 3. Game records — V3, the only training format
 
-## 4. Board-state encodings (runtime, not serialized)
+```
+u16 magic 'MG' | u16 version=3 | i32 board_size | f32 komi |
+i32 n_moves | i8 winner | f32 black_score
+per move: i16 action (hw = pass) | f32 policy[hw+1]
+footer:   i8 owner[hw]   (0 empty/dame, 1 black, 2 white)
+```
 
-| Encoding | Where | Used for |
-|----------|-------|----------|
-| MiniGo 17-plane (8×2 history snapshots + side-to-move) | `game.cpp encode()` | M1 models — selfplay, training data, inference |
-| KataGo V7: 22 spatial planes + 19 globals | `katago_inputs.cpp` (port of upstream `fillRowV7`) | M2 models — inference only; never written to disk |
+- Written by `build/selfplay` (one file per game, ~30 KB uncompressed —
+  ~60× smaller than the old pre-encoded V2), compressed to
+  `g_<id>.bin.zst` by the selfplay driver.
+- **Engine-neutral**: no encoded states, no pre-baked augmentation.
+  Any model format can *generate* records and any architecture can
+  *train* from them.  The trainer (via `scripts/gamedata.py`) replays
+  the moves, derives all targets (value/score/ownership/opp-action per
+  player), encodes positions for the active architecture, and applies
+  a fresh random dihedral transform per sample.
+- One disk row = one unique position; the replay bucket credits
+  `replay_target × rows` directly (no augmentation divisor).
+- Readers: trainer ring/scanner, `selfplay_driver._count_rows`,
+  `scripts/visualize.py`.  Parser/replayer/encoders live in ONE place:
+  `scripts/gamedata.py` (validated move-for-move against the C++
+  engine: replayed boards reproduce the recorded owners/score/winner).
+- **Removed**: V1 and V2 record support, the `.bin.gz` read fallback
+  (`.zst` is the only pool compression).  Old pools cannot be read —
+  archive them and regenerate (they were on-policy data for long-gone
+  models anyway).
 
-## 5. Asymmetry summary (for the next-stage cleanup)
+## 4. Board-state encodings
 
-- **Eval side**: `evaluate`/`play`/`benchmark` are format-agnostic —
-  any mix of M1 and M2 models works on TensorRT (e.g. gating a MiniGo
-  net against kata1).
-- **Training side**: strictly M1/D1/D2 — `selfplay` hard-rejects M2
-  models because D1 records can only hold 17-plane states, and the
-  trainer's parser assumes them.
-- **Bridge**: the only sanctioned KataGo→training path is
-  `warm_init_from_katago.py`, which maps K1 *weights* into the MiniGo
-  architecture (M3 + M1) — data formats never cross.
-- Cleanup candidates: drop D3 (gzip fallback) once old pools are gone;
-  D4 stays unsupported unless KataGo-data training becomes a goal;
-  decide whether M2 support should extend beyond TensorRT or be
-  documented as TRT-only permanently.
+Both encodings exist twice, and the pairs must stay byte-identical:
+
+| Encoding | C++ (selfplay/inference) | Python (training/replay) |
+|----------|--------------------------|--------------------------|
+| MiniGo 17-plane (8×2 history + color) | `game.cpp encode()` | `gamedata.encode_minigo` |
+| KataGo V7 (22 spatial + 19 global) | `src/katago_inputs.cpp` | `gamedata.encode_katago` |
+
+Shared V7 fidelity caveats (both sides): ladder planes 14-17, encore/
+button/PDA features and non-default rules bits are zero; ko plane uses
+simple ko.  The komi parity wave sits at `gl[18]` with board-area
+parity anchoring (upstream `fillRowV7`).
+
+## 5. Other formats
+
+| Format | Role |
+|--------|------|
+| SGF | evaluate `--output` match records; read by `visualize.py`.  Review only. |
+| `training/status.json` | trainer → selfplay/supervisor contract (ramp, bucket fill, liveness) |
+| `training/run_config.json` | architecture + komi single source of truth (`init` writes, `run` enforces) |

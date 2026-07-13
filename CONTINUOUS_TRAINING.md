@@ -193,7 +193,7 @@ watermark_id    = max filename ID already credited
 
 Scanner (rank 0, every ~5s):
   new_rows = sum of row counts of files with id > watermark_id
-  bucket += (replay_target * new_rows) // N_AUGMENTATIONS    (clamped at max_samples)
+  bucket += replay_target * new_rows                (clamped at max_samples)
   watermark_id = max id seen this pass
 
 Trainer:
@@ -203,10 +203,10 @@ Trainer:
 ```
 
 `replay_target = 4` means each unique position is visited ~4 times
-across augmented views (KataGo's semantics — their
-`-max-train-bucket-per-new-data`). The `//N_AUGMENTATIONS` divisor
-accounts for the C++ writer emitting all 8 dihedral augmentations per
-position.
+(KataGo's semantics — their `-max-train-bucket-per-new-data`).  With
+V3 records one disk row IS one unique position — dihedral augmentation
+happens at sample time in the loader (each visit draws a fresh random
+transform), so there is no augmentation divisor anywhere.
 
 **Cap sizing**: one selfplay publish (~300 games ≈ 240k rows) credits
 ~120k samples in one scanner tick.  The cap must dwarf that chunk or
@@ -490,7 +490,6 @@ tied to one worker is prefixed with that worker's name, so `--help
 --lr-gamma 0.5
 --weight-decay 1e-4
 --replay-target 4.0
---n-augmentations 8
 --ring-games 2000
 --bucket-cap-mult 64
 --min-window-games 2000
