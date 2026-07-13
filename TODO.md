@@ -179,3 +179,13 @@ the audit pass (each is a behavior change or larger refactor):
    notify_one` on `NNResultBuf::done` — removes the per-buf mutex and
    condvar entirely (plain load + futex, no LR/SC needed).  Requires
    bumping the project to -std=c++20.
+
+7. **Eigen dual-input loader doesn't know the trainable KataGoNet's
+   tensor names**: it resolves the converted-kata1 naming
+   (`stem.initial_conv.weight`, from tools/katago_arch.py) and fails
+   with a clean "missing tensor" error on `--arch katago` exports
+   (`stem_conv.weight`, `blocks.N.conv_regular.weight`, ...).  Fix is
+   a name map (or a shared naming scheme between scripts/model.py
+   KataGoNet and tools/katago_arch.py) in eigen_compute's tensor
+   lookup.  TensorRT is unaffected (it reads the graph, not the
+   embedded state_dict).

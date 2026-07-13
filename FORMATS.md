@@ -40,13 +40,18 @@ restrictions) has been removed.
 | M4 | TRT `.engine` cache | TRT backend (auto) | TRT backend (safe to delete) |
 | M5/M6 | `.rknn` / VIP9000 `.nb` | offline converters | NPU backends (compiled siblings of M1/M2) |
 
-\* Backend support level: **TensorRT implements both input kinds
-fully.  Eigen implements resnet + katago on CPU (ViT is a TODO
-placeholder).  CUDA / OpenCL / Metal accept every format at the
-interface but their kernels are TODO placeholders** — `create_handle`
-succeeds structurally and the handle constructor throws a uniform
-"placeholder (TODO)" error.  RKNN/VIP9000 run whatever was compiled
-into their artifacts.
+\* Backend support level (verified on hardware where possible):
+**TensorRT implements both input kinds fully** (parses the ONNX
+natively).  **Eigen** runs the MiniGo resnet on CPU; its dual-input
+path reads the CONVERTED-kata1 tensor naming only — the trainable
+KataGoNet's state_dict names are not mapped yet (clean "missing
+tensor" error; TODO.md item 7) — and is debugging-grade speed at
+b10c128.  ViT on Eigen is a TODO placeholder.  **CUDA / OpenCL /
+Metal** accept every format at the interface but their kernels are
+TODO placeholders — `create_handle` succeeds structurally and the
+handle constructor throws a uniform "placeholder (TODO)" error.
+**RKNN / VIP9000** run whatever was compiled into their `.rknn`/`.nb`
+artifacts (both encodings supported by their converters).
 
 ## 3. Game records — V3, the only training format
 
