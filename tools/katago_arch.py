@@ -2,7 +2,7 @@
 
 Mirrors the C++ runtime in cpp/neuralnet/desc.cpp / openclbackend.cpp /
 cudabackend.cpp. The PyTorch model is built once, weights are copied
-from the parsed KataGo binary (warm_init_from_katago.parse_katago_model),
+from the parsed KataGo binary (parse_katago.parse_katago_model),
 then exported as ONNX via katago_to_onnx.py.
 
 Key design choices:

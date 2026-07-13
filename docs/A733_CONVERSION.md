@@ -8,7 +8,7 @@
 > version=0x20000` (NBG v2.0.0, same as Allwinner's own `yolact/v3`
 > sample).
 >
-> The pip-`acuitylite` path at `tools/onnx_to_a733.py` does NOT work —
+> The pip-`acuitylite` path (removed; see §6.1) does NOT work —
 > it produces NBGs with `target=0x15` because the bundled chip table
 > doesn't contain A733's PID. That script is kept for reference with a
 > deprecation banner; do not use it.
@@ -605,7 +605,7 @@ ssh cubie 'cd /root/proj/AlphaZero && unzip -o ~/kata1-b10c128.a733.fp16.zip'
 
 ## 6. What we tried that doesn't work — and why
 
-### 6.1 Pip `acuitylite==6.51.0` (the path currently in `tools/onnx_to_a733.py`)
+### 6.1 Pip `acuitylite==6.51.0` (removed dead end — history below)
 
 This is the first thing we tried because it's a simple `pip install`
 in the existing alphazero conda env. It produces an NBG that **the
@@ -653,10 +653,9 @@ path's NBG is `0x20000` and was verified on-board with `vpm_run` ret=0
 on 2026-04-29. So both v1 and v2 NBGs work; the only true requirement
 is the right chip ID, which the pip path bungles.)
 
-`tools/onnx_to_a733.py` and `tools/a733_verify.py` are kept in the
-repo for reference but they should not be used for production
-artifacts. The top of `onnx_to_a733.py` has been updated with a
-deprecation banner.
+`tools/onnx_to_a733.py` and `tools/a733_verify.py` (the acuitylite-
+based scripts) have been removed — git history keeps them for
+reference.  Use the Docker scripts above for all artifacts.
 
 ### 6.2 PyPI alternates and acuitylite version sweep
 
@@ -937,8 +936,6 @@ later.
 | `tools/onnx_to_a733_docker.sh` | fp16 path entry point. Wraps the §3.3 pipeline. Run on a real Linux host with Docker + `ubuntu-npu:v2.0.10.1` loaded. | ✅ (sanity baseline) |
 | `tools/a733_gen_calib.py` | Self-play calibration-data generator for the int8 path. Drives 70% of moves with kata1's own ONNX policy via `onnxruntime`, 30% random eye-aware (with 20% of whole games dropped to pure-random for tactical diversity). Snapshots cover opening / midgame / endgame evenly. Encodes via Python port of `src/katago_inputs.cpp`. | ✅ (production) |
 | `tools/onnx_to_a733_quantize_docker.sh` | int8 path entry point. Generates a clean inputmeta (workaround for the §6.6 trap), seeds the `.quantize` file (workaround for the `--rebuild-all` requires-file trap), runs `pegasus.py quantize` then `export ovxlib --dtype quantized --pack-nbg-unify`, and reports the op-engine breakdown. Defaults to `perchannel_symmetric_affine` int8 weights + per-tensor int8 activations, `kl_divergence` algorithm, 400 iterations. | ✅ (production) |
-| `tools/onnx_to_a733.py` | Pip-`acuitylite` path. Produces NBGs with `target=0x15` that the on-board runtime rejects. | ❌ DO NOT USE |
-| `tools/a733_verify.py` | Host-side ORT vs Acuity simulator parity. Worked for the old pip path (just for fp16 noise floor); doesn't run inside the Docker conversion flow. | ⚠️ optional, host-only |
 | `models/<base>.a733.bs<N>.unshared.onnx` | Source ONNX (canonical reference for downstream parity). | — |
 | `models/<base>.a733.bs<N>.fp16/network_binary.nb` | fp16 NBG (slow on board — ~93% of ops fall through to PPU). Header bytes 8..11 must be `3b 00 00 10`. | — |
 | `models/<base>.a733.bs<N>.int8/network_binary.nb` | int8 NBG (production — ~110× faster). Same header check. | — |

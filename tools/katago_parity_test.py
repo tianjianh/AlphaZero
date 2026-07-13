@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from warm_init_from_katago import parse_katago_model  # noqa: E402
+from parse_katago import parse_katago_model  # noqa: E402
 from katago_arch import KataGoNet                      # noqa: E402
 
 

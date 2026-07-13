@@ -352,7 +352,7 @@ selfplay GPU time on credit that gets discarded.  Tune with
 ```
 models/
 ├── accepted/            # promoted models; latest -> v<step>.onnx symlink
-│   ├── v000000000.onnx  # seed from init (random or warm-init)
+│   ├── v000000000.onnx  # seed from init (random weights)
 │   └── latest           # what selfplay plays with (atomic symlink swap)
 ├── candidates/          # trainer exports, awaiting gate
 └── rejected/            # failed gate or stale-dropped
@@ -367,13 +367,6 @@ training/
 level, and scanner watermark on every export and on shutdown; selfplay IDs
 are recovered from directory state.  Re-running `run` continues everywhere
 it left off.
-
-#### Warm-starting from KataGo weights
-
-`tools/warm_init_from_katago.py` can seed the run with kata1 b10c128 trunk
-weights instead of random init — see the tool's docstring for the exact
-workflow (replace `accepted/v000000000.onnx` and optionally
-`training/checkpoints/training.pt` between `init` and `run`).
 
 #### Monitoring
 
@@ -588,7 +581,8 @@ first-class citizen:
   MiniGo's 7-head set, trained by the same loop as resnet/vit from the
   same V3 record pool, exported to the same dual-input ONNX contract.
 - Stock kata1 *checkpoints* are not resumable by the trainer (their
-  heads differ from our 7-head set); they run as-is or warm-init.
+  heads differ from our 7-head set); they run as-is for
+  selfplay/inference.
 
 See [docs/KATAGO_INFERENCE.md](docs/KATAGO_INFERENCE.md) for encoder fidelity notes (ladder
 planes are fully computed via a port of upstream's ladder search;
@@ -600,7 +594,7 @@ format-support matrix.
 | `build/play` / `build/evaluate` / `build/benchmark` | yes (all sections) |
 | `build/selfplay` | **yes — V3 records are engine-neutral** |
 | `scripts/train_continuous.py` | yes via `--arch katago` (fresh or resumed `KataGoNet`) |
-| `tools/katago_to_onnx.py` / `katago_parity_test.py` / `warm_init_from_katago.py` | stock-weight conversion / validation / warm-init |
+| `tools/katago_to_onnx.py` / `katago_parity_test.py` | stock-weight conversion / validation |
 
 Backend support for the dual-input format: **TensorRT** (full),
 **OpenCL** (full — both the converted-kata1 and trainable-KataGoNet

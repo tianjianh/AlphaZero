@@ -2,7 +2,7 @@
 # Turnkey: kata1 ONNX → Allwinner A733 NBG, via Allwinner's official
 # Acuity Toolkit Docker image (ubuntu-npu:v2.0.10.1, internally Acuity
 # v6.30.22).  This is the conversion path documented in
-# docs/A733_CONVERSION.md; the pip-acuitylite path in tools/onnx_to_a733.py
+# docs/A733_CONVERSION.md; the pip-acuitylite path (removed, see §6.1)
 # is broken (produces NBGs with target=0x15 that the on-board viplite
 # v2.0.3 rejects with nbglk_valid_nbg_check[920]).
 #

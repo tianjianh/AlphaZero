@@ -435,7 +435,7 @@ simulator's `vsi_nn_CreateGraph()` call).
 (not Docker Hub) — A733_CONVERSION.md §3.0/§3.2 has the retrieval
 recipe.  The pip `acuitylite` wheel is verified non-functional for
 this NPU (chip table missing PID `0x1000003B` in 6.42–6.51) and
-`tools/onnx_to_a733.py` is now a deprecation banner that exits 2.
+The old pip-acuitylite script has been removed (git history keeps it).
 
 **Step 2: convert.**  `tools/onnx_to_a733_docker.sh` runs the full
 ONNX export → unshare-initializers → Acuity import → NBG export

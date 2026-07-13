@@ -81,7 +81,7 @@ _ka._gpool_stats = _gpool_stats_4d
 _ka._vhpool_stats = _vhpool_stats_4d
 
 # Now safe to import the rest
-from warm_init_from_katago import parse_katago_model  # noqa: E402
+from parse_katago import parse_katago_model  # noqa: E402
 from katago_arch import KataGoNet                      # noqa: E402
 
 

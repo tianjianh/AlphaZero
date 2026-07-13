@@ -27,7 +27,8 @@ restrictions) has been removed.
   dual-input contract and is a drop-in for every binary — including
   selfplay, since V3 records are encoding-free.  Stock kata1
   *checkpoints* are not resumable by the trainer (their heads differ);
-  they run as-is or warm-init a fresh `KataGoNet`.
+  they run as-is (selfplay/inference); train the katago arch
+  from scratch instead.
 
 ## 2. Model file formats
 
@@ -36,7 +37,7 @@ restrictions) has been removed.
 | M1 | ONNX, single-input (resnet/vit) | `scripts/export_onnx.py` | all backends*, all binaries, whole pipeline |
 | M2 | ONNX, dual-input (katago arch or converted kata1) | `export_onnx.py --arch katago` / `tools/katago_to_onnx.py` | same as M1 — no binary treats it specially anymore |
 | M3 | PyTorch checkpoint `training.pt` (weights+optimizer+step+bucket+watermark+arch) | trainer | trainer resume, `export_onnx.py --checkpoint` |
-| K1 | KataGo native weights `.txt.gz`/`.bin.gz` | katagotraining.org | conversion/warm-init tools only (never loaded by C++) |
+| K1 | KataGo native weights `.txt.gz`/`.bin.gz` | katagotraining.org | conversion tools only (never loaded by C++) |
 | M4 | TRT `.engine` cache | TRT backend (auto) | TRT backend (safe to delete) |
 | M5/M6 | `.rknn` / VIP9000 `.nb` | offline converters | NPU backends (compiled siblings of M1/M2) |
 

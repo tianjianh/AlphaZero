@@ -514,7 +514,7 @@ class GoViT(nn.Module):
 #  - gpool stats use KataGo's (mean, mean·(√HW−14)·0.1, max) triple.
 #  Heads are OURS (not kata1's): stock kata1 checkpoints therefore
 #  can't be resumed directly — convert them for inference with
-#  tools/katago_to_onnx.py, or warm-init a fresh KataGoNet trunk.
+#  tools/katago_to_onnx.py (warm-init from kata1 was removed).
 # ══════════════════════════════════════════════════════════
 
 def _kata_gpool_stats(x):

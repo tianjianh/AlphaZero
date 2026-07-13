@@ -29,7 +29,7 @@ import torch
 # Same-directory imports — make sure tools/ is on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from warm_init_from_katago import parse_katago_model  # noqa: E402
+from parse_katago import parse_katago_model  # noqa: E402
 from katago_arch import KataGoNet                      # noqa: E402
 
 
@@ -65,8 +65,8 @@ def main():
 
     if kmodel.policy_head is None or kmodel.value_head is None:
         raise RuntimeError(
-            "Parser did not retain policy/value head. Check warm_init "
-            "extension (Phase 0.1) ran successfully.")
+            "Parser did not retain policy/value head — "
+            "tools/parse_katago.py failed to read this network.")
 
     print("Building KataGoNet ...")
     net = KataGoNet(kmodel).eval()

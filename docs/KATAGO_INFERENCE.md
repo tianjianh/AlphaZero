@@ -7,8 +7,8 @@ converted kata1 net can generate training data for any architecture.
 The KataGo V7 *architecture* is also trainable from scratch via
 `--arch katago` (see FORMATS.md); stock kata1 *checkpoints* themselves
 are still not resumable by the trainer — their head set differs from
-MiniGo's 7-head training contract — so they run as-is or warm-init a
-fresh KataGoNet.
+MiniGo's 7-head training contract — so they run as-is for selfplay
+and inference; to train the katago arch, start from scratch.
 
 ---
 
@@ -20,7 +20,7 @@ fresh KataGoNet.
 | `evaluate` | yes — match games (kata1 vs MiniGo, kata1 vs kata1, …) |
 | `benchmark` | yes — all sections including selfplay |
 | `selfplay` | yes — V3 records are engine-neutral, so a kata net can generate the training pool |
-| `scripts/train*.py`, `tools/warm_init_from_katago.py` (warm-init mode) | unchanged — no KataGo runtime path |
+| `scripts/train*.py` | unchanged — no KataGo runtime path |
 
 Backends that run the dual-input format natively: **TensorRT** and
 **OpenCL** (full, incl. fp16/tensor-core tiers); **Eigen** on CPU
@@ -306,7 +306,7 @@ or port the upstream piece if it bites.
   per-board-size because `tools/katago_to_onnx.py --board N` bakes
   H/W into the ONNX at export time.
 - **Newer model versions (v15+) are not exercised.** The parser
-  extension (`tools/warm_init_from_katago.py`) handles v15+ extras
+  parser (`tools/parse_katago.py`) handles v15+ extras
   for stream-position consistency but the architecture port targets
   v8-v14. v15+ networks may need additional layers wired up in
   `tools/katago_arch.py` (meta-encoder, extended policy pass-logit

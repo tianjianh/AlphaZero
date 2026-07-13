@@ -23,7 +23,6 @@ how to diagnose common problems.
 7. [Sanity checkpoints](#sanity-checkpoints)
 8. [Tuning knobs](#tuning-knobs)
 9. [Operations](#operations)
-10. [Warm-init from KataGo](#warm-init-from-katago)
 
 ---
 
@@ -893,105 +892,6 @@ python scripts/gatekeeper.py
 
 Each script writes to `logs/current/<worker>.log` when that symlink
 exists, or you can pass `--log-dir <path>` explicitly.
-
----
-
-## Warm-init from KataGo
-
-`tools/warm_init_from_katago.py` seeds the run with weights borrowed
-from a KataGo b10c128 network, instead of the random init that
-`run_continuous.py init` produces. About 45% of the model's float
-params get initialized from KataGo: 5 of 10 trunk blocks (the
-SE-style residuals) plus the trunk-to-pool stage of all four
-GPoolHead-style heads (value, score_mean, score_stdev, score_belief).
-The rest (stem, GPool blocks, trunk BN stats, SE attention modules,
-head FCs, ownership conv, policy head) remain at default init.
-
-This only makes sense for the `large` preset (10 blocks × 128
-filters) since that's the size that matches b10c128. Smaller / larger
-presets have a channel mismatch and the script will refuse.
-
-### What and where
-
-- **Source net.** Download from KataGo's training media bucket:
-  ```
-  https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b10c128-s1141046784-d204142634.txt.gz
-  ```
-  The script auto-detects `.txt.gz` (text floats) vs `.bin.gz` (binary
-  floats) from the filename; either works. If you only see a `.zip` /
-  `.ckpt` for a given net, those are PyTorch raw checkpoints and won't
-  parse — use the `.txt.gz` or `.bin.gz`.
-- **What gets transferred.**
-  - Conv kernels in 5 SE residual blocks, paired closest-depth-first
-    with KataGo's regular blocks.
-  - The first stage (1×1 conv [32,128,1,1] + BN) of all four MiniGo
-    GPoolHead-style heads, copied from KataGo's value-head v1Conv +
-    v1BN. KataGo's value pathway extracts "what features matter for
-    game evaluation" — same starting projection seeds value, score
-    mean / stdev, and score belief in MiniGo.
-  - **Speculative slice** for policy and opponent-policy: 2 rows of
-    KataGo's `p1Conv [32, 128, 1, 1]` and `p1BN [32]` are sliced into
-    MiniGo's `policy_conv [2, 128, 1, 1]` (rows 0, 1) and
-    `opp_policy_conv` (rows 2, 3). MiniGo's policy uses a flatten+FC
-    design while KataGo uses spatial-conv + gpool injection, so the
-    first-stage 1×1 conv is the only piece with matching input
-    dimensions. Two specific rows out of 32 is arbitrary — this is
-    "better-than-random in expectation," not a principled match.
-- **What does not.** Input stem (17 vs 22+19 channels), GPool blocks
-  (channel layout differs — MG keeps 128 mid-block, KG narrows to 96),
-  trunk BN running stats (pre-act vs post-act semantics differ), SE
-  attention modules (KataGo has none), head FC layers (KG hidden dim
-  is 80, MG is 128), ownership conv (KG reads from v1=32-channel,
-  MG reads directly from trunk=128-channel), policy_fc / opp_policy_fc
-  (KG has no flatten+FC equivalent).
-- **Optimizer state** in any pre-existing checkpoint is dropped, since
-  the conv weights changed and Adam moments would be paired with the
-  wrong tensors.
-
-### Workflow (replaces step "init seed model" with "init seed model from KataGo")
-
-```bash
-# 1. Standard init: archive previous run, build C++ binaries.
-#    This still creates models/accepted/v000000000.onnx with random
-#    weights; the next step overwrites it.
-python scripts/run_continuous.py init --filters 128 --blocks 10 -y
-
-# 2. Replace the seed ONNX with KataGo-warm weights.
-#    --onnx replaces the seed used by selfplay/gate.
-#    --checkpoint also seeds training.pt so the train worker resumes
-#    warm too (skip if you're OK letting train start fresh — selfplay
-#    games are KataGo-quality either way and train will catch up).
-python tools/warm_init_from_katago.py \
-  --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
-  --filters 128 --blocks 10 \
-  --onnx       models/accepted/v000000000.onnx \
-  --checkpoint training/checkpoints/training.pt
-
-# 3. Run as usual.
-python scripts/run_continuous.py run --filters 128 --blocks 10 [...]
-```
-
-The script prints the per-block pairing it chose (e.g.
-`MG[0] se ← KG[0] blk0`, `MG[4] se ← KG[3] blk3`, etc.), the four
-head transfers, and a coverage percentage. Use `--dry-run` to plan
-without writing outputs.
-
-### Caveats
-
-- **Architectural mismatch underneath.** MiniGo uses post-activation
-  residual blocks with BN; KataGo b10c128 uses pre-activation BN
-  (older nets) or fixup (newer configs). The conv kernels make sense
-  as a warm init but won't behave identically — early loss may be
-  noisier than a from-scratch run for the first hundred steps while
-  BN statistics catch up.
-- **No transfer of priors over MCTS / value scale.** The transferred
-  weights describe filter responses, not strategic preferences.
-  Expect modest sample-efficiency gains, not a free pre-trained model.
-- **No public b10c128 catalog entry.** kata1's main networks page
-  only lists b18c384 and larger; b10c128 isn't in the catalog UI but
-  the file exists at the URL above. If you want a different size,
-  `b6c64` is on the [extra_networks](https://katagotraining.org/extra_networks/)
-  page (note: b6c64 only matches MiniGo's `small` preset, not `large`).
 
 ---
 
