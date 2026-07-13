@@ -990,9 +990,14 @@ after touching `src/katago_inputs.cpp`, `src/game.cpp`, or
 `scripts/gamedata.py`:
 
 ```bash
-make -C build encode_dump
+make -C build encode_dump minigo_ladder
 python3 tools/encoder_parity_test.py --records 'training/selfplay/g_*.bin.zst'
+python3 tools/encoder_parity_test.py --force-py   # pure-Python fallback path
 ```
+
+The trainer loads `build/libminigo_ladder.so` for the V7 ladder planes
+(same C++ solver as inference); without it, a pure-Python fallback
+kicks in with a one-time warning and ~20x slower katago-arch encoding.
 
 ## Troubleshooting
 

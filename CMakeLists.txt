@@ -331,6 +331,7 @@ set(CORE_SOURCES
     src/mcts.cpp
     src/async_bot.cpp
     src/katago_inputs.cpp
+    src/ladder.cpp
 )
 
 if(HAS_EIGEN)
@@ -447,6 +448,14 @@ add_executable(verify    src/main_verify.cpp)
 target_link_libraries(verify PRIVATE minigo_core)
 add_executable(encode_dump src/main_encode_dump.cpp)
 target_link_libraries(encode_dump PRIVATE minigo_core)
+
+# Standalone ladder-solver shared library, ctypes-loaded by
+# scripts/gamedata.py so training uses the SAME solver as the C++
+# encoder (pure-Python fallback prints a warning).  Depends only on
+# libc++ — safe to build everywhere.
+add_library(minigo_ladder SHARED src/ladder.cpp)
+target_include_directories(minigo_ladder PRIVATE include)
+set_target_properties(minigo_ladder PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(HAS_VIP9000)
   add_executable(vip9000_smoke    src/main_vip9000_smoke.cpp)
   add_executable(vip9000_accuracy src/main_vip9000_accuracy.cpp)

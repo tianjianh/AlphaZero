@@ -51,7 +51,8 @@ from model import create_model
 #  random dihedral transform happens per sample in sample_batch.
 # ═══════════════════════════════════════════════════════════
 
-from gamedata import parse_v3, peek_v3_moves, V3_HEADER_LEN, sample_positions, sample_job
+from gamedata import (parse_v3, peek_v3_moves, V3_HEADER_LEN,
+                      sample_positions, sample_job, ladder_native_available)
 
 
 def _decompress_zst(blob):
@@ -395,7 +396,10 @@ class WindowRingBuffer:
         #   `spawn` keeps the workers CUDA-free (they import gamedata
         #   only, never torch), avoiding forked-CUDA-context hazards.
         self._decompress_workers = max(1, int(decompress_workers))
-        if encoder == "katago":
+        if encoder == "katago" and not ladder_native_available():
+            # Pure-Python ladder fallback only: processes beat the GIL.
+            # With libminigo_ladder.so present the ctypes call releases
+            # the GIL, so the (much cheaper) thread pool wins.
             import multiprocessing
             from concurrent.futures import ProcessPoolExecutor
             self._pool = ProcessPoolExecutor(

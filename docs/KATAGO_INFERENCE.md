@@ -281,9 +281,12 @@ or port the upstream piece if it bites.
   encoders now run a faithful port of upstream's bounded ladder search
   (`searchIsLadderCaptured` / `...AttackerFirst2Libs` + `iterLadders`,
   25k-node budget, double-ko-death rule, prev-board features 15/16
-  with historical ko points).  C++ ≈ 50-215 µs/position; the pure-
-  Python mirror (~3 ms/position) is parallelized with a spawn-based
-  process pool in the trainer's ring for `--arch katago`.
+  with historical ko points).  C++ ≈ 50-215 µs/position.  The solver
+  is also built as `libminigo_ladder.so`, which scripts/gamedata.py
+  ctypes-loads so the trainer uses the SAME implementation (ctypes
+  releases the GIL — the ring's thread pool parallelizes it).  A
+  pure-Python mirror remains as a fallback (one-time warning; forces
+  a spawn process pool to beat the GIL).
 - **Encore-only spatial planes (7, 20-21) are zeroed.** Plane 7 is
   ko-recap-blocked (encore phase only); planes 20-21 are
   second-encore start-stone colors. No encore support means these

@@ -29,9 +29,16 @@ import time
 
 import numpy as np
 
+# --force-py must land in the environment BEFORE gamedata is imported
+# (the native-lib probe result is cached at first use).
+if "--force-py" in sys.argv:
+    sys.argv.remove("--force-py")
+    os.environ["MINIGO_LADDER_FORCE_PY"] = "1"
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from gamedata import (parse_v3, Replay, encode_katago,       # noqa: E402
-                      KATAGO_SPATIAL, KATAGO_GLOBAL)
+                      KATAGO_SPATIAL, KATAGO_GLOBAL,
+                      ladder_native_available)
 
 PASS = None  # placeholder; per-board pass action = n*n
 
@@ -147,6 +154,8 @@ def main():
     total_pos = 0
     worst_g = 0.0
 
+    mode = "native ladder lib" if ladder_native_available() else "pure-Python ladder"
+    print(f"python encoder mode: {mode}")
     print("── synthetic ladder scenarios ──")
     for i, moves in enumerate(synthetic_games()):
         buf = io.BytesIO()

@@ -37,12 +37,12 @@ performance feature, not a correctness gap.
 
 ## KataGo-arch trainer sampling prefetch
 
-`--arch katago` batch sampling costs ~230 ms/batch (V7 ladder planes in
-pure Python, already parallelized across a 4-worker spawn process
-pool; the minigo path is unaffected at ~80 ms).  The step loop samples
-synchronously, so a one-batch prefetch (sample batch N+1 while N
-trains) would hide the cost entirely.  Alternative: Cythonize
-`gamedata`'s ladder module.
+`--arch katago` batch sampling costs ~135 ms/batch with the native
+ladder library (`libminigo_ladder.so`, ctypes-loaded, thread-pooled;
+the pure-Python fallback needs a spawn process pool and ~230 ms).
+The minigo path is ~50-80 ms.  The step loop samples synchronously, so
+a one-batch prefetch (sample batch N+1 while N trains) would hide the
+remaining cost entirely.
 
 ## FP8 training on Blackwell (te.Linear wgrad alignment)
 

@@ -100,10 +100,12 @@ Both encodings exist twice, and the pairs must stay byte-identical:
 
 Shared V7 fidelity caveats (both sides): encore/button/PDA features
 and non-default rules bits are zero; ko plane uses simple ko.  Ladder
-planes 14-17 ARE computed — both sides carry a faithful port of
-upstream's bounded ladder search, proven bit-identical across C++ and
-Python by `tools/encoder_parity_test.py` (synthetic ladder scenarios +
-real selfplay records; run it after touching either encoder).  The
+planes 14-17 ARE computed with upstream's bounded ladder search: ONE
+C++ implementation (src/ladder.cpp) serves the encoder AND — via the
+`libminigo_ladder.so` ctypes bridge — the Python trainer, with a
+pure-Python mirror as a warned fallback.  Bit-parity of every path is
+proven by `tools/encoder_parity_test.py` (and `--force-py` for the
+fallback); run it after touching either encoder.  The
 komi parity wave sits at `gl[18]` with board-area parity anchoring
 (upstream `fillRowV7`).
 

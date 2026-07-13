@@ -33,7 +33,9 @@ Per-position training targets are derived, never stored:
   opp_action(m) = actions[m+1], or −1 at the final move
 """
 
+import os
 import struct
+import sys
 from dataclasses import dataclass
 
 import numpy as np
@@ -744,8 +746,84 @@ def _l_search_attacker_first_2libs(b, loc, buf, cap_buf):
     return bool(working), working
 
 
+
+# ── Native ladder solver (libminigo_ladder.so via ctypes) ────
+#
+# The C++ solver is the single source of truth; this loader lets the
+# trainer use it directly (ctypes releases the GIL, so the ring's
+# thread pool parallelizes it).  The pure-Python mirror below stays as
+# a fallback — correct but ~20x slower — and prints a one-time warning.
+# Force the fallback with MINIGO_LADDER_FORCE_PY=1 (parity testing).
+
+_ladder_fn = None
+_ladder_checked = False
+
+
+def _load_ladder_lib():
+    global _ladder_fn, _ladder_checked
+    if _ladder_checked:
+        return _ladder_fn
+    _ladder_checked = True
+    if os.environ.get("MINIGO_LADDER_FORCE_PY"):
+        return None
+    import ctypes
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if os.environ.get("MINIGO_LADDER_LIB"):
+        candidates.append(os.environ["MINIGO_LADDER_LIB"])
+    candidates += [
+        os.path.join(here, "..", "build", "libminigo_ladder.so"),
+        "libminigo_ladder.so",
+    ]
+    for cand in candidates:
+        try:
+            lib = ctypes.CDLL(cand)
+            fn = lib.minigo_ladder_fill
+            fn.argtypes = [ctypes.c_char_p, ctypes.c_int32, ctypes.c_int32,
+                           ctypes.c_int32,
+                           ctypes.POINTER(ctypes.c_uint8),
+                           ctypes.POINTER(ctypes.c_uint8)]
+            fn.restype = None
+            _ladder_fn = fn
+            return fn
+        except OSError:
+            continue
+    print("[gamedata] WARNING: libminigo_ladder.so not found — using the "
+          "pure-Python ladder solver for KataGo V7 planes 14-17 (~20x "
+          "slower encoding).  Build it with: make -C build minigo_ladder",
+          file=sys.stderr, flush=True)
+    return None
+
+
+def ladder_native_available():
+    """True when the native solver library is loadable (the trainer uses
+    this to pick its sampling-pool type)."""
+    return _load_ladder_lib() is not None
+
+
 def _fill_ladder_planes(sp, flat_board, n, ko_flat,
                         plane_stones, plane_working, opp_color):
+    """Native-preferred dispatcher; falls back to the Python mirror."""
+    fn = _load_ladder_lib()
+    if fn is None:
+        return _fill_ladder_planes_py(sp, flat_board, n, ko_flat,
+                                      plane_stones, plane_working, opp_color)
+    import ctypes
+    nn = n * n
+    lad = np.zeros(nn, dtype=np.uint8)
+    lad_p = lad.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    if plane_working >= 0:
+        work = np.zeros(nn, dtype=np.uint8)
+        work_p = work.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        fn(flat_board, n, ko_flat, int(opp_color), lad_p, work_p)
+        sp[plane_working].reshape(-1)[work != 0] = 1.0
+    else:
+        fn(flat_board, n, ko_flat, 0, lad_p, None)
+    sp[plane_stones].reshape(-1)[lad != 0] = 1.0
+
+
+def _fill_ladder_planes_py(sp, flat_board, n, ko_flat,
+                           plane_stones, plane_working, opp_color):
     """Mirror of C++ fill_ladder_planes: decide once per 1-2-lib chain,
     mark its stones on plane_stones; for laddered 2-lib chains of
     opp_color additionally mark the attacker's working first moves on
