@@ -4,7 +4,7 @@
 The default `tools/katago_to_onnx.py` exports `_gpool_stats` as
 `ReduceMean(keepdims=False) + ReduceMax(keepdims=False) + Mul + Concat
 → Linear`.  rknn-toolkit2's graph-rewrite pipeline trips on that 2-D /
-4-D promotion (see `RKNN_CONVERSION.md` §10.1, §10.4) and either fails
+4-D promotion (see `docs/RKNN_CONVERSION.md` §10.1, §10.4) and either fails
 in `fold_constant` or hangs in C++ codegen.
 
 This helper monkey-patches `katago_arch._gpool_stats` and

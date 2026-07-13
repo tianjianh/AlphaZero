@@ -2,16 +2,16 @@
 # Turnkey: kata1 ONNX → Allwinner A733 NBG, via Allwinner's official
 # Acuity Toolkit Docker image (ubuntu-npu:v2.0.10.1, internally Acuity
 # v6.30.22).  This is the conversion path documented in
-# A733_CONVERSION.md; the pip-acuitylite path in tools/onnx_to_a733.py
+# docs/A733_CONVERSION.md; the pip-acuitylite path in tools/onnx_to_a733.py
 # is broken (produces NBGs with target=0x15 that the on-board viplite
 # v2.0.3 rejects with nbglk_valid_nbg_check[920]).
 #
 # Prereqs (the script checks these):
 #   * Real x86_64 Linux host with Docker (NOT a nested container — the
 #     VIP9000 simulator inside gen_nbg needs /proc mountable; see
-#     A733_CONVERSION.md §6.3).
+#     docs/A733_CONVERSION.md §6.3).
 #   * `ubuntu-npu:v2.0.10.1` already loaded.  This image is not on a
-#     public registry — see A733_CONVERSION.md §3.2 for how to fetch
+#     public registry — see docs/A733_CONVERSION.md §3.2 for how to fetch
 #     it from Allwinner's Synology netdisk and `docker load` it.
 #   * The matching `models/kata1-b10c128.a733.bs<N>.unshared.onnx`
 #     already produced from the .txt.gz weights.  See §3.1.
@@ -40,7 +40,7 @@ OUT_DIR="${REPO_ROOT}/models/${BASE}.a733.bs${BS}.fp16"
 
 # The chip target.  NOTE: NOT _PLUS_ despite Allwinner's pegasus_setup.sh
 # v3 saying so — the actual .config file shipped in ubuntu-npu:v2.0.10.1
-# is named without _PLUS_.  See A733_CONVERSION.md §0 / §6.1.
+# is named without _PLUS_.  See docs/A733_CONVERSION.md §0 / §6.1.
 CHIP="VIP9000NANODI_PID0X1000003B"
 
 # ── Sanity checks ──────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ This image is not on Docker Hub.  Get it from Allwinner's Synology netdisk:
   sudo docker load -i ubuntu-npu_v2.0.10.1.tar
 
 Total ~2.9 GB compressed, 7.4 GB uncompressed tar, then loaded into
-Docker.  See A733_CONVERSION.md §3.2 for full context.
+Docker.  See docs/A733_CONVERSION.md §3.2 for full context.
 EOF
     exit 1
 fi
@@ -115,7 +115,7 @@ echo "[a733] target chip: $CHIP"
 echo "[a733] output dir: $OUT_DIR"
 echo "[a733] running in container..."
 
-# ── The actual conversion (see A733_CONVERSION.md §3.3 for annotation) ─
+# ── The actual conversion (see docs/A733_CONVERSION.md §3.3 for annotation) ─
 
 docker run --rm \
     -v "${REPO_ROOT}:/workspace" \
@@ -209,6 +209,6 @@ print(f"[a733] {p}")
 print(f"[a733]   magic   = {magic:#x}    (expect 0x4e4d5056 = 'VPMN')")
 print(f"[a733]   version = {ver:#x}      (acuity v6.30.22 in ubuntu-npu:v2.0.10.1 emits 0x20000 = NBG v2.0.0)")
 print(f"[a733]   target  = {target:#x} (expect 0x1000003b)")
-print(f"[a733]   {'PASS — ship to the Cubie A7A and run vpm_run smoke test (A733_CONVERSION.md §7.1).' if ok else 'FAIL — these bytes will be rejected by on-board viplite.'}")
+print(f"[a733]   {'PASS — ship to the Cubie A7A and run vpm_run smoke test (docs/A733_CONVERSION.md §7.1).' if ok else 'FAIL — these bytes will be rejected by on-board viplite.'}")
 sys.exit(0 if ok else 1)
 PY

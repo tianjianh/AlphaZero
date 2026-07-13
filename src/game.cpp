@@ -461,7 +461,7 @@ void GoGame::score_game() {
     // not Tromp-Taylor's positional superko — long cycles (triple ko etc.)
     // are bounded only by max_moves_per_game.  KataGo defaults to
     // positional superko; adding it here would need a position-hash set
-    // in play().  See COMPARISON_WITH_KATAGO.md.
+    // in play().  See docs/COMPARISON_WITH_KATAGO.md.
     auto [b, w] = score();
     final_black_score = b - w;
     if (b > w) winner = BLACK;

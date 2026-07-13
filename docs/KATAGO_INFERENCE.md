@@ -26,7 +26,7 @@ Backends that run the dual-input format natively: **TensorRT** and
 **OpenCL** (full, incl. fp16/tensor-core tiers); **Eigen** on CPU
 (converted-kata1 naming); **RKNN / VIP9000** via pre-compiled
 artifacts.  CUDA and Metal still throw at handle creation (kernels
-not ported yet — see TODO.md).
+not ported yet — see ROADMAP.md).
 
 ---
 
@@ -328,7 +328,7 @@ or port the upstream piece if it bites.
 
 6. **Backends.** TensorRT and OpenCL run the dual-input format
    natively; Eigen runs it on CPU.  CUDA and Metal throw at handle
-   creation until their kernels are ported (TODO.md).
+   creation until their kernels are ported (ROADMAP.md).
 7. **Old TRT versions can choke on opset.** This build uses
    PyTorch's exporter (opset 18). TRT 10.13 used here parses cleanly;
    older TRT may fail.

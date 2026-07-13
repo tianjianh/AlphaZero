@@ -14,7 +14,7 @@ Architecture:
   - Every step is a collective decision: rank 0 computes go/no-go on the
     bucket + cold-start gate, broadcasts the bool, all ranks act together.
 
-See CONTINUOUS_TRAINING.md for the complete design rationale.
+See docs/CONTINUOUS_TRAINING.md for the complete design rationale.
 """
 
 import argparse

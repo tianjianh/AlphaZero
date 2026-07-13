@@ -52,7 +52,7 @@ variants (`scripts/make_test_vectors.py` + `build/verify`).
 **Eigen** runs the MiniGo resnet on CPU; its dual-input path reads
 the CONVERTED-kata1 tensor naming only — the trainable KataGoNet's
 state_dict names are not mapped yet (clean "missing tensor" error;
-TODO.md item 7) — and is debugging-grade speed at b10c128.  ViT on
+ROADMAP.md deferred item 6) — and is debugging-grade speed at b10c128.  ViT on
 Eigen is a TODO placeholder.  **CUDA / Metal** accept every format at
 the interface but their kernels are TODO placeholders — `create_handle`
 succeeds structurally and the handle constructor throws a uniform

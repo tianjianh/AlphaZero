@@ -1000,5 +1000,5 @@ without writing outputs.
 - `COMPARISON_WITH_KATAGO.md` — how this pipeline mirrors (and
   deviates from) KataGo's training code.
 - `README.md` — project overview, build, architecture.
-- `training_strategy.md` — postmortems and tuning rationale from
+- `TRAINING_STRATEGY.md` — postmortems and tuning rationale from
   earlier runs.

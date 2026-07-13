@@ -872,7 +872,7 @@ def add_run_args(p):
     # the ring stores zstd blobs (~3 KB per 9x9 game), so 2000 games is
     # only ~6 MB per rank.  Keep it near (window_games / world_size) ÷ k
     # for some small k so the ring tracks the newest slice of the pool;
-    # see training_strategy.md "Ring buffer staleness".
+    # see docs/TRAINING_STRATEGY.md "Ring buffer staleness".
     p.add_argument("--ring-games", type=int, default=2000)
     # Game-granular sampling controls.  K = batch_size / samples_per_game
     # games decompressed per batch (each contributes samples_per_game
@@ -894,7 +894,7 @@ def add_run_args(p):
     # to mitigate the score-head feedback loop observed in run 2:
     # loss_score_mean climbed 9 → 19 across the run while policy/value
     # continued to descend, dragging loss_total to a fake plateau.  See
-    # training_strategy.md "Score-head feedback loop".
+    # docs/TRAINING_STRATEGY.md "Score-head feedback loop".
     p.add_argument("--value-weight-start", type=float, default=1.0)
     p.add_argument("--value-weight-end", type=float, default=2.0)
     p.add_argument("--score-mean-weight-start", type=float, default=0.004)
@@ -917,7 +917,7 @@ def add_run_args(p):
                         "score_ramp from status.json and multiplies). "
                         "Lowered 0.06 → 0.04 to reduce the score head's "
                         "feedback into MCTS Q-values; see "
-                        "training_strategy.md.")
+                        "docs/TRAINING_STRATEGY.md.")
     p.add_argument("--selfplay-threads", type=int, default=0,
                    help="Parallel game workers (0 = os.cpu_count())")
     p.add_argument("--selfplay-search-threads", type=int, default=16,
@@ -985,7 +985,7 @@ def main():
     # Defaults match `add_run_args` so init-then-run with no arch flags
     # produces a consistent arch.  Mismatch would silently train a default-
     # sized net while selfplay used the bootstrap of a different size — see
-    # training_strategy.md "Issues overlooked: init/run arch divergence".
+    # docs/TRAINING_STRATEGY.md "Issues overlooked: init/run arch divergence".
     p_init.add_argument("--arch", default="resnet",
                         choices=["resnet", "vit", "katago"])
     p_init.add_argument("--board", type=int, default=9)

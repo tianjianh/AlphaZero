@@ -3,7 +3,7 @@
 #
 # The fp16 path produced by tools/onnx_to_a733_docker.sh runs almost
 # entirely on the VIP9000's PPU/Shader engines (89 SP + 71 SH ops, only
-# 2 NN-core ops out of 195 — see A733_CONVERSION.md §12).  This is
+# 2 NN-core ops out of 195 — see docs/A733_CONVERSION.md §12).  This is
 # because VIP9000 NN cores are int8 dataflow; fp16 convs fall back to
 # the shader path which is ~10× slower than the NN cores.
 #
@@ -63,7 +63,7 @@ for cmd in docker; do
 done
 docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon unreachable; sudo or add to docker group" >&2; exit 1; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
-    echo "ERROR: $IMAGE not loaded; see A733_CONVERSION.md §3.2" >&2; exit 1; }
+    echo "ERROR: $IMAGE not loaded; see docs/A733_CONVERSION.md §3.2" >&2; exit 1; }
 
 [ -f "$ONNX_PATH" ] || { echo "ERROR: $ONNX_PATH missing; run tools/onnx_to_a733_docker.sh $BS first to ensure ONNX exists" >&2; exit 1; }
 

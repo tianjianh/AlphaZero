@@ -22,7 +22,7 @@
    Which runs Allwinner's official Acuity v6.30.22 inside the
    `ubuntu-npu:v2.0.10.1` Docker image (its libEmulator.so chip
    table DOES contain `VIP9000NANODI_PID0X1000003B`, the right
-   chip for the Cubie A7A's A733).  See A733_CONVERSION.md for the
+   chip for the Cubie A7A's A733).  See docs/A733_CONVERSION.md for the
    full pipeline and on-board diagnostics that demonstrated the
    rejection.
 
@@ -49,7 +49,7 @@ print(
     "\n"
     "       That script needs a real x86_64 Linux host with Docker and\n"
     "       Allwinner's `ubuntu-npu:v2.0.10.1` image already loaded.\n"
-    "       Read A733_CONVERSION.md for the full procedure and context.\n",
+    "       Read docs/A733_CONVERSION.md for the full procedure and context.\n",
     file=sys.stderr,
 )
 sys.exit(2)

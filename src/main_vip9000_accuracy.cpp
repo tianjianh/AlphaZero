@@ -5,7 +5,7 @@
 // reports:
 //   * top-1 / top-3 / top-5 policy agreement (treating fp16 as reference,
 //     since fp16 on VIP9000 is essentially lossless vs the source ONNX —
-//     see A733_CONVERSION.md §6.1 host-side parity tables);
+//     see docs/A733_CONVERSION.md §6.1 host-side parity tables);
 //   * value / score / score_sd: mean and max absolute error;
 //   * ownership: mean and max absolute error per board cell.
 //

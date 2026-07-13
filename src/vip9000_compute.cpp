@@ -68,7 +68,7 @@ static bool ends_with(const std::string& s, const std::string& suf) {
 }
 
 // Pick the smallest pre-converted NBG batch ≥ max_batch_size.  We ship
-// bs=1 (live play) and bs=4 (self-play), per A733_CONVERSION.md §5.
+// bs=1 (live play) and bs=4 (self-play), per docs/A733_CONVERSION.md §5.
 static int pick_compiled_batch(int max_batch_size) {
     if (max_batch_size <= 1) return 1;
     if (max_batch_size <= 4) return 4;
@@ -148,7 +148,7 @@ static std::string resolve_nbg_path(const std::string& model_path, int chosen_bs
     os << "VIP9000: pre-converted NBG not found at "
        << base << ".a733.bs" << chosen_bs << ".{int8,fp16}/network_binary.nb."
        << "  Convert the ONNX with `bash tools/onnx_to_a733_docker.sh "
-       << chosen_bs << "` (see A733_CONVERSION.md).";
+       << chosen_bs << "` (see docs/A733_CONVERSION.md).";
     throw std::runtime_error(os.str());
 }
 
@@ -537,7 +537,7 @@ static void init_master(VIP9000DeviceState& dev, const LoadedModel* model,
               "acuitylite version against a different VIP9000 variant.  "
               "Re-convert on x86 with the toolkit that matches the on-board "
               "viplite runtime (current: 2.0.3.2-AW-2024-08-30) — see "
-              "A733_CONVERSION.md.  vip_create_network would otherwise fail "
+              "docs/A733_CONVERSION.md.  vip_create_network would otherwise fail "
               "with status=-4 and the NN server thread would die, causing "
               "evaluate_*() to hang forever.";
         throw std::runtime_error(os.str());
