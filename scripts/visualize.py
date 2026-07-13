@@ -2,7 +2,7 @@
 """
 MiniGo — Selfplay Game Visualizer
 
-Reads .bin / .bin.zst / .bin.gz selfplay data files or .sgf evaluation
+Reads .bin / .bin.zst selfplay data files or .sgf evaluation
 game files and displays the games move by move.
 
 Usage:

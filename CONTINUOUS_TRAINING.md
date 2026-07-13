@@ -33,8 +33,13 @@ Two commands: `init` (once, seeds bootstrap model) and `run` (launches
 the four workers).
 
 ```bash
+# Python deps for the pipeline (torch, numpy, zstandard, onnx):
+pip install -r scripts/requirements.txt
+
 # One-time: archive any previous run, build C++ binaries, seed
 # models/accepted/v000000000.onnx + accepted/latest symlink.
+# (Backend auto-detected by CMake: tensorrt > opencl > eigen on Linux;
+#  force one with MINIGO_BACKEND=opencl python scripts/run_continuous.py init)
 python scripts/run_continuous.py init -y
 
 # Launch the four workers.  Single-GPU (everything on GPU 0) is the default:
@@ -424,7 +429,7 @@ a random-init ONNX, and writes **`training/run_config.json`** — the
 single source of truth for architecture + komi that `run` reads back.
 
 ```
---arch {resnet,vit}      # default: resnet
+--arch {resnet,vit,katago}  # default: resnet
 --board N                # default: 9
 --filters N              # ResNet filters (default: 128)
 --blocks N               # ResNet blocks (default: 10)
@@ -491,7 +496,7 @@ tied to one worker is prefixed with that worker's name, so `--help
 --weight-decay 1e-4
 --replay-target 4.0
 --ring-games 2000
---bucket-cap-mult 64
+--bucket-cap-mult 512
 --min-window-games 2000
 --min-ring-rows 10240
 --sample-batch-timeout-s 30
@@ -503,7 +508,7 @@ tied to one worker is prefixed with that worker's name, so `--help
 --value-weight-start 1.0     # head-weight ramp endpoints
 --value-weight-end   2.0
 --score-mean-weight-start 0.004
---score-mean-weight-end   0.010
+--score-mean-weight-end   0.008
 --policy-weight 1.0          # fixed head weights (no ramp, but overridable)
 --score-stdev-weight 0.006
 --score-belief-weight 0.035
@@ -521,6 +526,8 @@ the workload-shape knobs.)
 --selfplay-sims 600           # MCTS simulations per move
 --window-games 100000         # disk retention cap
 --score-weight-max 0.04       # MCTS score weight at full ramp
+--throttle-high 0.9           # pause selfplay at this bucket fill (0 = off)
+--throttle-low 0.5            # resume below this fill
 ```
 
 **Gatekeeper workload:**
@@ -547,6 +554,7 @@ the workload-shape knobs.)
 --dirichlet-epsilon 0.22
 --temp-threshold 12
 --komi 7.5
+--win-loss-weight 1.0
 --score-scale 18.0
 --max-batch 256               # SHARED, not per-worker — part of the TRT
                               # engine cache key, so selfplay + gate must

@@ -18,13 +18,15 @@ fresh KataGoNet.
 |---|---|
 | `play` | yes — interactive play |
 | `evaluate` | yes — match games (kata1 vs MiniGo, kata1 vs kata1, …) |
-| `benchmark` | sections 1-4 — section 5 (selfplay) is auto-skipped |
-| `selfplay` | **no** — errors out at startup with `return 2` |
+| `benchmark` | yes — all sections including selfplay |
+| `selfplay` | yes — V3 records are engine-neutral, so a kata net can generate the training pool |
 | `scripts/train*.py`, `tools/warm_init_from_katago.py` (warm-init mode) | unchanged — no KataGo runtime path |
 
-Backend support is restricted to **TensorRT**. Eigen / CUDA /
-OpenCL / Metal / RKNN throw `"KataGo format requires the TensorRT
-backend"` at handle creation.
+Backends that run the dual-input format natively: **TensorRT** and
+**OpenCL** (full, incl. fp16/tensor-core tiers); **Eigen** on CPU
+(converted-kata1 naming); **RKNN / VIP9000** via pre-compiled
+artifacts.  CUDA and Metal still throw at handle creation (kernels
+not ported yet — see TODO.md).
 
 ---
 
@@ -45,7 +47,7 @@ python tools/katago_parity_test.py \
     --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
     --onnx models/kata1-b10c128.onnx --board 9
 
-# 4. Build (TensorRT backend is required for KataGo runs)
+# 4. Build (tensorrt or opencl both run KataGo models natively)
 cmake -B build -DMINIGO_BACKEND=tensorrt
 make -C build -j
 
@@ -317,15 +319,16 @@ or port the upstream piece if it bites.
 4. **No FPU reduction, no subtree value bias, no symmetric root
    augmentation.** Each of these would marginally improve search;
    none are implemented (see "MCTS / search differences").
-5. **Selfplay is hard-rejected.** The V2 record format and
-   augmentation (`mcts.cpp:608-668`) are MiniGo-shaped. Don't
-   bypass the guard — feeding KataGo states through MiniGo
-   augmentation would silently produce corrupt training data.
+5. **Selfplay records are V3 (engine-neutral).**  A kata net can
+   generate the training pool for any architecture: records store
+   moves + targets, and each trainer encodes positions for its own
+   input format at sample time (see FORMATS.md).
 
 ### Operational caveats
 
-6. **TensorRT-only.** Eigen, CUDA (non-TRT), OpenCL, Metal, RKNN all
-   throw at handle creation. Build with `cmake -DMINIGO_BACKEND=tensorrt`.
+6. **Backends.** TensorRT and OpenCL run the dual-input format
+   natively; Eigen runs it on CPU.  CUDA and Metal throw at handle
+   creation until their kernels are ported (TODO.md).
 7. **Old TRT versions can choke on opset.** This build uses
    PyTorch's exporter (opset 18). TRT 10.13 used here parses cleanly;
    older TRT may fail.
@@ -364,7 +367,7 @@ Remaining boundary — stock kata1 checkpoints never enter the
 | `TensorRTComputeHandle::predict_batch` | input split (spatial+global) |
 | `main_play`, `main_evaluate` | run via MCTS — work for both formats |
 | `main_benchmark` sections 1-4 | KataGo-aware |
-| `main_benchmark` section 5 | skipped for KataGo |
-| `main_selfplay` | rejects KataGo at startup with `return 2` |
+| `main_benchmark` section 5 | runs for KataGo (V3 records) |
+| `main_selfplay` | runs KataGo models (V3 records are engine-neutral) |
 | Eigen / CUDA / OpenCL / Metal / RKNN backends | reject KataGo at `create_handle` |
 | `mcts.cpp:699` (`self_play_game_impl` encode) | hardcoded to `game.encode()` (defense-in-depth, even though entry guards prevent KataGo from reaching it) |

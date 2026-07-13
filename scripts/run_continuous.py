@@ -85,10 +85,16 @@ def build_if_needed():
     evaluate = BUILD_DIR / "evaluate"
     if selfplay.is_file() and evaluate.is_file():
         return
-    print(f"[build] building C++ binaries into {BUILD_DIR}")
+    # Backend is auto-detected by CMake (tensorrt > opencl > eigen on
+    # Linux); set MINIGO_BACKEND=tensorrt|opencl|eigen|... to force one.
+    cmake_cmd = ["cmake", "..", "-DCMAKE_BUILD_TYPE=Release"]
+    backend = os.environ.get("MINIGO_BACKEND")
+    if backend:
+        cmake_cmd.append(f"-DMINIGO_BACKEND={backend}")
+    print(f"[build] building C++ binaries into {BUILD_DIR}"
+          + (f" (backend={backend})" if backend else " (backend=auto)"))
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["cmake", "..", "-DCMAKE_BUILD_TYPE=Release"],
-                   cwd=str(BUILD_DIR), check=True)
+    subprocess.run(cmake_cmd, cwd=str(BUILD_DIR), check=True)
     subprocess.run(["make", f"-j{os.cpu_count() or 4}"],
                    cwd=str(BUILD_DIR), check=True)
 
@@ -414,6 +420,7 @@ def selfplay_cmd(args, log_dir):
             "--dirichlet-epsilon", str(args.dirichlet_epsilon),
             "--temp-threshold", str(args.temp_threshold),
             "--komi", str(args.komi),
+            "--win-loss-weight", str(args.win_loss_weight),
             "--score-scale", str(args.score_scale),
             "--score-weight-max", str(args.score_weight_max),
             "--throttle-high", str(args.throttle_high),
@@ -441,6 +448,7 @@ def gate_cmd(args, log_dir):
             "--max-batch", str(args.max_batch),
             "--c-puct", str(args.c_puct),
             "--komi", str(args.komi),
+            "--win-loss-weight", str(args.win_loss_weight),
             "--score-scale", str(args.score_scale),
             ]
 
@@ -464,6 +472,7 @@ def rate_cmd(args, log_dir):
             "--max-batch", str(args.max_batch),
             "--c-puct", str(args.c_puct),
             "--komi", str(args.komi),
+            "--win-loss-weight", str(args.win_loss_weight),
             "--score-scale", str(args.score_scale),
             ]
 
@@ -859,11 +868,11 @@ def add_run_args(p):
     # (-max-train-bucket-per-new-data).  Their synchronous_loop.sh uses 8
     # but that's small-machine experimentation, not their main runs.
     p.add_argument("--replay-target", type=float, default=4.0)
-    # ring_games is host-RAM-bound: each rank holds ring_games × ~800 rows
-    # × ~6 KB ≈ ~10 GB at 2000 games.  4-rank box with ~64 GB host RAM
-    # caps at ~2000 per rank.  Raise to 4000+ if host has ≥128 GB.
-    # Tighter than KataGo's hour-scale shuffle buffer; see
-    # training_strategy.md "Ring buffer staleness".
+    # ring_games sets the per-rank freshness window, NOT a RAM budget:
+    # the ring stores zstd blobs (~3 KB per 9x9 game), so 2000 games is
+    # only ~6 MB per rank.  Keep it near (window_games / world_size) ÷ k
+    # for some small k so the ring tracks the newest slice of the pool;
+    # see training_strategy.md "Ring buffer staleness".
     p.add_argument("--ring-games", type=int, default=2000)
     # Game-granular sampling controls.  K = batch_size / samples_per_game
     # games decompressed per batch (each contributes samples_per_game
@@ -945,6 +954,7 @@ def add_run_args(p):
 
     # MCTS / game (shared across workers)
     p.add_argument("--c-puct", type=float, default=1.25)
+    p.add_argument("--win-loss-weight", type=float, default=1.0)
     p.add_argument("--dirichlet-alpha", type=float, default=0.15)
     p.add_argument("--dirichlet-epsilon", type=float, default=0.22)
     p.add_argument("--temp-threshold", type=int, default=12)

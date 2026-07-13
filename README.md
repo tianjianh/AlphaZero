@@ -282,13 +282,13 @@ for the chip-ID gotchas to spot-check after each re-conversion.
 ### Python (both platforms — only needed for training)
 
 ```bash
-pip install torch numpy onnx onnxscript zstandard
+pip install -r scripts/requirements.txt   # torch, numpy, zstandard, onnx
 
 # Optional: FP8 training on Blackwell+ GPUs (SM 10.0)
 pip install transformer_engine
 ```
 
-Python is NOT required for inference — only for training (`train.py`)
+Python is NOT required for inference — only for training (`train_continuous.py`)
 and model export (`export_onnx.py`).  Multi-GPU training uses PyTorch
 DistributedDataParallel via `torchrun` (included with PyTorch).
 
@@ -492,7 +492,7 @@ with no Dirichlet noise for clean evaluation.
 Review selfplay or evaluation games with the visualizer:
 
 ```bash
-# Selfplay game (binary format, supports .bin / .bin.zst / .bin.gz)
+# Selfplay game (binary format, supports .bin / .bin.zst)
 python scripts/visualize.py training/selfplay/g_00000000000000001.bin.zst
 
 # Evaluation game (SGF format)
@@ -712,8 +712,9 @@ python tools/katago_parity_test.py \
     --katago-bin kata1-b10c128-s1141046784-d204142634.txt.gz \
     --onnx models/kata1-b10c128.onnx --board 9
 
-# 4.  Build with the TensorRT backend (KataGo is TRT-only).
-cmake -B build -DMINIGO_BACKEND=tensorrt
+# 4.  Build with a backend that runs the dual-input format natively
+#     (tensorrt and opencl both do; eigen runs it on CPU).
+cmake -B build -DMINIGO_BACKEND=tensorrt   # or -DMINIGO_BACKEND=opencl
 make -C build -j
 
 # 5.  Run.  First run on each (GPU × max-batch × precision) builds a TRT
@@ -850,7 +851,7 @@ plus per-head MAE (treating fp16 as ground truth).
               Self-Play Data (.bin)
                       ▼
           ┌─── Python ───────────┐
-          │  train.py (PyTorch)  │
+          │ train_continuous.py  │
           │  export_onnx.py      │──▶ models/*.onnx
           └──────────────────────┘
 ```
@@ -1890,10 +1891,10 @@ flattened-FC design, which collapses all channel information before the FC.
 directional positional encoding (factorized row/col embedding + signed
 relative bias for full spatial and directional awareness).
 
-**Backend support for the new ResNet is currently TensorRT-only.**  The
-Eigen/CUDA/OpenCL/Metal backends still contain the old AlphaZero-ResNet
-forward pass but throw at handle creation until hand-written kernels for
-SE/GPool blocks and global-pool heads are added (see `TODO.md`).
+**Backend support for the new ResNet:** TensorRT and OpenCL implement it
+fully (OpenCL also runs the ViT and both KataGo-V7 namings — see the
+"OpenCL GPU Backend" section); Eigen runs it on CPU.  CUDA/Metal still
+throw at handle creation until their kernels are ported (see `TODO.md`).
 
 Both architectures share 7 output heads (KataGo-style).  4 drive MCTS at
 inference time and are exported to ONNX; 3 are training-only auxiliaries
@@ -2113,11 +2114,11 @@ python scripts/run_continuous.py status    Show pool/models/step summary
   --search-threads N     MCTS search threads per move (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
   --output DIR           Output directory (default: training/selfplay)
-  --sims N               MCTS simulations per move (default: 800)
-  --c-puct F             UCB exploration constant (default: 1.5)
+  --sims N               MCTS simulations per move (default: 600)
+  --c-puct F             UCB exploration constant (default: 1.25)
   --dirichlet-alpha F    Root noise concentration (default: 0.15)
-  --dirichlet-epsilon F  Root noise weight (default: 0.25)
-  --temp-threshold N     Moves of stochastic play (default: 15)
+  --dirichlet-epsilon F  Root noise weight (default: 0.22)
+  --temp-threshold N     Moves of stochastic play (default: 12)
   --score-scale F        Score atan compression scale (default: 18.0)
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
@@ -2128,10 +2129,10 @@ python scripts/run_continuous.py status    Show pool/models/step summary
 ```
 ./build/play [options]
   --model PATH           Model file (default: models/best.onnx)
-  --sims N               MCTS simulations per move (default: 800)
+  --sims N               MCTS simulations per move (default: 600)
   --search-threads N     MCTS search threads (default: 16)
   --max-batch N          Max GPU batch size (default: 256)
-  --c-puct F             UCB exploration constant (default: 1.5)
+  --c-puct F             UCB exploration constant (default: 1.25)
   --komi F               Komi value (default: 7.5)
   --score-weight F       Score utility weight (default: 0.0)
   --score-scale F        Score atan compression scale (default: 18.0)
@@ -2155,10 +2156,10 @@ the full state machine.
   --games N              Games to play (default: 100)
   --threads N            Parallel game workers (default: 1)
   --search-threads N     MCTS threads per move (default: 16)
-  --sims N               MCTS simulations per move (default: 800)
+  --sims N               MCTS simulations per move (default: 600)
   --max-batch N          Max GPU batch size (default: 256)
-  --threshold FLOAT      Win rate to pass (default: 0.55)
-  --c-puct F             UCB exploration constant (default: 1.5)
+  --threshold FLOAT      Win rate to pass (default: 0.5)
+  --c-puct F             UCB exploration constant (default: 1.25)
   --score-scale F        Score atan compression scale (default: 18.0)
   --output DIR           Save game records as SGF files
   --nn-server-threads N  NN server threads per model (default: 1)
@@ -2183,6 +2184,25 @@ SGF files can be reviewed with `python scripts/visualize.py`.
   --nn-server-threads N  NN server threads (default: 1)
   --nn-device-ids IDS    Comma-separated GPU indices (default: "0")
 ```
+
+### verify
+
+Numerical verification of the compiled backend against PyTorch
+reference vectors, plus a raw inference micro-benchmark:
+
+```
+# One-time: build reference models + vectors for all five formats
+python scripts/make_test_vectors.py build/test_vectors
+
+./build/verify --model build/test_vectors/resnet.onnx \
+               --vectors build/test_vectors/resnet.vec        # PASS/FAIL + max diffs
+./build/verify --model some_model.onnx --bench                # evals/s at B=1..256
+  --tol-pol/--tol-val/--tol-score/--tol-own   per-field tolerances
+  --max-batch N                               bench batch cap (default: 256)
+```
+
+Exit code 0 = within tolerance.  For the OpenCL backend, combine with
+`MINIGO_OPENCL_PRECISION=fp32|fp16|fp16-portable` to test each tier.
 
 ## Platform Notes
 

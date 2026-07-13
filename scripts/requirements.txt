@@ -1,0 +1,9 @@
+# Python dependencies for the training pipeline (scripts/*.py).
+#   pip install -r scripts/requirements.txt
+#
+# torch: install the build matching your CUDA first if pip's default
+# doesn't fit your system — https://pytorch.org/get-started/locally/
+torch>=2.1
+numpy>=1.24
+zstandard>=0.21     # selfplay pool compression (drivers + trainer ring)
+onnx>=1.15          # export_onnx.py graph post-processing / state_dict embed

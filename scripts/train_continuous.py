@@ -785,7 +785,10 @@ def main():
     # Window / ring / bucket
     ap.add_argument("--replay-target", type=float, default=4.0)
     ap.add_argument("--ring-games", type=int, default=2000,
-                    help="Games in per-rank ring; rows = ring_games * ~800")
+                    help="Games in per-rank ring (~100 rows/game on 9x9; "
+                         "blobs stay zstd-compressed in RAM, so 2000 games "
+                         "is only tens of MB — the setting controls the "
+                         "freshness window, not memory)")
     ap.add_argument("--samples-per-game", type=int, default=8,
                     help="Rows per game pulled into each batch (game-"
                          "granular sampling).  K = batch_size / "

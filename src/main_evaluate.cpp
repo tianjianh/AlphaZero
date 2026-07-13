@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
     int nn_server_threads  = 1;
     std::string nn_device_ids_str = "0";
     int sims               = -1;
-    float threshold        = 0.55f;
+    float threshold        = 0.5f;   // matches the pipeline's --gate-threshold default
     int max_batch_size     = 256;
     float c_puct           = -1.0f;  // -1 = use default
     float komi             = -1.0f;  // -1 = use default
@@ -175,10 +175,10 @@ int main(int argc, char* argv[]) {
                 << "  --games N               Games to play (default: 100)\n"
                 << "  --threads N             Parallel game workers (default: 1)\n"
                 << "  --search-threads N      MCTS threads per move (default: 16)\n"
-                << "  --sims N                MCTS simulations per move (default: 800)\n"
+                << "  --sims N                MCTS simulations per move (default: 600)\n"
                 << "  --max-batch N           Max GPU batch size (default: 256)\n"
-                << "  --threshold FLOAT       Win rate to pass (default: 0.55)\n"
-                << "  --c-puct F              UCB exploration constant (default: 1.5)\n"
+                << "  --threshold FLOAT       Win rate to pass (default: 0.5)\n"
+                << "  --c-puct F              UCB exploration constant (default: 1.25)\n"
                 << "  --komi F                Komi value (default: 7.5)\n"
                 << "  --win-loss-weight F     Win/loss utility weight (default: 1.0)\n"
                 << "  --score-weight F        Score utility weight (default: 0.0)\n"

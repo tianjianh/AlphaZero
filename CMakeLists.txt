@@ -165,11 +165,21 @@ if(MINIGO_BACKEND STREQUAL "auto")
           PATH_SUFFIXES lib lib64)
         if(NVINFER_LIB AND NVINFER_INCLUDE_DIR AND NVONNXPARSER_LIB)
           set(MINIGO_BACKEND "tensorrt")
-        else()
-          set(MINIGO_BACKEND "cuda")
         endif()
-      else()
-        set(MINIGO_BACKEND "cuda")
+      endif()
+      # No TensorRT (or SM too old): fall through to OpenCL.  The CUDA
+      # backend's forward pass is still a stub that throws at handle
+      # creation (see TODO.md), so `auto` must NEVER select it — the
+      # NVIDIA OpenCL ICD ships with the driver and the OpenCL backend
+      # implements every model format.  Use -DMINIGO_BACKEND=cuda only
+      # if you are developing that backend.
+      if(NOT MINIGO_BACKEND STREQUAL "tensorrt")
+        find_package(OpenCL QUIET)
+        if(OpenCL_FOUND)
+          set(MINIGO_BACKEND "opencl")
+        else()
+          set(MINIGO_BACKEND "eigen")
+        endif()
       endif()
     else()
       # No CUDA — on aarch64 Linux, prefer hardware NPU paths.

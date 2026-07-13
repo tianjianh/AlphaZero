@@ -20,12 +20,15 @@ struct Config {
     int vit_heads = 0;
     int vit_kv_groups = 0;
 
-    // MCTS
-    int num_simulations = 800;
-    float c_puct = 1.5f;
+    // MCTS — defaults match the continuous-training pipeline
+    // (scripts/run_continuous.py) so a standalone binary launch behaves
+    // like a supervised one.  The pipeline always passes these
+    // explicitly; only bare `build/<tool>` runs rely on the defaults.
+    int num_simulations = 600;
+    float c_puct = 1.25f;
     float dirichlet_alpha = 0.15f;   // ~10/avg_legal_moves (0.15 for 9x9, 0.03 for 19x19)
-    float dirichlet_epsilon = 0.25f; // blend: 75% network prior + 25% noise
-    int temperature_threshold = 15;  // moves of stochastic play (rest is greedy)
+    float dirichlet_epsilon = 0.22f; // blend: 78% network prior + 22% noise
+    int temperature_threshold = 12;  // moves of stochastic play (rest is greedy)
     float win_loss_weight = 1.0f;    // blend: utility = wlw * value + sw * score_utility
     float score_weight = 0.0f;       // blend: utility = wlw * value + sw * score_utility
     float score_scale = 18.0f;       // atan compression: 2*sqrt(boardArea) for 9x9 (KataGo formula)
