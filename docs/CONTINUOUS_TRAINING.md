@@ -397,7 +397,7 @@ shared between them.
 
 ### TRT engine cache sharing
 
-The TRT cache key is basename-based (see `src/tensorrt_compute.cpp`).
+The TRT cache key is basename-based (see `src/backends/tensorrt_compute.cpp`).
 Candidates are named `v{step:09d}.onnx` and preserved across the
 `candidates/ → accepted/` rename. Result: the gatekeeper's match warms
 the TRT cache; selfplay's next batch loads the plan from disk in <1s.

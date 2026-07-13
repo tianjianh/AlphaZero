@@ -24,7 +24,7 @@ This script:
   2. Snapshots positions densely across the game (every K moves, with
      denser sampling early/late).
   3. Encodes each snapshot via a faithful port of
-     `src/katago_inputs.cpp`'s KataGo V7 encoder.
+     `src/engine/katago_inputs.cpp`'s KataGo V7 encoder.
   4. Writes one ASCII text file per sample per input, plus the
      `dataset0_spatial.txt` / `dataset1_global.txt` index files
      Acuity's TEXT-mode loader points at.
@@ -323,7 +323,7 @@ def _flood_static(b: np.ndarray, r: int, c: int, color: int, n: int):
 
 
 # ─────────────────────────────────────────────────────────────────
-#  KataGo V7 input encoder — Python port of src/katago_inputs.cpp
+#  KataGo V7 input encoder — Python port of src/engine/katago_inputs.cpp
 # ─────────────────────────────────────────────────────────────────
 
 NUM_SPATIAL = 22

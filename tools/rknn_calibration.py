@@ -15,8 +15,8 @@ distribution the network never actually sees. Instead we **drive self-play
 with the model itself** and dump real positions across a spread of game
 phases.
 
-The encoder mirrors `src/katago_inputs.cpp` (V7, 22 spatial + 19 global) for
-KataGo-format ONNX files and `src/game.cpp::encode` (17 spatial planes for
+The encoder mirrors `src/engine/katago_inputs.cpp` (V7, 22 spatial + 19 global) for
+KataGo-format ONNX files and `src/engine/game.cpp::encode` (17 spatial planes for
 history_length=8) for MiniGo-format files. ONNX format is auto-detected from
 the model's graph inputs.
 
@@ -54,7 +54,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 # ────────────────────────────────────────────────────────────────────────
-#  Minimal Go board (port of src/game.cpp; correctness > speed)
+#  Minimal Go board (port of src/engine/game.cpp; correctness > speed)
 # ────────────────────────────────────────────────────────────────────────
 
 EMPTY, BLACK, WHITE = 0, 1, 2
@@ -257,7 +257,7 @@ def _compute_area(brd: np.ndarray) -> np.ndarray:
 
 
 def encode_katago_v7(game: GoGame) -> Tuple[np.ndarray, np.ndarray]:
-    """Mirror src/katago_inputs.cpp::encode_for_katago.
+    """Mirror src/engine/katago_inputs.cpp::encode_for_katago.
 
     Returns (state_spatial[22, H, W], state_global[19]) as float32.
     Deliberate simplifications match the C++ port:
@@ -353,7 +353,7 @@ def encode_katago_v7(game: GoGame) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def encode_minigo(game: GoGame, history_length: int = 8) -> np.ndarray:
-    """Mirror src/game.cpp::GoGame::encode.
+    """Mirror src/engine/game.cpp::GoGame::encode.
 
     Returns state[2*history_length + 1, H, W]:
       planes [0 .. H-1]:   most-recent first, current_player presence

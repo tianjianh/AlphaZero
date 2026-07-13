@@ -6,20 +6,20 @@ board-state encodings, shared by the trainer (train_continuous.py) and
 the viewer (visualize.py):
 
   parse_v3(data)          — bytes → GameV3 (moves, policies, outcome)
-  Replay                  — minimal Go engine mirroring src/game.cpp's
+  Replay                  — minimal Go engine mirroring src/engine/game.cpp's
                             board evolution, history ring, and recent-
                             action tracking (replays LEGAL recorded
                             moves; it does not re-check legality)
   encode_minigo(replay)   — 17-plane MiniGo encoding (game.cpp encode())
   encode_katago(replay)   — KataGo V7: 22 spatial planes + 19 globals
-                            (port of src/katago_inputs.cpp)
+                            (port of src/engine/katago_inputs.cpp)
   sample_positions(...)   — replay a game once, emit training samples
                             for the requested move indices in either
                             encoding, each under a random dihedral
                             transform (augmentation happens HERE, at
                             load time — V3 files store none)
 
-V3 layout (little-endian, packed; written by src/main_selfplay.cpp):
+V3 layout (little-endian, packed; written by src/apps/main_selfplay.cpp):
   u16 magic 'MG' (0x4D47) | u16 version=3 | i32 board_size | f32 komi
   i32 n_moves | i8 winner (0 draw, 1 black, 2 white) | f32 black_score
   per move: i16 action (hw = pass) | f32 policy[hw+1]
@@ -113,7 +113,7 @@ def parse_v3(data):
 
 
 # ════════════════════════════════════════════════════════════
-#  Replay engine — mirrors src/game.cpp board evolution
+#  Replay engine — mirrors src/engine/game.cpp board evolution
 # ════════════════════════════════════════════════════════════
 
 def _neighbors(r, c, n):
@@ -262,7 +262,7 @@ def _tt_area(board):
 # ════════════════════════════════════════════════════════════
 #  Ladder solver (KataGo V7 planes 14-17)
 #
-#  Byte-identical mirror of the C++ port in src/katago_inputs.cpp
+#  Byte-identical mirror of the C++ port in src/engine/katago_inputs.cpp
 #  (itself a faithful port of upstream KataGo's bounded ladder search:
 #  Board::searchIsLadderCaptured / ...AttackerFirst2Libs + iterLadders).
 #  Same node budget (25 000), same base cases, same double-ko-death
@@ -859,7 +859,7 @@ def _fill_ladder_planes_py(sp, flat_board, n, ko_flat,
 
 
 def encode_katago(rep, komi):
-    """KataGo V7 input encoding (port of src/katago_inputs.cpp).
+    """KataGo V7 input encoding (port of src/engine/katago_inputs.cpp).
     Returns (spatial float32 [22, n, n], global float32 [19]).
 
     Same fidelity caveats as the C++ encoder: encore/button/PDA
@@ -903,7 +903,7 @@ def encode_katago(rep, komi):
         else:
             sp[9 + i, a // n, a % n] = 1.0
 
-    # planes 14-17: ladder features (mirror of src/katago_inputs.cpp).
+    # planes 14-17: ladder features (mirror of src/engine/katago_inputs.cpp).
     # 14/17 use the current board + current ko; 15/16 use the boards
     # 1 / 2 plies ago with THEIR simple-ko points (clamped at game start).
     def _hist_at(back, seq):

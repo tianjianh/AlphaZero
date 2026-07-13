@@ -124,8 +124,8 @@ model expects:
 
 | Input layout                                   | Detected as | Encoder used by `tools/rknn_calibration.py` |
 |------------------------------------------------|-------------|---------------------------------------------|
-| `state_spatial: [B, C, H, W]`, `state_global: [B, G]` | `katago`    | V7 (22 spatial + 19 global), mirrors `src/katago_inputs.cpp` |
-| `state: [B, C, H, W]`                          | `minigo`    | MiniGo (2·history+1 planes), mirrors `src/game.cpp::GoGame::encode` |
+| `state_spatial: [B, C, H, W]`, `state_global: [B, G]` | `katago`    | V7 (22 spatial + 19 global), mirrors `src/engine/katago_inputs.cpp` |
+| `state: [B, C, H, W]`                          | `minigo`    | MiniGo (2·history+1 planes), mirrors `src/engine/game.cpp::GoGame::encode` |
 
 `board_size` is read from the spatial input's last two dims (must be
 square).  `input_channels` and `input_global_channels` come from the
@@ -173,7 +173,7 @@ For each of `--games` games:
 3. Sample a move using softmax(policy / temperature), masked by
    simple-ko / suicide / pass legality.
 4. Apply the move (full Tromp-Taylor simple-ko Go simulator, ported
-   from `src/game.cpp`); update history; repeat until pass-pass or
+   from `src/engine/game.cpp`); update history; repeat until pass-pass or
    `2·board_size²` plies elapse.
 5. Dump the encoded state every `--every` plies after the first
    `--skip-first` plies (defaults: skip 2, dump every 2).
@@ -190,14 +190,14 @@ positions:
 
 | C++ source                          | Python equivalent                          |
 |-------------------------------------|--------------------------------------------|
-| `src/katago_inputs.cpp::encode_for_katago` | `tools/rknn_calibration.py::encode_katago_v7` |
-| `src/game.cpp::GoGame::encode`     | `tools/rknn_calibration.py::encode_minigo`     |
-| `src/game.cpp::GoGame::play / is_legal / is_ko_ban` | `tools/rknn_calibration.py::GoGame.{play, is_legal, is_ko_ban}` |
+| `src/engine/katago_inputs.cpp::encode_for_katago` | `tools/rknn_calibration.py::encode_katago_v7` |
+| `src/engine/game.cpp::GoGame::encode`     | `tools/rknn_calibration.py::encode_minigo`     |
+| `src/engine/game.cpp::GoGame::play / is_legal / is_ko_ban` | `tools/rknn_calibration.py::GoGame.{play, is_legal, is_ko_ban}` |
 | Tromp-Taylor area flood-fill (`compute_area`) | `_compute_area` |
 
 The same simplifications carry over — V7 ladder planes (14–17) and
 encore start colors (20–21) are zeroed; the Tromp-Taylor area
-approximation matches `src/katago_inputs.cpp`.  These planes are also
+approximation matches `src/engine/katago_inputs.cpp`.  These planes are also
 zero in the runtime, so calibration matches what the NPU sees in
 production.
 
@@ -451,7 +451,7 @@ quantize_parameters:
 ```
 
 The runtime then loads the .rknn with mixed precision —
-[`rknn_compute.cpp`](src/rknn_compute.cpp) does not need any changes;
+[`rknn_compute.cpp`](src/backends/rknn_compute.cpp) does not need any changes;
 the toolkit bakes the per-tensor dtype into the file format.
 
 ---
@@ -492,7 +492,7 @@ The supported deployment targets are **RK3576** and **RK3588**:
 | `rk3568`     | 1         | 0.8         | accepted by toolkit; not validated end-to-end here |
 
 The C++ runtime auto-detects the actual SoC at startup
-([`src/rknn_compute.cpp::detect_soc`](src/rknn_compute.cpp)) and
+([`src/backends/rknn_compute.cpp::detect_soc`](src/backends/rknn_compute.cpp)) and
 distributes server threads round-robin across cores via
 `rknn_set_core_mask`.  A `.rknn` compiled for one SoC won't load on
 another — recompile per SoC.
@@ -637,7 +637,7 @@ output names — `kata_export_for_rknn.py` emits the same five outputs
 with byte-equivalent semantics on representable positions.
 
 The runtime side still rejects KataGo dual-input ONNX
-([`src/rknn_compute.cpp`](src/rknn_compute.cpp)
+([`src/backends/rknn_compute.cpp`](src/backends/rknn_compute.cpp)
 throws `"KataGo format requires the TensorRT backend"` at handle
 creation), so the conversion artifact isn't yet end-to-end runnable —
 the dual-input runtime path is tracked separately (§14).
@@ -1087,7 +1087,7 @@ In rough order:
 | `tools/onnx_rknn_mitigations.py`                | Math-equivalent ONNX rewrites for fp16-on-hardware bug — `--input-scale N` (currently a no-op for kata1, kept as escape hatch) and `--unshare-initializers` (the bs=1 fix). |
 | `models/*.onnx`                                 | Source ONNX models (KataGo or MiniGo). |
 | `models/*.rknn`                                 | Compiled RKNN; sits next to the .onnx, found by extension swap. |
-| `src/rknn_compute.cpp` / `include/rknn_compute.h` | Runtime backend (aarch64). |
+| `src/backends/rknn_compute.cpp` / `include/rknn_compute.h` | Runtime backend (aarch64). |
 | `third_party/rknn/rknn_api.h`                   | Vendored Rockchip C API header. |
 
 ---
@@ -1098,7 +1098,7 @@ In rough order:
   place; pair with `build/benchmark` runs on real Rockchip hardware
   to populate the throughput tables in `README.md` for hybrid vs fp16
   vs int8 across SoCs.
-* **KataGo dual-input runtime path** — `src/rknn_compute.cpp`
+* **KataGo dual-input runtime path** — `src/backends/rknn_compute.cpp`
   currently rejects dual-input ONNX (`expected 1 input tensor, got 2`)
   and throws `"KataGo format requires the TensorRT backend"` at
   handle creation.  Adding dual-input support — bind both

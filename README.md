@@ -811,32 +811,20 @@ minigo-cpp/
 │   ├── checkpoints/training.pt #   Trainer checkpoint (weights+optimizer+bucket)
 │   └── status.json             #   Trainer → selfplay/supervisor live state
 ├── logs/<timestamp>/           # Per-run logs; logs/current symlink
-├── include/
-│   ├── config.h                # Hyperparameters
-│   ├── game.h                  # Go engine (ring buffer history, fast is_legal)
-│   ├── loaded_model.h          # Shared CPU weights (ONNX parsed once)
-│   ├── compute_context.h       # ComputeContext + ComputeHandle base classes
-│   ├── batch_evaluator.h       # BatchEvaluator interface + NNResultBuf
-│   ├── nn_request_queue.h      # Ring-buffer request queue (KataGo semantics)
-│   ├── nn_evaluator.h          # KataGo-style batching server (N server threads)
-│   ├── async_bot.h             # Persistent worker wrapper (ponder + analyze)
-│   ├── katago_inputs.h         # KataGo V7 input encoder (22 spatial + 19 global)
-│   ├── eigen_compute.h         # Eigen CPU backend (context + handle)
-│   ├── opencl_compute.h        # OpenCL GPU backend (context + handle)
-│   ├── cuda_compute.h          # CUDA GPU backend (context + handle)
-│   ├── tensorrt_compute.h      # TensorRT GPU backend (context + handle)
-│   ├── metal_compute.h         # Metal/MPSGraph GPU backend (macOS)
-│   ├── rknn_compute.h          # Rockchip NPU backend (aarch64)
-│   ├── vip9000_compute.h       # VeriSilicon NPU backend (aarch64)
-│   ├── onnx_loader.h           # Built-in minimal ONNX protobuf parser
-│   └── mcts.h                  # Multi-threaded MCTS (atomic MCTSNode)
-├── docs/                       # Deep-dive documentation (see map above)
-├── src/                        # Implementations of the above + 5 binaries:
-│   ├── main_play.cpp           # Human vs AI (uses AsyncBot for ponder/analyze)
-│   ├── main_selfplay.cpp       # Multi-threaded data generation (V3 records)
-│   ├── main_evaluate.cpp       # Model vs model evaluation matches (+SGF)
-│   ├── main_benchmark.cpp      # Performance tests
-│   └── main_verify.cpp         # Backend numerical verification vs PyTorch
+├── include/                    # Headers, one subfolder per layer
+│   ├── engine/                 #   Go board, MCTS, AsyncBot, V7 encoder + ladder, config
+│   ├── model/                  #   ONNX parser + LoadedModel (shared weights)
+│   ├── nn/                     #   NNEvaluator server, request queue, Context/Handle API
+│   └── backends/               #   eigen / opencl / cuda / tensorrt / metal / rknn / vip9000
+├── src/                        # Implementations, mirroring include/
+│   ├── engine/  model/  nn/  backends/
+│   └── apps/                   #   The binaries:
+│       ├── main_play.cpp       #     Human vs AI (AsyncBot: ponder/analyze)
+│       ├── main_selfplay.cpp   #     Multi-threaded data generation (V3 records)
+│       ├── main_evaluate.cpp   #     Model-vs-model matches (+SGF)
+│       ├── main_benchmark.cpp  #     Performance tests
+│       ├── main_encode_dump.cpp #    Encoder-parity dump (tools/encoder_parity_test.py)
+│       └── main_verify.cpp     #     Backend numerical verification vs PyTorch
 ├── scripts/                    # The continuous pipeline + tooling
 │   ├── run_continuous.py       # Supervisor: init / run / status
 │   ├── train_continuous.py     # Continuous trainer (DDP, bucket, ring)
@@ -980,7 +968,7 @@ Exit code 0 = within tolerance.  For the OpenCL backend, combine with
 
 Related: `tools/encoder_parity_test.py` proves the C++ and Python
 KataGo-V7 encoders (incl. the ladder solver) bit-identical — run it
-after touching `src/katago_inputs.cpp`, `src/game.cpp`, or
+after touching `src/engine/katago_inputs.cpp`, `src/engine/game.cpp`, or
 `scripts/gamedata.py`:
 
 ```bash

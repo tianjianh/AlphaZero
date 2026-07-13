@@ -97,12 +97,12 @@ Both encodings exist twice, and the pairs must stay byte-identical:
 | Encoding | C++ (selfplay/inference) | Python (training/replay) |
 |----------|--------------------------|--------------------------|
 | MiniGo 17-plane (8×2 history + color) | `game.cpp encode()` | `gamedata.encode_minigo` |
-| KataGo V7 (22 spatial + 19 global) | `src/katago_inputs.cpp` | `gamedata.encode_katago` |
+| KataGo V7 (22 spatial + 19 global) | `src/engine/katago_inputs.cpp` | `gamedata.encode_katago` |
 
 Shared V7 fidelity caveats (both sides): encore/button/PDA features
 and non-default rules bits are zero; ko plane uses simple ko.  Ladder
 planes 14-17 ARE computed with upstream's bounded ladder search: ONE
-C++ implementation (src/ladder.cpp) serves the encoder AND — via the
+C++ implementation (src/engine/ladder.cpp) serves the encoder AND — via the
 `libminigo_ladder.so` ctypes bridge — the Python trainer, with a
 pure-Python mirror as a warned fallback.  Bit-parity of every path is
 proven by `tools/encoder_parity_test.py` (and `--force-py` for the

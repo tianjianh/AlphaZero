@@ -43,7 +43,7 @@ from model import create_model
 
 
 # ═══════════════════════════════════════════════════════════
-#  V3 game records (see scripts/gamedata.py / src/main_selfplay.cpp)
+#  V3 game records (see scripts/gamedata.py / src/apps/main_selfplay.cpp)
 #
 #  A record stores the GAME (moves + MCTS policies + outcome), not
 #  encoded states: the ring keeps the compressed blob, and encoding

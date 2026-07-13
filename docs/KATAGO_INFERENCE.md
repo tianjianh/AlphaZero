@@ -66,7 +66,7 @@ reuse the cached engine.
 
 ## Knobs (CLI flag reference)
 
-All knobs come from `Config` (`include/config.h`) and are parsed by
+All knobs come from `Config` (`include/engine/config.h`) and are parsed by
 each `main_*.cpp`. Defaults are the engine's MiniGo-style defaults
 (documented in the table). The "KataGo-like" column shows what to
 change to approximate kata1's training-time setup.
@@ -88,7 +88,7 @@ change to approximate kata1's training-time setup.
 | `--dirichlet-alpha F` | `0.15` (9×9) / `0.03` (19×19) | `0.03` (KataGo's value) | Root noise concentration. Only fires when `add_noise=true` (selfplay); `evaluate` and `play` don't add noise. |
 | `--dirichlet-epsilon F` | `0.25` | `0.25` | Mix factor: `0.75 * prior + 0.25 * dirichlet`. |
 
-**Where the utility blend is computed** (`src/mcts.cpp:262-265`):
+**Where the utility blend is computed** (`src/engine/mcts.cpp:262-265`):
 ```cpp
 float utility = config_.win_loss_weight * result.value;
 if (config_.score_weight != 0.0f) {
@@ -222,7 +222,7 @@ Drop / approximation in the encoder direction (input):
   `consecutive_passes >= 1`. Upstream's logic is more nuanced under
   area + tax-seki rules but reduces to this for area + TAX_NONE.
 - **Area** (planes 18-19): Tromp-Taylor flood-fill (`compute_area`
-  in `src/katago_inputs.cpp`). Upstream uses
+  in `src/engine/katago_inputs.cpp`). Upstream uses
   `Board::calculateArea` with pass-alive groups + safe-territory
   reasoning — slightly different on disputed positions.
 - **Komi parity wave** (global 15): implemented per upstream's
@@ -297,7 +297,7 @@ or port the upstream piece if it bites.
   area + tax-seki rules but reduces to this for area + TAX_NONE
   (the only rule combination this engine supports).
 - **Area scoring uses simple Tromp-Taylor flood-fill** (per
-  `compute_area` in `src/katago_inputs.cpp`). Upstream uses
+  `compute_area` in `src/engine/katago_inputs.cpp`). Upstream uses
   `Board::calculateArea` with pass-alive groups + safe-territory
   reasoning. Disputed positions can encode slightly differently;
   for the typical mid-game position the difference is zero.

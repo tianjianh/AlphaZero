@@ -581,7 +581,7 @@ class KataGoNet(nn.Module):
     as AlphaZeroNet/GoViT, so train_continuous is architecture-uniform.
     """
 
-    # Input contract (matches src/katago_inputs.cpp / scripts/gamedata.py)
+    # Input contract (matches src/engine/katago_inputs.cpp / scripts/gamedata.py)
     SPATIAL_CHANNELS = 22
     GLOBAL_CHANNELS = 19
     input_kind = "dual"   # export/training dispatch (others default "single")

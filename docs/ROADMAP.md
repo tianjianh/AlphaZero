@@ -15,11 +15,11 @@ AlphaZero-ResNet forward pass and throw at `ComputeHandle` creation.
 
 Re-enabling them is now only a kernel port: all weight plumbing lives
 in `LoadedModel::weights()` (lazy, shared, pre-fused, covers all four
-format variants), and `src/opencl_compute.cpp::forward_*` is the
+format variants), and `src/backends/opencl_compute.cpp::forward_*` is the
 reference for the exact op sequences.  See the stubs in:
 
-- `src/cuda_compute.cu` (`CUDAComputeHandle` constructor)
-- `src/metal_compute.mm` (`MetalComputeHandle` constructor)
+- `src/backends/cuda_compute.cu` (`CUDAComputeHandle` constructor)
+- `src/backends/metal_compute.mm` (`MetalComputeHandle` constructor)
 
 Because `auto` backend selection never picks a stub, this is a
 performance feature, not a correctness gap.

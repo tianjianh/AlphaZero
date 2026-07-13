@@ -323,43 +323,43 @@ endif()
 
 # ── Library: minigo core ────────────────────────────────────
 set(CORE_SOURCES
-    src/game.cpp
-    src/onnx_loader.cpp
-    src/loaded_model.cpp
-    src/compute_context.cpp
-    src/nn_evaluator.cpp
-    src/mcts.cpp
-    src/async_bot.cpp
-    src/katago_inputs.cpp
-    src/ladder.cpp
+    src/engine/game.cpp
+    src/model/onnx_loader.cpp
+    src/model/loaded_model.cpp
+    src/nn/compute_context.cpp
+    src/nn/nn_evaluator.cpp
+    src/engine/mcts.cpp
+    src/engine/async_bot.cpp
+    src/engine/katago_inputs.cpp
+    src/engine/ladder.cpp
 )
 
 if(HAS_EIGEN)
-  list(APPEND CORE_SOURCES src/eigen_compute.cpp)
+  list(APPEND CORE_SOURCES src/backends/eigen_compute.cpp)
 endif()
 
 if(HAS_OPENCL)
-  list(APPEND CORE_SOURCES src/opencl_compute.cpp)
+  list(APPEND CORE_SOURCES src/backends/opencl_compute.cpp)
 endif()
 
 if(HAS_CUDA)
-  list(APPEND CORE_SOURCES src/cuda_compute.cu)
+  list(APPEND CORE_SOURCES src/backends/cuda_compute.cu)
 endif()
 
 if(HAS_TENSORRT)
-  list(APPEND CORE_SOURCES src/tensorrt_compute.cpp)
+  list(APPEND CORE_SOURCES src/backends/tensorrt_compute.cpp)
 endif()
 
 if(HAS_METAL)
-  list(APPEND CORE_SOURCES src/metal_compute.mm)
+  list(APPEND CORE_SOURCES src/backends/metal_compute.mm)
 endif()
 
 if(HAS_RKNN)
-  list(APPEND CORE_SOURCES src/rknn_compute.cpp)
+  list(APPEND CORE_SOURCES src/backends/rknn_compute.cpp)
 endif()
 
 if(HAS_VIP9000)
-  list(APPEND CORE_SOURCES src/vip9000_compute.cpp)
+  list(APPEND CORE_SOURCES src/backends/vip9000_compute.cpp)
 endif()
 
 add_library(minigo_core STATIC ${CORE_SOURCES})
@@ -440,25 +440,25 @@ if(HAS_VIP9000)
 endif()
 
 # ── Executables ─────────────────────────────────────────────
-add_executable(play      src/main_play.cpp)
-add_executable(selfplay  src/main_selfplay.cpp)
-add_executable(benchmark src/main_benchmark.cpp)
-add_executable(evaluate  src/main_evaluate.cpp)
-add_executable(verify    src/main_verify.cpp)
+add_executable(play      src/apps/main_play.cpp)
+add_executable(selfplay  src/apps/main_selfplay.cpp)
+add_executable(benchmark src/apps/main_benchmark.cpp)
+add_executable(evaluate  src/apps/main_evaluate.cpp)
+add_executable(verify    src/apps/main_verify.cpp)
 target_link_libraries(verify PRIVATE minigo_core)
-add_executable(encode_dump src/main_encode_dump.cpp)
+add_executable(encode_dump src/apps/main_encode_dump.cpp)
 target_link_libraries(encode_dump PRIVATE minigo_core)
 
 # Standalone ladder-solver shared library, ctypes-loaded by
 # scripts/gamedata.py so training uses the SAME solver as the C++
 # encoder (pure-Python fallback prints a warning).  Depends only on
 # libc++ — safe to build everywhere.
-add_library(minigo_ladder SHARED src/ladder.cpp)
+add_library(minigo_ladder SHARED src/engine/ladder.cpp)
 target_include_directories(minigo_ladder PRIVATE include)
 set_target_properties(minigo_ladder PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(HAS_VIP9000)
-  add_executable(vip9000_smoke    src/main_vip9000_smoke.cpp)
-  add_executable(vip9000_accuracy src/main_vip9000_accuracy.cpp)
+  add_executable(vip9000_smoke    src/apps/main_vip9000_smoke.cpp)
+  add_executable(vip9000_accuracy src/apps/main_vip9000_accuracy.cpp)
   target_link_libraries(vip9000_smoke    PRIVATE minigo_core)
   target_link_libraries(vip9000_accuracy PRIVATE minigo_core)
 endif()

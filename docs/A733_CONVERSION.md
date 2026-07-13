@@ -56,7 +56,7 @@ xxd models/kata1-b10c128.a733.bs1.int8/network_binary.nb | head -1
 ```
 
 If those bytes match, ship the `.nb` to the Cubie A7A. The runtime
-resolver in `src/vip9000_compute.cpp` picks `.int8/` first and falls
+resolver in `src/backends/vip9000_compute.cpp` picks `.int8/` first and falls
 back to `.fp16/`; set `VIP9000_FORCE_PRECISION=fp16` to pin the
 slower path for an A/B comparison. Run §7 to verify on-board.
 
@@ -67,7 +67,7 @@ slower path for an A/B comparison. Run §7 to verify on-board.
 | In scope | Out of scope |
 |---|---|
 | Converting kata1 ONNX → `.nb` on an x86_64 Linux host with Docker | The `awnn` / VIPLite runtime on the Cubie A7A board (covered by README.md "VIP9000 NPU Backend" section) |
-| Producing an NBG that the on-board viplite v2.0.3.2-AW-2024-08-30 accepts at `vip_create_network` | The C++ `Vip9000ComputeHandle` backend in `src/vip9000_compute.cpp` (works once the NBG header validates and the `.quantize` table is correct) |
+| Producing an NBG that the on-board viplite v2.0.3.2-AW-2024-08-30 accepts at `vip_create_network` | The C++ `Vip9000ComputeHandle` backend in `src/backends/vip9000_compute.cpp` (works once the NBG header validates and the `.quantize` table is correct) |
 | Both the **fp16** path (sanity baseline) and the **int8 hybrid** path (production — ~110× faster) | Int16 / w8a16 / pcq variants — int8 hybrid is the right point on this NPU's accuracy/speed curve |
 | Why pip `acuitylite==6.51.0` cannot do either path | The `build/vip9000_accuracy` harness and `VIP9000_FORCE_PRECISION` env var — those live on the board side |
 
@@ -441,7 +441,7 @@ for kata1's activations), with 20% of whole games dropped to a
 pure-random eye-aware policy for tactical-position diversity.
 Snapshots are taken at moves 2/5/8/12/16/21/28/36/45/55/65/75 to
 cover opening, midgame, and endgame evenly. Encoder is a faithful
-port of `src/katago_inputs.cpp` (planes 14-17 / 20-21 zeroed,
+port of `src/engine/katago_inputs.cpp` (planes 14-17 / 20-21 zeroed,
 matching the C++ version).
 
 ```bash
@@ -512,7 +512,7 @@ models/kata1-b10c128.a733.bs4.int8/<base>_int8.quantize
 
 The `.quantize` companion file is the per-tensor scale/zp table that
 the on-board input-quantize / output-dequantize code in
-`src/vip9000_compute.cpp` consumes (input encode = `q = round(x/scale) + zp`,
+`src/backends/vip9000_compute.cpp` consumes (input encode = `q = round(x/scale) + zp`,
 output decode = `x = (q - zp) * scale`). Always ship it alongside the
 `.nb`.
 
@@ -782,7 +782,7 @@ network still ran — it just saw an entirely different input
 distribution than it ever saw at training time, so the activation
 ranges the calibrator measured were nonsense.
 
-On the runtime side, `src/vip9000_compute.cpp` does NOT apply
+On the runtime side, `src/backends/vip9000_compute.cpp` does NOT apply
 inputmeta preprocessing — it feeds the user's fp32 directly into the
 NBG, then quantizes per the `.quantize` table. So the calibration
 distribution and the inference distribution disagreed on every
@@ -882,7 +882,7 @@ cd /root/proj/AlphaZero
     --max-batch 1 --nn-iters 100 --games 0 --threads 0
 ```
 
-The C++ backend (`src/vip9000_compute.cpp` on `multi-gpu` — not yet
+The C++ backend (`src/backends/vip9000_compute.cpp` on `multi-gpu` — not yet
 checked in as of 2026-04-29) prints its sanity check at startup:
 
 ```
@@ -934,7 +934,7 @@ later.
 | `tools/kata_export_for_rknn.py` | KataGo `.txt.gz` → ONNX (4D-gpool, opset 13). Shared with the RKNN target. | ✅ |
 | `tools/onnx_rknn_mitigations.py` | `--unshare-initializers` (math-equivalent BN initializer split). Same script as the RKNN bs=1 fp16 fix. | ✅ |
 | `tools/onnx_to_a733_docker.sh` | fp16 path entry point. Wraps the §3.3 pipeline. Run on a real Linux host with Docker + `ubuntu-npu:v2.0.10.1` loaded. | ✅ (sanity baseline) |
-| `tools/a733_gen_calib.py` | Self-play calibration-data generator for the int8 path. Drives 70% of moves with kata1's own ONNX policy via `onnxruntime`, 30% random eye-aware (with 20% of whole games dropped to pure-random for tactical diversity). Snapshots cover opening / midgame / endgame evenly. Encodes via Python port of `src/katago_inputs.cpp`. | ✅ (production) |
+| `tools/a733_gen_calib.py` | Self-play calibration-data generator for the int8 path. Drives 70% of moves with kata1's own ONNX policy via `onnxruntime`, 30% random eye-aware (with 20% of whole games dropped to pure-random for tactical diversity). Snapshots cover opening / midgame / endgame evenly. Encodes via Python port of `src/engine/katago_inputs.cpp`. | ✅ (production) |
 | `tools/onnx_to_a733_quantize_docker.sh` | int8 path entry point. Generates a clean inputmeta (workaround for the §6.6 trap), seeds the `.quantize` file (workaround for the `--rebuild-all` requires-file trap), runs `pegasus.py quantize` then `export ovxlib --dtype quantized --pack-nbg-unify`, and reports the op-engine breakdown. Defaults to `perchannel_symmetric_affine` int8 weights + per-tensor int8 activations, `kl_divergence` algorithm, 400 iterations. | ✅ (production) |
 | `models/<base>.a733.bs<N>.unshared.onnx` | Source ONNX (canonical reference for downstream parity). | — |
 | `models/<base>.a733.bs<N>.fp16/network_binary.nb` | fp16 NBG (slow on board — ~93% of ops fall through to PPU). Header bytes 8..11 must be `3b 00 00 10`. | — |

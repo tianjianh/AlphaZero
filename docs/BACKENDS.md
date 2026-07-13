@@ -7,7 +7,7 @@ measured performance, and platform notes.  The engine-side architecture
 
 ### CUDA GPU Backend (NVIDIA)
 
-`CUDAComputeHandle` (`src/cuda_compute.cu`) implements the forward pass using
+`CUDAComputeHandle` (`src/backends/cuda_compute.cu`) implements the forward pass using
 FP16 Tensor Cores via **CUTLASS GEMM** for conv3x3 (with im2col precompute)
 and hand-written WMMA kernels for FC/head layers.  FP32 fallback for SM < 7.0.
 
@@ -30,7 +30,7 @@ and hand-written WMMA kernels for FC/head layers.  FP32 fallback for SM < 7.0.
 
 ### TensorRT GPU Backend (NVIDIA)
 
-`TensorRTComputeHandle` (`src/tensorrt_compute.cpp`) uses NVIDIA TensorRT for
+`TensorRTComputeHandle` (`src/backends/tensorrt_compute.cpp`) uses NVIDIA TensorRT for
 optimized inference.  TensorRT parses the ONNX model directly using its own
 ONNX parser and applies automatic optimizations:
 
@@ -49,8 +49,8 @@ The design follows the same Context/Handle pattern:
 
 ### OpenCL GPU Backend
 
-`OpenCLComputeHandle` (`src/opencl_compute.cpp`, kernels in
-`src/opencl_kernels.h`) runs **all three model architectures** — the
+`OpenCLComputeHandle` (`src/backends/opencl_compute.cpp`, kernels in
+`src/backends/opencl_kernels.h`) runs **all three model architectures** — the
 MiniGo KataGo-style ResNet (SE + GPool blocks), the GoViT transformer
 (GQA + directional relative bias), and KataGo-V7 dual-input networks
 (both trainable-KataGoNet exports and converted stock kata1 nets,
@@ -106,7 +106,7 @@ Numerical verification against PyTorch reference outputs
 
 ### Metal GPU Backend (macOS)
 
-`MetalComputeHandle` (`src/metal_compute.mm`) uses **MPSGraph** (Metal
+`MetalComputeHandle` (`src/backends/metal_compute.mm`) uses **MPSGraph** (Metal
 Performance Shaders Graph) to build the entire forward pass as a computation
 graph.  Each `predict_batch()` call feeds inputs through the pre-compiled
 graph via `graph.run()`.
@@ -120,7 +120,7 @@ graph via `graph.run()`.
 
 ### RKNN NPU Backend (Rockchip, aarch64 Linux)
 
-`RKNNComputeHandle` (`src/rknn_compute.cpp`) runs inference on Rockchip's
+`RKNNComputeHandle` (`src/backends/rknn_compute.cpp`) runs inference on Rockchip's
 on-chip NPU via the `librknnrt` runtime.  Unlike the GPU backends, which compile
 or build their kernels at program start, the RKNN backend loads a **pre-compiled
 `.rknn` file** produced by `rknn-toolkit2` on an x86_64 host.
@@ -259,7 +259,7 @@ expected throughput ≈ full int8, expected MCTS strength ≈ fp16.
 
 ### VIP9000 NPU Backend (VeriSilicon, aarch64 Linux — Allwinner A733)
 
-`VIP9000ComputeHandle` (`src/vip9000_compute.cpp`) runs inference on the
+`VIP9000ComputeHandle` (`src/backends/vip9000_compute.cpp`) runs inference on the
 VeriSilicon Vivante VIP9000 NanoDI+ NPU embedded in the Allwinner A733
 SoC, via VIPLite v2.0 (`libNBGlinker.so` + `libVIPhal.so`).  Like RKNN,
 the runtime consumes a **pre-compiled `.nb` (Network Binary Graph)**
@@ -471,7 +471,7 @@ numbers).
 
 The architecture has three layers:
 
-1. **`LoadedModel`** (`include/loaded_model.h`) — parses ONNX once, holds
+1. **`LoadedModel`** (`include/model/loaded_model.h`) — parses ONNX once, holds
    pre-fused BN weights in CPU memory.  Shared (const) across all threads.
 
 2. **`ComputeContext`** (`include/compute_context.h`) — per-device GPU state.
