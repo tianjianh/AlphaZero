@@ -112,7 +112,7 @@ static void draw_board(WINDOW* win, const GoGame& game,
         int y = oy + r;
 
         // Row label
-        char rl[8];
+        char rl[16];
         snprintf(rl, sizeof(rl), "%2d", n - r);
         wattron(win, COLOR_PAIR(CP_LABEL));
         mvwaddstr(win, y, ox - 3, rl);
@@ -175,7 +175,7 @@ static void draw_board(WINDOW* win, const GoGame& game,
 
         // Row label right
         wattron(win, COLOR_PAIR(CP_LABEL));
-        char rr[8];
+        char rr[16];
         snprintf(rr, sizeof(rr), "%d", n - r);
         mvwaddstr(win, y, ox + (n - 1) * cell_w + 2, rr);
         wattroff(win, COLOR_PAIR(CP_LABEL));

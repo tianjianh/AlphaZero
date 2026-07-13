@@ -197,18 +197,35 @@ private:
 };
 
 // ================================================================
-// Training data
+// Game record (V3) — engine-neutral training data
+//
+// One record = one complete game: the move sequence, the MCTS visit
+// distribution at every move, the outcome, and the final ternary
+// ownership.  NO encoded board states and NO pre-baked augmentation:
+// the trainer replays the moves and encodes positions on the fly for
+// whichever architecture it is training (MiniGo 17-plane or KataGo
+// V7), applying a random dihedral transform per sample.  This is what
+// lets a single record pool train resnet / vit / katago models alike,
+// and shrinks records ~60× vs the old pre-encoded V2 format.
+//
+// Per-position targets are all derivable:
+//   player(m)     = BLACK if m even else WHITE (games always alternate)
+//   value(m)      = +1 if winner==player, −1 if opposite, 0 on draw
+//   score(m)      = black_score from player's perspective
+//   ownership(m)  = owners[] mapped to player's perspective
+//   opp_action(m) = actions[m+1] (or −1 at the last move)
 // ================================================================
-struct TrainingRecord {
-    std::vector<float> state;
-    std::vector<float> policy;
-    float value;
-    float score;                       // points, current player's perspective
-    std::vector<float> ownership;      // [board²] — 1.0 = current player owns
-    int   opponent_action;             // opponent's next move (-1 if last move)
+struct GameRecord {
+    int   board_size = 0;
+    float komi = 0.0f;
+    Stone winner = EMPTY;              // EMPTY = draw
+    float black_score = 0.0f;          // black − white, komi included
+    std::vector<int16_t> actions;      // per move; hw = pass
+    std::vector<std::vector<float>> policies;  // per move; [hw+1] visit dist
+    std::vector<int8_t> owners;        // final position; [hw] of
+                                       // {0 = empty/dame, 1 = black, 2 = white}
 };
 
-std::vector<TrainingRecord> self_play_game(
-    BatchEvaluator* evaluator, const Config& config);
+GameRecord self_play_game(BatchEvaluator* evaluator, const Config& config);
 
 }  // namespace minigo

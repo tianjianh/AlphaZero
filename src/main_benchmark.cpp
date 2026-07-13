@@ -245,11 +245,9 @@ int main(int argc, char* argv[]) {
     eval_single.reset();
 
     // ── 5. Multi-threaded self-play ───────────────────────────────
-    if (model->format == ModelFormat::KataGo) {
-        std::cout << "5. Self-play: SKIPPED for KataGo-format model "
-                  << "(KataGo runs inference only; selfplay generates "
-                  << "MiniGo training records).\n";
-    } else {
+    // Works for every model format: V3 game records store moves +
+    // targets, not encoded states.
+    {
         std::cout << "5. Self-play (" << num_games << " games, "
                   << num_threads << " threads, "
                   << nn_server_threads << " server(s))...\n";
@@ -262,7 +260,7 @@ int main(int argc, char* argv[]) {
         nn_evaluator->wait_ready();
 
         std::atomic<int> games_done{0};
-        std::atomic<int> total_records{0};
+        std::atomic<int> total_moves_sp{0};
         std::mutex print_mutex;
         auto wall_t0 = std::chrono::steady_clock::now();
 
@@ -272,14 +270,14 @@ int main(int argc, char* argv[]) {
                 if (gid >= num_games) break;
 
                 auto t0 = std::chrono::steady_clock::now();
-                auto records = self_play_game(nn_evaluator.get(), config);
+                GameRecord rec = self_play_game(nn_evaluator.get(), config);
                 double secs = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t0).count();
 
-                total_records += (int)records.size();
+                total_moves_sp += (int)rec.actions.size();
                 std::lock_guard<std::mutex> lk(print_mutex);
                 std::cout << "   Game " << (gid + 1)
-                          << ": " << (records.size() / 8) << " moves, "
+                          << ": " << rec.actions.size() << " moves, "
                           << std::fixed << std::setprecision(2) << secs << "s\n";
             }
         };
@@ -293,7 +291,7 @@ int main(int argc, char* argv[]) {
 
         double total_secs = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - wall_t0).count();
-        std::cout << "   Total: " << total_records.load() << " samples, "
+        std::cout << "   Total: " << total_moves_sp.load() << " moves, "
                   << std::fixed << std::setprecision(2) << total_secs
                   << "s wall  (" << (total_secs / num_games) << "s/game)\n";
     }

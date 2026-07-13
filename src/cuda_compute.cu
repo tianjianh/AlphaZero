@@ -606,10 +606,10 @@ CUDADeviceState& CUDAComputeContext::device_state(int gpu_id) {
 
 std::unique_ptr<ComputeHandle>
 CUDAComputeContext::create_handle(const LoadedModel* model, int gpu_id, int max_batch_size) {
-    if (model->format == ModelFormat::KataGo)
-        throw std::runtime_error(
-            "KataGo format requires the TensorRT backend. "
-            "Rebuild with `cmake -DMINIGO_BACKEND=tensorrt`.");
+    // Interface contract: all three model formats (MiniGo resnet/vit
+    // single-input, KataGo-V7 dual-input) are accepted here; the
+    // handle constructor below is the placeholder that still throws
+    // for both until the SE/GPool + dual-input kernels land.
     return std::make_unique<CUDAComputeHandle>(device_state(gpu_id), model, max_batch_size);
 }
 
@@ -955,9 +955,11 @@ CUDAComputeHandle::CUDAComputeHandle(CUDADeviceState& dev,
     // Until then, use the TensorRT backend.
     (void)dev; (void)model; (void)max_batch_size;
     throw std::runtime_error(
-        "CUDA backend currently disabled: the KataGo-style ResNet "
-        "(SE + GPool blocks + global-pool heads) requires TensorRT.  "
-        "TODO: add CUDA kernels for the new blocks.");
+        "CUDA backend: implementation is a placeholder (TODO).  "
+        "All three model formats are accepted at the interface "
+        "(MiniGo resnet/vit single-input, KataGo-V7 dual-input) but "
+        "the kernels for the current architectures are not written "
+        "yet — use the TensorRT backend.");
 
     CUDA_CHECK(cudaSetDevice(dev.device_id));
     impl_ = new Impl(dev);

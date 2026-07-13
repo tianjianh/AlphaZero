@@ -27,7 +27,7 @@ static std::vector<int> parse_device_ids(const std::string& str) {
 }
 
 // Game record: sequence of moves + result
-struct GameRecord {
+struct MatchRecord {
     int board_size;
     float komi;
     bool model1_is_black;
@@ -38,14 +38,14 @@ struct GameRecord {
 
 // Play one game between two evaluators.
 // Returns: +1 if eval1 wins, -1 if eval2 wins, 0 if draw.
-static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
+static MatchRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
                                 const Config& config, bool eval1_is_black) {
     GoGame game(config.board_size, config.komi);
     MCTS mcts1(eval1, config);
     MCTS mcts2(eval2, config);
     int action_size = config.action_size();
 
-    GameRecord rec;
+    MatchRecord rec;
     rec.board_size = config.board_size;
     rec.komi = config.komi;
     rec.model1_is_black = eval1_is_black;
@@ -87,7 +87,7 @@ static GameRecord play_one_game(BatchEvaluator* eval1, BatchEvaluator* eval2,
 }
 
 // Write a game record as SGF
-static void write_sgf(const std::string& path, const GameRecord& rec,
+static void write_sgf(const std::string& path, const MatchRecord& rec,
                       int game_id, const std::string& m1_name,
                       const std::string& m2_name) {
     std::ofstream out(path);

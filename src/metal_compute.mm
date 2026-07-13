@@ -39,10 +39,10 @@ MetalComputeContext::~MetalComputeContext() {
 
 std::unique_ptr<ComputeHandle>
 MetalComputeContext::create_handle(const LoadedModel* model, int /*gpu_id*/, int /*max_batch_size*/) {
-    if (model->format == ModelFormat::KataGo)
-        throw std::runtime_error(
-            "KataGo format requires the TensorRT backend. "
-            "Rebuild with `cmake -DMINIGO_BACKEND=tensorrt`.");
+    // Interface contract: all three model formats (MiniGo resnet/vit
+    // single-input, KataGo-V7 dual-input) are accepted here; the
+    // implementation below is the placeholder that still throws for
+    // both until MPSGraph kernels for the current architectures land.
     return std::make_unique<MetalComputeHandle>(impl_, model);
 }
 
@@ -124,9 +124,11 @@ MetalComputeHandle::MetalComputeHandle(MetalComputeContext::Impl* ctx_impl,
     // Until then, use the TensorRT backend.
     (void)ctx_impl; (void)model;
     throw std::runtime_error(
-        "Metal backend currently disabled: the KataGo-style ResNet "
-        "(SE + GPool blocks + global-pool heads) requires TensorRT.  "
-        "TODO: add MPSGraph construction for the new blocks.");
+        "Metal backend: implementation is a placeholder (TODO).  "
+        "All three model formats are accepted at the interface "
+        "(MiniGo resnet/vit single-input, KataGo-V7 dual-input) but "
+        "the kernels for the current architectures are not written "
+        "yet — use the TensorRT backend.");
 
     impl_ = new Impl();
     impl_->ctx = ctx_impl;

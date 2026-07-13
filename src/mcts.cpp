@@ -518,84 +518,17 @@ MCTS::AnalysisInfo MCTS::get_analysis(int max_moves) const {
 }
 
 // ================================================================
-// Dihedral augmentation (8-fold symmetry)
+// Self-play game → V3 GameRecord (moves + policies + outcome only;
+// no encoded states — the trainer replays and encodes per-arch, and
+// dihedral augmentation happens at sample time in the loader)
 // ================================================================
-static void augment_sample(const std::vector<float>& state,
-                           const std::vector<float>& policy,
-                           float value, float score,
-                           const std::vector<float>& ownership,
-                           int opponent_action,
-                           int board_size, int input_channels,
-                           std::vector<TrainingRecord>& out) {
-    int n  = board_size;
-    int hw = n * n;
-    int action_size = hw + 1;
-    float pass_prob = policy[hw];
-
-    for (int rot = 0; rot < 4; rot++) {
-        for (int flip = 0; flip < 2; flip++) {
-            TrainingRecord rec;
-            rec.state.resize((size_t)input_channels * hw);
-            rec.policy.resize(action_size);
-            rec.ownership.resize(hw);
-            rec.value = value;
-            rec.score = score;
-
-            auto transform = [&](int r, int c) -> std::pair<int,int> {
-                int tr = r, tc = c;
-                for (int k = 0; k < rot; k++) {
-                    int tmp = tr; tr = tc; tc = n - 1 - tmp;
-                }
-                if (flip) tc = n - 1 - tc;
-                return {tr, tc};
-            };
-
-            for (int ch = 0; ch < input_channels; ch++) {
-                for (int r = 0; r < n; r++) {
-                    for (int c = 0; c < n; c++) {
-                        auto [tr, tc] = transform(r, c);
-                        rec.state[ch * hw + tr * n + tc] =
-                            state[ch * hw + r * n + c];
-                    }
-                }
-            }
-            for (int r = 0; r < n; r++) {
-                for (int c = 0; c < n; c++) {
-                    auto [tr, tc] = transform(r, c);
-                    rec.policy[tr * n + tc] = policy[r * n + c];
-                    rec.ownership[tr * n + tc] = ownership[r * n + c];
-                }
-            }
-            rec.policy[hw] = pass_prob;
-
-            // Transform opponent action (board moves only; pass stays as-is)
-            if (opponent_action >= 0 && opponent_action < hw) {
-                int or_ = opponent_action / n, oc = opponent_action % n;
-                auto [tr, tc] = transform(or_, oc);
-                rec.opponent_action = tr * n + tc;
-            } else {
-                rec.opponent_action = opponent_action;  // pass or -1
-            }
-
-            out.push_back(std::move(rec));
-        }
-    }
-}
-
-// ================================================================
-// Self-play game
-// ================================================================
-static std::vector<TrainingRecord> self_play_game_impl(
-        MCTS& mcts, const Config& config) {
+GameRecord self_play_game(BatchEvaluator* evaluator, const Config& config) {
+    MCTS mcts(evaluator, config);
     GoGame game(config.board_size, config.komi);
 
-    struct Step {
-        std::vector<float> state;
-        std::vector<float> policy;
-        Stone player;
-        int action;  // the action taken at this step
-    };
-    std::vector<Step> trajectory;
+    GameRecord rec;
+    rec.board_size = config.board_size;
+    rec.komi       = config.komi;
 
     int action_size = config.action_size();
 
@@ -610,12 +543,8 @@ static std::vector<TrainingRecord> self_play_game_impl(
         int action = mcts.get_action(game, pi, temp, -1, /*add_noise=*/true,
                                       /*reuse_tree=*/true);
 
-        Step step;
-        game.encode(step.state);
-        step.policy = pi;
-        step.player = game.current_player;
-        step.action = action;
-        trajectory.push_back(std::move(step));
+        rec.actions.push_back((int16_t)action);
+        rec.policies.push_back(std::move(pi));
 
         if (action == action_size - 1)
             game.play(PASS_MOVE);
@@ -627,49 +556,21 @@ static std::vector<TrainingRecord> self_play_game_impl(
 
     while (!game.game_over) game.play(PASS_MOVE);
 
-    // Compute score target: raw point difference from BLACK's perspective
     auto [bs, ws] = game.score();
-    float black_score = bs - ws;  // raw points, e.g. +12.5
+    rec.black_score = bs - ws;          // komi included (in ws)
+    rec.winner      = game.winner;
 
-    // Compute ownership from game-end position
-    std::vector<float> black_ownership, white_ownership;
-    game.get_ownership(BLACK, black_ownership);
-    game.get_ownership(WHITE, white_ownership);
+    // Final ternary ownership: {0 empty/dame, 1 black, 2 white}
+    std::vector<float> own_b, own_w;
+    game.get_ownership(BLACK, own_b);
+    game.get_ownership(WHITE, own_w);
+    int hw = config.board_size * config.board_size;
+    rec.owners.resize(hw);
+    for (int i = 0; i < hw; i++)
+        rec.owners[i] = own_b[i] > 0.5f ? (int8_t)1
+                      : own_w[i] > 0.5f ? (int8_t)2 : (int8_t)0;
 
-    std::vector<TrainingRecord> records;
-    records.reserve(trajectory.size() * 8);
-
-    for (size_t i = 0; i < trajectory.size(); i++) {
-        auto& step = trajectory[i];
-        float value;
-        if      (game.winner == EMPTY)        value =  0.0f;
-        else if (game.winner == step.player)  value =  1.0f;
-        else                                  value = -1.0f;
-
-        // Score from current player's perspective (raw points)
-        float score = (step.player == BLACK) ? black_score : -black_score;
-
-        // Ownership from current player's perspective
-        const auto& ownership = (step.player == BLACK) ? black_ownership : white_ownership;
-
-        // Opponent's next action (look-ahead by one step)
-        int opponent_action = -1;
-        if (i + 1 < trajectory.size()) {
-            opponent_action = trajectory[i + 1].action;
-        }
-
-        augment_sample(step.state, step.policy, value, score,
-                       ownership, opponent_action,
-                       config.board_size, config.input_channels, records);
-    }
-
-    return records;
-}
-
-std::vector<TrainingRecord> self_play_game(
-        BatchEvaluator* evaluator, const Config& config) {
-    MCTS mcts(evaluator, config);
-    return self_play_game_impl(mcts, config);
+    return rec;
 }
 
 }  // namespace minigo

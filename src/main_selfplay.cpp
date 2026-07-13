@@ -17,37 +17,42 @@
 
 using namespace minigo;
 
-static void write_records(const std::string& path,
-                           const std::vector<TrainingRecord>& records,
-                           int board_size) {
+// V3 game record — engine-neutral: the move sequence, per-move MCTS
+// policy targets, the outcome, and final ternary ownership.  The
+// trainer replays the moves and encodes positions per-architecture
+// (MiniGo 17-plane or KataGo V7); augmentation happens at load time.
+// Layout (little-endian, packed):
+//   u16 magic 'MG' | u16 version=3 | i32 board_size | f32 komi
+//   i32 n_moves | i8 winner (0 draw, 1 black, 2 white) | f32 black_score
+//   per move: i16 action (hw = pass) | f32 policy[hw+1]
+//   footer:   i8 owner[hw]  (0 empty/dame, 1 black, 2 white)
+static void write_record(const std::string& path, const GameRecord& rec) {
     std::ofstream out(path, std::ios::binary);
 
-    // V2 header: [magic:u16][version:u16][count:i32][board_size:i32]
     uint16_t magic   = 0x4D47;  // 'MG'
-    uint16_t version = 2;
-    int32_t  n       = (int32_t)records.size();
-    int32_t  bs      = board_size;
+    uint16_t version = 3;
+    int32_t  bs      = rec.board_size;
+    float    komi    = rec.komi;
+    int32_t  n_moves = (int32_t)rec.actions.size();
+    int8_t   winner  = (int8_t)rec.winner;
+    float    black_score = rec.black_score;
+
     out.write(reinterpret_cast<const char*>(&magic), 2);
     out.write(reinterpret_cast<const char*>(&version), 2);
-    out.write(reinterpret_cast<const char*>(&n), 4);
     out.write(reinterpret_cast<const char*>(&bs), 4);
+    out.write(reinterpret_cast<const char*>(&komi), 4);
+    out.write(reinterpret_cast<const char*>(&n_moves), 4);
+    out.write(reinterpret_cast<const char*>(&winner), 1);
+    out.write(reinterpret_cast<const char*>(&black_score), 4);
 
-    int board_sq = board_size * board_size;
-
-    for (auto& rec : records) {
-        int32_t ss = (int32_t)rec.state.size();
-        int32_t ps = (int32_t)rec.policy.size();
-        out.write(reinterpret_cast<const char*>(&ss), 4);
-        out.write(reinterpret_cast<const char*>(rec.state.data()), ss * sizeof(float));
-        out.write(reinterpret_cast<const char*>(&ps), 4);
-        out.write(reinterpret_cast<const char*>(rec.policy.data()), ps * sizeof(float));
-        out.write(reinterpret_cast<const char*>(&rec.value), sizeof(float));
-        out.write(reinterpret_cast<const char*>(&rec.score), sizeof(float));
-        // V2 fields
-        out.write(reinterpret_cast<const char*>(rec.ownership.data()), board_sq * sizeof(float));
-        int32_t opp = rec.opponent_action;
-        out.write(reinterpret_cast<const char*>(&opp), 4);
+    for (int32_t m = 0; m < n_moves; m++) {
+        int16_t action = rec.actions[m];
+        out.write(reinterpret_cast<const char*>(&action), 2);
+        out.write(reinterpret_cast<const char*>(rec.policies[m].data()),
+                  rec.policies[m].size() * sizeof(float));
     }
+    out.write(reinterpret_cast<const char*>(rec.owners.data()),
+              rec.owners.size());
 }
 
 static std::vector<int> parse_device_ids(const std::string& str) {
@@ -128,15 +133,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Load model once (shared CPU weights — KataGo pattern)
+    // Load model once (shared CPU weights — KataGo pattern).  Any model
+    // format works: V3 records store moves + targets, not encoded
+    // states, so the record pool is independent of the generating
+    // model's input encoding.
     auto model = LoadedModel::load(model_path);
-
-    if (model->format == ModelFormat::KataGo) {
-        std::cerr << "ERROR: selfplay does not support KataGo-format models.\n"
-                  << "  KataGo weights are inference-only in this build.\n"
-                  << "  Use the play or evaluate binary for KataGo runs.\n";
-        return 2;
-    }
 
     config.model_type         = model->model_type;
     config.board_size         = model->board_size;
@@ -199,22 +200,23 @@ int main(int argc, char* argv[]) {
             if (game_id >= num_games) break;
 
             auto t0 = std::chrono::steady_clock::now();
-            auto records = self_play_game(nn_evaluator.get(), config);
+            GameRecord rec = self_play_game(nn_evaluator.get(), config);
             auto t1 = std::chrono::steady_clock::now();
 
             double secs = std::chrono::duration<double>(t1 - t0).count();
-            int moves   = (int)records.size() / 8;
 
             std::string filename = output_dir + "/game_" +
                                    std::to_string(game_id) + ".bin";
-            write_records(filename, records, config.board_size);
+            write_record(filename, rec);
 
             {
                 std::lock_guard<std::mutex> lock(print_mutex);
                 std::cout << "  Game " << (game_id + 1) << "/" << num_games
-                          << " — " << moves << " moves, "
-                          << records.size() << " samples, "
-                          << std::fixed << std::setprecision(2)
+                          << " — " << rec.actions.size() << " moves, "
+                          << (rec.winner == BLACK ? "B" :
+                              rec.winner == WHITE ? "W" : "=")
+                          << std::showpos << rec.black_score << std::noshowpos
+                          << ", " << std::fixed << std::setprecision(2)
                           << secs << "s\n";
             }
         }

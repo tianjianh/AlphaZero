@@ -18,9 +18,10 @@ namespace minigo {
 std::unique_ptr<ComputeHandle>
 EigenComputeContext::create_handle(const LoadedModel* model,
                                    int /*gpu_id*/, int /*max_batch_size*/) {
-    if (model->model_type == "vit")
-        throw std::runtime_error(
-            "Eigen backend does not support ViT models. Use TensorRT.");
+    // Interface contract: all three model formats (MiniGo resnet/vit
+    // single-input, KataGo-V7 dual-input) are accepted here; the
+    // handle constructor throws its own placeholder (TODO) for the
+    // architectures whose CPU forward pass isn't implemented yet.
     return std::make_unique<EigenComputeHandle>(model);
 }
 
@@ -208,6 +209,11 @@ bool detect_mish(const std::string& path) {
 // EigenComputeHandle — load weights from the model's ONNX file
 // ================================================================
 EigenComputeHandle::EigenComputeHandle(const LoadedModel* model) {
+    if (model->model_type == "vit")
+        throw std::runtime_error(
+            "Eigen backend: ViT forward pass is a placeholder (TODO) — "
+            "resnet and KataGo-V7 models run on CPU; use TensorRT for ViT.");
+
     format_                = model->format;
     board_size_            = model->board_size;
     input_channels_        = model->input_channels;
