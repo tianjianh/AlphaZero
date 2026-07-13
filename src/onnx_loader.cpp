@@ -287,6 +287,60 @@ std::vector<OnnxGraphIO> parse_onnx_graph_inputs(const std::string& path) {
 }
 
 // ----------------------------------------------------------------
+// Graph node op_type counting (for activation detection)
+// ----------------------------------------------------------------
+// GraphProto.node is field 1 (repeated NodeProto);
+// NodeProto.op_type is field 4 (string).
+static void count_graph_ops(Reader r, int& mish, int& softplus) {
+    while (r.has_data()) {
+        auto [field, wire] = r.read_tag();
+        if (field == 1 && wire == LENGTH_DELIMITED) {
+            auto node = r.read_submessage();
+            while (node.has_data()) {
+                auto [nf, nw] = node.read_tag();
+                if (nf == 4 && nw == LENGTH_DELIMITED) {
+                    auto len = node.read_varint();
+                    std::string op((const char*)node.data, (size_t)len);
+                    node.data += len;
+                    if (op == "Mish") mish++;
+                    else if (op == "Softplus") softplus++;
+                } else {
+                    node.skip(nw);
+                }
+            }
+        } else {
+            r.skip(wire);
+        }
+    }
+}
+
+bool graph_uses_mish(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+        throw std::runtime_error("Cannot open model file: " + path);
+    size_t file_size = (size_t)file.tellg();
+    file.seekg(0);
+    std::vector<uint8_t> buf(file_size);
+    file.read(reinterpret_cast<char*>(buf.data()), (std::streamsize)file_size);
+    file.close();
+
+    int mish = 0, softplus = 0;
+    Reader r(buf.data(), buf.size());
+    while (r.has_data()) {
+        auto [field, wire] = r.read_tag();
+        if (field == 7 && wire == LENGTH_DELIMITED) {
+            auto sub = r.read_submessage();
+            count_graph_ops(sub, mish, softplus);
+        } else {
+            r.skip(wire);
+        }
+    }
+    // One Softplus is the score_stdev post-processing; a Mish trunk
+    // decomposed at opset<=17 contributes one per activation site.
+    return mish > 0 || softplus > 2;
+}
+
+// ----------------------------------------------------------------
 // Public API
 // ----------------------------------------------------------------
 std::vector<OnnxTensor> parse_onnx_file(const std::string& path) {

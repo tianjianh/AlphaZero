@@ -108,14 +108,34 @@ This works but wastes FP8 potential — the transformer blocks are >99% of compu
 
 ## Non-TensorRT backends for the new KataGo-style ResNet
 
-**Status**: Stubbed — throws at handle creation.
+**Status**: OpenCL DONE (2026-07); CUDA / Metal still stubbed.
 
 The ResNet architecture was replaced with a KataGo-style design (alternating
 SE + GPool residual blocks, global-pool value/score heads; see
 `scripts/model.py` for the PyTorch definition).  TensorRT parses the new
-ONNX graph directly and works out of the box.  The Eigen/CUDA/OpenCL/Metal
-backends still contain their old AlphaZero-ResNet forward passes but
-throw at `ComputeHandle` construction with a "TODO: add kernels" message.
+ONNX graph directly and works out of the box.
+
+**OpenCL now implements all three architectures** (resnet, vit, katago-V7
+in both namings) at three precision tiers (fp32 / portable fp16 / NVIDIA
+tensor-core fp16 via inline-PTX mma.sync), verified against PyTorch
+reference vectors — see the "OpenCL GPU Backend" section in README.md.
+The weight plumbing it needed now lives in `LoadedModel::weights()`
+(lazy, shared, all four format variants pre-fused) so re-enabling CUDA /
+Metal is only a matter of porting the kernel sequences in
+`src/opencl_compute.cpp::forward_*` to those APIs.
+
+Deferred OpenCL performance ideas (measured unnecessary for now):
+- register double-buffering in the MMA gemm — wins ~20% at batch ≤ 16
+  but costs ~20% at batch ≥ 128 (occupancy cliff from +16..32 staging
+  registers); selfplay lives at large batch, so single-stage was kept.
+- a skinny-M gemm variant for the 1-2 channel head convs (launch-bound).
+- ViT attention at hw=81 is latency-bound on the serial per-query
+  softmax chain (~50% of ViT time); a warp-cooperative (i,j)-parallel
+  scheme would need cross-lane reductions.
+
+The CUDA / Metal backends still contain their old AlphaZero-ResNet forward
+passes but throw at `ComputeHandle` construction with a "TODO: add
+kernels" message.
 
 To re-enable a backend, add forward-pass support for:
 
@@ -131,16 +151,14 @@ To re-enable a backend, add forward-pass support for:
 
 Blocks alternate in the trunk: block 0 SE, block 1 GPool, block 2 SE, ...
 
-And teach `loaded_model.cpp` to populate per-block weight slots for the
-new layout.  The old per-op `load_conv` / `load_bn` / `load_fc` helpers are
-kept in place (currently `(void)`-cast to silence unused warnings) for
-exactly this re-enable path.
+The weight plumbing already exists: `LoadedModel::weights()` returns a
+lazily-built, pre-fused `ModelWeights` bundle covering all four format
+variants (resnet / vit / KataGoNet / converted kata1) — the OpenCL
+backend consumes it and is the reference for the kernel sequences.
 
-See the stubs in:
+See the remaining stubs in:
 
-- `src/eigen_compute.cpp` (`EigenComputeHandle` constructor)
 - `src/cuda_compute.cu` (`CUDAComputeHandle` constructor)
-- `src/opencl_compute.cpp` (`OpenCLComputeHandle` constructor)
 - `src/metal_compute.mm` (`MetalComputeHandle` constructor)
 
 ## Deferred items from the 2026-07 codebase audit
@@ -166,8 +184,9 @@ the audit pass (each is a behavior change or larger refactor):
    ONNX graphs.  The build supports TRT 11 (guarded), but for FP16/BF16
    engines install TRT 10.x until the exporters emit half-precision
    graphs.
-5. **KataGo-model banner prints `filters=0 blocks=0`**: LoadedModel
-   doesn't populate trunk metadata for KataGo-format ONNX.  Cosmetic.
+5. ~~**KataGo-model banner prints `filters=0 blocks=0`**~~ FIXED with
+   the OpenCL backend work: LoadedModel now reads trunk channel/block
+   counts from the embedded state_dict for KataGo-format ONNX.
 6. **Per-eval blocking handoff still uses mutex+condvar** (the only
    sync heavier than a single AMO left on the search path): each NN
    evaluation does one queue push (mutex) and one wait on the buf's
@@ -187,5 +206,7 @@ the audit pass (each is a behavior change or larger refactor):
    (`stem_conv.weight`, `blocks.N.conv_regular.weight`, ...).  Fix is
    a name map (or a shared naming scheme between scripts/model.py
    KataGoNet and tools/katago_arch.py) in eigen_compute's tensor
-   lookup.  TensorRT is unaffected (it reads the graph, not the
-   embedded state_dict).
+   lookup — or porting Eigen to `LoadedModel::weights()`, which
+   already resolves both namings (the OpenCL backend runs both).
+   TensorRT is unaffected (it reads the graph, not the embedded
+   state_dict).

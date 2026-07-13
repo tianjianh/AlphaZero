@@ -12,7 +12,7 @@ Training runs in Python/PyTorch. Works on **Linux** and **macOS** (Intel + Apple
 - **TensorRT** (default on Linux with NVIDIA GPU + TensorRT installed) — optimized inference via NVIDIA TensorRT; automatic FP16, layer fusion, and kernel auto-tuning. Engine cached to disk after first build
 - **CUDA** (default on Linux with NVIDIA GPU, no TensorRT) — FP16 Tensor Core inference via WMMA; hand-written implicit GEMM kernels. Supports Turing, Ampere, Ada, Hopper, Blackwell
 - **Metal** (default on macOS Apple Silicon) — GPU inference via MPSGraph with FP16 compute; 2-3× faster than OpenCL on the same hardware
-- **OpenCL** — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); hand-written implicit GEMM kernels with fused BN/ReLU
+- **OpenCL** — GPU inference on any OpenCL 1.2+ device (NVIDIA, AMD, Intel); all three model architectures (resnet / vit / katago-V7) with fp32, portable-fp16 and NVIDIA tensor-core (inline-PTX `mma.sync`) precision tiers
 - **RKNN** (aarch64 Linux with Rockchip NPU — RK3562/RK3566/RK3568/RK3576/RK3588) — NPU inference via Rockchip's `librknnrt`; fp16 or int8/hybrid quantisation, multi-core NPU support (auto-distributed across NPU cores). Requires offline ONNX → .rknn conversion on an x86_64 host with `rknn-toolkit2`.
 - **VIP9000** (aarch64 Linux with VeriSilicon Vivante VIP9000 NPU — Allwinner A733 / V853 / similar) — NPU inference via the VIPLite v2.0 runtime (`libNBGlinker.so` + `libVIPhal.so`); fp16-native, single core. Requires offline ONNX → `.nb` (Network Binary Graph) conversion on an x86_64 Linux host running Allwinner's official Acuity Toolkit Docker image (`ubuntu-npu:v2.0.10.1`); the pip `acuitylite` wheel is a dead end — its bundled chip table doesn't contain A733's PID `0x1000003B` (verified across 6.42–6.51).
 - **Eigen** (always available) — CPU inference using Apple Accelerate / OpenBLAS
@@ -190,6 +190,16 @@ sudo apt install libnvinfer-dev libnvonnxparsers-dev
 # CUTLASS headers (header-only, for optimized GEMM):
 #   git clone --depth 1 https://github.com/NVIDIA/cutlass.git /tmp/cutlass
 #   sudo cp -r /tmp/cutlass/include/cutlass /usr/local/include/
+
+# NOTE (NVIDIA + CUDA "compat" packages): if /usr/local/cuda-*/compat
+# shadows the driver libs in ldconfig with a NEWER version than the
+# kernel driver, NVIDIA's OpenCL JIT loads a mixed 560/575-style chain
+# and clBuildProgram segfaults non-deterministically (or errors with
+# "Unsupported .version"). Force the driver-matched chain, e.g.:
+#   export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libcuda.so.<drv> \
+#     /usr/lib/x86_64-linux-gnu/libnvidia-nvvm.so.<drv> \
+#     /usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.<drv>"
+# (CUDA/PyTorch in other processes keep using the compat chain.)
 
 # For NVIDIA GPU (OpenCL — portable alternative):
 sudo apt install ocl-icd-opencl-dev
@@ -675,9 +685,11 @@ format-support matrix.
 | `tools/katago_to_onnx.py` / `katago_parity_test.py` / `warm_init_from_katago.py` | stock-weight conversion / validation / warm-init |
 
 Backend support for the dual-input format: **TensorRT** (full),
-**Eigen** (CPU forward), **RKNN / VIP9000** (via their pre-compiled
-artifacts).  CUDA / OpenCL / Metal accept it at the interface but
-their kernels are TODO placeholders (as for the MiniGo formats).
+**OpenCL** (full — both the converted-kata1 and trainable-KataGoNet
+namings, mish/relu autodetected), **Eigen** (CPU forward,
+converted-kata1 naming), **RKNN / VIP9000** (via their pre-compiled
+artifacts).  CUDA / Metal accept it at the interface but their kernels
+are TODO placeholders (as for the MiniGo formats).
 
 #### How to use it (5 steps)
 
@@ -1027,22 +1039,60 @@ The design follows the same Context/Handle pattern:
 
 ### OpenCL GPU Backend
 
-`OpenCLComputeHandle` (`src/opencl_compute.cpp`) implements the full AlphaZero
-forward pass using hand-written OpenCL kernels:
+`OpenCLComputeHandle` (`src/opencl_compute.cpp`, kernels in
+`src/opencl_kernels.h`) runs **all three model architectures** — the
+MiniGo KataGo-style ResNet (SE + GPool blocks), the GoViT transformer
+(GQA + directional relative bias), and KataGo-V7 dual-input networks
+(both trainable-KataGoNet exports and converted stock kata1 nets,
+mish/relu autodetected from the graph ops).
 
-| Kernel | Purpose |
-|---|---|
-| `transpose_nchw_to_cnhw` | GPU-side NCHW → channel-major transpose |
-| `conv3x3_sgemm_bn` | Implicit GEMM: fused im2col + register-blocked SGEMM + BN/residual/ReLU |
-| `conv1x1_bn_relu_reshape` | Fused 1×1 conv + BN + ReLU + layout reshape for FC input |
-| `fc_bias_relu` | Fused FC GEMM + bias + optional ReLU |
-| `fc_bias_softmax` | Fused FC + bias + softmax (policy head) |
-| `fc_bias_tanh` | Fused FC + bias + tanh (value head) |
+Three precision tiers, chosen per device at context init
+(`MINIGO_OPENCL_PRECISION` = `fp32` | `fp16` | `fp16-portable` | `auto`):
 
-The implicit GEMM kernel (`conv3x3_sgemm_bn`) computes im2col indices
-on-the-fly during B-tile loading, eliminating the separate im2col scratch
-buffer.  Register blocking (WPT_M=2, WPT_N=4) gives 8 outputs per work-item
-with shared-memory tiling.
+| Tier | Storage | Math | Hardware |
+|---|---|---|---|
+| `fp32` | float | float | any OpenCL 1.2 device |
+| `fp16` (portable) | half via core `vload_half`/`vstore_half` | fp32 | any OpenCL 1.2 device — **no `cl_khr_fp16` needed** |
+| `fp16` + MMA | half | tensor cores, fp32 accumulate | NVIDIA (inline-PTX `mma.sync.m16n8k16`, probe-compiled) |
+
+Kernel design:
+
+- **One unified implicit-GEMM kernel** covers every conv (k=1/3/5,
+  im2col gathered on the fly — never materialized) and every FC.  Its
+  fused epilogue applies pre-fused BN, row bias, the per-(channel,image)
+  global-pool bias injection (pre- or post-BN), residual add and the
+  activation — so a whole residual block is 3-4 launches and a KataGo
+  gpool block needs **zero** separate element-wise kernels.
+- The gather hoists all per-column index math out of the K-loop and
+  builds the K→(ic,kh,kw) decomposition in a tiny local-memory LUT once
+  per tile (integer division is ~25 emulated instructions on GPUs;
+  doing it per element measurably dominated the kernel).
+- The tensor-core version stages packed-half tiles in local memory with
+  a bank-conflict-free 36-uint row stride and issues
+  `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` from inline PTX —
+  fp16 inputs, **fp32 accumulation**.  Compiled as its own program and
+  probe-tested at init; any failure falls back to portable fp16.
+- **Flash-style fused attention** for ViT: one work-group per
+  (image, head), online softmax in fp32, K/V tiles staged in local
+  memory, and the directional rel-position bucket recomputed from token
+  coordinates — the [hw, hw] bias matrix is never materialized.
+- LayerNorm / softmax / global-pool statistics always accumulate in
+  fp32; outputs pack GPU-side into one buffer read back once per batch.
+
+Measured on an NVIDIA A40 (9×9 board, batch 256, evals/s):
+
+| Model | fp32 | fp16+MMA |
+|---|---|---|
+| resnet b10c128 | 11.1k | **25.4k** |
+| katago b10c128 | 11.0k | **24.1k** |
+| vit d192×8 | 6.0k | 7.0k |
+
+`MINIGO_OPENCL_PROFILE=1` prints a per-kernel GPU-time summary after
+every batch (uses `CL_QUEUE_PROFILING_ENABLE`).
+
+Numerical verification against PyTorch reference outputs
+(`scripts/make_test_vectors.py` + `build/verify`): fp32 matches to
+~1e-7 on all five model formats; fp16 policy logits within 4e-2.
 
 ### Metal GPU Backend (macOS)
 

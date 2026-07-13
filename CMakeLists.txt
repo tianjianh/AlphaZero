@@ -370,7 +370,8 @@ if(HAS_EIGEN)
 endif()
 
 if(HAS_OPENCL)
-  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_OPENCL=1)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_OPENCL=1
+                                                CL_TARGET_OPENCL_VERSION=120)
   target_link_libraries(minigo_core PUBLIC OpenCL::OpenCL)
 endif()
 
@@ -431,6 +432,8 @@ add_executable(play      src/main_play.cpp)
 add_executable(selfplay  src/main_selfplay.cpp)
 add_executable(benchmark src/main_benchmark.cpp)
 add_executable(evaluate  src/main_evaluate.cpp)
+add_executable(verify    src/main_verify.cpp)
+target_link_libraries(verify PRIVATE minigo_core)
 if(HAS_VIP9000)
   add_executable(vip9000_smoke    src/main_vip9000_smoke.cpp)
   add_executable(vip9000_accuracy src/main_vip9000_accuracy.cpp)

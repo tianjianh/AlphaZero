@@ -46,5 +46,13 @@ struct OnnxGraphIO {
 // MiniGo (one input).
 std::vector<OnnxGraphIO> parse_onnx_graph_inputs(const std::string& path);
 
+// Does the graph use Mish activations?  Robust across exporters:
+// opset >= 18 emits real `Mish` nodes; opset <= 17 decomposes each
+// Mish into Softplus+Tanh+Mul, so a trunk full of them shows many
+// Softplus nodes while a ReLU kata1 graph has exactly one (the
+// baked-in score_stdev softplus).  (A plain "Mish" byte-scan misses
+// the decomposed form entirely.)
+bool graph_uses_mish(const std::string& path);
+
 }  // namespace onnx_parser
 }  // namespace minigo

@@ -176,33 +176,6 @@ void load_gpool_head(EigenComputeHandle::GPoolHead& head, const TensorMap& tm,
     load_fc(head.fc2, tm, prefix + ".fc2.weight", true);
 }
 
-// Heuristic: scan the raw ONNX file for the byte sequence "Mish".
-// KataGo kata1 networks use Mish; older nets and the MiniGo training
-// path use ReLU. The check is robust because random binary data is
-// extremely unlikely to contain the literal string "Mish".
-bool detect_mish(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
-    static constexpr char NEEDLE[] = "Mish";
-    constexpr size_t NEEDLE_LEN = sizeof(NEEDLE) - 1;
-    constexpr size_t CHUNK = 64 * 1024;
-    std::vector<char> buf(CHUNK + NEEDLE_LEN);
-    size_t carry = 0;
-    while (f) {
-        f.read(buf.data() + carry, CHUNK);
-        size_t got = (size_t)f.gcount();
-        size_t total = carry + got;
-        if (total < NEEDLE_LEN) break;
-        for (size_t i = 0; i + NEEDLE_LEN <= total; ++i) {
-            if (std::memcmp(buf.data() + i, NEEDLE, NEEDLE_LEN) == 0)
-                return true;
-        }
-        carry = std::min<size_t>(NEEDLE_LEN - 1, total);
-        std::memmove(buf.data(), buf.data() + total - carry, carry);
-    }
-    return false;
-}
-
 }  // namespace
 
 // ================================================================
@@ -233,7 +206,10 @@ EigenComputeHandle::EigenComputeHandle(const LoadedModel* model) {
 
     if (format_ == ModelFormat::KataGo) {
         // ── KataGo path ────────────────────────────────────────
-        katago_use_mish_ = detect_mish(model->model_path);
+        // Graph-op-based detection: a plain "Mish" byte-scan misses
+        // opset<=17 exports, where each Mish is decomposed into
+        // Softplus+Tanh+Mul and the literal never appears.
+        katago_use_mish_ = onnx_parser::graph_uses_mish(model->model_path);
         // KataGo's binary format stores BN epsilon (1e-20 in stock kata1
         // networks) and katago_arch.py copies it into PyTorch BN modules
         // before export. The embedded state_dict carries running stats

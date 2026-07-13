@@ -42,16 +42,23 @@ restrictions) has been removed.
 
 \* Backend support level (verified on hardware where possible):
 **TensorRT implements both input kinds fully** (parses the ONNX
-natively).  **Eigen** runs the MiniGo resnet on CPU; its dual-input
-path reads the CONVERTED-kata1 tensor naming only — the trainable
-KataGoNet's state_dict names are not mapped yet (clean "missing
-tensor" error; TODO.md item 7) — and is debugging-grade speed at
-b10c128.  ViT on Eigen is a TODO placeholder.  **CUDA / OpenCL /
-Metal** accept every format at the interface but their kernels are
-TODO placeholders — `create_handle` succeeds structurally and the
-handle constructor throws a uniform "placeholder (TODO)" error.
-**RKNN / VIP9000** run whatever was compiled into their `.rknn`/`.nb`
-artifacts (both encodings supported by their converters).
+natively).  **OpenCL implements all three architectures fully** —
+resnet, vit, and BOTH dual-input namings (converted kata1 with
+mish/relu autodetection AND the trainable KataGoNet) — with three
+precision tiers: fp32, portable fp16 (half storage + fp32 math, any
+CL 1.2 device), and NVIDIA tensor-core fp16 via inline-PTX mma.sync;
+verified against PyTorch reference vectors on all five format
+variants (`scripts/make_test_vectors.py` + `build/verify`).
+**Eigen** runs the MiniGo resnet on CPU; its dual-input path reads
+the CONVERTED-kata1 tensor naming only — the trainable KataGoNet's
+state_dict names are not mapped yet (clean "missing tensor" error;
+TODO.md item 7) — and is debugging-grade speed at b10c128.  ViT on
+Eigen is a TODO placeholder.  **CUDA / Metal** accept every format at
+the interface but their kernels are TODO placeholders — `create_handle`
+succeeds structurally and the handle constructor throws a uniform
+"placeholder (TODO)" error.  **RKNN / VIP9000** run whatever was
+compiled into their `.rknn`/`.nb` artifacts (both encodings supported
+by their converters).
 
 ## 3. Game records — V3, the only training format
 
