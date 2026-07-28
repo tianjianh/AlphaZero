@@ -7,6 +7,7 @@
 #include "nn/nn_evaluator.h"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -37,18 +38,95 @@ enum {
     CP_AI_INFO,     // AI stats
 };
 
-static void init_colors() {
+// ── Theme ───────────────────────────────────────────────────
+// The background is never painted (every pair uses -1, the
+// terminal's own background), but the FOREGROUNDS still have to suit
+// it: the dark palette leans on near-white greys (252/255) that are
+// invisible on a white terminal, and the light palette leans on dark
+// inks that vanish on a black one.  So pick a palette per background.
+enum Theme { THEME_DARK, THEME_LIGHT };
+
+// Resolve the theme, most explicit source first:
+//   1. --theme light|dark|auto
+//   2. MINIGO_THEME=light|dark
+//   3. COLORFGBG (set by rxvt/konsole/iTerm2 and others) — "fg;bg" or
+//      "fg;<extra>;bg"; the LAST field is the background index, where
+//      0-6 and 8 are dark and 7 plus 9-15 are light.
+//   4. dark — the historical default, so existing setups don't shift.
+static Theme resolve_theme(const std::string& cli) {
+    auto parse = [](const std::string& s, Theme& out) {
+        if (s == "light") { out = THEME_LIGHT; return true; }
+        if (s == "dark")  { out = THEME_DARK;  return true; }
+        return false;
+    };
+    Theme t = THEME_DARK;
+    if (!cli.empty() && cli != "auto") {
+        if (parse(cli, t)) return t;
+        fprintf(stderr, "Warning: unknown --theme '%s' (use light|dark|auto)\n",
+                cli.c_str());
+    }
+    if (const char* env = getenv("MINIGO_THEME"))
+        if (parse(env, t)) return t;
+    if (const char* fgbg = getenv("COLORFGBG")) {
+        std::string s(fgbg);
+        size_t semi = s.find_last_of(';');
+        if (semi != std::string::npos) {
+            std::string bg = s.substr(semi + 1);
+            if (!bg.empty() && bg.find_first_not_of("0123456789") == std::string::npos) {
+                int idx = atoi(bg.c_str());
+                return (idx == 7 || idx >= 9) ? THEME_LIGHT : THEME_DARK;
+            }
+        }
+    }
+    return THEME_DARK;
+}
+
+static void init_colors(Theme theme) {
     start_color();
-    use_default_colors();
-    init_pair(CP_GRID,        237,  -1);   // dark gray grid
-    init_pair(CP_STATUS,      252,  -1);   // status text
-    init_pair(CP_ACCENT,      214,  -1);   // gold title
-    init_pair(CP_RED,         196,  -1);   // red highlights
-    init_pair(CP_LABEL,       245,  -1);   // dim labels
-    init_pair(CP_BLACK_STONE, 255,  -1);   // black stone (bright for visibility)
-    init_pair(CP_WHITE_STONE, 252,  -1);   // white stone
-    init_pair(CP_CURSOR,       46,  -1);   // green cursor
-    init_pair(CP_AI_INFO,      81,  -1);   // cyan AI info
+    use_default_colors();          // background stays the terminal's own
+
+    // 8-colour terminals have no 256-colour cube; the base ANSI colours
+    // are remapped by the terminal itself, so they already track the
+    // user's scheme.  Only the greys need a side-dependent choice.
+    if (COLORS < 256) {
+        short ink  = (theme == THEME_LIGHT) ? COLOR_BLACK : COLOR_WHITE;
+        short dim  = (theme == THEME_LIGHT) ? COLOR_BLUE  : COLOR_CYAN;
+        init_pair(CP_GRID,        dim,          -1);
+        init_pair(CP_STATUS,      ink,          -1);
+        init_pair(CP_ACCENT,      COLOR_YELLOW, -1);
+        init_pair(CP_RED,         COLOR_RED,    -1);
+        init_pair(CP_LABEL,       dim,          -1);
+        init_pair(CP_BLACK_STONE, ink,          -1);
+        init_pair(CP_WHITE_STONE, dim,          -1);
+        init_pair(CP_CURSOR,      COLOR_GREEN,  -1);
+        init_pair(CP_AI_INFO,     COLOR_CYAN,   -1);
+        return;
+    }
+
+    if (theme == THEME_LIGHT) {
+        // Dark inks on a light background.  Stones are already told
+        // apart by their glyph ('X' vs 'O'), so black ink + mid grey
+        // reads naturally without needing a literal white.
+        init_pair(CP_GRID,        250,  -1);   // light grey grid — present, not loud
+        init_pair(CP_STATUS,       235,  -1);  // near-black status text
+        init_pair(CP_ACCENT,       130,  -1);  // dark amber title
+        init_pair(CP_RED,          160,  -1);  // deep red highlights
+        init_pair(CP_LABEL,        243,  -1);  // grey labels
+        init_pair(CP_BLACK_STONE,   16,  -1);  // true black stone
+        init_pair(CP_WHITE_STONE,  244,  -1);  // grey "white" stone
+        init_pair(CP_CURSOR,        28,  -1);  // dark green cursor
+        init_pair(CP_AI_INFO,       25,  -1);  // dark blue AI info
+    } else {
+        init_pair(CP_GRID,        237,  -1);   // dark gray grid
+        init_pair(CP_STATUS,      252,  -1);   // status text
+        init_pair(CP_ACCENT,      214,  -1);   // gold title
+        init_pair(CP_RED,         196,  -1);   // red highlights
+        init_pair(CP_LABEL,       245,  -1);   // dim labels
+        init_pair(CP_BLACK_STONE, 255,  -1);   // black stone (bright for visibility)
+        init_pair(CP_WHITE_STONE, 252,  -1);   // white stone
+        init_pair(CP_CURSOR,       46,  -1);   // green cursor
+        init_pair(CP_AI_INFO,      81,  -1);   // cyan AI info
+    }
 }
 
 // ================================================================
@@ -292,6 +370,7 @@ int main(int argc, char* argv[]) {
     Config config;
     std::string model_path  = "models/best.onnx";
     bool use_random         = false;
+    std::string theme_opt   = "auto";
     int  board_override     = -1;
     int  search_threads     = 16;
     int  nn_server_threads  = 1;
@@ -313,6 +392,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--nn-server-threads" && i+1<argc) nn_server_threads = std::stoi(argv[++i]);
         else if (arg == "--nn-device-ids"     && i+1<argc) nn_device_ids_str = argv[++i];
         else if (arg == "--pvs"              && i+1<argc) pvs             = std::stoi(argv[++i]);
+        else if (arg == "--theme"             && i+1<argc) theme_opt       = argv[++i];
         else if (arg == "--random") use_random = true;
         else if (arg == "--help" || arg == "-h") {
             printf("Usage: play [options]\n"
@@ -329,6 +409,9 @@ int main(int argc, char* argv[]) {
                    "  --nn-server-threads N  NN server threads (default: 1)\n"
                    "  --nn-device-ids IDS    Comma-separated GPU indices (default: \"0\")\n"
                    "  --pvs N                Top K moves to show in analysis (default: 5)\n"
+                   "  --theme T              UI palette: light, dark, or auto\n"
+                   "                         (default auto: MINIGO_THEME, else\n"
+                   "                          COLORFGBG, else dark)\n"
                    "  --random               Random bot (no model needed)\n"
                    "  --help                 This help\n");
             return 0;
@@ -389,8 +472,12 @@ int main(int argc, char* argv[]) {
     // No stdout redirect — background threads (TRT engine build)
     // may print to the terminal.  Press 'r' or Ctrl-L to redraw.
     setlocale(LC_ALL, "");
+    // Resolve before initscr() — resolve_theme may warn on stderr, and
+    // once curses owns the terminal that warning is invisible.
+    Theme theme = resolve_theme(theme_opt);
+
     initscr();
-    init_colors();
+    init_colors(theme);
     cbreak();
     noecho();
     keypad(stdscr, TRUE);

@@ -467,6 +467,46 @@ rationale (why fp16, why Docker-only, why un-share initializers, why
 the `_PLUS_` config name doesn't exist in v6.30.22, host-side parity
 numbers).
 
+### Eigen CPU Backend (any CPU)
+
+`EigenComputeHandle` (`src/backends/eigen_compute.cpp`) runs the forward
+pass on the CPU with Eigen, batching each layer into one
+`[c_out, B*HW]` GEMM.  It is the reference implementation — the
+numerically strictest backend (`build/verify` matches the PyTorch
+vectors to ~6e-08) and the portability fallback.  It covers the MiniGo
+resnet and converted-kata1 nets; ViT and the trainable KataGoNet are
+placeholders.
+
+Two things decide whether it is merely slow or unusably slow:
+
+- **OpenMP** multi-threads Eigen's GEMM.  Without it the trunk runs
+  single-threaded no matter the batch.
+- **The BLAS backing.**  Eigen only reaches good GEMM throughput where
+  it has a vectorised path for the ISA.  It ships packet backends for
+  SSE/AVX/NEON/SVE/AltiVec/MSA — but **not for the RISC-V Vector
+  extension**, so on RVV its packet math degenerates to scalar and only
+  gcc's auto-vectoriser salvages anything.  Compiling with
+  `EIGEN_USE_BLAS` hands every matrix product to `sgemm_` instead, so a
+  tuned BLAS supplies the kernel.
+
+CMake wires this up automatically: Apple hosts link **Accelerate**, and
+other hosts link **OpenBLAS** when it is installed
+(`-DMINIGO_EIGEN_BLAS=OFF` opts out).  On the SpacemiT K3 that is worth
+**7×** — OpenBLAS runtime-dispatches to a hand-written
+`sgemm_kernel_RISCV64_ZVL256B` matching the X100's VLEN=256 (confirm with
+`OPENBLAS_VERBOSE=2`, which prints `Core: riscv64_zvl256b`):
+
+| resnet b3c32 9×9, batch 16, 8 threads | evals/s |
+|---|---:|
+| Eigen alone (gcc auto-vectorised RVV) | 175 |
+| Eigen + OpenBLAS (`ZVL256B` RVV kernel) | **1234** |
+
+Pin the process to the application cores on heterogeneous chips —
+`OMP_NUM_THREADS=8 taskset -c 0-7` on the K3, whose cpus 8-15 are the AI
+cluster.  Even so the CPU path is a *fallback*: on b10c128 9×9 it reaches
+~85 evals/s against the K3 backend's 1910 (fp16) / 3208 (int8).  Use it
+for debugging, verification, and portability — not for play.
+
 ### K3 Backend (SpacemiT K3, riscv64 Linux)
 
 `K3ComputeHandle` (`src/backends/k3_compute.cpp`) runs inference through
@@ -661,6 +701,14 @@ The EP's own `SPACEMIT_EP_*` variables pass straight through
   graph on the first Run, a harness that warms up at batch 1 and then
   measures batch 16 reports the batch-1 kernel — 4× low, and it looks
   like a hardware ceiling rather than a harness artefact.
+- **Rebuild every binary after touching the backend**, not just the one
+  you are testing.  `make verify` leaves `play` / `benchmark` /
+  `evaluate` / `selfplay` stale, and a stale `play` carrying an older
+  batching policy feeds the EP a shape its cached tile graph was not
+  compiled for — which returns garbage for most rows of the batch
+  rather than failing loudly.  In MCTS, where nearly every leaf is
+  scored from those rows, that surfaces as an engine playing absurd
+  moves while `verify` still reports PASS.
 
 ### Modular Backend Design (KataGo pattern)
 

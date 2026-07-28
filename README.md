@@ -491,6 +491,19 @@ for movement.
 
 **Modes**: (B)lack vs AI, (W)hite vs AI, (H)uman vs Human.
 
+**Light and dark terminals**: the UI never paints a background — it draws on
+whatever your terminal uses — but the *foregrounds* have to suit it, so there
+are two palettes.  The theme is resolved from, in order: `--theme
+light|dark|auto`, then `MINIGO_THEME`, then `COLORFGBG` (exported by rxvt,
+konsole, iTerm2 and others), falling back to `dark`.  Auto-detection only
+works if your terminal exports `COLORFGBG`, so on a white background you may
+need to say so explicitly:
+
+```bash
+./build/play --model models/accepted/latest --sims 800 --theme light
+export MINIGO_THEME=light      # or set it once per shell
+```
+
 #### Hotkeys
 
 | Key | Action |
