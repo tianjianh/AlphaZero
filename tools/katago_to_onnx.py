@@ -102,10 +102,7 @@ def main():
     # the original conv-weight initializer name for the folded weight, which
     # collides with the embedded state_dict step below: the C++ Eigen backend
     # would end up reading folded weights and then double-applying mid_bn.
-    torch.onnx.export(
-        net,
-        (sp, gl),
-        out_path,
+    export_kwargs = dict(
         input_names=["state_spatial", "state_global"],
         output_names=["policy_logits", "value", "score_mean",
                       "score_stdev", "ownership"],
@@ -120,8 +117,14 @@ def main():
         },
         opset_version=args.opset,
         do_constant_folding=True,
-        dynamo=False,
     )
+    # `dynamo=False` forces the legacy TorchScript exporter — but the kwarg
+    # only exists on torch>=2.0.  On older torch the TorchScript path is the
+    # only exporter, so omit it there rather than crash.
+    import inspect
+    if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+        export_kwargs["dynamo"] = False
+    torch.onnx.export(net, (sp, gl), out_path, **export_kwargs)
 
     # PyTorch's exporter writes weights to an external `.onnx.data`
     # sidecar by default for large models. Inline those weights so the

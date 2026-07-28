@@ -15,6 +15,7 @@ ignored).  Pure numpy — no torch dependency.
 
 import gzip
 import io
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
