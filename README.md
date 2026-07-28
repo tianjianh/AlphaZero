@@ -29,6 +29,7 @@ Silicon), plus two embedded NPU targets.
 | **Eigen** | any CPU | resnet + converted-kata1 (debugging-grade speed) |
 | **RKNN** | Rockchip NPU (RK356x/3576/3588, aarch64) | fp16 / int8 via pre-compiled `.rknn` ([conversion guide](docs/RKNN_CONVERSION.md)) |
 | **VIP9000** | VeriSilicon NPU (Allwinner A733, aarch64) | fp16 / int8 via pre-compiled `.nb` ([conversion guide](docs/A733_CONVERSION.md)) |
+| **K3** | SpacemiT K3 AI cores (riscv64; A100 Tensor Cores + TCM) | Full, all model formats — ONNX Runtime + SpacemiT EP, no offline conversion. **Quantise first** (`tools/onnx_to_int8.py`, else `onnx_to_fp16.py`) — the Tensor Cores have no fp32 path, so fp32 is **141× slower** |
 | CUDA | NVIDIA | **stub** — throws at handle creation; kernels not ported to the current architectures (see [roadmap](docs/ROADMAP.md)) |
 
 **Multi-GPU / multi-core**: N server threads, each owning a
@@ -193,6 +194,60 @@ Conversion must happen on x86_64; aarch64 has no Acuity binaries.  See
 and the verification checklist in [docs/A733_CONVERSION.md §7](docs/A733_CONVERSION.md)
 for the chip-ID gotchas to spot-check after each re-conversion.
 
+### Linux (riscv64 — SpacemiT K3 board, e.g. K3 Pico-ITX, Bianbu OS)
+
+```bash
+sudo apt install cmake g++ libeigen3-dev libncurses-dev git
+
+# SpacemiT's ONNX Runtime build (ships ORT 1.24 + the SpacemiT EP +
+# C/C++ headers into /usr/include and /usr/lib):
+sudo apt install spacemit-onnxruntime
+
+# The EP stages tensors through the A100 cores' TCM.  The TCM driver
+# ABI must match the spacemit-tcm userspace (>= 3.0.0 needs the
+# 1.0.2.x kernel build) — verify:
+spacemit-tcm-smi          # should list 8 blocks, "runtime=available"
+dmesg | grep tcm          # "tcm 0.tcm: direct mmap phys ..." at boot
+# If spacemit-tcm-smi hangs or the EP prints "mmap tcm block: Invalid
+# argument" + "tcm buffer acquire failed", apt full-upgrade and reboot
+# into the matching kernel.
+```
+
+CMake auto-detects the runtime on riscv64 (`/usr/lib/libonnxruntime.so` +
+headers); alternatively force it with `cmake .. -DMINIGO_BACKEND=k3`.
+The backend reads the same `.onnx` as every other backend — but
+**quantise it first**:
+
+```bash
+pip install onnxconverter-common
+# conv nets (resnet / katago trunks) — int8 is ~1.7x fp16 here:
+python3 tools/onnx_to_int8.py models/best.onnx --calib calib_states/
+# anything GEMM-shaped (vit), or if you have no calibration data:
+python3 tools/onnx_to_fp16.py models/best.onnx
+```
+
+The A100's Tensor Cores implement int4/int8/fp16/bf16/fp8 — there is **no
+fp32 MMA path**, so an fp32 graph quietly runs on the RVV vector unit
+instead.  On b10c128 9×9: **fp32 22.7 → fp16 1910 → int8 3208 evals/s**
+(141×).  The backend warns if it sees an fp32 compute graph.  Accuracy is
+unaffected in practice — the Tensor Core accumulates into fp32, and
+`verify` matches PyTorch within ~6e-4.
+
+Also set the A100 governor (it boots as `userspace` at 1800 MHz, ~11%
+left on the table):
+
+```bash
+for c in $(seq 8 15); do
+  echo performance > /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor
+done
+```
+
+Use `--max-batch 32` (int8) or `16` (fp16): the EP compiles one fixed
+batch per handle, and throughput peaks where tiles stay resident in the
+3 MB TCM scratchpad.  Backend knobs (`MINIGO_K3_*`), the TOPS table, the
+int8 rules, and TCM troubleshooting are in
+[docs/BACKENDS.md](docs/BACKENDS.md).
+
 ### Python (both platforms — only needed for training)
 
 ```bash
@@ -220,6 +275,7 @@ DistributedDataParallel via `torchrun` (included with PyTorch).
 | librknnrt | RKNN backend (aarch64 Linux) | `/usr/lib/librknnrt.so` from [airockchip/rknn-toolkit2](https://github.com/airockchip/rknn-toolkit2) (`rknpu2/runtime/Linux/librknn_api/aarch64/`) |
 | rknn-toolkit2 | ONNX → .rknn conversion (x86_64 host only) | `pip install rknn-toolkit2==2.3.2` |
 | viplite-tina SDK | VIP9000 backend (aarch64 Linux) | `libNBGlinker.so` + `libVIPhal.so` from [ZIFENG278/ai-sdk](https://github.com/ZIFENG278/ai-sdk) (`viplite-tina/lib/aarch64-none-linux-gnu/v2.0/`) |
+| spacemit-onnxruntime | K3 backend (riscv64 Bianbu) | `apt install spacemit-onnxruntime` (ORT 1.24 fork + SpacemiT EP + headers; kernel with matching TCM driver) |
 | Acuity Toolkit v6.30.22 | ONNX → .nb conversion (x86_64 Linux + Docker only) | Allwinner's `ubuntu-npu:v2.0.10.1` Docker image (Synology netdisk — see docs/A733_CONVERSION.md §3.2). pip `acuitylite` does NOT work — chip table missing A733 PID. |
 | PyTorch | Training | `pip install torch` |
 | Transformer Engine | FP8 training (optional) | `pip install transformer_engine` |

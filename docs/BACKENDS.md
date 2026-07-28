@@ -467,6 +467,201 @@ rationale (why fp16, why Docker-only, why un-share initializers, why
 the `_PLUS_` config name doesn't exist in v6.30.22, host-side parity
 numbers).
 
+### K3 Backend (SpacemiT K3, riscv64 Linux)
+
+`K3ComputeHandle` (`src/backends/k3_compute.cpp`) runs inference through
+**ONNX Runtime** (SpacemiT's 1.24 fork) with the **SpacemiT execution
+provider**.  Unlike the other embedded targets it needs no offline
+conversion — it reads the same `.onnx` every other backend does, dynamic
+batch axis and all.
+
+**The hardware, and the one thing that matters**
+
+The K3 is a homogeneous-fusion CPU: two clusters of **X100** application
+cores (RVA23, VLEN=256, cpus 0-7) and two clusters of **A100** AI cores
+(VLEN=1024, cpus 8-15).  Each *pair* of A100 cores shares a **Tensor
+Core** (4 per chip) fed from a software-managed **local memory** — the
+3 MB TCM scratchpad (8 × 384 KB blocks, each bound to one core pair) —
+via asynchronous AI-DMA.
+
+Per the K3 paper (Table 1), the Tensor Cores implement:
+
+| Precision | Dense | Sparse | Paper's note |
+|---|---:|---:|---|
+| INT4 | 30 TOPS | 60 TOPS | block scaling |
+| INT8 | 15 TOPS | 30 TOPS | **"accelerates convolution"** |
+| BF16 / FP16 | 7.5 TFLOPS | — | |
+| FP8 | 7.5 TFLOPS | — | |
+
+**There is no FP32 row — and that is the whole story.**  An fp32 graph
+runs fine, but only on the RVV vector unit; the Tensor Cores sit idle.
+The 60 TOPS headline is INT4 *with* sparsity.
+
+Measured on-board, b10c128 9×9 at its best batch:
+
+| Precision | evals/s | vs fp32 |
+|---|---:|---:|
+| fp32 | 22.7 | 1× |
+| fp16 (B=16) | **1910** | 84× |
+| int8 (B=32) | **3208** | 141× |
+
+and ResNet50 (batch 1, 4 threads) reaches **151 inf/s** in int8 against
+the **129** the paper reports in Table 8 — i.e. the backend is at or
+slightly above the vendor's own reference.
+
+So: **convert the model** — `tools/onnx_to_int8.py` for conv nets
+(ResNet/KataGo trunks), `tools/onnx_to_fp16.py` otherwise.  The backend
+warns loudly if it sees an fp32 compute graph.  Accuracy is not the
+tradeoff it sounds like: the Tensor Core takes fp16 operands and
+accumulates into fp32, so `build/verify` matches the PyTorch reference
+within ~6e-4 on every head.
+
+**INT8 accelerates convolution only.**  This is the single most
+counter-intuitive property of the target, and it is stated in Table 1's
+own note.  Measured:
+
+| Workload | int8 | fp16 |
+|---|---:|---:|
+| ResNet50 (conv) | **1651 GOPS** | 500 GFLOPS |
+| GEMM 1024³ (dense) | 398 GOPS (2.7% of spec) | **2377 GFLOPS** |
+
+Dense int8 is *not* mapped to IME 2.0 by this EP, so a GEMM-shaped
+model (ViT, LLM) gains nothing from int8 and should stay fp16.  Only
+`QDQ`-format graphs qualify; see the four traps in
+`tools/onnx_to_int8.py`, the sharpest being that **unsigned weights are
+rejected outright** — `cannot find kernel config for this vlen 1024 and
+weight type u8` — and that a `QOperator` graph (QLinearConv) lands 100%
+on the CPU EP and runs ~15× slower than fp16.
+
+**Per-architecture fusion (static batch 16, fp16, measured).**  The EP
+is a *convolution* compiler, and it shows:
+
+| Model | fusion | evals/s |
+|---|---|---:|
+| resnet (MiniGo SE+GPool) | **1 node — fully fused** | 13973 |
+| b10c128 (bigger resnet) | **1 node — fully fused** | 1942 |
+| katanet (KataGo trunk) | **1 node — fully fused** | 13891 |
+| **vit (GoViT)** | **4 EP + 18 CPU islands** | 1283 |
+
+Every convolutional architecture collapses to a single fused tile graph
+once the batch is static (the free-dim override does this).  **ViT does
+not** — even at static batch, 18 nodes stay on the CPU EP: the attention
+`MatMul`/`Softmax`/`Transpose`, `LayerNormalization`, `Erf` (GELU), and
+the directional rel-bias `Tile`/`Expand`/`Where`/`Gather` machine.  This
+is an op-*support* gap, not a shape gap — constant-folding the shape
+machinery does not recover it (ORT's optimizer actually decomposes
+`Softmax` into primitives and fragments it further).  So the tiny
+d64 ViT is *slower* than the 15×-larger b10c128 conv net: its dense
+matmuls never reach the Tensor Core and its norms/softmax run on the
+X100 CPU.  ViT on K3 is where a custom Triton fused-attention kernel
+(the `smt` dialect has the flash-attention primitives — `mbarrier`,
+`descriptor_load`, online `smt.dot`) would pay off; the conv nets have
+nothing left to gain.
+
+**One fixed batch per handle.**  The EP compiles its tile graph on the
+first Run and caches it against *that shape*; it never recompiles.  A
+later, larger batch is then served by the batch-1 kernel (4× slow) or
+fails outright once the frozen subgraph feeds a CPU-EP node
+(`cannot be reshaped to the requested shape`).  So `predict_batch`
+always pads to exactly `max_batch`, the handle warms up at that shape,
+and the session pins the batch axis with `AddFreeDimensionOverrideByName`
+before the graph is built.  Sweep of a *fresh session per shape*:
+
+| B | 8 | 16 | 32 |
+|---|---:|---:|---:|
+| fp16 | 1737 | **1954** | 1368 |
+| int8 | 2437 | 2982 | **3287** |
+
+Use `--max-batch 16` (fp16) or `32` (int8).  Beyond that the tiles stop
+fitting the 3 MB scratchpad — the same curve fp16 GEMM traces
+(1663 → 1929 → **2377** → 1535 GFLOPS at N = 512/768/1024/1536).
+
+**Thread count comes from the session, not the environment.**
+`SPACEMIT_EP_INTRA_THREAD_NUM` is read during the EP library's *static
+init*, so a `setenv()` from application code is far too late.  The
+backend therefore calls `SetIntraOpNumThreads(threads)`; getting this
+wrong silently runs the EP on one A100 core (4×).  The EP pins one pool
+thread per A100 core itself via `/proc/set_ai_thread`.
+
+**Efficiency ceiling.**  fp16 GEMM tops out at ~40% of the 7.5 TFLOPS
+spec (2994 GFLOPS at N=1024, 2.0 GHz).  The paper's own roofline
+(Table 4) puts a register-blocked single-core microkernel at U ≈ 66.7%,
+and 100% only when *both* cores of a pair continuously issue MMA to
+their shared Tensor Core — so ORT's generic MatMul reaching ~60% of the
+realistic ceiling is expected.
+
+**The Triton path (Figure 11's second track) — measured.**  It is real
+and installable on the board: `pip install triton --index-url
+https://git.spacemit.com/api/v4/projects/33/packages/pypi/simple/`
+pulls a prebuilt riscv64/cp314 `spine_triton` wheel (a fork of
+`triton-shared` on `spine-mlir` — the same `mlir::speir` dialect the EP
+lowers to).  A Triton kernel compiles Triton IR → speir MLIR → RISC-V
+and runs on the A100 clusters via `mlir::speir::spineMultiStreamDispatch`.
+It does reach the Tensor Core: the `triton.language.extra.smt` dialect
+exposes `smt.dot` (the IME MMA), `smt.descriptor_load` (DMA into the
+scratchpad), `smt.parallel` / `smt.mbarrier` (multi-stream + double
+buffering).  Torch is not required — tensors can be numpy arrays wrapped
+with a `data_ptr()` shim (the launcher accepts uint64 or any object with
+`data_ptr`).  The fp16 MMA tile is `MICRO=(16,16,8)` — the stock
+example's `MICRO_K=32` aborts in the MMT4D lowering (`kb == cbSz.k`).
+
+**But it does not beat ORT out of the box.**  A correct `smt.dot` fp16
+matmul measures 626 GFLOPS (N=512) / 819 GFLOPS (N=1024) — *below* ORT's
+hand-tuned 1781 / 2994.  The pipelined `SPLIT_MN` example path (scratchpad
+staging + mbarrier) has dtype/param bugs in the shipped example and did
+not run.  This matches the paper's stated strategy (§4.2: hand-tuned
+kernels first for peak, Triton to *generalize*).  So Triton's value here
+is authoring kernels for shapes ORT's library covers poorly — not
+re-beating an already-hand-tuned GEMM; that would take real kernel
+engineering (a working double-buffered schedule), not just `pip install`.
+
+**Topology.**  One logical device; each server thread owns its own
+`Ort::Session`.  `gpu_id` is ignored (RKNN pattern) — handles get a
+slice index from an atomic counter.  Two EPs are selectable per handle:
+
+- `spacemit` — the A100 cluster.  The EP's own thread pool marks itself
+  via `/proc/set_ai_thread` (write `"0"`; **one-way** — an AI thread can
+  never re-bind to X100) and pins one thread per A100 core, so ORT's
+  intra-op pool is left at 1.
+- `cpu` — stock ORT CPU EP with its intra-op pool pinned to an X100
+  slice.  Useful off-K3, or alongside a spacemit handle so both clusters
+  work (`hetero`); the NNEvaluator queue self-balances.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MINIGO_K3_EP` | `spacemit` | `spacemit` / `cpu` / `hetero` |
+| `MINIGO_K3_THREADS` | AI cores ÷ servers | compute threads per handle |
+| `MINIGO_K3_CPUSET` | non-AI cores | cpu list for cpu-EP handles |
+| `MINIGO_K3_BUCKET` | `1` | pad every batch to `max_batch` (0 = dynamic; debug only — forfeits the tensor-core kernel) |
+| `MINIGO_K3_SPIN` | `1` | intra-op spinning (cpu handles) |
+| `MINIGO_K3_VERBOSE` | `0` | per-handle placement chatter |
+
+The EP's own `SPACEMIT_EP_*` variables pass straight through
+(`SPACEMIT_EP_INTRA_THREAD_NUM` sizes the AI pool).
+
+**Operational gotchas**
+
+- The TCM userspace (`spacemit-tcm` ≥ 3.0.0) must match the kernel; a
+  mismatch shows up as `mmap tcm block: Invalid argument` then
+  `tcm buffer acquire failed`.  `apt full-upgrade` + reboot.
+- A crashed process **leaks its TCM block** — the next run then dies
+  with `wait tcm buffer failed for cpu_id: N`.  `spacemit-tcm-smi` shows
+  `available_blocks < 8` with a dead PID; `spacemit-tcm-smi -c`
+  force-releases them.
+- Concurrent processes contend for the 8 blocks: a benchmark left
+  running will starve the next one.  Check `spacemit-tcm-smi` first.
+- `/dev/tcm_sync_mem` is absent on stock Bianbu (no udev rule ships it),
+  so llama.cpp logs `failed to allocate init_barrier from shared mem,
+  falling back to heap`.  Measured impact: ~1%.
+- The A100 cpufreq governor comes up as **`userspace`, parked at
+  1800 MHz** (the paper's A100 closes timing at 2.1 GHz; the node's own
+  max is 2000 MHz).  Worth ~11%:
+  `for c in $(seq 8 15); do echo performance > /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor; done`
+- Benchmark the shape you will ship.  Because the EP freezes its tile
+  graph on the first Run, a harness that warms up at batch 1 and then
+  measures batch 16 reports the batch-1 kernel — 4× low, and it looks
+  like a hardware ceiling rather than a harness artefact.
+
 ### Modular Backend Design (KataGo pattern)
 
 The architecture has three layers:

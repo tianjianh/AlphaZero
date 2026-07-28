@@ -34,6 +34,10 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
   if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -mcpu=native -DNDEBUG")
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+    # riscv gcc has no -march=native; the distro default ISA already
+    # matches the SoC (e.g. rv64gcv on Bianbu/K3).
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
   else()
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
   endif()
@@ -66,6 +70,8 @@ endif()
 #   opencl — OpenCL 1.2+ (Linux NVIDIA/AMD/Intel, macOS)
 #   rknn    — Rockchip NPU (aarch64 Linux, RK3562/66/68/76/88)
 #   vip9000 — VeriSilicon VIP9000 NPU (Allwinner A733 / V853 / etc., aarch64)
+#   k3      — SpacemiT K3 AI cores via ONNX Runtime (riscv64 Linux;
+#             also usable as a generic ORT-CPU backend elsewhere)
 #   eigen   — CPU only (no GPU)
 #
 # Usage:
@@ -76,10 +82,11 @@ endif()
 #   cmake .. -DMINIGO_BACKEND=opencl
 #   cmake .. -DMINIGO_BACKEND=rknn
 #   cmake .. -DMINIGO_BACKEND=vip9000
+#   cmake .. -DMINIGO_BACKEND=k3
 #   cmake .. -DMINIGO_BACKEND=eigen
 #
-set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, eigen")
-set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "rknn" "vip9000" "eigen")
+set(MINIGO_BACKEND "auto" CACHE STRING "Inference backend: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, k3, eigen")
+set_property(CACHE MINIGO_BACKEND PROPERTY STRINGS "auto" "metal" "tensorrt" "cuda" "opencl" "rknn" "vip9000" "k3" "eigen")
 
 # ── VIPLite SDK location (override with -DVIPLITE_ROOT=/path) ─
 # Defaults to the bundled SDK at /root/proj/ai-sdk/viplite-tina/
@@ -183,7 +190,21 @@ if(MINIGO_BACKEND STREQUAL "auto")
         endif()
       endif()
     else()
-      # No CUDA — on aarch64 Linux, prefer hardware NPU paths.
+      # No CUDA — on riscv64 (SpacemiT K3) prefer the ONNX Runtime
+      # backend when the runtime is installed (spacemit-onnxruntime
+      # ships /usr/lib/libonnxruntime.so + headers in /usr/include).
+      set(_k3_ok FALSE)
+      if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+        find_library(ONNXRUNTIME_LIB onnxruntime
+          PATHS /usr/lib /usr/local/lib /usr/lib/riscv64-linux-gnu)
+        find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+          PATHS /usr/include /usr/local/include
+                /usr/include/onnxruntime /usr/local/include/onnxruntime)
+        if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE_DIR)
+          set(_k3_ok TRUE)
+        endif()
+      endif()
+      # On aarch64 Linux, prefer hardware NPU paths.
       set(_rknn_ok FALSE)
       set(_vip9000_ok FALSE)
       if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
@@ -201,7 +222,9 @@ if(MINIGO_BACKEND STREQUAL "auto")
           set(_vip9000_ok TRUE)
         endif()
       endif()
-      if(_rknn_ok)
+      if(_k3_ok)
+        set(MINIGO_BACKEND "k3")
+      elseif(_rknn_ok)
         set(MINIGO_BACKEND "rknn")
       elseif(_vip9000_ok)
         set(MINIGO_BACKEND "vip9000")
@@ -233,6 +256,7 @@ set(HAS_CUDA FALSE)
 set(HAS_TENSORRT FALSE)
 set(HAS_RKNN FALSE)
 set(HAS_VIP9000 FALSE)
+set(HAS_K3 FALSE)
 set(HAS_EIGEN FALSE)
 
 if(MINIGO_BACKEND STREQUAL "metal")
@@ -309,6 +333,19 @@ elseif(MINIGO_BACKEND STREQUAL "vip9000")
   set(VIP_LIB_DIR     "${_VIP_LIB_DIR}")
   set(HAS_VIP9000 TRUE)
 
+elseif(MINIGO_BACKEND STREQUAL "k3")
+  find_library(ONNXRUNTIME_LIB onnxruntime REQUIRED
+    PATHS /usr/lib /usr/local/lib /usr/lib/riscv64-linux-gnu
+          /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu)
+  find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h REQUIRED
+    PATHS /usr/include /usr/local/include
+          /usr/include/onnxruntime /usr/local/include/onnxruntime)
+  # Optional: SpacemiT execution provider (A100 AI cores + TCM).
+  # Without it the backend still builds and runs on the ORT CPU EP.
+  find_library(SPACEMIT_EP_LIB spacemit_ep
+    PATHS /usr/lib /usr/local/lib)
+  set(HAS_K3 TRUE)
+
 elseif(MINIGO_BACKEND STREQUAL "eigen")
   set(HAS_EIGEN TRUE)
   # OpenMP unlocks Eigen's multi-threaded GEMM. Without it the trunk
@@ -318,7 +355,7 @@ elseif(MINIGO_BACKEND STREQUAL "eigen")
   find_package(OpenMP)
 
 else()
-  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, eigen")
+  message(FATAL_ERROR "Unknown backend: ${MINIGO_BACKEND}. Use: auto, metal, tensorrt, cuda, opencl, rknn, vip9000, k3, eigen")
 endif()
 
 # ── Library: minigo core ────────────────────────────────────
@@ -362,6 +399,10 @@ if(HAS_VIP9000)
   list(APPEND CORE_SOURCES src/backends/vip9000_compute.cpp)
 endif()
 
+if(HAS_K3)
+  list(APPEND CORE_SOURCES src/backends/k3_compute.cpp)
+endif()
+
 add_library(minigo_core STATIC ${CORE_SOURCES})
 target_include_directories(minigo_core PUBLIC include)
 target_link_libraries(minigo_core PUBLIC Eigen3::Eigen Threads::Threads)
@@ -378,6 +419,28 @@ if(HAS_EIGEN)
     message(STATUS "OpenMP:     enabled (Eigen GEMM will multi-thread)")
   else()
     message(STATUS "OpenMP:     NOT FOUND — Eigen GEMM will be single-threaded")
+  endif()
+
+  # ── Route Eigen's GEMM through OpenBLAS when available (non-Apple) ──
+  # Eigen 3.4 has NO RISC-V Vector backend — its packet math falls back to
+  # scalar on RVV, and only gcc auto-vectorisation salvages any SIMD.  A
+  # SpacemiT-built OpenBLAS ships hand-written RVV kernels that runtime-
+  # dispatch to the core's vector width (sgemm_kernel_RISCV64_ZVL256B on
+  # the X100's VLEN=256).  EIGEN_USE_BLAS hands every Eigen matrix product
+  # to BLAS sgemm_, so the CPU backend gets real RVV GEMM.  Opt out with
+  # -DMINIGO_EIGEN_BLAS=OFF.
+  option(MINIGO_EIGEN_BLAS "Use OpenBLAS for Eigen GEMM (RVV kernels on RISC-V)" ON)
+  if(NOT APPLE AND MINIGO_EIGEN_BLAS)
+    find_library(OPENBLAS_LIB NAMES openblas openblasp openblas-pthread blas
+      PATHS /usr/lib /usr/local/lib
+            /usr/lib/riscv64-linux-gnu /usr/lib/riscv64-linux-gnu/openblas-pthread)
+    if(OPENBLAS_LIB)
+      target_compile_definitions(minigo_core PUBLIC EIGEN_USE_BLAS)
+      target_link_libraries(minigo_core PUBLIC ${OPENBLAS_LIB})
+      message(STATUS "Eigen BLAS: ${OPENBLAS_LIB} (RVV GEMM on RISC-V)")
+    else()
+      message(STATUS "Eigen BLAS: OpenBLAS not found — Eigen's own (scalar-on-RVV) GEMM")
+    endif()
   endif()
 endif()
 
@@ -437,6 +500,19 @@ if(HAS_VIP9000)
   target_link_options(minigo_core INTERFACE
     "-Wl,--disable-new-dtags"
     "-Wl,-rpath,${VIP_LIB_DIR}")
+endif()
+
+if(HAS_K3)
+  target_compile_definitions(minigo_core PUBLIC MINIGO_HAS_K3=1)
+  target_include_directories(minigo_core PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
+  target_link_libraries(minigo_core PUBLIC ${ONNXRUNTIME_LIB})
+  if(SPACEMIT_EP_LIB)
+    target_compile_definitions(minigo_core PUBLIC MINIGO_K3_HAS_SPACEMIT_EP=1)
+    target_link_libraries(minigo_core PUBLIC ${SPACEMIT_EP_LIB})
+    message(STATUS "K3 backend:  SpacemiT EP enabled (${SPACEMIT_EP_LIB})")
+  else()
+    message(STATUS "K3 backend:  SpacemiT EP not found — ORT CPU EP only")
+  endif()
 endif()
 
 # ── Executables ─────────────────────────────────────────────

@@ -59,7 +59,10 @@ the interface but their kernels are TODO placeholders — `create_handle`
 succeeds structurally and the handle constructor throws a uniform
 "placeholder (TODO)" error.  **RKNN / VIP9000** run whatever was
 compiled into their `.rknn`/`.nb` artifacts (both encodings supported
-by their converters).
+by their converters).  **K3** parses the ONNX natively through ONNX
+Runtime (no conversion step) and passes verification on all five
+format variants — resnet, vit, katanet, kata1 relu+mish — on the
+SpacemiT EP (fp32, max|diff| ≈ 2e-4).
 
 ## 3. Game records — V3, the only training format
 

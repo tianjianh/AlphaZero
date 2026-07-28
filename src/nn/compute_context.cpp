@@ -28,6 +28,10 @@
 #include "backends/vip9000_compute.h"
 #endif
 
+#ifdef MINIGO_HAS_K3
+#include "backends/k3_compute.h"
+#endif
+
 #include <stdexcept>
 
 namespace minigo {
@@ -43,6 +47,8 @@ std::unique_ptr<ComputeContext> create_compute_context(const std::vector<int>& d
     return std::make_unique<RKNNComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_VIP9000)
     return std::make_unique<VIP9000ComputeContext>(device_ids);
+#elif defined(MINIGO_HAS_K3)
+    return std::make_unique<K3ComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_OPENCL)
     return std::make_unique<OpenCLComputeContext>(device_ids);
 #elif defined(MINIGO_HAS_EIGEN)
@@ -64,6 +70,8 @@ std::string backend_name() {
     return "rknn";
 #elif defined(MINIGO_HAS_VIP9000)
     return "vip9000";
+#elif defined(MINIGO_HAS_K3)
+    return "k3";
 #elif defined(MINIGO_HAS_OPENCL)
     return "opencl";
 #elif defined(MINIGO_HAS_EIGEN)
